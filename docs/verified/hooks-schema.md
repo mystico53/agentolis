@@ -79,6 +79,24 @@ There are **32** hook events. This is the full set as of the fetched reference:
 
 ### 1.2 Valid events the PRD missed that Polis needs
 
+> **Correction — read §6 and ADR-0044 before acting on this table.** This section
+> reads as a list of events to register, and §6's `install-hooks` template
+> registers only four of the seven. That is deliberate, not an omission: the code
+> is right and this table is the earlier, wider survey.
+>
+> **Registered:** `PreToolUse` (narrowed to `^(Edit|Write|NotebookEdit)$`),
+> `Notification` (narrowed), `CwdChanged`.
+> **Rejected:** `FileChanged` — it is not a repo watcher and carries no
+> attribution (§9.2, ADR-0003).
+> **Deliberately not registered:** `PostToolUse`, `UserPromptSubmit`,
+> `PermissionDenied` — each is covered at zero process-spawn cost by Channel A or
+> Channel C, and `UserPromptSubmit`'s exit 2 erases the user's prompt.
+> ADR-0044 gives the full reasoning per event and the conditions under which each
+> would be revisited.
+>
+> Nothing else in this document is amended; the payload and exit-code facts below
+> stand for every event whether Polis registers it or not.
+
 | Event | Why Polis needs it | Caveat |
 |---|---|---|
 | `PreToolUse` | **PRD §11.3 depends on it** for contention claims on `Edit`/`Write`. §4.2's hook list omits it — an internal PRD contradiction. | Exit 2 blocks the tool call. Exit 0 always. |

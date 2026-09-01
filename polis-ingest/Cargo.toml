@@ -12,6 +12,11 @@ polis-events = { workspace = true }
 # Channel A. `trace` on opentelemetry-proto is required, not optional: see ADR-0006.
 tonic = { workspace = true }
 opentelemetry-proto = { workspace = true }
+# Not needed to *build* the receiver (docs/verified/otlp-receiver.md §1 proved
+# that), but declared so a hand-written test client or a `prost::Message`
+# round-trip needs no manifest edit. Both are already in the resolved graph.
+prost = { workspace = true }
+tonic-prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 # Channel C.
@@ -20,8 +25,18 @@ notify = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Transcript fixtures, endpoint files and watched directories all want a real
+# path that cleans itself up.
+tempfile = { workspace = true }
+# PRD §16 mandates the transcript parser degrade rather than panic on arbitrary
+# input; that is a property, so it gets a property test.
+proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

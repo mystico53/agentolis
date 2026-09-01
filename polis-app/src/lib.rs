@@ -21,8 +21,13 @@
 //! There is no `#[tokio::main]` anywhere in Polis.
 
 pub mod cli;
+pub mod commands;
 pub mod config;
+pub mod format;
 pub mod ui;
+
+#[cfg(test)]
+pub(crate) mod testutil;
 
 use eframe::egui;
 use polis_world::snapshot::SnapshotReader;

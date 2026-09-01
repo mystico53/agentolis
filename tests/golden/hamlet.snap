@@ -1,0 +1,371 @@
+---
+source: polis-layout/tests/m1_gate.rs
+expression: "city.snapshot().expect(\"serializes\")"
+---
+{
+  "layout": {
+    "format": 1,
+    "schema": 1,
+    "quantum": 0.001,
+    "extent": 37.688,
+    "roads": {
+      "snap_tolerance": 2.0,
+      "nodes": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          6.203,
+          3.243
+        ],
+        [
+          -3.806,
+          -3.315
+        ],
+        [
+          -10.606,
+          -4.978
+        ],
+        [
+          -11.751,
+          -10.922
+        ],
+        [
+          -14.352,
+          -10.643
+        ],
+        [
+          -5.935,
+          -3.712
+        ],
+        [
+          -12.067,
+          -7.087
+        ]
+      ],
+      "segments": [
+        {
+          "from": 0,
+          "to": 1,
+          "class": "street"
+        },
+        {
+          "from": 0,
+          "to": 2,
+          "class": "street"
+        },
+        {
+          "from": 2,
+          "to": 6,
+          "class": "street"
+        },
+        {
+          "from": 3,
+          "to": 7,
+          "class": "street"
+        },
+        {
+          "from": 4,
+          "to": 5,
+          "class": "street"
+        },
+        {
+          "from": 0,
+          "to": 6,
+          "class": "street"
+        },
+        {
+          "from": 6,
+          "to": 7,
+          "class": "arterial"
+        },
+        {
+          "from": 6,
+          "to": 3,
+          "class": "arterial"
+        },
+        {
+          "from": 7,
+          "to": 4,
+          "class": "street"
+        },
+        {
+          "from": 7,
+          "to": 5,
+          "class": "street"
+        }
+      ]
+    },
+    "blocks": [
+      {
+        "id": 0,
+        "district": "",
+        "boundary": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            -5.935,
+            -3.712
+          ],
+          [
+            -3.806,
+            -3.315
+          ]
+        ]
+      },
+      {
+        "id": 1,
+        "district": "src",
+        "boundary": [
+          [
+            -10.606,
+            -4.978
+          ],
+          [
+            -12.067,
+            -7.087
+          ],
+          [
+            -5.935,
+            -3.712
+          ]
+        ]
+      },
+      {
+        "id": 2,
+        "district": "src",
+        "boundary": [
+          [
+            -11.751,
+            -10.922
+          ],
+          [
+            -12.067,
+            -7.087
+          ],
+          [
+            -14.352,
+            -10.643
+          ]
+        ]
+      }
+    ],
+    "lots": [
+      {
+        "id": 0,
+        "block": 0,
+        "occupant": ".gitattributes",
+        "boundary": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            -5.935,
+            -3.712
+          ],
+          [
+            -3.806,
+            -3.315
+          ]
+        ]
+      },
+      {
+        "id": 1,
+        "block": 1,
+        "occupant": "src/util.rs",
+        "boundary": [
+          [
+            -10.606,
+            -4.978
+          ],
+          [
+            -12.067,
+            -7.087
+          ],
+          [
+            -5.935,
+            -3.712
+          ]
+        ]
+      },
+      {
+        "id": 2,
+        "block": 2,
+        "occupant": "src/main.rs",
+        "boundary": [
+          [
+            -11.751,
+            -10.922
+          ],
+          [
+            -12.067,
+            -7.087
+          ],
+          [
+            -14.352,
+            -10.643
+          ]
+        ]
+      }
+    ],
+    "buildings": [
+      {
+        "path": "src/main.rs",
+        "lot": 2,
+        "height": 2.5,
+        "roof": "stepped",
+        "rotation": 0.035,
+        "footprint": [
+          [
+            -12.162,
+            -10.453
+          ],
+          [
+            -12.418,
+            -8.284
+          ],
+          [
+            -13.643,
+            -10.346
+          ]
+        ]
+      },
+      {
+        "path": "src/util.rs",
+        "lot": 1,
+        "height": 1.0,
+        "roof": "pitched",
+        "rotation": 0.041,
+        "footprint": [
+          [
+            -10.363,
+            -5.338
+          ],
+          [
+            -10.747,
+            -5.944
+          ],
+          [
+            -9.072,
+            -4.931
+          ]
+        ]
+      }
+    ],
+    "districts": [
+      {
+        "path": "",
+        "centre": [
+          1.524,
+          -0.268
+        ],
+        "blocks": [
+          0
+        ],
+        "boundary": [
+          [
+            -5.935,
+            -3.712
+          ],
+          [
+            -3.806,
+            -3.315
+          ],
+          [
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      {
+        "path": "src",
+        "centre": [
+          -12.315,
+          -5.923
+        ],
+        "blocks": [
+          1,
+          2
+        ],
+        "boundary": [
+          [
+            -14.352,
+            -10.643
+          ],
+          [
+            -11.751,
+            -10.922
+          ],
+          [
+            -5.935,
+            -3.712
+          ],
+          [
+            -10.606,
+            -4.978
+          ],
+          [
+            -12.067,
+            -7.087
+          ]
+        ]
+      }
+    ],
+    "streets": []
+  },
+  "terrain": {
+    "seed": "0x91d51b0b7c25dbd8",
+    "extent": 37.688,
+    "octaves": 3,
+    "relief": 5.653,
+    "districts": 2,
+    "digest": "0x620040f8a2c29513"
+  },
+  "monuments": [
+    {
+      "path": "src/main.rs",
+      "rank": 0,
+      "entry": "main",
+      "inbound": 0,
+      "top_decile": false
+    }
+  ],
+  "industrial": [],
+  "vacancies": [],
+  "host_of": [
+    [
+      "",
+      ""
+    ],
+    [
+      "src",
+      "src"
+    ]
+  ],
+  "overflow": [
+    {
+      "path": "README.md",
+      "shares": 0
+    }
+  ],
+  "report": {
+    "files": 4,
+    "buildings": 2,
+    "blocks": 3,
+    "lots": 3,
+    "empty_lots": 0,
+    "massed": 0,
+    "overflow": 1,
+    "unbuilt": 1,
+    "road_nodes": 8,
+    "road_segments": 10,
+    "cycles": 3,
+    "junctions": 3,
+    "complex_junctions": 2,
+    "monuments": 1
+  }
+}

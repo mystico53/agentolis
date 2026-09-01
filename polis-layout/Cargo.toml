@@ -10,17 +10,24 @@ repository.workspace = true
 [dependencies]
 polis-events = { workspace = true }
 polis-repo = { workspace = true }
-noise = { workspace = true }
+# There is deliberately NO noise crate. PRD §7.4 requires byte-identical output
+# across machines and across releases, and no noise crate promises output
+# stability between versions. Simplex is written out in `determinism` — ADR-0050.
 lyon = { workspace = true }
+# Parallel only where the result is collected into an index-ordered structure.
+# `par_iter().map().collect::<Vec<_>>()` is deterministic; folding into a shared
+# map or pushing into a `Mutex<Vec<_>>` is not, and would break PRD §7.4.
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 # Golden-file layout snapshots — PRD §16's most important test.
 insta = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -1206,6 +1206,187 @@ directly spawned agent) and `WorkflowJournal` gains `run: String`.
 
 ---
 
+## ADR-0048 — The drift-carrying enums are `#[non_exhaustive]`
+
+**Context.** Seven enums in `polis-events` model schemas Polis does not own:
+`EventKind` (hook events), `ToolKind` (Claude Code's tool set), `OtelEvent` (26
+beta log events plus five span names), `TranscriptRecordKind` (19 undocumented
+record types), `FsEvent` (`notify`'s vocabulary), `Payload` (the four channels
+plus control) and `ControlEvent` (Polis's own failure modes). Every one of them
+is expected to gain members — ADR-0044 states outright that the `EventKind` tag
+table is **append-only**, `docs/verified/otel-schema.md` is explicit that the
+OTel schema moves, and the transcript format is undocumented internals.
+
+Each already carries an escape variant — `Unknown`, `Other`, `Unspecified` — so
+a *runtime* addition degrades gracefully. The compile-time side was not covered:
+an exhaustive `match` in any of the seven downstream crates turns "Claude Code
+2.1.260 added an event" into a workspace-wide compile break, which is the exact
+opposite of the "degrade, never fail" posture PRD §4.1, §4.4 and §17 all
+mandate. With eight crates fanning out in parallel, the number of exhaustive
+matches only grows.
+
+**Decision.** All seven carry `#[non_exhaustive]`. `Channel` deliberately does
+**not**: it enumerates Polis's *own* four ingest channels plus its control
+signal, it is not a foreign schema, and a fifth channel is a design decision that
+*should* fail to compile until every match site has considered it.
+
+`#[non_exhaustive]` does not restrict matching within the defining crate, so
+`polis-events`' own dispatch tables — `EventKind::name`, `ToolKind::parse`,
+`BusStats::dropped` and the rest — keep their exhaustive matches and keep the
+compile-time guarantee that a new variant was handled *there*. The constraint
+lands only on downstream crates, which is the point.
+
+**Consequences.** A `match` on any of the seven outside `polis-events` needs a
+wildcard arm, and that arm is where a `ControlEvent::SchemaDrift` belongs rather
+than a silent drop. Variants remain constructible downstream — the attribute
+restricts matching, not construction — so no call site loses the ability to build
+an event. Adding a variant is now a non-breaking change, which is what makes the
+append-only tag table of ADR-0044 something the compiler helps enforce instead of
+something a reviewer has to remember.
+
+---
+
+## ADR-0049 — `RecordedEvent`: the on-disk format for `polis replay`
+
+**Context.** `EventMeta.observed` is a `std::time::Instant`, and ADR-0014 makes
+that load-bearing: order by receipt, never by a timestamp inside a payload,
+because 20% of transcript files contain a backwards step and one observed jump
+was 60 seconds. A monotonic clock is also immune to NTP corrections and to the
+operator changing the system clock mid-session, which PRD §4.3's ±2 s attribution
+window depends on.
+
+An `Instant` has no meaning outside its process, and neither `Event` nor
+`EventMeta` derived `Serialize`. PRD §15 M2 — "read one JSONL file offline and
+animate it over the city", the milestone the PRD says to spend real time on
+because most of the visual notation gets decided there — therefore had no on-disk
+format at all. Retrofitting a wire format after three milestones of consumers
+exist is exactly the change that is cheap today and expensive later.
+
+**Decision.** A new `polis_events::record` module defines the recorded form:
+
+```rust
+pub struct RecordedEvent {
+    pub wall: WallTime,             // display key
+    pub monotonic_offset_ms: u64,   // ordering key
+    pub event: Event,
+}
+```
+
+with `RecordingClock` (live → recorded) and `ReplayClock` (recorded → live), a
+`RecordingHeader` carrying `RECORDING_FORMAT`, and JSON Lines as the file format.
+
+Four decisions inside that:
+
+* **Two clocks, one reading.** `RecordingClock` reads the system clock **once**,
+  at the recording's origin, and pairs it with the `Instant` taken at the same
+  moment. Every event's `wall` is then *derived* as origin + monotonic offset.
+  So `wall` and `monotonic_offset_ms` sort identically, and a system-clock jump
+  mid-session cannot put a backwards timestamp in the file — the failure mode
+  that made transcript timestamps unusable in the first place.
+* **`observed` is `#[serde(skip)]`, defaulting to `Instant::now()`.** The live
+  path keeps the `Instant`; the recorded path carries time in the two fields
+  above; `ReplayClock::live` stamps `observed = mono_origin + offset` so a
+  replayed stream is windowable by exactly the same rules as a live one. The cost
+  is that serializing a bare `Event` silently loses its timing, which is why
+  `RecordedEvent` is documented as the only sanctioned serialization path.
+* **`WallTime` is written out**, as `i64` milliseconds since the Unix epoch, with
+  no `chrono` or `time` dependency. Same reasoning as ADR-0029: this value is part
+  of a persisted format, and a dependency that changes its serialization or its
+  calendar handling in a patch release changes the format underneath it. Signed,
+  so a rewritten git history's pre-1970 commit is representable — `WallTime` is
+  also `polis-repo`'s commit-time type, which is what keeps one timestamp type
+  across the workspace.
+* **JSON Lines with a version header.** One record per line survives a truncated
+  file, matches the transcript idiom Claude Code already uses, and lets a reader
+  skip a half-written final line while a recording is still being appended to.
+  `RECORDING_FORMAT` exists so a future Polis refuses an unreadable file instead
+  of misreading it.
+
+**Consequences.** Eleven types across `polis-events` gained `Serialize` +
+`Deserialize`, which makes **the `Event` enum's variant names a wire format**:
+serde's external tagging writes `{"Hook":{…}}`, so *adding* a variant is free
+(ADR-0048) but *renaming* one invalidates every recording on disk and must bump
+`RECORDING_FORMAT`. `polis-ingest`'s replay path and `polis-app`'s
+`polis replay` subcommand now have a format to target in M2 rather than
+inventing one under deadline.
+
+---
+
+## ADR-0050 — Simplex noise is written out; the `noise` crate is removed
+
+**Context.** `[workspace.dependencies]` pinned `noise = "0.9.0"` for PRD §7.2's
+terrain field. PRD §7.4 requires that "the same repo produces the same city on
+every launch **and on every machine**", and PRD §16 makes a two-OS byte
+comparison of the serialized `CityLayout` "the most important test in the suite".
+
+The terrain field is not decoration. PRD §7.2 makes it the thing every road
+contour follows — "its only job is to give roads contours to follow, so curvature
+looks justified rather than randomly wiggled". A different noise function is not
+a slightly different texture; it is a different road network, therefore different
+blocks, lots and buildings. The whole city.
+
+No noise crate promises output stability between releases, and none is under any
+obligation to: changing a permutation table or a gradient set is a legitimate
+quality improvement for a noise library and a catastrophe for a golden-file
+suite. `cargo update` would silently invalidate every stored layout, and the
+failure would present as "the determinism test broke on CI" with no obvious
+cause.
+
+**Decision.** `noise` is removed from `[workspace.dependencies]` and from
+`polis-layout`, and added to the manifest's ABSENT list alongside `wgpu` and
+`winit`. 2-D simplex plus fBm are implemented in
+`polis_layout::determinism::{simplex2, fbm2, fbm2_gradient}`, with the
+permutation table derived from the seed by a written-out function, and pinned by
+a test with literal expected values — exactly as `LogicalPath::layout_seed` is
+pinned (ADR-0029).
+
+**Consequences.** Roughly eighty lines of well-understood, thoroughly documented
+algorithm replace a dependency, and `polis-layout`'s output is now stable against
+`cargo update` by construction. If the pinned noise test ever fails, every golden
+layout file is invalidated **on purpose** — that is the signal, not a nuisance.
+The same rule applies to anything else that might be reached for later: a
+Poisson-disc sampler, a Voronoi relaxation, a hash. If its output reaches the
+layout, it is written out here.
+
+---
+
+## ADR-0051 — tree-sitter grammar pins look mismatched and are not
+
+**Context.** The runtime is `tree-sitter 0.27.0`; the four grammars PRD §9 needs
+resolve to `tree-sitter-rust 0.24.2`, `tree-sitter-javascript 0.25.0`,
+`tree-sitter-typescript 0.23.2` and `tree-sitter-python 0.25.0`. That reads like
+version skew, and grammar/runtime skew is a real and common build break.
+
+It is not skew here. Since tree-sitter 0.24 a grammar crate depends on the tiny
+`tree-sitter-language` ABI shim (0.1.x) and **not** on the runtime; all four
+declare `tree-sitter-language = "0.1"` and nothing else. The version number
+tracks the *grammar's* releases, not the parser's, and each of the four is the
+latest published version.
+
+The real hazard is that a genuine ABI mismatch is a **runtime** failure, not a
+compile error: `Parser::set_language` returns `Err(LanguageError)`. PRD §9's
+"failure to parse a file is non-fatal — that file simply has no streets" would
+swallow it perfectly. Every file would silently have no streets, the streets
+layer would render empty, and the map would look entirely healthy.
+
+**Decision.** The four versions above are pinned in `[workspace.dependencies]`,
+and `polis-repo/tests/grammar_abi.rs` loads each one into a real `Parser` and
+parses a snippet containing the import construct the extractor queries for,
+asserting the tree is error-free. All six cases pass against runtime 0.27.0 on
+this machine. `.tsx` is modelled as its own `polis_repo::Language` variant
+because `LANGUAGE_TSX` is a separate grammar, not a flag on the TypeScript one.
+
+**Consequences.** A grammar bump that crosses an ABI boundary fails one loud test
+instead of quietly costing the product its streets. The grammars compile C
+through the `cc` crate, which needs a working C toolchain — already required on
+Windows by the MSVC target, and the same toolchain `rusqlite`'s `bundled` feature
+uses. MSVC's linker prints an informational "creating library …" line for the
+grammars' exported symbols, which `rustc` surfaces as a `linker_messages`
+warning; the workspace allows that lint rather than living with a permanently
+noisy `cargo test` on Windows.
+
+---
+
 ## Open items carried forward
 
 Not decided here, and each needs an owner:

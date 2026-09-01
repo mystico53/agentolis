@@ -78,13 +78,17 @@ jobs:
       - name: Build the hook with its own profile
         run: cargo build --profile hook -p polis-hook
 
-  # PRD §7.4 requires byte-identical layout across runs. Running the suite twice
-  # in one process with HashMap iteration order randomized is the cheapest way to
-  # catch the class of bug PRD §16 calls out: "a common source of nondeterminism
-  # and it will be subtle when it bites."
+  # PRD §7.4 requires byte-identical layout across runs — the class of bug PRD
+  # §16 calls out as "a common source of nondeterminism, and it will be subtle
+  # when it bites."
   #
-  # This job is expected to be a no-op until M1 lands the golden-file test; it is
-  # wired up now so the first golden file is covered on the day it appears.
+  # Note what the step below does and does not do. `RUST_TEST_SHUFFLE` shuffles
+  # the ORDER TESTS RUN IN; it does not randomize `HashMap` iteration. Rust needs
+  # no such switch — `RandomState` already seeds from the OS in every process, so
+  # every run is differently ordered — and the tests that actually hunt this are
+  # `two_fresh_processes_agree` and `hash_map_iteration_order_cannot_move_the_city`.
+  # Shuffling still earns its place: it catches a test that only passes because an
+  # earlier test warmed a cache or a `OnceLock`.
   nondeterminism:
     name: nondeterminism hunt
     runs-on: ubuntu-latest
@@ -100,12 +104,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test with randomized hash seeds
+      - name: Test with shuffled test order
         run: cargo test -p polis-layout -p polis-repo -p polis-events
         env:
-          # Perturbs anything that leaked HashMap iteration order into output.
+          # Catches a test that only passes because an earlier one warmed a cache.
           RUST_TEST_SHUFFLE: 1
           RUST_TEST_THREADS: 1
+
+      # The determinism suite MUST run in release as well, and this is not
+      # belt-and-braces. `debug_assert!` compiles to nothing when
+      # `debug_assertions` is off, so every guard written as a `debug_assert` is
+      # absent from the profile the product actually ships. A layout invariant
+      # that is only enforced by a debug assertion is not enforced at all.
+      #
+      # This is not hypothetical: `city::build_streets` asserted its input was in
+      # canonical order and returned it unsorted, so `CityLayout::streets`
+      # serialized in caller order. Every `cargo test` passed and the release
+      # snapshot changed when the caller's `Vec` was permuted — PRD §15's
+      # "byte-identical layout" broken in the only build that ships.
+      # `caller_supplied_input_order_cannot_move_the_city` covers it, and its
+      # adversarial half runs ONLY here.
+      - name: Determinism suite in release
+        run: cargo test --release -p polis-layout -p polis-repo -p polis-events
 
   docs:
     name: rustdoc

@@ -29,8 +29,13 @@ use serde::{Deserialize, Serialize};
 /// Built-ins are enumerated; MCP tools and anything new arrive as
 /// [`ToolKind::Mcp`] / [`ToolKind::Other`] so a Claude Code release that adds a
 /// tool is a drift event, never a parse failure (PRD §17).
+/// `#[non_exhaustive]` because Claude Code adds tools between releases and every
+/// addition here would otherwise break an exhaustive `match` in `polis-world`,
+/// `polis-layout` or `polis-app`. [`ToolKind::Other`] already forces callers to
+/// have a fallback arm; this makes the compiler agree (ADR-0048).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
+#[non_exhaustive]
 pub enum ToolKind {
     /// `Read` — weak evidence; could be orientation (PRD §6.1, weight 1.0).
     Read,

@@ -75,10 +75,22 @@ impl fmt::Display for Channel {
 /// Every identity field is `Option` on purpose: absence is routine and often
 /// *meaningful*. A `None` [`worker`](Self::worker) means the main agent, not a
 /// parse failure.
-#[derive(Debug, Clone)]
+///
+/// # `observed` does not serialize
+///
+/// [`Instant`] has no wire representation and deliberately gains none here: the
+/// live path is the only place it means anything, because it is the only clock
+/// that cannot step backwards (ADR-0014). The recorded path carries time
+/// separately, as [`crate::record::RecordedEvent`]'s wall clock plus monotonic
+/// offset, and [`crate::record::ReplayClock`] puts a coherent `Instant` back on
+/// the way in. Serializing an [`Event`] by itself therefore loses its timing and
+/// deserializing one stamps it `Instant::now()`; go through `RecordedEvent`
+/// (ADR-0049).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventMeta {
     /// When Polis received it. The only clock safe to window on (see the module
-    /// docs).
+    /// docs). Not serialized — see the type docs.
+    #[serde(skip, default = "Instant::now")]
     pub observed: Instant,
     /// Which channel produced it.
     pub channel: Channel,
@@ -135,7 +147,10 @@ impl EventMeta {
 }
 
 /// One normalised event on the bus.
-#[derive(Debug, Clone)]
+///
+/// Serializable so [`crate::record::RecordedEvent`] can wrap it, but note that
+/// [`EventMeta::observed`] is skipped: an `Event` on its own carries no time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Channel-independent envelope.
     pub meta: EventMeta,
@@ -160,7 +175,15 @@ impl Event {
 /// Boxed variants keep the enum small: the bus holds 65 536 of these
 /// (PRD §4.5), so an unboxed 600-byte variant would cost tens of megabytes of
 /// resident memory for the queue alone.
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`: a fifth Claude Code channel, or a second class of Polis
+/// health signal, must not break every `match` in `polis-world` (ADR-0048).
+///
+/// The variant names are the recorded wire format (ADR-0049): serde's default
+/// external tagging writes `{"Hook": {...}}`, so renaming a variant invalidates
+/// every recording on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Payload {
     /// Channel A, logs and traces.
     Otel(Box<OtelEvent>),
@@ -187,7 +210,13 @@ pub enum Payload {
 /// with an un-prefixed short name in the `event.name` attribute. The OTLP 1.7
 /// `LogRecord.event_name` field is empty on every record, and `severity_number`
 /// is `UNSPECIFIED` on every record — so neither is usable for dispatch.
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`: this enum tracks a **beta** schema that
+/// `docs/verified/otel-schema.md` expects to drift, and [`OTEL_EVENT_NAMES`] is
+/// 26 entries long. Every new `claude_code.*` event would otherwise be a
+/// workspace-wide compile break instead of the drift signal it is (ADR-0048).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum OtelEvent {
     /// `user_prompt` — the start of a turn; mints the [`PromptId`].
     UserPrompt {
@@ -401,7 +430,7 @@ pub enum OtelEvent {
 /// Assembled from `tool_result`, the `claude_code.tool` span, a `PostToolUse`
 /// hook, or a transcript `tool_use` block. `tool_use_id` is the join key across
 /// all of them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Which tool.
     pub tool: ToolKind,
@@ -431,7 +460,7 @@ pub struct ToolCall {
 /// export interval" and still looks plausible — which is why
 /// [`temporality`](Self::temporality) is read off the wire rather than assumed
 /// (ADR-0007).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OtelMetric {
     /// Which counter.
     pub name: MetricName,
@@ -562,7 +591,7 @@ pub const PII_ATTRIBUTES: &[&str] = &[
 ///
 /// The variant set is [`EventKind`], which enumerates exactly the 19 events
 /// `polis install-hooks` registers — `WorktreeCreate` deliberately excluded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookEvent {
     /// Authoritative kind, taken from `hook_event_name` in the payload. The wire
     /// tag is only a routing hint.
@@ -664,7 +693,13 @@ impl HookPayload {
 /// list and carries no `tool_name` or `tool_use_id`, so it is exactly as
 /// attribution-blind as this channel while additionally costing a process spawn
 /// (ADR-0003).
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`: `notify` 9 is already in release-candidate and its event
+/// vocabulary is the thing most likely to grow (permission changes, hard-link
+/// events). Reducing a new one into this enum must not break `polis-world`
+/// (ADR-0048).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FsEvent {
     /// A file appeared.
     Created {
@@ -700,7 +735,7 @@ pub enum FsEvent {
 // ---------------------------------------------------------------------------
 
 /// One transcript record (PRD §4.4).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEvent {
     /// Which record type.
     pub kind: TranscriptRecordKind,
@@ -720,7 +755,7 @@ pub struct TranscriptEvent {
 /// A session is a **forest**, not a tree: the main transcript plus one
 /// independently-rooted tree per subagent, with no `parentUuid` edge crossing
 /// between files. Cross-file parenthood is carried by `agent-<id>.meta.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TranscriptSource {
     /// `<munged-cwd>/<session-id>.jsonl`.
     Main,
@@ -761,8 +796,14 @@ pub enum TranscriptSource {
 /// are flat session sidecars with no envelope and no position in any tree; about
 /// 25% of all lines have no `uuid` at all, so a parser that assumes one breaks
 /// on a quarter of the corpus.
+///
+/// `#[non_exhaustive]`: the format is undocumented internals and the count went
+/// from "a handful" to 19 inside the observed release window. A twentieth must
+/// arrive as [`TranscriptRecordKind::Unknown`] plus a drift signal, not as a
+/// compile error in four crates (ADR-0048).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum TranscriptRecordKind {
     /// `user` — threaded. Carries `tool_result` blocks and `toolUseResult`.
     User,
@@ -819,7 +860,13 @@ pub enum TranscriptRecordKind {
 /// Polis's own health signals, surfaced in the status bar (PRD §4.5, §17).
 ///
 /// > a schema-drift warning in the status bar rather than a crash.
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`: this is the list of things that can go wrong, and it
+/// grows every time a new failure mode is found in the field. The status bar
+/// having no rendering for a new one is a cosmetic gap; a compile break across
+/// the workspace is not (ADR-0048).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ControlEvent {
     /// A channel is unavailable and Polis is running without it.
     ///

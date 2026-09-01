@@ -30,12 +30,19 @@ repository = "https://github.com/mystico53/agentolis"
 # (rustc 1.98.0, x86_64-pc-windows-msvc) or taken from the crates.io index today.
 # Members refer to them with `{ workspace = true }` so a bump happens in one place.
 #
-# Two crates are deliberately ABSENT and must never be added:
+# Three crates are deliberately ABSENT and must never be added:
 #   * `wgpu`  — eframe 0.36.1 re-exports it (`eframe::wgpu`). A direct dependency
 #               silently resolves to a *different* wgpu the day eframe bumps, and
 #               the Device/Queue type mismatch that follows is famously opaque.
 #   * `winit` — same story; eframe pins 0.30.13, not the 0.31.0-beta.2 on crates.io.
-# See docs/verified/gpu-stack.md and ADR-0012.
+#   * `noise` — PRD §7.4 requires byte-identical layout across machines *and*
+#               across releases. `noise` makes no output-stability promise between
+#               versions, so a patch bump would silently reshuffle every city ever
+#               generated. Simplex is written out in
+#               `polis_layout::determinism` instead, exactly as
+#               `LogicalPath::layout_seed` is written out rather than using
+#               `DefaultHasher`. See ADR-0050.
+# See docs/verified/gpu-stack.md, ADR-0012 and ADR-0050.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 # --- internal ---------------------------------------------------------------
@@ -58,9 +65,16 @@ thiserror = "2.0.20"
 
 # --- ingest (Channel A: OTLP/gRPC) ------------------------------------------
 # Compile-verified in docs/verified/otlp-receiver.md §9 with these exact features.
-# `tonic-prost`, `prost` and `prost-types` are NOT direct dependencies: the
-# ProstCodec call lives inside opentelemetry-proto, which carries its own
-# tonic-prost dep. Proven by building the reference receiver without them.
+#
+# `tonic-prost` and `prost` are NOT *required*: the `ProstCodec::default()` call
+# in the generated stubs lives inside opentelemetry-proto, which carries its own
+# `tonic-prost` dep, and §1 proved the receiver builds with both removed. They are
+# declared below anyway, for one reason: no agent after the contract agent may edit
+# a `Cargo.toml`, and a hand-written test client or a `prost::Message` round-trip
+# is a plausible thing for the receiver's tests to want. Both are already in the
+# resolved graph via opentelemetry-proto, so declaring them costs zero build time
+# and zero extra crates. `prost-types` stays out — nothing in the OTLP surface
+# uses `google.protobuf.*` wrappers.
 tonic = { version = "0.14.6", default-features = false, features = [
     "router",
     "server",
@@ -85,6 +99,10 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "sync",
 ] }
 tokio-stream = { version = "0.1.17", default-features = false, features = ["net"] }
+# Both are transitive dependencies of opentelemetry-proto already; see the note
+# above the `tonic` pin for why they are declared directly.
+prost = "0.14.4"
+tonic-prost = "0.14.6"
 
 # --- ingest (Channel C: filesystem watch) -----------------------------------
 # 8.2.0 is the latest STABLE. 9.0.0-rc.5 exists but is a release candidate.
@@ -97,10 +115,22 @@ rayon = "1.12.0"
 
 # --- repo indexing ----------------------------------------------------------
 tree-sitter = "0.27.0"
+# Grammar pins. The version numbers look mismatched against the 0.27 runtime and
+# are not: since tree-sitter 0.24 a grammar crate depends on the tiny
+# `tree-sitter-language` ABI shim (0.1.x) and **not** on the runtime, so the
+# grammar version tracks the *grammar's* releases, not the parser's. All four
+# below declare `tree-sitter-language = "0.1"` and nothing else, and all four are
+# proven loadable into a `tree_sitter::Parser` at runtime 0.27.0 by
+# `polis-repo/tests/grammar_abi.rs`. These are the latest published versions of
+# each. See ADR-0051.
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # --- layout -----------------------------------------------------------------
-noise = "0.9.0"
+# No `noise` crate — see the ABSENT list above and ADR-0050.
 lyon = "1.0.19"
 
 # --- rendering --------------------------------------------------------------
@@ -114,12 +144,25 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 
 # --- misc -------------------------------------------------------------------
 smallvec = { version = "1.16.0", features = ["union", "const_generics"] }
+# WARNING: `ahash`'s default `RandomState` is seeded per process, so an `AHashMap`
+# whose iteration order can reach a layout or a serialized artifact violates
+# PRD §7.4. Use it only for hot lookup tables that are never iterated for output;
+# use `BTreeMap` everywhere else.
 ahash = "0.8.12"
 clap = { version = "4.6.6", features = ["derive"] }
+# Structured logging. Polis installs no subscriber by default: this is the
+# channel a `--verbose` run and `polis doctor` read, and PRD §4.1's "unknown
+# event types are logged at debug and dropped, never fatal" is a `tracing::debug!`.
+tracing = "0.1.44"
 
 # --- dev --------------------------------------------------------------------
 insta = "1.48.0"
 criterion = "0.8.2"
+tempfile = "3.27.0"
+# Property tests for the defensive parsers PRD §16 requires. Genuine fuzzing
+# (`cargo-fuzz` + `libfuzzer-sys`) lives in a separate, nightly-only `fuzz/`
+# crate outside this workspace; it is not a dev-dependency of any member.
+proptest = "1.11.0"
 
 # ---------------------------------------------------------------------------
 # Lints. Every member opts in with `[lints] workspace = true`.
@@ -128,6 +171,13 @@ criterion = "0.8.2"
 # rule that every public item names the PRD section it implements.
 # ---------------------------------------------------------------------------
 [workspace.lints.rust]
+# MSVC's `link.exe` prints an informational "creating library … and object …"
+# line whenever a binary links a `__declspec(dllexport)` symbol, which every
+# tree-sitter grammar's generated C emits. `rustc` surfaces that as a
+# `linker_messages` warning, so a `cargo test` that touches `polis-repo` is
+# permanently noisy on Windows through no fault of any code. Nothing else on the
+# lint reaches us as a warning — a duplicate or missing symbol is an error.
+linker_messages = "allow"
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unsafe_code = "deny"

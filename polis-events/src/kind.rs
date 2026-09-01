@@ -31,9 +31,19 @@ use serde::{Deserialize, Serialize};
 /// The tag is a **routing hint only**. `hook_event_name` inside the JSON payload
 /// is authoritative; the tag exists so `polis-ingest` can shard a datagram onto
 /// the right handler without parsing JSON on the receive thread.
+/// # Adding a variant is not a breaking change downstream
+///
+/// `#[non_exhaustive]`: ADR-0044 already promises this table is **append-only**,
+/// because the discriminants are the wire tags `polis-hook` writes. The attribute
+/// makes the compiler enforce the other half of that promise — an exhaustive
+/// `match` in one of the seven downstream crates would otherwise turn "Claude
+/// Code added an event" into a workspace-wide compile break. Matching inside
+/// `polis-events` is unaffected, which is why the tables below still compile
+/// without a wildcard arm (ADR-0048).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u32)]
 #[serde(rename_all = "PascalCase")]
+#[non_exhaustive]
 pub enum EventKind {
     /// Tag 0. An unrecognised `--event` name, or none at all. Still delivered:
     /// the daemon re-derives the true kind from the payload.

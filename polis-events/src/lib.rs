@@ -32,10 +32,26 @@
 //! decoder in [`wire`] is fuzz-shaped by construction: it validates lengths
 //! before slicing and returns [`wire::WireError`] rather than unwinding.
 
+//! # Two rules that bind every downstream crate
+//!
+//! 1. **The drift-carrying enums are `#[non_exhaustive]`** — [`EventKind`],
+//!    [`ToolKind`], [`OtelEvent`], [`TranscriptRecordKind`], [`FsEvent`],
+//!    [`Payload`] and [`ControlEvent`]. Every one of them models a beta or
+//!    undocumented Claude Code schema that is expected to gain members, and with
+//!    eight crates matching on them, an addition would otherwise be a
+//!    workspace-wide compile break rather than the drift signal it is. A `match`
+//!    on any of them outside this crate needs a wildcard arm; that arm is where a
+//!    [`ControlEvent::SchemaDrift`] belongs (ADR-0048).
+//! 2. **Serialization goes through [`record::RecordedEvent`]**, never through a
+//!    bare [`Event`]. [`EventMeta::observed`] is an `Instant` — right for live
+//!    ordering, meaningless on disk — so it is skipped by serde and the recorded
+//!    form carries a wall clock plus a monotonic offset instead (ADR-0049).
+
 pub mod event;
 pub mod ids;
 pub mod kind;
 pub mod path;
+pub mod record;
 pub mod tool;
 pub mod wire;
 
@@ -47,6 +63,9 @@ pub use event::{
 pub use ids::{AgentType, PromptId, SessionId, ThreadId, ToolUseId, WorkerId, WorktreeId};
 pub use kind::EventKind;
 pub use path::{LogicalPath, PathMapper, PathParseError};
+pub use record::{
+    RecordedEvent, RecordingClock, RecordingHeader, ReplayClock, WallTime, RECORDING_FORMAT,
+};
 pub use tool::{Glyph, Outcome, ToolKind};
 pub use wire::{
     encode_frame, WireError, WireHeader, DEFAULT_HOOK_PORT, HEADER_LEN, HOOK_ENDPOINT_ENV,

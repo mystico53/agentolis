@@ -13,14 +13,29 @@ polis-events = { workspace = true }
 # there is no libgit2 dependency: the parse surface is one stable plumbing
 # format, and it avoids a C build on every platform.
 tree-sitter = { workspace = true }
+# The four grammars PRD §9 needs. Version skew against the 0.27 runtime is
+# expected and safe — a grammar crate depends on the `tree-sitter-language` ABI
+# shim, not on the runtime. Proven loadable by `tests/grammar_abi.rs`; ADR-0051.
+tree-sitter-rust = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
 # `bundled` so a fresh clone needs no system SQLite. The corpus/TF-IDF store is
 # the only thing Polis persists (PRD §6.1).
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# Hot lookup tables only. See the warning on the workspace pin: `ahash` is seeded
+# per process, so nothing whose iteration order can reach a layout may use it.
 ahash = { workspace = true }
+
+[dev-dependencies]
+# PRD §16's fixture repos: `git init` into a temp dir, commit a pinned history,
+# assert the growth order.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
