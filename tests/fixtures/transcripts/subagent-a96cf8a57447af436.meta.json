@@ -1,0 +1,6 @@
+{
+  "agentType": "general-purpose",
+  "description": "Read target.txt and return first line",
+  "toolUseId": "toolu_01Q3g2QgvKmHqJZ3XMPgmJJ5",
+  "spawnDepth": 1
+}

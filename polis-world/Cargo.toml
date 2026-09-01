@@ -1,0 +1,26 @@
+[package]
+name = "polis-world"
+description = "Polis world state: single-writer World, territory inference, contention, attention (PRD §5, §6, §11)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polis-events = { workspace = true }
+polis-layout = { workspace = true }
+polis-repo = { workspace = true }
+# The lock-free snapshot the renderer reads (PRD §5).
+arc-swap = { workspace = true }
+crossbeam-channel = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+
+[lints]
+workspace = true

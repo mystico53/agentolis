@@ -1,0 +1,186 @@
+[workspace]
+resolver = "3"
+members = [
+    "polis-hook",
+    "polis-events",
+    "polis-ingest",
+    "polis-repo",
+    "polis-layout",
+    "polis-world",
+    "polis-render",
+    "polis-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The workspace floor is 1.95, NOT the 1.94 the environment brief assumed.
+# `docs/verified/gpu-stack.md` measured, and this workspace re-verified, that the
+# egui 0.36 family (ecolor/eframe/egui/egui-wgpu/egui-winit/emath/epaint) declares
+# `rust-version = 1.95` and `cargo check` refuses outright on 1.94.0. See ADR-0001
+# in docs/DECISIONS.md. `polis-hook` alone is std-only and builds far below this.
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mystico53/agentolis"
+
+# ---------------------------------------------------------------------------
+# Shared dependency pins.
+#
+# Every version here was resolved and compiled by a recon agent on this machine
+# (rustc 1.98.0, x86_64-pc-windows-msvc) or taken from the crates.io index today.
+# Members refer to them with `{ workspace = true }` so a bump happens in one place.
+#
+# Two crates are deliberately ABSENT and must never be added:
+#   * `wgpu`  — eframe 0.36.1 re-exports it (`eframe::wgpu`). A direct dependency
+#               silently resolves to a *different* wgpu the day eframe bumps, and
+#               the Device/Queue type mismatch that follows is famously opaque.
+#   * `winit` — same story; eframe pins 0.30.13, not the 0.31.0-beta.2 on crates.io.
+# See docs/verified/gpu-stack.md and ADR-0012.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# --- internal ---------------------------------------------------------------
+polis-events = { path = "polis-events", version = "0.1.0" }
+polis-ingest = { path = "polis-ingest", version = "0.1.0" }
+polis-repo = { path = "polis-repo", version = "0.1.0" }
+polis-layout = { path = "polis-layout", version = "0.1.0" }
+polis-world = { path = "polis-world", version = "0.1.0" }
+polis-render = { path = "polis-render", version = "0.1.0" }
+
+# --- serialization ----------------------------------------------------------
+serde = { version = "1.0.229", features = ["derive"] }
+# `preserve_order` keeps transcript object key order stable, which matters for
+# golden-file tests (docs/verified/jsonl-schema.md §12).
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+# --- errors -----------------------------------------------------------------
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+
+# --- ingest (Channel A: OTLP/gRPC) ------------------------------------------
+# Compile-verified in docs/verified/otlp-receiver.md §9 with these exact features.
+# `tonic-prost`, `prost` and `prost-types` are NOT direct dependencies: the
+# ProstCodec call lives inside opentelemetry-proto, which carries its own
+# tonic-prost dep. Proven by building the reference receiver without them.
+tonic = { version = "0.14.6", default-features = false, features = [
+    "router",
+    "server",
+    "transport",
+    "codegen",
+    "gzip",
+] }
+# `trace` is REQUIRED, not optional: it is the only channel that distinguishes a
+# subagent's tool call from the main agent's (docs/verified/otel-schema.md, ADR-0006).
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+    "metrics",
+    "trace",
+] }
+# No "macros": the runtime is constructed explicitly on a named background
+# thread. There is no `#[tokio::main]` anywhere in Polis — winit owns main.
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+] }
+tokio-stream = { version = "0.1.17", default-features = false, features = ["net"] }
+
+# --- ingest (Channel C: filesystem watch) -----------------------------------
+# 8.2.0 is the latest STABLE. 9.0.0-rc.5 exists but is a release candidate.
+notify = "8.2.0"
+
+# --- event bus / concurrency ------------------------------------------------
+crossbeam-channel = "0.5.16"
+arc-swap = "1.9.2"
+rayon = "1.12.0"
+
+# --- repo indexing ----------------------------------------------------------
+tree-sitter = "0.27.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# --- layout -----------------------------------------------------------------
+noise = "0.9.0"
+lyon = "1.0.19"
+
+# --- rendering --------------------------------------------------------------
+# default-features = false drops the glow renderer; "wgpu" selects the one Polis
+# uses. eframe re-exports egui, egui_wgpu and wgpu from its root.
+eframe = { version = "0.36.1", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+
+# --- misc -------------------------------------------------------------------
+smallvec = { version = "1.16.0", features = ["union", "const_generics"] }
+ahash = "0.8.12"
+clap = { version = "4.6.6", features = ["derive"] }
+
+# --- dev --------------------------------------------------------------------
+insta = "1.48.0"
+criterion = "0.8.2"
+
+# ---------------------------------------------------------------------------
+# Lints. Every member opts in with `[lints] workspace = true`.
+#
+# `missing_docs = "warn"` plus CI's `clippy -D warnings` is what enforces the
+# rule that every public item names the PRD section it implements.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Deliberate opt-outs, each with a reason:
+# `polis_events::EventKind` etc. read better with the crate name repeated.
+module_name_repetitions = "allow"
+# The skeleton is signatures with `todo!()` bodies; error/panic prose lands with
+# the implementation. Re-enable per crate once a crate is real.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# ---------------------------------------------------------------------------
+# Profiles.
+# ---------------------------------------------------------------------------
+
+# The application. `thin` LTO rather than `fat`: the wgpu + tonic tree is large
+# and fat LTO costs minutes per build for a UI whose bottleneck is the GPU.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = "debuginfo"
+panic = "unwind"
+
+# `polis-hook` only. Build it with:
+#     cargo build --profile hook -p polis-hook
+#
+# Every setting is load-bearing and measured in docs/verified/hook-ipc.md:
+# this binary is spawned once per hook event on a real agent's critical path,
+# so size and dynamic-link cost are the budget. `panic = "abort"` is safe ONLY
+# because main() installs a panic hook that exits 0 first — without it a panic
+# exits 0xC0000409 and cancels the agent's tool call (ADR-0009).
+[profile.hook]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = false
+debug-assertions = false
+incremental = false
+
+# Golden-layout tests (PRD §16) replay real git history; an unoptimised
+# polis-layout makes them take minutes instead of seconds.
+[profile.test.package.polis-layout]
+opt-level = 2
+[profile.test.package.polis-repo]
+opt-level = 2

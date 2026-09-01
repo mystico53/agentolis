@@ -1,0 +1,25 @@
+[package]
+name = "polis-hook"
+description = "Polis hook transport binary: one loopback UDP datagram per Claude Code hook event (PRD §4.2)."
+version.workspace = true
+edition.workspace = true
+# std only, so this crate builds far below the workspace floor. It is pinned to
+# the workspace value anyway because `cargo` resolves a single lockfile.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# DELIBERATELY EMPTY, AND IT MUST STAY THAT WAY.
+#
+# PRD §14: "tiny static binary; no deps beyond libc + std". Measured in
+# docs/verified/hook-ipc.md: this achieves it with std ALONE — Cargo.lock for
+# this package contains exactly one entry, itself. The release binary is
+# 148,480 bytes, of which ~100 KB is the Rust std floor (a `fn main(){exit(0)}`
+# binary on the identical profile is 99,840 bytes).
+#
+# `cargo tree -p polis-hook` is asserted in CI. Adding even a "small" crate here
+# puts its initialiser on the critical path of every tool call on the machine.
+[dependencies]
+
+[lints]
+workspace = true

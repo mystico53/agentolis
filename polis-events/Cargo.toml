@@ -1,0 +1,19 @@
+[package]
+name = "polis-events"
+description = "Polis shared contract crate: the Event enum, the hook wire format, LogicalPath, and the ids every other crate keys on (PRD §4.5, §5, §7.6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# Every channel needs an untyped catch-all: PRD §4.4 mandates
+# `{ known fields } + serde_json::Value`, and docs/verified/otlp-receiver.md
+# proves `tool_input` is a JSON *string* that must be decoded, not sliced.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

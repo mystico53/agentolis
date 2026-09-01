@@ -1,0 +1,26 @@
+[package]
+name = "polis-repo"
+description = "Polis repository index: git growth order, tree-sitter import graph, TF-IDF corpus store (PRD §6.1, §7.1, §9)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polis-events = { workspace = true }
+# `git log` is invoked as a subprocess (PRD §7.1 names the exact command), so
+# there is no libgit2 dependency: the parse surface is one stable plumbing
+# format, and it avoids a C build on every platform.
+tree-sitter = { workspace = true }
+# `bundled` so a fresh clone needs no system SQLite. The corpus/TF-IDF store is
+# the only thing Polis persists (PRD §6.1).
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+ahash = { workspace = true }
+
+[lints]
+workspace = true

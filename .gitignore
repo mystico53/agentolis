@@ -1,0 +1,17 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# insta review artifacts
+**/*.snap.new
+
+# Local state: the corpus/TF-IDF store (PRD §6.1) and the hook endpoint file.
+/.polis/
+corpus.db
+corpus.db-journal
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

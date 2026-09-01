@@ -1,0 +1,27 @@
+[package]
+name = "polis-ingest"
+description = "Polis ingest: OTLP/gRPC receiver, hook UDP listener, JSONL tailer, filesystem watcher (PRD §4)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polis-events = { workspace = true }
+# Channel A. `trace` on opentelemetry-proto is required, not optional: see ADR-0006.
+tonic = { workspace = true }
+opentelemetry-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+# Channel C.
+notify = { workspace = true }
+# The bus (PRD §4.5).
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

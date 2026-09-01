@@ -1,0 +1,8 @@
+# `clippy::doc_markdown` treats any word with interior capitals as an identifier
+# that should be in a code span. These are prose, not identifiers.
+doc-valid-idents = ["OTel", "ACLed", ".."]
+
+# The workspace is a skeleton: signatures with `todo!()` bodies. Keep the
+# argument-count limit generous enough that a real signature is not forced to
+# grow a parameter struct before anyone has written the function.
+too-many-arguments-threshold = 8

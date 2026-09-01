@@ -1,0 +1,24 @@
+[package]
+name = "polis-render"
+description = "Polis renderer: wgpu pipelines, offscreen density field, camera, culling (PRD §10, §13)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polis-events = { workspace = true }
+polis-layout = { workspace = true }
+polis-world = { workspace = true }
+# NO direct `wgpu` and NO direct `winit`. eframe re-exports both
+# (`eframe::wgpu`, and winit through egui-winit) and pins them: wgpu 30.0.1,
+# winit 0.30.13. A direct dependency resolves to a *different* wgpu the day
+# eframe bumps, and the Device/Queue mismatch that follows is opaque. ADR-0012.
+eframe = { workspace = true }
+lyon = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

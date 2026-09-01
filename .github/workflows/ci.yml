@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in CI is a failure. The workspace is at zero.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # PRD §16 demands the layout determinism check run on two operating systems,
+  # so the whole suite runs on both rather than only the golden-file test — a
+  # nondeterminism bug that only shows up under a different std or a different
+  # float unit would otherwise hide in the crate that produced it.
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain input: rust-toolchain.toml pins 1.98.0 with rustfmt and
+      # clippy. Pinning matters — the egui 0.36 family needs >= 1.95 and the
+      # failure on an older toolchain reads like a dependency problem (ADR-0001).
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      # eframe/wgpu need X11 and Wayland development headers on Linux even for
+      # `cargo check`, because egui-winit links against them.
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libx11-dev libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # PRD §14: "polis-hook must have a near-empty dependency tree — it is
+      # spawned hundreds of times per second and its binary size and dynamic-link
+      # cost are on the critical path." Measured, it needs nothing but std, so
+      # the assertion is exact rather than approximate (ADR-0036).
+      #
+      # `cargo tree -p polis-hook` prints exactly one line: the package itself.
+      - name: polis-hook has no dependencies
+        shell: bash
+        run: |
+          tree=$(cargo tree -p polis-hook -e normal --no-dedupe)
+          echo "$tree"
+          lines=$(printf '%s\n' "$tree" | grep -c .)
+          if [ "$lines" -ne 1 ]; then
+            echo "::error::polis-hook grew a dependency tree ($lines lines)."
+            echo "::error::It is spawned once per hook event on an agent's critical path."
+            exit 1
+          fi
+
+      # Built with the dedicated profile so the shipped artifact — not a debug
+      # build — is what gets exercised.
+      - name: Build the hook with its own profile
+        run: cargo build --profile hook -p polis-hook
+
+  # PRD §7.4 requires byte-identical layout across runs. Running the suite twice
+  # in one process with HashMap iteration order randomized is the cheapest way to
+  # catch the class of bug PRD §16 calls out: "a common source of nondeterminism
+  # and it will be subtle when it bites."
+  #
+  # This job is expected to be a no-op until M1 lands the golden-file test; it is
+  # wired up now so the first golden file is covered on the day it appears.
+  nondeterminism:
+    name: nondeterminism hunt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libx11-dev libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test with randomized hash seeds
+        run: cargo test -p polis-layout -p polis-repo -p polis-events
+        env:
+          # Perturbs anything that leaked HashMap iteration order into output.
+          RUST_TEST_SHUFFLE: 1
+          RUST_TEST_THREADS: 1
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libx11-dev libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Every public item names the PRD section it implements; `missing_docs` is
+      # a workspace lint and broken intra-doc links are how those citations rot.
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

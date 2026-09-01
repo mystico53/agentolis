@@ -1,0 +1,34 @@
+[package]
+name = "polis-app"
+description = "Polis application shell: eframe/winit window, UI overlay, config, CLI (PRD §12, §13)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "polis_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polis"
+path = "src/bin/polis.rs"
+
+[dependencies]
+polis-events = { workspace = true }
+polis-ingest = { workspace = true }
+polis-layout = { workspace = true }
+polis-render = { workspace = true }
+polis-repo = { workspace = true }
+polis-world = { workspace = true }
+eframe = { workspace = true }
+arc-swap = { workspace = true }
+crossbeam-channel = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

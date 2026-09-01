@@ -1,0 +1,10 @@
+# PRD §7.4 makes byte-identical layout across machines a hard requirement, and
+# PRD §16 runs the golden-file layout test on two operating systems. A CRLF
+# checkout on Windows would change every hash derived from a file's bytes and
+# make that test fail for a reason that has nothing to do with the layout engine.
+* text eol=lf
+
+# Transcript fixtures are compared byte-for-byte by the parser tests.
+*.jsonl -text
+*.png binary
+*.wgsl text eol=lf
