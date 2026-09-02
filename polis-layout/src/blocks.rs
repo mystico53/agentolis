@@ -543,6 +543,65 @@ pub(crate) fn heal_districts(blocks: &mut [BlockPlan], territory: &crate::territ
             break;
         }
     }
+
+    settle_open_blocks(blocks, &adj);
+}
+
+/// Give every remaining district-less block to the district next to it.
+///
+/// # The metric was not measuring what the renderer draws
+///
+/// A face with no plot inside it — an open block — came out of [`assign`] with
+/// `district: None`, and [`publish`] turned that into
+/// [`LogicalPath::root`]. So the renderer painted it in the **root district's**
+/// colour, drew a district border all the way round it, and counted it as root's
+/// ground when it decided which edges are borders — while
+/// [`crate::districts::fragmented`], which reads `BlockPlan::district`, skipped
+/// it entirely. Django ships ten such blocks, Neovim one, `click` three. Ten
+/// blocks of root scattered across a map is exactly the fragmentation the metric
+/// exists to report, and the metric could not see them.
+///
+/// Rather than teach the metric about a fallback, the fallback is removed: an
+/// empty face inside a district is that district's ground, which is also what it
+/// looks like. After this runs, every block that the road graph connects to
+/// settled ground has a district, `publish` never reaches its fallback, and the
+/// set the metric reads and the set the renderer draws are the same set.
+///
+/// # Why this cannot fragment a district
+///
+/// Multi-source breadth-first search from every seated block at once. A block is
+/// only ever given the district of a **neighbour that already has it**, so the
+/// district it joins gains a block adjacent to one of its own and stays one
+/// piece. The same argument covers every ancestor of that district, so
+/// [`crate::districts::fragmented_subtrees`] and `fragmented_packages` are
+/// preserved too.
+///
+/// Ties are broken by the seeded queue's order — block id ascending, neighbours
+/// ascending — so the answer is a function of the block list alone (PRD §7.4).
+fn settle_open_blocks(blocks: &mut [BlockPlan], adj: &[Vec<u32>]) {
+    let mut queue: std::collections::VecDeque<u32> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.district.is_some())
+        .map(|(i, _)| u32::try_from(i).expect("block count fits in u32"))
+        .collect();
+    if queue.is_empty() {
+        // No block has a district at all, so there is nothing to spread. That is
+        // a repository with no files; `publish` falls back to the root and the
+        // city is empty either way.
+        return;
+    }
+    while let Some(b) = queue.pop_front() {
+        let Some(d) = blocks[b as usize].district else {
+            continue;
+        };
+        for &nb in &adj[b as usize] {
+            if blocks[nb as usize].district.is_none() {
+                blocks[nb as usize].district = Some(d);
+                queue.push_back(nb);
+            }
+        }
+    }
 }
 
 /// How many times [`heal_districts`] sweeps before it gives up.
@@ -573,6 +632,12 @@ pub(crate) fn civic_square(blocks: &[BlockPlan], s: &Settlement) -> Option<u32> 
 }
 
 /// Convert the internal blocks to the public [`Block`] list.
+///
+/// The [`LogicalPath::root`] fallback is a **last resort that no city with a
+/// file in it reaches**: [`settle_open_blocks`] gives every block the road graph
+/// connects to settled ground a district first, precisely so the published path
+/// and the plan's district cannot disagree. `m1_gate`'s acceptance table asserts
+/// that on four corpora, and ADR-0081 records why.
 pub(crate) fn publish(
     blocks: &[BlockPlan],
     district_path: &dyn Fn(u32) -> LogicalPath,
@@ -724,5 +789,97 @@ mod tests {
         };
         assert_eq!(sliver_count(&[square.clone(), square.clone()]), 0);
         assert_eq!(sliver_count(&[square.clone(), square, slab]), 1);
+    }
+
+    /// A block with a district, and `n` blocks with none, in one chain.
+    fn chain(districts: &[Option<u32>]) -> (Vec<BlockPlan>, Vec<Vec<u32>>) {
+        let blocks: Vec<BlockPlan> = districts
+            .iter()
+            .map(|d| BlockPlan {
+                ring: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+                district: *d,
+                plots: Vec::new(),
+                open: d.is_none(),
+                industrial: false,
+                half_edges: Vec::new(),
+                birth: 0,
+            })
+            .collect();
+        let n = u32::try_from(blocks.len()).expect("fits");
+        let adj: Vec<Vec<u32>> = (0..n)
+            .map(|i| {
+                let mut out = Vec::new();
+                if i > 0 {
+                    out.push(i - 1);
+                }
+                if i + 1 < n {
+                    out.push(i + 1);
+                }
+                out
+            })
+            .collect();
+        (blocks, adj)
+    }
+
+    /// The bug this fixes: an empty face was published as the root district and
+    /// the fragmentation metric could not see it.
+    #[test]
+    fn an_open_block_takes_the_district_next_to_it() {
+        let (mut blocks, adj) = chain(&[Some(7), None, None]);
+        settle_open_blocks(&mut blocks, &adj);
+        assert_eq!(
+            blocks.iter().map(|b| b.district).collect::<Vec<_>>(),
+            vec![Some(7), Some(7), Some(7)]
+        );
+    }
+
+    /// Between two districts, an open block goes to whichever reaches it first
+    /// by breadth-first search — and that is a function of the block list, so it
+    /// is the same answer on every run and every machine (PRD §7.4).
+    #[test]
+    fn the_fill_is_a_function_of_the_block_list() {
+        let seed = [Some(3), None, None, None, Some(9)];
+        let (mut a, adj) = chain(&seed);
+        settle_open_blocks(&mut a, &adj);
+        let (mut b, adj2) = chain(&seed);
+        settle_open_blocks(&mut b, &adj2);
+        assert_eq!(
+            a.iter().map(|x| x.district).collect::<Vec<_>>(),
+            b.iter().map(|x| x.district).collect::<Vec<_>>()
+        );
+        assert!(a.iter().all(|x| x.district.is_some()));
+        // Nearest wins, and the midpoint goes to the lower-numbered seed,
+        // because it is dequeued first.
+        assert_eq!(
+            a.iter().map(|x| x.district).collect::<Vec<_>>(),
+            vec![Some(3), Some(3), Some(3), Some(9), Some(9)]
+        );
+    }
+
+    /// Every filled block borders a block that already had its district, so no
+    /// district can be split by the fill.
+    #[test]
+    fn the_fill_only_ever_extends_a_district_across_a_shared_edge() {
+        let (mut blocks, adj) = chain(&[Some(1), None, None, Some(2), None]);
+        settle_open_blocks(&mut blocks, &adj);
+        for (i, b) in blocks.iter().enumerate() {
+            let d = b.district.expect("every block is settled");
+            let seeded = matches!(i, 0 | 3);
+            assert!(
+                seeded
+                    || adj[i]
+                        .iter()
+                        .any(|&n| blocks[n as usize].district == Some(d)),
+                "block {i} joined district {d} with no neighbour in it"
+            );
+        }
+    }
+
+    /// A repository with no files leaves the fallback alone rather than looping.
+    #[test]
+    fn a_city_with_no_district_at_all_is_left_as_it_is() {
+        let (mut blocks, adj) = chain(&[None, None]);
+        settle_open_blocks(&mut blocks, &adj);
+        assert!(blocks.iter().all(|b| b.district.is_none()));
     }
 }

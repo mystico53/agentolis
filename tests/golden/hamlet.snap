@@ -1,7 +1,6 @@
 ---
 source: polis-layout/tests/m1_gate.rs
-assertion_line: 316
-expression: "city.snapshot().expect(\"serializes\")"
+expression: snapshot
 ---
 {
   "layout": {
@@ -328,16 +327,12 @@ expression: "city.snapshot().expect(\"serializes\")"
             2.338
           ],
           [
-            1.428,
-            1.345
+            1.603,
+            1.009
           ],
           [
-            4.062,
-            1.845
-          ],
-          [
-            4.088,
-            1.909
+            3.736,
+            2.118
           ],
           [
             2.854,
@@ -351,16 +346,20 @@ expression: "city.snapshot().expect(\"serializes\")"
         "occupant": null,
         "boundary": [
           [
-            1.428,
-            1.345
+            1.603,
+            1.009
           ],
           [
             2.786,
             -1.267
           ],
           [
-            4.062,
-            1.845
+            4.088,
+            1.909
+          ],
+          [
+            3.736,
+            2.118
           ]
         ]
       }
@@ -369,108 +368,100 @@ expression: "city.snapshot().expect(\"serializes\")"
       {
         "path": ".gitattributes",
         "lot": 0,
-        "height": 1.163,
+        "height": 1.272,
         "roof": "pitched",
-        "rotation": 0.02,
+        "rotation": 0.0,
         "footprint": [
           [
-            0.318,
-            0.12
+            1.489,
+            -1.078
           ],
           [
-            0.451,
-            -0.146
+            1.62,
+            -1.324
           ],
           [
-            0.871,
-            0.088
+            1.172,
+            -1.562
           ],
           [
-            0.732,
-            0.35
+            1.041,
+            -1.315
           ]
         ]
       },
       {
         "path": "README.md",
         "lot": 1,
-        "height": 2.277,
+        "height": 3.937,
         "roof": "stepped",
-        "rotation": -0.064,
+        "rotation": 0.0,
         "footprint": [
           [
-            0.407,
-            1.235
+            0.417,
+            2.153
           ],
           [
-            1.224,
-            -0.307
+            0.853,
+            2.259
           ],
           [
-            1.442,
-            -0.208
+            1.266,
+            0.543
           ],
           [
-            1.038,
-            1.519
+            0.83,
+            0.437
           ]
         ]
       },
       {
         "path": "src/main.rs",
         "lot": 2,
-        "height": 6.0,
+        "height": 7.0,
         "roof": "stepped",
-        "rotation": -0.041,
+        "rotation": 0.0,
         "footprint": [
           [
-            1.291,
-            0.997
+            2.25,
+            -1.279
           ],
           [
-            1.697,
-            -0.741
+            1.845,
+            -1.374
           ],
           [
-            2.295,
-            -0.46
+            1.46,
+            0.27
           ],
           [
-            1.489,
-            1.09
+            1.866,
+            0.365
           ]
         ]
       },
       {
         "path": "src/util.rs",
         "lot": 3,
-        "height": 2.123,
+        "height": 3.491,
         "roof": "stepped",
-        "rotation": -0.056,
+        "rotation": -0.01,
         "footprint": [
           [
-            1.857,
-            1.514
+            1.651,
+            1.064
           ],
           [
-            2.67,
-            1.595
+            1.228,
+            1.897
           ],
           [
-            3.255,
-            1.706
+            2.403,
+            2.493
           ],
           [
-            3.189,
-            2.369
-          ],
-          [
-            2.841,
-            2.576
-          ],
-          [
-            1.768,
-            2.408
+            2.826,
+            1.661
           ]
         ]
       }

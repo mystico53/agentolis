@@ -35,6 +35,11 @@
 //! | 4 | 52.2 / 59.5 ms | **34.8 / 38.7 ms** |
 //! | 24 (all) | 49.0 / 55.7 ms | **34.1 / 36.4 ms** |
 //!
+//! Re-measured this round at one rayon thread on an idle machine: median
+//! 34.3 ms, p95 **41.2 ms**, twelve samples spanning 30.8-41.2 ms. The gate's
+//! 57.6 ms was taken at one thread *under load*, which is the case the section
+//! below is about.
+//!
 //! Every row was over the 50 ms budget before, on a machine with nothing else
 //! running; every row is now inside it, **including on a single core**, which is
 //! the contention case that made the gate yellow. Repeated four times per thread
@@ -79,12 +84,47 @@
 //! of the twelve: ~200 blocks of ~900 change their file list, against ~49 that
 //! change shape.
 //!
-//! Making the partition incremental is the remaining lever on the second kind;
-//! it is not a caching problem and no cache can fix it, because the arguments
-//! really did change. It is no longer a budget problem either — the whole spread
-//! now fits inside 50 ms on one core — but it is still a few hundred buildings
-//! moving under an operator who was looking at them, and that is PRD §7.7's
-//! business rather than PRD §13.1's.
+//! Making the partition incremental is the remaining lever on that **churn**.
+//! It is not a caching problem and no cache can fix it, because the arguments
+//! really did change. That is PRD §7.7's business rather than PRD §13.1's.
+//!
+//! # It is NOT the remaining lever on the clock, and this file used to imply it
+//!
+//! The previous version of this header named `regions::partition` as "the
+//! remaining lever" without separating churn from time, and the next reader took
+//! it as a performance claim. It is not one. Profiled directly at 5 000 files,
+//! release, one stage at a time:
+//!
+//! | stage | ms | what it is |
+//! |---|---:|---|
+//! | `Graph::from_cells_indexed` | 2.13 | weld the Voronoi corners into a planar graph |
+//! | `regions::adjacency` | 0.15 | |
+//! | **`regions::partition`** | **3.41** | the district partition |
+//! | `Settlement::reseated` | 0.33 | |
+//! | `districts::links_to_keep` | 0.28 | |
+//! | `Graph::collapse_short` + `compact_nodes` | 2.68 | |
+//! | `Graph::faces` (first pass) | 0.42 | |
+//! | `face_districts` + `border_edges` + `choose_prunes` | 3.23 | |
+//! | `delete_edges` + `compact_nodes` + `faces` | 0.68 | |
+//! | `classify_by_betweenness` | 1.04 | |
+//! | `blocks::assign` | 2.58 | |
+//! | `blocks::heal_districts` | 0.52 | |
+//! | **graph pipeline, total** | **17.4** | redone in full on every step |
+//! | `lots::parcel_city` | 30.7 cold / ~9 warm | 78 % of block cuts are cache hits |
+//! | building seating | ~30 cold / ~2 warm | 96 % of buildings are cache hits |
+//!
+//! **The partition is a tenth of the step.** Making it incremental would buy at
+//! most 3.4 ms of a 35 ms floor, and the floor is what to attack: it is paid in
+//! full even by a step that moves three buildings, because the whole cell
+//! diagram is re-welded, re-collapsed, re-pruned and re-faced whether or not a
+//! plot was added. Half the adds in this test add no plot at all, and for those
+//! every one of the seventeen milliseconds above recomputes an identical answer.
+//!
+//! That is the real lever, it is a cache keyed on the cell diagram rather than
+//! an incremental partition, and it is **not taken here** (ADR-0083): the step is inside
+//! its budget (p95 41 ms on one core against 50 ms) and the change spans
+//! `city::assemble`, which this round's parallel work owns. Recorded so the next
+//! reader attacks the right stage.
 //!
 //! # What was fixed here, and what it was
 //!

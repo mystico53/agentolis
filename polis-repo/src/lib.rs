@@ -11,6 +11,7 @@
 //! | [`git`] | §7.1, §7.6 — growth order from `git log`, worktrees, diff counts |
 //! | [`imports`] | §9 — tree-sitter import extraction and the streets it becomes |
 //! | [`corpus`] | §6.1 — the TF-IDF ubiquity discount |
+//! | [`manifest`] | §16 — a real repository, recorded so CI can lay it out without a clone |
 //!
 //! # Determinism reaches this crate, not just `polis-layout`
 //!
@@ -41,6 +42,7 @@
 pub mod corpus;
 pub mod git;
 pub mod imports;
+pub mod manifest;
 pub mod synthetic;
 pub mod tree;
 

@@ -146,6 +146,13 @@ pub struct SnapshotArgs {
     /// it. It answers one question and only that question: is a base map held
     /// in the bottom fifth of the contrast range still legible as context under
     /// the highlights it exists to make room for? Nothing in it is live data.
+    ///
+    /// The clouds are PRD §10.4's *"discrete iso-contour bands, 2–3 levels,
+    /// never a continuous blur"* drawn literally — three nested contours and a
+    /// hatch that tightens toward the core — because the wash that preceded them
+    /// inked two thirds of its own footprint and moved the base median under it
+    /// from `L 22` to `L 43`. Measure this render, not the palette: the median
+    /// of the base map under a cloud has to match the median outside one.
     #[arg(long, value_name = "PATH")]
     pub bands: Option<PathBuf>,
 

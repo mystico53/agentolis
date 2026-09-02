@@ -1553,24 +1553,109 @@ impl History {
     /// earlier `last_touched`, and `seen` keeps a re-added path at its *first*
     /// addition, so applying a range on top of an existing history is correct
     /// without any comparison.
+    ///
+    /// # The stream is folded through a slot table, not straight into the maps
+    ///
+    /// ADR-0082 records the measurement and the cold-start arithmetic around it.
+    ///
+    /// PRD §13.1 budgets the whole cold start at three seconds, and this walk is
+    /// the largest single term in it. Measured on Django — 34 898 commits,
+    /// 155 432 file lines, 11 869 of them additions — the walk cost **1 712 ms**
+    /// while `git log` on its own, timed at the shell, costs **1 131 ms**. The
+    /// 580 ms difference was two things done once per *line*: decoding the raw
+    /// bytes into a [`LogicalPath`] (an allocation and a case fold) and inserting
+    /// it into a `BTreeMap` of some twelve thousand string keys.
+    ///
+    /// A repository has far fewer paths than it has file lines — 155 432 lines
+    /// against ~12 000 paths here, thirteen to one — so both costs are paid over
+    /// and over for the same path. Each *raw spelling* therefore gets a slot on
+    /// first sight, and every later line for it is an `ahash` lookup on the raw
+    /// bytes and one `Vec` write.
+    ///
+    /// **Determinism is unaffected, and the identity rules are unchanged**
+    /// (PRD §7.4). The map is a lookup table that is never iterated for output:
+    /// the slots are drained in *walk order*, recovered from a sequence number,
+    /// and the outputs are still a `Vec` in commit order and a `BTreeMap`. Two
+    /// different raw spellings that decode to one `LogicalPath` — a case-only
+    /// rename, which [`LogicalPath`] folds and the raw bytes do not (ADR-0028) —
+    /// get two slots and are merged by `seen` and by the `BTreeMap` exactly as
+    /// before, in the same order, because the drain is in walk order.
     fn fold_range(
         &mut self,
         repo_root: &Path,
         rev: &str,
         seen: &mut BTreeSet<LogicalPath>,
     ) -> anyhow::Result<()> {
-        let growth = &mut self.growth.entries;
-        let touched = &mut self.last_touched;
+        /// A raw spelling git printed, and what became of it.
+        struct Slot {
+            /// `None` for a path that cannot be a layout key. Cached so a
+            /// repeated bad path is decoded and logged once, not once a line.
+            path: Option<LogicalPath>,
+            /// Walk position and time of the last line naming this spelling.
+            last: (u64, WallTime),
+            /// Walk position and time of its first `A` line, if any.
+            first_add: Option<(u64, WallTime)>,
+        }
+
+        let mut index: ahash::AHashMap<Box<[u8]>, u32> = ahash::AHashMap::default();
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut seq: u64 = 0;
+
         let run = walk_log_status(repo_root, rev, |time, status, raw| {
-            let Some(path) = decode_path_logged(raw) else {
-                return;
+            seq += 1;
+            let slot = if let Some(&s) = index.get(raw) {
+                s
+            } else {
+                let s = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+                slots.push(Slot {
+                    path: decode_path_logged(raw),
+                    last: (0, time),
+                    first_add: None,
+                });
+                index.insert(raw.into(), s);
+                s
             };
-            if status == b'A' && seen.insert(path.clone()) {
-                growth.push((path.clone(), time));
+            let slot = &mut slots[slot as usize];
+            slot.last = (seq, time);
+            if status == b'A' && slot.first_add.is_none() {
+                slot.first_add = Some((seq, time));
             }
-            touched.insert(path, time);
         })?;
-        run.check("log --name-status", repo_root)
+        run.check("log --name-status", repo_root)?;
+
+        // Drain in walk order, which is what makes this identical to folding the
+        // maps line by line rather than merely equivalent.
+        let growth = &mut self.growth.entries;
+        let mut adds: Vec<(u64, WallTime, u32)> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let (at, time) = s.first_add?;
+                s.path.as_ref()?;
+                Some((at, time, u32::try_from(i).unwrap_or(u32::MAX)))
+            })
+            .collect();
+        adds.sort_unstable_by_key(|(at, _, _)| *at);
+        for (_, time, slot) in adds {
+            let path = slots[slot as usize].path.clone().expect("filtered to Some");
+            if seen.insert(path.clone()) {
+                growth.push((path, time));
+            }
+        }
+
+        let touched = &mut self.last_touched;
+        let mut lasts: Vec<(u64, u32)> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.path.is_some())
+            .map(|(i, s)| (s.last.0, u32::try_from(i).unwrap_or(u32::MAX)))
+            .collect();
+        lasts.sort_unstable_by_key(|(at, _)| *at);
+        for (_, slot) in lasts {
+            let s = &slots[slot as usize];
+            touched.insert(s.path.clone().expect("filtered to Some"), s.last.1);
+        }
+        Ok(())
     }
 
     /// [`Self::read`], reusing a cache keyed on `HEAD` and refreshing it

@@ -10,18 +10,20 @@
 //! > most important test in the suite — everything else in the product depends
 //! > on the map not moving. (PRD §16)
 //!
-//! # The six things this file asserts, and what each one can and cannot prove
+//! # The things this file asserts, and what each one can and cannot prove
 //!
 //! | # | Assertion | Catches |
 //! |---|---|---|
 //! | a | [`the_fixture_repositories_have_pinned_history`] | a fixture that is itself nondeterministic, which would make everything below meaningless |
-//! | b | [`golden_hamlet`], [`golden_town`] | any change to the serialized layout, reviewably |
+//! | b | [`golden_hamlet`], [`golden_town`] | any change to the serialized layout, reviewably — and [`classify_golden`] is what stops a determinism bug being regenerated away as a stale snapshot |
 //! | c | [`two_runs_in_one_process_are_byte_identical`] | a mutable static, a cached value, an accumulating buffer |
 //! | d | [`two_fresh_processes_agree`] | anything seeded per process — `RandomState`, ASLR-ordered pointers, an environment variable read three layers down |
 //! | e | [`hash_map_iteration_order_cannot_move_the_city`], [`no_hash_map_reaches_the_layout`] | PRD §16's nondeterminism hunt |
-//! | f | [`ci_runs_the_golden_test_on_ubuntu_and_windows`] | the two-OS leg silently not being wired up |
+//! | f | [`ci_runs_the_golden_test_on_ubuntu_and_windows`] | the two-OS leg silently not being wired up, and a shallow `actions/checkout` laying out a repository with no history |
 //! | g | [`a_render_written_between_two_runs_cannot_move_the_city`] | the repo-walk trap: Polis ingesting its own renders and growing the town a little every run |
 //! | h | [`the_age_ramp_follows_real_commit_time`] | PRD §7.1's age ramp quietly reading list position instead of the clock, so every history draws the same city |
+//! | i | [`the_real_repository_holds_the_gate`] | a generated corpus flattering the layout. The full acceptance table ([`assert_the_acceptance_table`]) runs on three **real** repositories and on this checkout, not only on `polis_repo::synthetic` |
+//! | j | [`the_corpus_manifests_round_trip_byte_for_byte`] | a corpus fixture that has drifted from the format, so every number the gate reports about `click` is about something else |
 //!
 //! # On PRD §16's "run layout twice with `HashMap` iteration randomization
 //! # enabled"
@@ -309,19 +311,234 @@ macro_rules! golden {
     };
 }
 
+/// The body of a golden file, with `insta`'s YAML header removed.
+///
+/// `None` when the file is absent — a first run, which is not a failure.
+fn stored_golden(name: &str) -> Option<String> {
+    let path = workspace_root()
+        .join("tests")
+        .join("golden")
+        .join(format!("{name}.snap"));
+    let text = std::fs::read_to_string(path).ok()?;
+    // `---\n<yaml>\n---\n<body>`. Everything after the second delimiter.
+    let rest = text.strip_prefix("---\n")?;
+    let end = rest.find("\n---\n")?;
+    Some(rest[end + 5..].to_owned())
+}
+
+/// What a golden-file comparison found. See [`classify_golden`].
+#[derive(Debug, PartialEq, Eq)]
+enum GoldenVerdict {
+    /// The stored file and the layout agree, or there is no stored file yet.
+    Matches,
+    /// Two generations agreed with each other and differ from the file.
+    Changed {
+        /// Lines that moved, so the banner can say how big the change is.
+        moved: usize,
+        /// Lines in the stored file.
+        total: usize,
+    },
+    /// Two generations of the same repository disagreed.
+    Nondeterministic {
+        /// One-based line of the first difference.
+        line: usize,
+        /// What the first generation put there.
+        a: String,
+        /// What the second put there.
+        b: String,
+    },
+}
+
+/// Decide **why** a golden file no longer matches, before anything is printed.
+///
+/// # Why a stale golden has to be loud, and loud about the right thing
+///
+/// PRD §16 calls these "the most important test in the suite". Last round all
+/// three were **red on arrival**: the layout had changed and nobody regenerated
+/// them, so the first thing anyone saw was a snapshot diff with no explanation.
+/// The reflex when a golden file fails is `cargo insta accept`, and that reflex
+/// is right exactly half the time. The other half it silently accepts a
+/// determinism bug — a layout that differs *between two runs* also differs from
+/// the file, and the diff looks identical.
+///
+/// So the two cases are separated before `insta` ever sees the value, and only
+/// one of them is regenerable:
+///
+/// * [`GoldenVerdict::Nondeterministic`] panics in [`golden_city`] and never
+///   reaches `insta`, so there is no `.snap.new` to accept and no way to make it
+///   go away by regenerating.
+/// * [`GoldenVerdict::Changed`] prints a banner saying what to do and then lets
+///   `insta` show the diff, which is a review task rather than a bug.
+///
+/// Checking the first costs one extra generation of a fixture city — under two
+/// milliseconds — and it is the case that costs a fortune to find later.
+/// ADR-0084 records the decision.
+fn classify_golden(first: &str, second: &str, stored: Option<&str>) -> GoldenVerdict {
+    if first != second {
+        let line = first
+            .lines()
+            .zip(second.lines())
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| first.lines().count().min(second.lines().count()));
+        return GoldenVerdict::Nondeterministic {
+            line: line + 1,
+            a: first
+                .lines()
+                .nth(line)
+                .unwrap_or("<end of output>")
+                .to_owned(),
+            b: second
+                .lines()
+                .nth(line)
+                .unwrap_or("<end of output>")
+                .to_owned(),
+        };
+    }
+    let Some(stored) = stored else {
+        // No file yet. A first run writes one; that is not a failure.
+        return GoldenVerdict::Matches;
+    };
+    if stored.trim_end() == first.trim_end() {
+        return GoldenVerdict::Matches;
+    }
+    GoldenVerdict::Changed {
+        moved: stored
+            .lines()
+            .zip(first.lines())
+            .filter(|(a, b)| a != b)
+            .count()
+            + stored.lines().count().abs_diff(first.lines().count()),
+        total: stored.lines().count(),
+    }
+}
+
+/// Generate the fixture city twice, act on [`classify_golden`]'s verdict, and
+/// hand the snapshot to `insta`.
+fn golden_city(name: &str, produce: impl Fn() -> String) -> String {
+    let first = produce();
+    let second = produce();
+    match classify_golden(&first, &second, stored_golden(name).as_deref()) {
+        GoldenVerdict::Matches => {}
+        GoldenVerdict::Nondeterministic { line, a, b } => panic!(
+            "
+             ============================================================
+             THE LAYOUT IS NONDETERMINISTIC — golden `{name}`
+             ============================================================
+             Two generations of the SAME repository in the SAME process
+             disagreed. This is not a stale snapshot, and regenerating it
+             would bury the bug (PRD §7.4, §15's M1 gate).
+             
+             First difference at line {line}:
+               run 1: {a}
+               run 2: {b}
+             
+             Look for: a `HashMap` whose iteration order reaches the layout, a
+             wall-clock read, a cached value that survives a call, or a float
+             compared after being narrowed.
+             ============================================================
+"
+        ),
+        GoldenVerdict::Changed { moved, total } => eprintln!(
+            "
+             ============================================================
+             THE LAYOUT CHANGED — golden `{name}` is stale
+             ============================================================
+             Two generations agreed with each other and disagree with
+             tests/golden/{name}.snap, so the layout is deterministic and this
+             is a real, reviewable change: {moved} of {total} lines moved.
+             
+             1. READ the diff below. It is the product changing shape.
+             2. Look at a render before accepting it:
+                  cargo run -p polis-app -- snapshot --out city.png
+             3. Then regenerate, and say in the commit message that you did:
+                  cargo insta accept     (or INSTA_UPDATE=always cargo test)
+             ============================================================
+"
+        ),
+    }
+    first
+}
+
+/// The alarm has to work, or it is a comment.
+///
+/// [`classify_golden`] is a pure function precisely so this can be asserted
+/// without a panic hook and without a deliberately broken fixture.
+#[test]
+fn a_stale_golden_and_a_nondeterministic_one_are_told_apart() {
+    let a = "one
+two
+three
+";
+    let b = "one
+TWO
+three
+";
+
+    // Deterministic and matching.
+    assert_eq!(classify_golden(a, a, Some(a)), GoldenVerdict::Matches);
+    // A trailing newline in the stored file is not a layout change.
+    assert_eq!(
+        classify_golden(
+            a,
+            a,
+            Some(
+                "one
+two
+three"
+            )
+        ),
+        GoldenVerdict::Matches
+    );
+    // No stored file: a first run, not a failure.
+    assert_eq!(classify_golden(a, a, None), GoldenVerdict::Matches);
+    // Deterministic and different: regenerable.
+    assert_eq!(
+        classify_golden(a, a, Some(b)),
+        GoldenVerdict::Changed { moved: 1, total: 3 }
+    );
+    // Two runs disagree. This must NOT be reported as a stale golden, even
+    // though the stored file also differs — that is the whole point.
+    assert_eq!(
+        classify_golden(a, b, Some(a)),
+        GoldenVerdict::Nondeterministic {
+            line: 2,
+            a: "two".to_owned(),
+            b: "TWO".to_owned()
+        }
+    );
+    // …and it wins even when the stored file matches the first run exactly,
+    // which is the case a naive comparison would call a pass.
+    assert!(matches!(
+        classify_golden(
+            a,
+            "one
+two
+three
+four
+",
+            Some(a)
+        ),
+        GoldenVerdict::Nondeterministic { .. }
+    ));
+}
+
 /// (b) The smallest city there is, so a golden-file diff is readable.
 #[test]
 fn golden_hamlet() {
-    let city = fixture_city("hamlet");
-    golden!("hamlet", city.snapshot().expect("serializes"));
+    let snapshot = golden_city("hamlet", || {
+        fixture_city("hamlet").snapshot().expect("serializes")
+    });
+    golden!("hamlet", snapshot);
 }
 
 /// (b) The one that exercises nesting, non-ASCII, a deletion, a rename and an
 /// industrial tree.
 #[test]
 fn golden_town() {
-    let city = fixture_city("town");
-    golden!("town", city.snapshot().expect("serializes"));
+    let snapshot = golden_city("town", || {
+        fixture_city("town").snapshot().expect("serializes")
+    });
+    golden!("town", snapshot);
 }
 
 /// (b) The town with agents working on it: PRD §9's streets, PRD §8's
@@ -337,26 +554,29 @@ fn golden_town() {
 /// plausible agent's working state.
 #[test]
 fn golden_town_in_use() {
-    let tree = repo_tree(&fixtures().join("town"), false);
-    let imports = polis_repo::imports::ImportGraph::build(&tree);
-    let inputs = LayoutInputs {
-        streets: imports.cross_district_edges(),
-        inbound: imports.inbound_counts(),
-        diff_lines: [
-            ("src/auth/session.rs", 420_u32),
-            ("src/auth/providers/oauth/google.rs", 65),
-            ("src/net/server.rs", 12),
-            ("src/ui/app.tsx", 1_900),
-            ("src/café/módulo.rs", 3),
-            ("docs/日本語.md", 140),
-        ]
-        .into_iter()
-        .map(|(path, lines)| (lp(path), lines))
-        .collect(),
+    let build = || {
+        let tree = repo_tree(&fixtures().join("town"), false);
+        let imports = polis_repo::imports::ImportGraph::build(&tree);
+        let inputs = LayoutInputs {
+            streets: imports.cross_district_edges(),
+            inbound: imports.inbound_counts(),
+            diff_lines: [
+                ("src/auth/session.rs", 420_u32),
+                ("src/auth/providers/oauth/google.rs", 65),
+                ("src/net/server.rs", 12),
+                ("src/ui/app.tsx", 1_900),
+                ("src/café/módulo.rs", 3),
+                ("docs/日本語.md", 140),
+            ]
+            .into_iter()
+            .map(|(path, lines)| (lp(path), lines))
+            .collect(),
+        };
+        city::generate_with(&tree, &inputs)
     };
-    let city = city::generate_with(&tree, &inputs);
 
     // The tallest thing on the map is the biggest unreviewed pile (PRD §7.3).
+    let city = build();
     let tallest = city
         .layout
         .buildings
@@ -369,7 +589,8 @@ fn golden_town_in_use() {
         "the 1900-line pile is not the tallest building"
     );
 
-    golden!("town-in-use", city.snapshot().expect("serializes"));
+    let snapshot = golden_city("town-in-use", || build().snapshot().expect("serializes"));
+    golden!("town-in-use", snapshot);
 }
 
 /// (b) The golden files must actually **contain** a street.
@@ -1104,6 +1325,26 @@ fn ci_runs_the_golden_test_on_ubuntu_and_windows() {
          so the golden test is not the one running on two operating systems"
     );
 
+    // Every checkout must be **deep**. `actions/checkout` defaults to
+    // `fetch-depth: 1`, and PRD §7.1 makes `git log` the growth order, so a
+    // shallow clone hands `polis-repo` a repository whose every file was added
+    // by one commit. `the_real_repository_holds_the_gate` lays out this very
+    // checkout: without the deep fetch it would quietly be measuring a
+    // repository with no history — the easiest case there is — and reporting a
+    // pass.
+    let checkouts = text.matches("actions/checkout@").count();
+    // Whole lines only: this file's own comment above each step mentions
+    // `fetch-depth: 0` too, and counting substrings would pass on the comment.
+    let deep = text
+        .lines()
+        .filter(|l| l.trim() == "fetch-depth: 0")
+        .count();
+    assert_eq!(
+        deep, checkouts,
+        "{deep} of {checkouts} `actions/checkout` steps set `fetch-depth: 0`. The \
+         default is a shallow clone, and PRD §7.1's growth order is `git log`."
+    );
+
     // And everything above covers **debug only**. The bug that took M1 red the
     // first time was release-only, so the release leg has to run on both
     // operating systems as well — otherwise the two-OS matrix covers debug, the
@@ -1132,17 +1373,333 @@ fn ci_runs_the_golden_test_on_ubuntu_and_windows() {
 // The real repository
 // ---------------------------------------------------------------------------
 
-/// PRD §15's gate, run against this workspace rather than a fixture.
+/// The acceptance criteria that are supposed to hold on **any** repository.
 ///
-/// The fixtures are the *reviewable* half — small, pinned, diffable. This is the
-/// half that says the pipeline survives a real repository: real directory
-/// depths, real size distribution, untracked files, a `target/` tree, and
-/// whatever eight agents have left in the working tree.
+/// # Why this is a function and not a list of assertions inside one test
 ///
-/// Prints the report, because "does the gate hold" is a question someone asks
-/// out loud and the numbers are the answer.
+/// It used to be a list of assertions inside one test, and that test ran against
+/// [`polis_repo::synthetic`] alone. The real-repository test next to it checked
+/// four things: that the layout does not move between two runs, that there is a
+/// block, that there is a cycle, and that there are twenty buildings. So every
+/// number in the table below — solidity, the ruler test, coverage, the longest
+/// stroke, the junction share — was answered only by a corpus written by the
+/// same people who tuned the layout to pass it.
+///
+/// That is not a hypothetical failure mode. Measured, before the fix in
+/// `polis_layout::accrete`'s `QUARTER_MIN_DENOM`:
+///
+/// | corpus | files | solidity | longest stroke | straight borders |
+/// |---|---:|---:|---:|---:|
+/// | `synthetic::repository(200)` | 200 | 0.763 | — | 0 |
+/// | this workspace | 112 | **0.918** | **77.6 %** | **1** |
+///
+/// Three criteria failed on the developer's own checkout — the first city any
+/// new user sees — while the generated corpus passed all three comfortably at
+/// the same size, because its top-level packages are big enough to found several
+/// quarters and a hundred-file repository's are not.
+///
+/// So the table lives here, and everything with a real repository to offer calls
+/// it.
+///
+/// `through_streets` is the one bound that scales, and it scales because it
+/// counts strokes rather than measuring a ratio: a city with a hundred blocks
+/// cannot have as many long streets as one with two thousand, and asserting the
+/// same integer at both scales would be asserting something about size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bars {
+    /// Every criterion, hard. For a corpus that cannot move: a pinned fixture or
+    /// a checked-in manifest.
+    Full,
+    /// The absolute invariants only, with the shape statistics **reported**.
+    ///
+    /// For the live checkout, and the reason is measured rather than assumed. At
+    /// a hundred-odd files the shape statistics have a sampling noise of several
+    /// points, because the convex hull and the junction census are decided by a
+    /// handful of blocks. The same working tree two files apart:
+    ///
+    ///   | files | 4-and-5+ share | solidity | straight borders | longest stroke |
+    ///   |---:|---:|---:|---:|---:|
+    ///   | 112 | 47.2 % | 0.784 | 0 | 47.9 % |
+    ///   | 114 | 44.6 % | 0.833 | 1 | 64.9 % |
+    ///
+    /// This checkout gains and loses files on every commit, so a hard geometric
+    /// bar on it is a flake generator that fires on whoever happens to add the
+    /// unlucky file. The ground it uniquely covers — a **one-day history** — is
+    /// held instead by `polis-day-one.corpus`, which is a capture of this same
+    /// repository pinned at a commit, and that one is asserted at [`Bars::Full`].
+    Invariants,
+}
+
+/// `numerator / denominator` as a share, without dividing by zero.
+#[allow(clippy::cast_precision_loss)] // both are counts of one city's parts
+fn share(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+// One acceptance table, read as one ordered list. Cutting it into
+// `assert_the_roads`, `assert_the_buildings` and `assert_the_districts` would
+// hide the fact that it is a single checklist and invite a caller to run half.
+#[allow(clippy::too_many_lines)]
+fn assert_the_acceptance_table(label: &str, city: &City, bars: Bars) {
+    let s = city::measure(city);
+    let r = city.report;
+    println!("POLIS_GATE {label} report={r:?}");
+    println!("POLIS_GATE {label} structure={s:?}");
+
+    // --- The road graph is a city, not a tree and not a tangle -------------
+    assert_eq!(
+        r.components, 1,
+        "{label}: the city is in {} pieces",
+        r.components
+    );
+    assert_eq!(r.dangling, 0, "{label}: a road ends in mid-air");
+    assert_eq!(r.crossings, 0, "{label}: roads cross without a junction");
+    assert_eq!(r.blocks, r.cycles, "{label}");
+    assert!(r.blocks > 0, "{label}: no block at all");
+
+    // --- PRD §7.2's organic signature -------------------------------------
+    // Four- and five-way junctions. **45 %**, which is the number the
+    // 200-to-5 000-file scale test has always used; the single-scale gate next
+    // to it asserted two fifths for three rounds and nobody reconciled them.
+    // Measured with this bound in force: 46.7 % on the synthetic corpus,
+    // 47.2 % on this workspace, 51.1 % on `click`, 66.8 % on `pytest`, 55.2 %
+    // on Neovim and 48.1 % on Django — every real corpus is clear of it, and
+    // the generated fixture is the closest to it.
+    if bars == Bars::Full {
+        assert!(
+            r.complex_junctions * 100 >= r.junctions * 45,
+            "{label}: only {} of {} junctions are four-way or better",
+            r.complex_junctions,
+            r.junctions
+        );
+    }
+
+    // --- Buildings ---------------------------------------------------------
+    assert_eq!(s.buildings_on_road, 0, "{label}");
+    assert_eq!(s.buildings_outside_lot, 0, "{label}");
+    // Coverage has a **scale**, and this is the first round it has been measured
+    // anywhere but the five-thousand-file fixture. 25 % is that fixture's bar and
+    // it is unchanged; below a thousand files the same code measures lower and
+    // always has, because a small repository parcels more ground than it has
+    // files to put on it and the remainder is PRD §7.5's vacant lots:
+    //
+    //   | corpus | files | coverage | vacant lots |
+    //   |---|---:|---:|---:|
+    //   | `synthetic::repository(100)` |   100 | 21.5 % | — |
+    //   | `synthetic::repository(200)` |   200 | 26.3 % | — |
+    //   | `click`                      |   166 | 20.0 % | 53 of 219 |
+    //   | this workspace               |   112 | 26.5 % | 32 of 144 |
+    //   | `pytest`                     |   690 | 33.6 % | — |
+    //   | this fixture                 | 5 000 | 32.7 % | — |
+    //
+    // So the bound below a thousand files is stated at 18 % rather than pretended
+    // to be 25 %: the synthetic corpus was already at 21.5 % at a hundred files
+    // before anything in this round moved, and a bar nothing has ever met is a
+    // bar that gets quietly deleted the first time it fires.
+    let coverage_floor = if r.files >= 1_000 { 0.25 } else { 0.18 };
+    assert!(
+        s.coverage > coverage_floor,
+        "{label}: only {:.1}% of the ground is built on (floor {:.0}%)",
+        s.coverage * 100.0,
+        coverage_floor * 100.0
+    );
+
+    // --- Every file is on the map -----------------------------------------
+    // The one property whose failure is invisible in a render: a file with no
+    // building and no overflow record is a file the operator will look for and
+    // not find.
+    assert_eq!(
+        r.unhoused, 0,
+        "{label}: {} files were not placed",
+        r.unhoused
+    );
+    assert_eq!(
+        r.overflow, 0,
+        "{label}: {} files had to share a parcel",
+        r.overflow
+    );
+    assert_eq!(r.empty_cells, 0, "{label}");
+    assert_eq!(r.plots_off_face, 0, "{label}");
+    assert_eq!(
+        r.buildings + r.massed,
+        r.files,
+        "{label}: {} of {} files have neither a building nor a mass",
+        r.files - r.buildings - r.massed,
+        r.files
+    );
+
+    // --- Is it a place, or a diagram? -------------------------------------
+    println!(
+        "POLIS_SHAPE {label} files={} solidity={:.4} straight_border={:.4} straight_borders={}          radial_spokes={} radial_strokes={} longest_stroke={:.4} through_streets={}          junction_share={:.3} coverage={:.4} hierarchy={:.1}",
+        r.files,
+        s.solidity,
+        s.straight_border,
+        s.straight_borders,
+        s.radial_spokes,
+        s.radial_strokes,
+        s.longest_stroke,
+        s.through_streets,
+        share(r.complex_junctions, r.junctions),
+        s.coverage,
+        s.block_hierarchy
+    );
+    if bars == Bars::Invariants {
+        return;
+    }
+    assert!(
+        s.solidity < 0.90,
+        "{label}: the city fills {:.1}% of its own convex hull: that is a coin, not a coast",
+        s.solidity * 100.0
+    );
+    assert_eq!(
+        s.radial_spokes, 0,
+        "{label}: {} district borders run from the middle of the city to its edge on a radial bearing",
+        s.radial_spokes
+    );
+    assert_eq!(
+        s.radial_strokes, 0,
+        "{label}: {} through-streets pass through the civic square and out the other side",
+        s.radial_strokes
+    );
+    // The bearing-free one. A ruler is a ruler whatever direction it points.
+    assert_eq!(
+        s.straight_borders,
+        0,
+        "{label}: {} district borders are dead straight for more than a fifth of the city          (longest {:.1}%): the partition is drawing with a ruler",
+        s.straight_borders,
+        s.straight_border * 100.0
+    );
+
+    // --- Through-streets, both bounds -------------------------------------
+    assert!(
+        s.longest_stroke > 0.35 && s.longest_stroke < 0.70,
+        "{label}: longest stroke is {:.1}% of the diameter; the acceptance band is 35-70%",
+        s.longest_stroke * 100.0
+    );
+    let strokes_wanted = if r.files >= 1_000 { 8 } else { 4 };
+    assert!(
+        s.through_streets >= strokes_wanted,
+        "{label}: only {} strokes reach a quarter of the city diameter",
+        s.through_streets
+    );
+
+    // --- Districts ---------------------------------------------------------
+    assert_eq!(
+        r.fragmented_districts, 0,
+        "{label}: {} of {} districts are in more than one piece",
+        r.fragmented_districts, r.districts
+    );
+    assert_eq!(
+        r.fragmented_packages, 0,
+        "{label}: {} top-level packages are in more than one piece",
+        r.fragmented_packages
+    );
+    assert_eq!(r.faceless_districts, 0, "{label}");
+    assert_eq!(
+        r.relaxed_to_ancestor + r.relaxed_to_anywhere + r.detached_placements,
+        0,
+        "{label}"
+    );
+    assert_eq!(r.settled_on_fringe, 0, "{label}");
+
+    // --- What is measured is what is drawn --------------------------------
+    // `blocks::publish` used to give a face with no plot in it
+    // `LogicalPath::root`, so the renderer painted it as the root district and
+    // drew a border round it while `districts::fragmented` — which reads
+    // `BlockPlan::district` — skipped it. Django shipped ten of them.
+    // `blocks::settle_open_blocks` gives every such face the district beside it,
+    // and this is the assertion that says the two sets are now one set.
+    let published: usize = city.layout.districts.values().map(|d| d.blocks.len()).sum();
+    assert_eq!(
+        published,
+        city.layout.blocks.len(),
+        "{label}: {} of {} published blocks belong to no district the fragmentation \
+         metric measures — they are drawn as ROOT and counted as nothing",
+        city.layout.blocks.len() - published,
+        city.layout.blocks.len()
+    );
+}
+
+/// A corpus manifest checked into `tests/corpora/`, by name.
+///
+/// No network, no clone and no `git` subprocess: the file **is** the repository
+/// as far as the layout is concerned (see [`polis_repo::manifest`]).
+fn corpus(name: &str) -> polis_repo::manifest::Corpus {
+    let path = workspace_root()
+        .join("tests")
+        .join("corpora")
+        .join(format!("{name}.corpus"));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    polis_repo::manifest::load(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// PRD §15's gate, run against **real repositories** rather than a generator.
+///
+/// Four of them, and each answers something the others cannot:
+///
+/// * `click` — 166 files, 3 333 commits over twelve years. The **small
+///   repository**, which is the first city a new user sees, and the size at
+///   which the layout was quietly failing.
+/// * `pytest` — 690 files, 17 715 commits over eighteen years. A repository
+///   whose history *accelerated*: 0.1 % of its files date from its first year,
+///   which is the case `polis_layout::age`'s equalisation exists for.
+/// * `polis-day-one` — this repository, pinned, with a history **one day long**.
+///   Nothing in a fixture library is one day old, and a repository that young is
+///   the other common case: a project someone started this morning. It is also
+///   the corpus that failed three criteria before this round's fix to
+///   `polis_layout::accrete`, and the reason that fix cannot be lost again.
+/// * the **live checkout** — untracked files, a `target/` tree, and whatever
+///   eight agents have left in the working tree. Asserted at
+///   [`Bars::Invariants`]: see that variant for the measured reason.
+///
+/// The first three are checked-in manifests (`polis_repo::manifest`), so CI runs
+/// them with no clone and no network, and they cannot drift.
+///
+/// Anything that holds only on the generated corpus is not a property of the
+/// layout.
 #[test]
 fn the_real_repository_holds_the_gate() {
+    // `(name, at least this many files, at least this many commits)`. The commit
+    // floor is per-corpus on purpose: `polis-day-one` has nine, and that is the
+    // whole point of it, while a `click` that suddenly reported nine would be a
+    // shallow capture with no growth order at all.
+    for (name, files, commits) in [
+        ("click", 150_usize, 1_000_u64),
+        ("pytest", 600, 1_000),
+        ("polis-day-one", 100, 2),
+    ] {
+        let c = corpus(name);
+        assert!(
+            c.tree.files.len() >= files,
+            "{name}: the manifest holds only {} files",
+            c.tree.files.len()
+        );
+        assert_eq!(
+            c.header.head.len(),
+            40,
+            "{name}: the manifest pins no commit"
+        );
+        assert!(
+            c.header.commits >= commits,
+            "{name}: {} commits, expected at least {commits} — a shallow capture              has no growth order",
+            c.header.commits
+        );
+        let city = city::generate_city(&c.tree);
+        // Two runs, because a corpus that is byte-identical on disk is the
+        // cleanest possible input for the nondeterminism hunt.
+        assert_eq!(
+            city.digest(),
+            city::generate_city(&c.tree).digest(),
+            "{name}: the city moved between two runs in one process"
+        );
+        assert_the_acceptance_table(name, &city, Bars::Full);
+    }
+
     let root = workspace_root();
     let tree = repo_tree(&root, true);
     assert!(
@@ -1159,25 +1716,72 @@ fn the_real_repository_holds_the_gate() {
         "the real repository's city moved between two runs in one process"
     );
     assert_eq!(first.digest(), second.digest());
-
-    let report = first.report;
     println!("POLIS_REAL_CITY digest={:016x}", first.digest());
-    println!("POLIS_REAL_CITY report={report:?}");
-    println!(
-        "POLIS_REAL_CITY districts={} monuments={} industrial={} streets={}",
-        first.layout.districts.len(),
-        first.monuments.len(),
-        first.industrial.len(),
-        first.layout.streets.len()
-    );
+    assert_the_acceptance_table("this workspace", &first, Bars::Invariants);
+    assert!(first.report.monuments > 0, "{:?}", first.report);
+}
 
-    assert!(report.blocks > 0, "no block: {report:?}");
+/// The checked-in corpora are a **faithful** record, not an approximation.
+///
+/// Loading one and capturing it again has to reproduce the file byte for byte,
+/// or the fixture and the format have drifted apart and every number the gate
+/// reports about `click` is about something else.
+#[test]
+fn the_corpus_manifests_round_trip_byte_for_byte() {
+    for name in ["click", "pytest", "polis-day-one"] {
+        let path = workspace_root()
+            .join("tests")
+            .join("corpora")
+            .join(format!("{name}.corpus"));
+        let text = std::fs::read_to_string(&path).expect("read the manifest");
+        let c = corpus(name);
+        assert_eq!(
+            polis_repo::manifest::capture(&c.tree, &c.header),
+            text.replace("\r\n", "\n"),
+            "{name}: the manifest does not survive a round trip"
+        );
+        // A capture full of untracked files would mean the growth order was
+        // lost — and this is a **rate**, not a zero, because a real repository
+        // has files git will not name an add for. Measured: 0 of 166 on
+        // `click`, 1 of 690 on `pytest` (`CONTRIBUTING.rst`, which carries a
+        // `last_touched` from the fused walk and no `A` entry anywhere in
+        // 17 715 commits). One file with no growth index gets
+        // `growth_index = u32::MAX` and reads at the newest ground, which is the
+        // documented behaviour for an untracked working-tree file; a corpus
+        // where that were common would be a corpus with no age structure at all.
+        let untracked = c.tree.files.values().filter(|m| !m.is_tracked()).count();
+        assert!(
+            untracked * 100 <= c.tree.files.len(),
+            "{name}: {untracked} of {} files carry no growth index",
+            c.tree.files.len()
+        );
+    }
+}
+
+/// A shallow checkout has one commit and therefore no growth order at all, and
+/// `actions/checkout` is shallow **by default**.
+///
+/// Without this, the real-repository leg would silently degrade in CI to the one
+/// case the layout finds easiest — every file the same age — and say nothing.
+/// It is asserted separately from the gate above so the message names the cause
+/// rather than showing up as a solidity failure.
+#[test]
+fn this_checkout_has_its_history() {
+    let root = workspace_root();
+    let history = polis_repo::git::History::read(&root).expect("read git history");
+    let commits: std::collections::BTreeSet<i64> = history
+        .growth
+        .entries
+        .iter()
+        .map(|(_, at)| at.unix_millis())
+        .collect();
     assert!(
-        report.cycles > 0,
-        "the real repository grew a tree, not a city: {report:?}"
+        commits.len() > 1,
+        "every file in this checkout was added at the same instant, so it has \
+         one commit. PRD §7.1 makes `git log` the growth order, and a shallow \
+         clone therefore lays out a different city: `actions/checkout` needs \
+         `fetch-depth: 0`."
     );
-    assert!(report.buildings > 20, "{report:?}");
-    assert!(report.monuments > 0, "{report:?}");
 }
 
 /// Writes the real repository's snapshot where `tests/render-city.py` can find
@@ -1326,65 +1930,50 @@ fn the_layout_holds_at_five_thousand_files() {
     println!("POLIS_SCALE structure={structure:?}");
     println!("POLIS_SCALE generated in {elapsed:?}");
 
-    // Connectivity and planarity: the whole reason this architecture replaced
-    // space colonisation.
-    assert_eq!(r.components, 1, "the city is in {} pieces", r.components);
-    assert_eq!(r.dangling, 0, "a road ends in mid-air");
-    assert_eq!(r.crossings, 0, "roads cross without a junction");
-    assert_eq!(r.blocks, r.cycles);
+    // Every criterion that is supposed to hold on **any** repository is
+    // asserted by one function, and this test and
+    // `the_real_repository_holds_the_gate` both call it. That is not tidying:
+    // the junction-share bound existed twice in this file at two different
+    // numbers — two fifths here and 45 % in the scale test below — for three
+    // rounds, and a bar that disagrees with itself is not a bar. There is now
+    // one of it, at 45 %.
+    assert_the_acceptance_table("synthetic 5 000", &city, Bars::Full);
+
     assert!(r.blocks > 700, "only {} blocks: {r:?}", r.blocks);
-
-    // The organic signature: four- and five-way junctions, which is what the eye
-    // reads as "grown" (PRD §7.2). The bake-off baseline was 53.3 %; measured
-    // with the commit-time ramp it is 46.7 % here, 55.2 % on Neovim and 48.1 %
-    // on Django. The share moves with the grain distribution — a repository
-    // whose ground is mostly one age tiles more regularly — so the bound is set
-    // below all three rather than at the fixture's own number. Two fifths is
-    // still far above what a snapped tree or a chord partition produces, and the
-    // properties that say "not a tree" (cycles, no dangling) are asserted
-    // separately and absolutely.
-    assert!(
-        r.complex_junctions * 5 >= r.junctions * 2,
-        "only {} of {} junctions are four-way or better",
-        r.complex_junctions,
-        r.junctions
-    );
-
-    // Buildings (baseline: 1.6 % in the road corridor, 0.3 % outside their lot,
-    // 8.9 % coverage).
-    assert_eq!(structure.buildings_on_road, 0);
-    assert_eq!(structure.buildings_outside_lot, 0);
-    assert!(
-        structure.coverage > 0.25,
-        "only {:.1}% of the ground is built on",
-        structure.coverage * 100.0
-    );
 
     // Block geometry (bake-off baseline: 0 slivers, p95:p05 6.8x, median
     // compactness 0.722, age gradient 1.96x).
     assert!(structure.compactness > 0.65, "{}", structure.compactness);
 
-    // # Both of these are now properties of the repository, not of the generator
+    // # Both of these are properties of the repository, not of the generator
     //
-    // The age ramp reads real commit time (PRD §7.1, `polis_layout::age`), so a
-    // repository with a large founding cohort has a large fine-grained core and
-    // a steep gradient, and one that rewrote itself has neither. Measured on
-    // three corpora with the same code:
+    // JUDGEMENT.md asks for a 30x block-size hierarchy and this gate has
+    // asserted 8x for three rounds without either meeting the target or arguing
+    // against it. **ADR-0079 settles it, and the argument is a measurement**:
+    // p95:p05 block area with this exact code, on five real repositories and the
+    // fixture —
     //
-    //   | corpus            | first-year files | p95:p05 | age gradient |
-    //   |-------------------|------------------|---------|--------------|
-    //   | Neovim, 3 890     | 36.3 %           | 23.8x   | 5.96x        |
-    //   | this fixture      |  8.2 %           | 10.0x   | 2.07x        |
-    //   | Django, 7 014     |  3.4 %           |  5.2x   | 1.65x        |
+    //   | corpus              | files | first-year files | p95:p05 | age gradient |
+    //   |---------------------|------:|-----------------:|--------:|-------------:|
+    //   | `click`             |   166 |           25.9 % |  56.0x  |        8.48x |
+    //   | this workspace      |   112 |           95.5 % |  19.1x  |        2.48x |
+    //   | Neovim              | 3 890 |           36.3 % |  13.0x  |        5.96x |
+    //   | Django              | 7 014 |            3.4 % |   9.1x  |        1.65x |
+    //   | `pytest`            |   690 |            0.1 % |   7.0x  |        2.29x |
+    //   | this fixture, 5 000 | 4 965 |            8.2 % |   9.4x  |        2.35x |
     //
-    // The previous 20.2x and 2.98x came from ramping on *growth-sequence
-    // position*, which spreads every repository's ages evenly over the ramp
-    // whatever its history — a number the generator manufactured rather than
-    // measured. These bounds are set below the fixture and above Django on
-    // purpose: the gate's job is to catch a generator that stopped producing a
-    // gradient at all, not to require every repository to have an old town.
-    // `the_age_ramp_follows_real_commit_time` is where the ramp's *response* to
-    // history is asserted, and it is the stronger test.
+    // The hierarchy tracks the **age spread of the repository**, not the quality
+    // of the generator: `click` has a real old town and measures 56x; `pytest`
+    // rewrote itself and has almost no first-year files, so there is no old
+    // grain for a coarse rim to contrast with, and it measures 7.0x. A 30x bar
+    // would fail three of the five real corpora for having the wrong history,
+    // which is not a defect the layout can fix and not one it should hide by
+    // manufacturing a gradient (see `polis_layout::age`'s `Uniform` case).
+    //
+    // So the bar stays a **floor that catches a generator which stopped
+    // producing a gradient at all**, and the fixture's own 9.4x is the number
+    // it is set below. `the_age_ramp_follows_real_commit_time` is where the
+    // ramp's *response* to history is asserted, and it is the stronger test.
     assert!(
         structure.block_hierarchy > 8.0,
         "block size hierarchy is only {:.1}x",
@@ -1396,86 +1985,6 @@ fn the_layout_holds_at_five_thousand_files() {
         structure.age_gradient
     );
 
-    // Through-streets: the design bake-off's second named defect, and its
-    // acceptance range. **Both bounds matter.** Under 35 % of the city diameter
-    // the plan is the soap foam the bake-off rejected; over 70 % it is
-    // `treemap-arterials`' city-spanning boulevard chord, which it also
-    // rejected. And one long stroke on its own proves nothing, so the count of
-    // strokes past a quarter of the diameter is asserted with it: a city has a
-    // *hierarchy* of through-streets, a foam with one boulevard in it does not.
-    //
-    // Measured on this corpus: longest 46 %, 16 through-streets, against 42 %
-    // and 13 before the avenues — and, more to the point, a median sinuosity
-    // (arc length over end-to-end reach) of 1.00 for the ten longest against
-    // 1.07 before. The strokes are now geometrically straight rather than
-    // chains of wiggles that happen to end up far apart.
-    assert!(
-        structure.longest_stroke > 0.35 && structure.longest_stroke < 0.70,
-        "longest stroke is {:.1}% of the diameter; the acceptance band is 35-70%",
-        structure.longest_stroke * 100.0
-    );
-    assert!(
-        structure.through_streets >= 8,
-        "only {} strokes reach a quarter of the city diameter",
-        structure.through_streets
-    );
-
-    // Is it a place, or a diagram? These are the two numbers three M1 gates in
-    // a row were failed on, and neither was in this file — they were in a
-    // reviewer's notebook, which is why the answer to a geometric failure was a
-    // tonal fix, three times.
-    //
-    // Solidity was 0.9947–0.9994 across five corpora while the city limit was a
-    // convex polygon. A circle is 1.00. Anything under 0.90 has a coastline.
-    assert!(
-        structure.solidity < 0.90,
-        "the city fills {:.1}% of its own convex hull: that is a coin, not a coast",
-        structure.solidity * 100.0
-    );
-    // And there were four to nine dead-straight district borders running from
-    // inside 5 % of the radius out past 90 % of it, within two degrees of
-    // radial: the pie chart. Zero, not a rate — one such border is a drawn
-    // avenue and the eye finds it immediately.
-    assert_eq!(
-        structure.radial_spokes, 0,
-        "{} district borders run from the middle of the city to its edge on a radial bearing",
-        structure.radial_spokes
-    );
-    assert_eq!(
-        structure.radial_strokes, 0,
-        "{} through-streets pass through the civic square and out the other side",
-        structure.radial_strokes
-    );
-    // And the same question with the bearing taken out of it, because the two
-    // above only ask whether the ruler pointed at the middle. The competing
-    // attempt in this round scored `radial_spokes == 0` with a dead-straight
-    // border still running 60 % of the way across the city: it had replaced a
-    // radial chord partition with a non-radial one. A border made of Voronoi
-    // bisectors measures 8-10 % here.
-    assert_eq!(
-        structure.straight_borders, 0,
-        "{} district borders are dead straight for more than a fifth of the city (longest {:.1}%): the partition is drawing with a ruler",
-        structure.straight_borders,
-        structure.straight_border * 100.0
-    );
-
-    // Districts. The bake-off baseline was 102 of 276 in more than one piece,
-    // and the first port of the territory graft still had 41 of 307. Both were
-    // tuning misses; the number this gate holds is **zero**, because
-    // `polis_layout::districts`' two rules make a district's blocks one
-    // edge-connected region by construction (see that module for the argument).
-    // Any fragment at all means the construction failed, not that a weight
-    // needs adjusting.
-    assert_eq!(
-        r.fragmented_districts, 0,
-        "{} of {} districts are in more than one piece",
-        r.fragmented_districts, r.districts
-    );
-    assert_eq!(
-        r.fragmented_packages, 0,
-        "{} top-level packages are in more than one piece",
-        r.fragmented_packages
-    );
     assert!(
         r.fragmented_subtrees * 8 <= r.districts,
         // A rate, and the loosest of the three contiguity numbers on purpose.
@@ -1505,18 +2014,6 @@ fn the_layout_holds_at_five_thousand_files() {
         r.settled_nonadjacent,
         r.plots
     );
-    // There is no district polygon any more, so there is no fringe of one to
-    // settle on: the growth is free and `regions` partitions afterwards. The
-    // field is kept and asserted at **zero** rather than deleted, because a
-    // non-zero value would mean some polygon had come back.
-    assert_eq!(
-        r.settled_on_fringe, 0,
-        "{} plots settled on the fringe of a polygon that should not exist",
-        r.settled_on_fringe
-    );
-    assert_eq!(r.relaxed_to_ancestor, 0);
-    assert_eq!(r.relaxed_to_anywhere, 0);
-    assert_eq!(r.detached_placements, 0);
     // Districts that had to seat their files on a sibling's ground because the
     // subtree they are in was given fewer plots than it has directories. A
     // **rate**, and a small one: the partition divides plot *capacity*, so a
@@ -1532,25 +2029,6 @@ fn the_layout_holds_at_five_thousand_files() {
         r.shared_faces,
         r.districts
     );
-    assert_eq!(r.faceless_districts, 0);
-
-    // Every plot has a cell and every cell has a face. Both are zero by
-    // construction and both were **not** on a real repository: Django's leaf
-    // quarters stopped tiling the city limit, 1 453 of 2 413 plots came out with
-    // an empty cell, and 2 006 files ended up sharing a parcel four stages
-    // later. `polis_layout::territory::Quarter` records the bug and
-    // `covers_the_rim` is the net under it; these two are how the gate says so.
-    assert_eq!(
-        r.empty_cells, 0,
-        "{} plots have no Voronoi cell at all",
-        r.empty_cells
-    );
-    assert_eq!(
-        r.plots_off_face, 0,
-        "{} plots landed inside no face and were attached to a stranger's block",
-        r.plots_off_face
-    );
-    assert_eq!(r.overflow, 0, "{} files had to share a parcel", r.overflow);
 
     // PRD §13.1: cold start to first frame under 3 s for a 5 000-file repo, and
     // generation is only part of that.

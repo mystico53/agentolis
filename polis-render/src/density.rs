@@ -26,6 +26,24 @@
 //! rebuild — and the thresholds *will* need retuning: 0.08 / 0.30 / 0.75 and the
 //! −4.5 falloff constant are probe values from a synthetic ten-kernel scene.
 //!
+//! # A band is a set of marks, not a fill — settled on the CPU path first
+//!
+//! Thresholding the field into bands and then *filling* each band is the obvious
+//! reading of §10.4 and it is the wrong one. `plan`'s first cloud layer did
+//! exactly that, and measured on the shipped image it inked two thirds of its
+//! own footprint, lifted 40 % of the city by more than six levels, and moved the
+//! base median underneath it from `L 22` to `L 43` — the map fogging into pale
+//! grey precisely where the activity was.
+//!
+//! What `plan::render_band_validation` draws instead, and what this pass must
+//! reproduce: for each of the 2–3 levels, a **contour stroke** on the level's
+//! boundary (widest on the outermost, because that silhouette is what survives
+//! being seen from across the room) plus a **hatch** whose spacing tightens and
+//! whose stroke widens toward the core. Both opaque, both sparse. The test of a
+//! correct implementation is not a screenshot: it is that the median luminance
+//! of base-map pixels under a cloud equals the median outside one. On the CPU
+//! path it does, to a tenth of a level.
+//!
 //! # Format
 //!
 //! `R16Float` with `RENDER_ATTACHMENT | TEXTURE_BINDING`, verified filterable and

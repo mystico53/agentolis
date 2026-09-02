@@ -24,7 +24,15 @@ jobs:
         os: [ubuntu-latest, windows-latest]
 
     steps:
+      # `fetch-depth: 0`, not the default 1. PRD §7.1 makes `git log` the growth
+      # order, so a shallow clone hands `polis-repo` a repository whose every
+      # file was added by one commit — the one case the layout finds easiest, and
+      # a different city from the one a developer sees.
+      # `m1_gate::the_real_repository_holds_the_gate` lays out THIS checkout, so
+      # without this the real-repository leg silently measures something else.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # No toolchain input: rust-toolchain.toml pins 1.98.0 with rustfmt and
       # clippy. Pinning matters — the egui 0.36 family needs >= 1.95 and the
@@ -106,7 +114,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
+      # `fetch-depth: 0`, not the default 1. PRD §7.1 makes `git log` the growth
+      # order, so a shallow clone hands `polis-repo` a repository whose every
+      # file was added by one commit — the one case the layout finds easiest, and
+      # a different city from the one a developer sees.
+      # `m1_gate::the_real_repository_holds_the_gate` lays out THIS checkout, so
+      # without this the real-repository leg silently measures something else.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
@@ -145,7 +161,15 @@ jobs:
     name: rustdoc
     runs-on: ubuntu-latest
     steps:
+      # `fetch-depth: 0`, not the default 1. PRD §7.1 makes `git log` the growth
+      # order, so a shallow clone hands `polis-repo` a repository whose every
+      # file was added by one commit — the one case the layout finds easiest, and
+      # a different city from the one a developer sees.
+      # `m1_gate::the_real_repository_holds_the_gate` lays out THIS checkout, so
+      # without this the real-repository leg silently measures something else.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Linux GUI dependencies
         run: |

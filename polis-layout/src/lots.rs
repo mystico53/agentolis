@@ -10,6 +10,17 @@
 //! the difference between a plan that reads as a town and one that reads as
 //! graph paper.
 //!
+//! # "Its longest axis" is measured in the block's frame, not the piece's
+//!
+//! The axis is one of **two perpendicular directions fixed once per block**
+//! (`block_frame`), and the recursion only ever chooses between them. Reading
+//! the sentence the other way — the principal axis of *this* ring, recomputed at
+//! every level — is what produced the artefact that failed five visual reviews:
+//! the axis turns twenty or thirty degrees at each level on a block with no
+//! dominant direction, the cuts fan out from the middle, and the parcels come
+//! out as **wedges radiating from an interior point**. `block_frame` carries the
+//! measurement and ADR-0076 the record.
+//!
 //! # The plot is the size of the file that stands on it
 //!
 //! > **Footprint area** ∝ `sqrt(file_size_bytes)` (PRD §7.3)
@@ -110,8 +121,8 @@ use crate::accrete::Settlement;
 use crate::blocks::BlockPlan;
 use crate::determinism::{combine_seeds, narrow, quantize_f64, seed_for_path, SeededRng};
 use crate::geom::{
-    area, centroid, dist, dist_to_boundary, extent_along, interior_point_avoiding, longest_axis,
-    perp, split_ring, Pt,
+    area, centroid, convex_hull, dist, dist_to_boundary, extent_along, interior_point_avoiding,
+    len2, norm, perp, split_ring, sub, Pt,
 };
 use crate::memo::BlockCut;
 use crate::{Lot, LotId};
@@ -463,7 +474,121 @@ fn district_grain(files: usize) -> f64 {
 // Subdivision
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The block's frame — why every cut in a block runs one of two ways
+// ---------------------------------------------------------------------------
+
+/// The two orthogonal directions every cut in one block is allowed to run.
+///
+/// # The pinwheel, and the one line that caused it
+///
+/// PRD §7.2 step 4 says "recursive subdivision of each block along its longest
+/// axis". Read literally — *this* ring's longest axis, recomputed at every level
+/// — it is a trap, and five visual-review rounds died in it. A block from
+/// [`crate::accrete`] is a Voronoi-ish cell: six or seven sides, no dominant
+/// direction, and a principal axis (`geom::longest_axis`, the PCA of its
+/// vertices) that is nearly degenerate. Cut it once, and each half is a
+/// different, smaller polygon whose own principal axis has turned twenty or
+/// thirty degrees. Cut those, and the axis turns again. After three levels the
+/// cuts fan out from the middle of the block and the parcels are **wedges
+/// radiating from an interior point** — an asterisk, one per block, at every
+/// zoom. The reviewer's name for it was "a Voronoi cell decomposition rendered
+/// directly as architecture", and the buildings inherited it whole, because a
+/// wedge inset by a setback is a smaller wedge.
+///
+/// # The fix, and why it is still the PRD's sentence
+///
+/// The frame is computed **once per block**, from the block's own shape, and
+/// every cut at every depth runs along one of its two perpendicular axes. Which
+/// of the two is still chosen by which way the piece is longer — that is
+/// PRD §7.2's "along its longest axis", measured in the frame the block sets
+/// rather than in a frame that rotates under the recursion. Consequences:
+///
+/// * an interior parcel is bounded by four cuts from two perpendicular
+///   directions, so it is an **exact rectangle**;
+/// * a parcel on the block edge is that rectangle clipped by the block
+///   boundary, so it keeps a slanted side — "irregular blocks give irregular
+///   lots for free", which is the same sentence, now meaning the block's
+///   irregularity rather than the algorithm's;
+/// * every parcel in a block shares two edge directions with every other, so a
+///   row of buildings has parallel frontages and parallel party walls. That is
+///   what makes a terrace read as a terrace instead of as a fan.
+///
+/// # Which frame
+///
+/// The axes of the block's **minimum-area bounding rectangle**. Two reasons
+/// over the principal axis: the minimum-area rectangle always has a side
+/// collinear with a hull edge (Freeman–Shapira), and a hull edge of a block
+/// **is a road**, so the parcels line up with a street rather than with a
+/// statistical summary of the corners; and it is a property of the ring's shape
+/// rather than of its vertex sampling, so re-meshing a boundary cannot turn it.
+///
+/// Deterministic (PRD §7.4): candidates are the ring's own hull edges in hull
+/// order, the winner is the smallest quantised rectangle area, and ties — a
+/// square has two exactly-equal candidates and a regular hexagon three — go to
+/// the highest quantised direction, so an axis-aligned ring frames on `+x`.
+/// No trigonometry, no clock, no iteration order.
+pub(crate) fn block_frame(ring: &[Pt]) -> [Pt; 2] {
+    let hull = convex_hull(ring);
+    let src: &[Pt] = if hull.len() >= 3 { &hull } else { ring };
+    let n = src.len();
+    let mut best: Option<((i64, i64, i64), Pt)> = None;
+    for i in 0..n {
+        let e = sub(src[(i + 1) % n], src[i]);
+        if len2(e) <= 1e-24 {
+            continue;
+        }
+        let u = canonical_axis(norm(e));
+        let v = perp(u);
+        let (ulo, uhi) = extent_along(src, u);
+        let (vlo, vhi) = extent_along(src, v);
+        let a = (uhi - ulo) * (vhi - vlo);
+        if !a.is_finite() {
+            continue;
+        }
+        // Quantised, so two exactly-equal rectangles are decided by direction
+        // and not by floating-point noise a re-mesh could flip.
+        let key = (
+            (a * 1e9) as i64,
+            -((u[0] * 1e9) as i64),
+            -((u[1] * 1e9) as i64),
+        );
+        if best.is_none_or(|(bk, _)| key < bk) {
+            best = Some((key, u));
+        }
+    }
+    let u = best.map_or([1.0, 0.0], |(_, u)| u);
+    [u, perp(u)]
+}
+
+/// One sign per direction: an axis is a line, not an arrow.
+fn canonical_axis(v: Pt) -> Pt {
+    if len2(v) < 0.5 {
+        return [1.0, 0.0];
+    }
+    if v[0] < 0.0 || (v[0] == 0.0 && v[1] < 0.0) {
+        [-v[0], -v[1]]
+    } else {
+        v
+    }
+}
+
+/// Which of the block's two axes this piece is longest along (PRD §7.2 step 4).
+fn frame_axis(ring: &[Pt], frame: [Pt; 2]) -> Pt {
+    let (alo, ahi) = extent_along(ring, frame[0]);
+    let (blo, bhi) = extent_along(ring, frame[1]);
+    if ahi - alo >= bhi - blo {
+        frame[0]
+    } else {
+        frame[1]
+    }
+}
+
 /// Recursive subdivision along the longest axis (PRD §7.2 step 4).
+///
+/// `frame` is the block's own pair of perpendicular directions
+/// ([`block_frame`]); every cut at every depth runs along one of them, and
+/// "longest axis" means "the one of the two this piece is longer along".
 ///
 /// `want` is how many parcels this ring should end up as; `target` the area to
 /// stop at; `min_w` the narrowest strip a building can stand on. The split
@@ -492,6 +617,7 @@ fn district_grain(files: usize) -> f64 {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subdivide(
     ring: &[Pt],
+    frame: [Pt; 2],
     target: f64,
     want: u32,
     axis: Option<Pt>,
@@ -512,7 +638,7 @@ pub(crate) fn subdivide(
         }
         return;
     }
-    let principal = longest_axis(ring);
+    let principal = frame_axis(ring, frame);
     let ax = match axis {
         Some(prev) => {
             let (lo, hi) = extent_along(ring, prev);
@@ -572,6 +698,7 @@ pub(crate) fn subdivide(
         let w = ((f64::from(want) * frac).round() as u32).max(1);
         subdivide(
             p,
+            frame,
             target,
             w,
             Some(ax),
@@ -764,6 +891,7 @@ fn in_place_order(pieces: &mut [Vec<Pt>]) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subdivide_weighted(
     ring: &[Pt],
+    frame: [Pt; 2],
     weights: &[f64],
     axis: Option<Pt>,
     seed: u64,
@@ -779,7 +907,7 @@ pub(crate) fn subdivide_weighted(
         out.push(ring.to_vec());
         return;
     }
-    let principal = longest_axis(ring);
+    let principal = frame_axis(ring, frame);
     let ax = match axis {
         Some(prev) => {
             let (lo, hi) = extent_along(ring, prev);
@@ -873,6 +1001,7 @@ pub(crate) fn subdivide_weighted(
             }
             subdivide_weighted(
                 piece,
+                frame,
                 slice,
                 Some(ax),
                 seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(child),
@@ -1159,9 +1288,13 @@ pub(crate) fn parcel_city(
             files.len(),
             [min_w, road_half, min_clear],
             || {
+                // One frame per block, and every cut in it runs one of two
+                // ways — see [`block_frame`] for the pinwheel this removes.
+                let frame = block_frame(&block.ring);
                 let mut rings: Vec<Vec<Pt>> = Vec::new();
                 subdivide_weighted(
                     &block.ring,
+                    frame,
                     &items,
                     None,
                     seed,
@@ -1174,7 +1307,16 @@ pub(crate) fn parcel_city(
                 if rings.is_empty() {
                     rings.push(block.ring.clone());
                 }
-                parcel_geometry(block, rings, files.len(), road_half, min_clear, min_w, seed)
+                parcel_geometry(
+                    block,
+                    frame,
+                    rings,
+                    files.len(),
+                    road_half,
+                    min_clear,
+                    min_w,
+                    seed,
+                )
             },
         );
 
@@ -1434,8 +1576,10 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// why the occupant assignment is [`seat_block`]'s job and not this function's.
 /// See [`crate::memo::BlockCut`] for the measurement that moved the boundary
 /// here.
+#[allow(clippy::too_many_arguments)]
 fn parcel_geometry(
     block: &BlockPlan,
+    frame: [Pt; 2],
     rings: Vec<Vec<Pt>>,
     file_count: usize,
     road_half: f64,
@@ -1500,6 +1644,7 @@ fn parcel_geometry(
         let mut pieces: Vec<Vec<Pt>> = Vec::new();
         subdivide(
             &ring,
+            frame,
             area(&ring) * 0.45,
             2,
             None,
@@ -1564,6 +1709,10 @@ fn seat_block(
     let BlockCut { viable, spare } = cut;
     let probe = |ring: &[Pt]| interior_point_avoiding(ring, Some(&block.ring), road_half);
     let buildable = |r: &[Pt]| probe(r).is_some_and(|(_, clear)| clear >= min_clear);
+    // The same two directions the block was surveyed on, so a plot halved to
+    // take a latecomer is halved the way the rest of the block was cut and not
+    // across it ([`block_frame`]).
+    let frame = block_frame(&block.ring);
 
     let base = out.parcels.len();
     for (ring, _, _) in &viable {
@@ -1679,6 +1828,7 @@ fn seat_block(
                 let mut pieces: Vec<Vec<Pt>> = Vec::new();
                 subdivide(
                     &out.parcels[host].ring,
+                    frame,
                     area(&out.parcels[host].ring) * 0.45,
                     2,
                     None,
@@ -1979,6 +2129,9 @@ mod tests {
         LogicalPath::new(s).expect("a valid test path")
     }
 
+    /// The frame every axis-aligned fixture block in this module has.
+    const AXES: [Pt; 2] = [[1.0, 0.0], [0.0, 1.0]];
+
     fn square(s: f64) -> Vec<Pt> {
         vec![[0.0, 0.0], [s, 0.0], [s, s], [0.0, s]]
     }
@@ -1987,7 +2140,18 @@ mod tests {
     fn subdivision_conserves_area_and_hits_the_target() {
         let block = square(8.0);
         let mut out = Vec::new();
-        subdivide(&block, 4.0, 16, None, 0xABCD, 0, 0.2, &any_parcel, &mut out);
+        subdivide(
+            &block,
+            AXES,
+            4.0,
+            16,
+            None,
+            0xABCD,
+            0,
+            0.2,
+            &any_parcel,
+            &mut out,
+        );
         assert!(out.len() >= 8, "only {} parcels", out.len());
         let total: f64 = out.iter().map(|r| area(r)).sum();
         assert!(
@@ -2010,6 +2174,7 @@ mod tests {
         let min_w = 0.5;
         subdivide(
             &block,
+            AXES,
             0.6,
             200,
             None,
@@ -2020,7 +2185,7 @@ mod tests {
             &mut out,
         );
         for r in &out {
-            let ax = longest_axis(r);
+            let ax = frame_axis(r, AXES);
             let (a0, a1) = extent_along(r, perp(ax));
             assert!(
                 a1 - a0 >= min_w * 0.95,
@@ -2035,8 +2200,30 @@ mod tests {
         let block = square(6.0);
         let mut a = Vec::new();
         let mut b = Vec::new();
-        subdivide(&block, 1.0, 12, None, 0x5555, 0, 0.2, &any_parcel, &mut a);
-        subdivide(&block, 1.0, 12, None, 0x5555, 0, 0.2, &any_parcel, &mut b);
+        subdivide(
+            &block,
+            AXES,
+            1.0,
+            12,
+            None,
+            0x5555,
+            0,
+            0.2,
+            &any_parcel,
+            &mut a,
+        );
+        subdivide(
+            &block,
+            AXES,
+            1.0,
+            12,
+            None,
+            0x5555,
+            0,
+            0.2,
+            &any_parcel,
+            &mut b,
+        );
         assert_eq!(a, b);
     }
 
@@ -2047,7 +2234,18 @@ mod tests {
         // property PRD §7.2 step 4 is after.
         let block: Vec<Pt> = vec![[0.0, 0.0], [12.0, 0.0], [12.0, 2.0], [0.0, 2.0]];
         let mut out = Vec::new();
-        subdivide(&block, 3.0, 8, None, 0x99, 0, 0.2, &any_parcel, &mut out);
+        subdivide(
+            &block,
+            AXES,
+            3.0,
+            8,
+            None,
+            0x99,
+            0,
+            0.2,
+            &any_parcel,
+            &mut out,
+        );
         assert!(out.len() >= 4);
         for r in &out {
             let (x0, x1) = extent_along(r, [1.0, 0.0]);
@@ -2104,6 +2302,98 @@ mod tests {
         if b == a {
             assert!(ledger.get(a).is_none());
         }
+    }
+
+    #[test]
+    fn the_frame_is_the_minimum_area_rectangle_and_it_is_a_line_not_an_arrow() {
+        // A square: any of its four edges is a minimum-area rectangle, and the
+        // canonical sign has to pick the same one however the ring is wound.
+        let s = square(4.0);
+        let mut reversed = s.clone();
+        reversed.reverse();
+        assert_eq!(block_frame(&s), block_frame(&reversed));
+        assert_eq!(block_frame(&s), AXES);
+
+        // A slab turned 30°: the frame follows the slab, not the world.
+        let (sn, cs) = (0.5_f64, 0.75_f64.sqrt());
+        let turned: Vec<Pt> = [[0.0, 0.0], [8.0, 0.0], [8.0, 1.0], [0.0, 1.0]]
+            .into_iter()
+            .map(|p: Pt| [p[0] * cs - p[1] * sn, p[0] * sn + p[1] * cs])
+            .collect();
+        let frame = block_frame(&turned);
+        assert!(
+            (frame[0][0] - cs).abs() < 1e-9 && (frame[0][1] - sn).abs() < 1e-9,
+            "{frame:?} is not the slab's own bearing"
+        );
+        assert!(
+            (frame[0][0] * frame[1][0] + frame[0][1] * frame[1][1]).abs() < 1e-12,
+            "the two axes are not perpendicular"
+        );
+    }
+
+    #[test]
+    fn every_cut_in_a_block_runs_one_of_two_ways() {
+        // The pinwheel, pinned. A per-piece principal axis turns under the
+        // recursion and the parcels fan out from the middle of the block; a
+        // frame fixed once per block cannot, so every edge a *cut* produced is
+        // parallel to one of the block's two axes and the parcels are
+        // rectangles wherever the block boundary is not in the way.
+        //
+        // A hexagon, which is the shape `crate::accrete` actually produces and
+        // the shape a principal axis is worst on.
+        let block: Vec<Pt> = vec![
+            [4.00, 0.00],
+            [2.00, 3.46],
+            [-2.00, 3.46],
+            [-4.00, 0.00],
+            [-2.00, -3.46],
+            [2.00, -3.46],
+        ];
+        let frame = block_frame(&block);
+        let mut out = Vec::new();
+        subdivide_weighted(
+            &block,
+            frame,
+            &[1.0; 12],
+            None,
+            0x5127,
+            0,
+            0.3,
+            &any_parcel,
+            &mut out,
+        );
+        assert!(out.len() >= 6, "only {} parcels", out.len());
+        // Every edge is either on the block boundary or parallel to an axis.
+        let mut cuts = 0;
+        for ring in &out {
+            for i in 0..ring.len() {
+                let a = ring[i];
+                let b = ring[(i + 1) % ring.len()];
+                let e = [b[0] - a[0], b[1] - a[1]];
+                if len2(e) <= 1e-18 {
+                    continue;
+                }
+                let e = norm(e);
+                let on_block = dist_to_boundary(
+                    &block,
+                    [f64::midpoint(a[0], b[0]), f64::midpoint(a[1], b[1])],
+                ) <= 1e-6;
+                if on_block {
+                    continue;
+                }
+                cuts += 1;
+                let along = (e[0] * frame[0][0] + e[1] * frame[0][1]).abs();
+                let across = (e[0] * frame[1][0] + e[1] * frame[1][1]).abs();
+                assert!(
+                    along > 1.0 - 1e-9 || across > 1.0 - 1e-9,
+                    "a cut edge {e:?} runs neither way of the frame {frame:?}"
+                );
+            }
+        }
+        assert!(
+            cuts > 8,
+            "only {cuts} cut edges: the block was not subdivided"
+        );
     }
 
     #[test]
@@ -2198,7 +2488,17 @@ mod tests {
         let block = square(20.0);
         let items = vec![1.0, 3.0, 1.0, 3.0, 1.0, 3.0, 1.0, 3.0];
         let mut out = Vec::new();
-        subdivide_weighted(&block, &items, None, 0x5127, 0, 0.2, &any_parcel, &mut out);
+        subdivide_weighted(
+            &block,
+            AXES,
+            &items,
+            None,
+            0x5127,
+            0,
+            0.2,
+            &any_parcel,
+            &mut out,
+        );
         assert_eq!(out.len(), items.len(), "one parcel per item");
         let total: f64 = out.iter().map(|r| area(r)).sum();
         assert!((total - 400.0).abs() < 1e-6, "ground was lost: {total}");
@@ -2223,6 +2523,7 @@ mod tests {
         let mut b = Vec::new();
         subdivide_weighted(
             &block,
+            AXES,
             &items,
             None,
             0x00C0_FFEE,
@@ -2233,6 +2534,7 @@ mod tests {
         );
         subdivide_weighted(
             &block,
+            AXES,
             &items,
             None,
             0x00C0_FFEE,
@@ -2256,6 +2558,7 @@ mod tests {
         let mut merged = Vec::new();
         subdivide_weighted(
             &block,
+            AXES,
             &items,
             None,
             0xABCD,
@@ -2270,6 +2573,7 @@ mod tests {
         let mut coarse = Vec::new();
         subdivide_weighted(
             &block,
+            AXES,
             &items,
             None,
             0xABCD,
@@ -2293,6 +2597,7 @@ mod tests {
         let mut out = Vec::new();
         subdivide_weighted(
             &block,
+            AXES,
             &items,
             None,
             0x1234,
@@ -2302,7 +2607,7 @@ mod tests {
             &mut out,
         );
         for r in &out {
-            let ax = longest_axis(r);
+            let ax = frame_axis(r, AXES);
             let (a0, a1) = extent_along(r, perp(ax));
             assert!(
                 a1 - a0 >= min_w * 0.95,
@@ -2360,6 +2665,7 @@ mod tests {
         let mut greedy = Vec::new();
         subdivide(
             &block,
+            AXES,
             4.0,
             16,
             None,
@@ -2376,6 +2682,7 @@ mod tests {
         let mut merged = Vec::new();
         subdivide(
             &block,
+            AXES,
             4.0,
             16,
             None,
@@ -2393,6 +2700,7 @@ mod tests {
         let mut coarse = Vec::new();
         subdivide(
             &block,
+            AXES,
             0.5,
             128,
             None,

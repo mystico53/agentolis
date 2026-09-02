@@ -2454,11 +2454,15 @@ dependencies = [
  "crossbeam-channel",
  "insta",
  "polis-events",
+ "polis-ingest",
  "polis-layout",
  "polis-repo",
  "serde",
+ "serde_json",
  "smallvec",
+ "tempfile",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

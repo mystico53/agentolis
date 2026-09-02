@@ -283,8 +283,55 @@ const MAX_QUARTERS: usize = 14;
 /// standing at the end of the growth.
 const QUARTER_SHARE: f64 = 0.012;
 
-/// Smallest absolute size, in files, for the same reason.
+/// Smallest absolute size, in files, for the same reason — **on a repository
+/// big enough for twelve files to be a small part of it**.
+///
+/// # This constant is why a small repository had no coastline
+///
+/// Twelve files is a quarter of a percent of Django and **eleven percent** of
+/// this workspace's own hundred-file checkout. Taken absolutely it stops a
+/// hundred-file repository founding anything: two of its ten top-level packages
+/// clear the bar, the other eight seed off the civic square, and the settlement
+/// packs into a disc. Measured, and the numbers are the reason the rule below
+/// exists rather than a taste:
+///
+/// | repository | files | quarters at 12 | solidity | quarters scaled | solidity |
+/// |---|---:|---:|---:|---:|---:|
+/// | this workspace | 112 | 2 | **0.918** | 9 | **0.784** |
+/// | `click` | 166 | 4 | 0.725 | 5 | **0.680** |
+/// | `pytest` | 690 | — | 0.831 | *unchanged* | 0.831 |
+/// | Neovim | 3 890 | — | 0.756 | *unchanged* | 0.756 |
+/// | Django | 7 014 | — | 0.773 | *unchanged* | 0.773 |
+///
+/// A solidity of 0.918 is the coin PRD §7.2 and three M1 gates exist to prevent,
+/// and it was reachable only on a real small repository: the synthetic corpus at
+/// 100–400 files scores 0.76–0.85, because its packages are large enough to
+/// clear an absolute twelve. That is precisely the shape of failure a generated
+/// fixture cannot show, and `m1_gate::the_real_repository_holds_the_gate` is
+/// where it is now caught. ADR-0078 records the measurement.
 const QUARTER_FILES: u32 = 12;
+
+/// A quarter must also be at least a `1/N` share of the town.
+///
+/// [`QUARTER_FILES`] is a bound on the *causeway* — a quarter has to be worth
+/// the road settled out to it — and a causeway's length is a multiple of the
+/// separation, which scales with the town. So the bound has to scale with the
+/// town too. Twenty is the reciprocal of the smallest quarter worth a road: at
+/// five per cent of the repository, a package is a neighbourhood.
+///
+/// The two bounds compose so that the scaled one **only ever binds below 240
+/// files** (`240 / 20 = 12`). Every corpus at or above that count lays out byte
+/// for byte as before, which is checked rather than claimed: `pytest` at 690,
+/// Neovim at 3 890 and Django at 7 014 all produce the same digest either way.
+const QUARTER_MIN_DENOM: u32 = 20;
+
+/// However small the repository, a package under three files is not a quarter.
+///
+/// The lower stop on [`QUARTER_MIN_DENOM`]'s scaling. Without it a twenty-file
+/// repository founds a quarter per file and the causeways outnumber the ground
+/// they reach — the failure [`QUARTER_FILES`]' comment describes, arrived at
+/// from the other direction.
+const QUARTER_FILES_FLOOR: u32 = 3;
 
 /// Largest share of the repository one quarter may carry before it is split
 /// into its own subdirectories.
@@ -1117,7 +1164,14 @@ impl Settlement {
             return Vec::new();
         };
         let total = f64::from(self.total_files.max(1));
-        let floor = QUARTER_FILES.max((total * QUARTER_SHARE).round() as u32);
+        // The causeway bound, scaled to the town (see [`QUARTER_MIN_DENOM`]),
+        // then the share bound over the top of it. Integer arithmetic only: the
+        // one float is `QUARTER_SHARE`, and it is rounded before it is compared
+        // (PRD §7.4).
+        let causeway = QUARTER_FILES
+            .min(self.total_files.max(1).div_ceil(QUARTER_MIN_DENOM))
+            .max(QUARTER_FILES_FLOOR);
+        let floor = causeway.max((total * QUARTER_SHARE).round() as u32);
         let ceiling = (total * QUARTER_CEILING).round() as u32;
 
         // Start at the top level, then **split whatever is too big to be one

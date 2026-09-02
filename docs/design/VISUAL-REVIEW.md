@@ -1,6 +1,262 @@
 # Polis — Visual Review (fresh eyes, no implementer claims read)
 
-> **ROUND 6 is the current review. Round 5 and earlier are archived below the rule.**
+> **ROUND 7 is the current review. Round 6 and earlier are archived below the rule.**
+
+---
+
+# Round 7 — the wedges are gone, the seed is not. And the ground is a Twister mat.
+
+Reviewer: independent pass. Given only the PRD intent and the §10.3 dimness ruling. I did not read
+any implementer claim, and I did not read the round-6 text until after I had finished looking and
+measuring — noted because I arrived at the rosette independently, which makes it a converged finding
+rather than a repeated one.
+
+Method, in order: 180 px squint sheet first, before anything else; full frame at 900 px; automated
+search for the densest text-free fabric, cropped at 160–280 px and brightened 5× with nearest-neighbour
+upsampling; hand-picked crops at 1× to check the operator's real working view; then measurement —
+junction-dot extraction from the three junction renders (111 / 891 / 754 nodes recovered against
+legend counts of 129 / 1000 / 852), nearest-neighbour spacing binned by radius, angular harmonics of
+the node field, built-density by radius, silhouette raggedness, and a luminance / chroma census.
+
+Note on which file is which, because the names mislead: `city-m1-large.png` is the **synthetic
+5000-file** repo; `city-real-5k.png` is **neovim**; `city-real-django.png` is django (10 441 lots).
+`city-m1.png` / `city-m1-junctions.png` were re-rendered 15 minutes after the rest and are the newest
+geometry in the set.
+
+## Verdict up front: NO — but for the first time the answer is not "no" everywhere.
+
+At the operator's zoom, the two large real-repo renders genuinely read as a city. That is new and it
+is real. `dj_operator_raw` and `nv_operator_raw` — 500 px crops at 1×, unbrightened, un-retouched —
+look like an aerial photograph of a dense old town. Rectangular buildings, party walls, block
+interiors, a lane network. Six rounds of "shards / glaze / lichen / mould" do not survive contact
+with those two crops. **Credit that properly: buildings are now rectangles, and at 1:1 the fabric is
+a city.**
+
+It still fails, on three things, in descending order of how badly:
+
+1. **The radial seed is still in the geometry.** It has been demoted from one axle to one axle per
+   district, and in the newest render it is still global.
+2. **40–68 % of the map is saturated colour.** The dimness ruling has been honoured in *value* and
+   ignored in *chroma*. The result is a stained-glass Voronoi diagram with a city drawn on it.
+3. **Roof luminance spread across every render is 17 levels out of 255.** Height — the primary
+   quantity — contributes essentially nothing to the image.
+
+---
+
+## 1. The seed. Measured, not asserted.
+
+`city-m1-junctions.png` is the newest geometry in the set (re-rendered at 11:17, after everything
+else). Extracting its 111 recoverable junctions and binning nearest-neighbour spacing by distance
+from the node centroid:
+
+| render | NN spacing, inner 25 % | NN spacing, outer 25 % | ratio | nodes inside inner 25 % of R | uniform disc would be |
+|---|---|---|---|---|---|
+| `city-m1-junctions` | 61.3 px | 123.5 px | **2.02×** | 14 % | 6 % |
+| `city-m1-large-junctions` | 23.9 px | 32.8 px | 1.37× | 17 % | 6 % |
+| `city-real-5k-junctions` | 28.2 px | 33.9 px | 1.20× | 9 % | 6 % |
+
+The newest render has a **single centre with twice the junction density of its rim**. That is a
+measured radius, in the file that was regenerated last.
+
+In the large renders the global gradient is diluted — but only because the seed has been *replicated*.
+Crop `city-m1-large-junctions.png` at (720,320) and (640,900) and you are looking at two textbook
+rosettes: a knot of magenta degree-5+ nodes in concentric rings with spokes radiating outward into a
+surrounding ring of pentagons. Not an interpretation — a picture of a flower.
+
+And it is visible **without brightening**, at 1×, in the shipping render: `city-real-django.png` around
+(640,850) has a circular burst of miniature buildings arranged in concentric rings about a point, with
+their long axes tangential to the ring. In `dj_operator_raw` at 1:1 it is the first thing the eye
+lands on. It reads as a spore, or a dandelion clock, dropped into an otherwise convincing town.
+
+**Alternating with the rosettes: crystalline lattice patches.** Crop `city-real-5k-junctions.png` at
+(1120,960). It is a *perfect regular rhombic grid* — congruent cells, equal edge lengths, exact
+degree-4 nodes — dropped whole into an organic surround. `city-m1-large-junctions.png` has at least
+three more. So the fabric is not "grown"; it is two machine idioms alternating: a radial flower and a
+ruled lattice, stitched together by a ring of pentagons. Pentagon rings are the give-away. Cities do
+not produce fields of pentagons; a Voronoi taken about a ring of seed points does.
+
+**The arithmetic tell is printed in the legend and is conclusive.** Every junction render says
+`DEG 1 (DANGLING) : 0`. Zero. Not one dead end in 129, 1000 or 852 junctions. And `DEG4+ SHARE` reads
+50 % / 65 % / 62 %, with 22 / 205 / 150 junctions at degree **five or more**. A real street network is
+~65–75 % degree-3, has almost nothing above degree 4, and is full of cul-de-sacs. What is drawn here
+is a planar mesh, and the numbers say so before the picture does.
+
+## 2. The ground is doing all the shouting
+
+Chroma census over city pixels only (text excluded):
+
+| render | share of city pixels with saturation > 0.30 | mean saturation |
+|---|---|---|
+| `city-m1` | **67.6 %** | 0.354 |
+| `city-real-django` | 51.7 % | 0.290 |
+| `city-real-5k` | 49.9 % | 0.267 |
+| `city-m1-large` | 40.8 % | 0.233 |
+
+§10.3 has been read as a *brightness* budget and satisfied by dropping value while leaving chroma
+untouched. Two thirds of `city-m1` is a full-chroma green, purple, maroon or teal field. Brighten any
+crop 5× and the ground is the loudest object in it — louder than the buildings, which are the content.
+This is what turns the squint view into a stained-glass panel, and it is why the last six rounds kept
+reaching for words like "glaze" and "lichen": those describe *coloured cells with a fine crackle on
+top*, which is literally what is being drawn.
+
+Nothing here asks for a brighter map. It asks for a **less coloured** one. Desaturating the district
+fills toward neutral spends no contrast budget at all — it *frees* budget.
+
+Second offender at the same fault: **the road strokes are the brightest non-text element in the base
+map**, and inside a district they form a fine pale web over a flat colour. Flat coloured cell + fine
+pale crackle = craquelure. The buildings have to fight that web to be seen.
+
+## 3. Height is not in the image
+
+Roof-pixel luminance, p05 → p95, measured over the same neutral mid-tone mask in each render:
+
+| render | p05 | p50 | p95 | spread |
+|---|---|---|---|---|
+| `city-m1` | 30 | 39 | 47 | **17** |
+| `city-m1-large` | 29 | 35 | 46 | **17** |
+| `city-real-5k` | 29 | 35 | 46 | **17** |
+| `city-real-django` | 29 | 34 | 46 | **17** |
+
+Seventeen levels out of 255, identical in all four. There is no tonal ramp on roofs — none. The only
+height cue is the extruded side face, which is a dark quad on a dark ground, and which competes with
+footprint area: a wide low building reads taller than a narrow tall one.
+
+The legends make it worse. Three of the four renders report `TALLEST ... H=7.0`. On a clean tree every
+building is a 1–7 slab, so on the renders an operator would actually look at, **the map's primary
+variable is flat and invisible**. In `city-real-5k` the label `MAIN.C` points at the tallest building
+in neovim and I cannot pick that building out of its neighbours at any zoom. In `city-m1`, where
+`H=59.8`, I still cannot find `TESTS/GOLDEN/TOWN.SNAP` without the label — the gold monument tint pulls
+the eye instead, so *colour is beating height* at the one job the map exists to do.
+
+Related: built-density is **flat with radius** on all three large renders (density by radius bin varies
+between 0.02 and 0.03 edge to edge). There is no downtown. Uniform grain from coast to coast is
+exactly what makes a texture read as moss rather than as a settlement.
+
+---
+
+## 4. Per image
+
+### `city-m1.png` — the render the team dogfoods, and the worst in the set
+- **Squint (180 px):** fails outright. A coloured polygon rosette — purple, navy, green, maroon, teal
+  wedges meeting at a point — with grey confetti scattered over it. Reads as an *object*: a cracked
+  enamel brooch, a Trivial Pursuit wheel. Not a place.
+- **Brightened crop:** buildings are clean rectangular prisms with a lit roof and a shaded side. Good.
+  But four of them fill an entire district; they float in the middle of flat green with no frontage,
+  and several straddle the road line. The "streets" are hairlines with no width.
+- **City?** No. 146 lots over a 1600 px canvas is a hamlet drawn at metropolitan scale.
+- **Centre / radius:** yes, measured — 2.02× junction density at the centre, angular harmonics peaking
+  at 2- and 3-fold. The district polygons all converge on one point near `SRC/LIB.RS`.
+- **Silhouette:** near-convex blob with shallow notches. Not a coastline.
+- **Height:** visible as extrusion, but unrankable; gold monument tint out-shouts it.
+- **Crisp?** Crisp, yes. Legible as a city, no.
+- **Worst thing:** the automated search for the highest-edge-energy 160 px region in the whole image
+  landed on the word `SRC/LIB.RS`. **Text is the highest-contrast object in this map.** At mid-zoom the
+  labels tile over the fabric and the map becomes a word cloud with scenery behind it.
+
+### `city-m1-large.png` — synthetic 5000
+- **Squint:** passes. A landmass with a ragged coast and internal grain.
+- **Crop:** rectangles, in rows, largely street-aligned. The best building fabric in the set.
+- **Artefact:** a large diagonally-hatched grey void through `VENDOR` / `CODEC` at the centre of the
+  map, visible at 180 px. Whatever it encodes, it reads as a hole punched in the render.
+- **Centre:** three replicated rosettes plus lattice patches (see §1).
+- **Worst thing:** the central hatched void, competing directly with the M4 cloud hatch, which is the
+  same angle and nearly the same pitch.
+
+### `city-real-5k.png` — neovim
+- **Squint:** passes. Reads as a place.
+- **Crop:** convincing at 1:1. But large district polygons in the north are **empty of buildings** —
+  flat blue fields with only outlines, which read as unbuilt farmland inside the city wall.
+- **Artefact:** the rhombic lattice patch at (1120,960) — a ruled grid, perfectly regular.
+- **Height:** invisible; `MAIN.C` cannot be found without its label.
+- **Worst thing:** the lattice patch. One crop of it undoes the whole "grown, not planned" claim.
+
+### `city-real-django.png` — the best of the four
+- **Squint:** passes, and the silhouette is genuinely coastline-like — peninsulas, bays, a torn edge.
+  Best footprint in the project's history.
+- **But:** at 180 px it reads as a **two-tone political map** — one green half, one maroon half, split
+  by a near-straight diagonal — rather than as a city. The tint is at continental scale.
+- **Crop:** rectangles lining lanes. Good.
+- **Artefact:** the building rosette at ~(640,850), visible at 1× without brightening.
+- **Worst thing:** that rosette, because it is visible unaided in the flagship render.
+
+### The three junction renders
+These are the most useful images in the set and they should keep being produced. They are also the
+prosecution's evidence: `DEG 1 = 0` in all of them, `DEG4+ SHARE` 50–65 %, rosettes and lattices
+plainly visible. `city-m1-junctions.png` in particular is a rosette drawn on black — a dense core, a
+ring of large near-congruent pentagons around the rim, and spiral arms of degree-4 nodes between them.
+
+### `contrast-validation.png`
+- **Overlays read clearly.** M5 attention marks (orange) are unambiguously the brightest thing in the
+  frame; the red alert chord is legible end to end; the M4 marker glyphs are distinct at 1×.
+- **The clouds no longer fog the city into grey mush.** This is fixed. Iso-contour + diagonal hatch
+  keeps the fabric visible underneath — I can read buildings and lanes inside the cloud at 1×. That is
+  a genuine, verified improvement over the previous round's complaint.
+- **New problem in its place:** the cloud hatch is a set of parallel high-contrast diagonals at ~45°,
+  the same angle and roughly the same pitch as the building rows and the lane network beneath it.
+  Inside the cloud the hatch reads as *avenues*. The old failure was "I can't see the city"; the new
+  one is "I see a city that isn't there". Change the hatch to a different frequency and a
+  non-street angle, or make it a stipple.
+- **Second:** the cloud contour strokes sit at roughly the same luminance as the road network, so the
+  base map and the overlay share a value band. That is the §10.3 separation not holding — again
+  because the base map spends its allowance on roads and chroma rather than on buildings.
+- Roof spread in this render is 43 rather than 17, so the overlay layer *does* have headroom. It is
+  the base map that is refusing to use its own dynamic range on the thing that matters.
+
+## 5. Mid-zoom — the scale an operator works at
+
+This is where the round succeeds, and it should be said plainly. `dj_operator_raw` and
+`nv_operator_raw` (500 px, 1×, no processing) hold up. Party walls, block interiors, lanes, varied
+footprints. If the full-frame view were as good as the mid-zoom view, this would be a yes.
+
+What does not hold up at mid-zoom: labels. In `city-m1` at working zoom the yellow and white plates
+cover a third of the fabric and every automated hunt for the busiest region in the image found text.
+In the large renders the label count is sane. Fix the small-repo case.
+
+## 6. The single worst thing in each image
+
+| image | worst thing |
+|---|---|
+| `city-m1.png` | Text is the highest-contrast object in the map. The city is the background to its own labels. |
+| `city-m1-large.png` | A hatched void punched through the centre of the city, at the same angle as the cloud hatch. |
+| `city-real-5k.png` | A perfectly regular rhombic lattice patch — a ruled grid inside the "grown" city. |
+| `city-real-django.png` | A radial building rosette visible at 1× without brightening. |
+| `city-m1-junctions.png` | It is a flower. Dense core, ring of congruent pentagons, spiral arms. |
+| `city-m1-large-junctions.png` | Three rosettes and three lattice patches in one frame. |
+| `city-real-5k-junctions.png` | `DEG 1 (DANGLING) : 0` — printed in the legend, in every render. |
+| `contrast-validation.png` | The cloud hatch impersonates a street grid at the same angle and pitch. |
+
+## 7. The highest-value change to the IMAGE
+
+**Delete the per-district radial seed and the lattice patches, and build the street graph to a
+degree histogram instead.**
+
+Not another palette pass. Round 6 asked for the polar layout to go; it went at the *map* scale — the
+coastlines are now ragged and two of four renders pass the squint test, which is real progress — and
+it was reinstalled at the *district* scale, one seed per directory, with ruled lattices filling the
+gaps between. Until that is gone the map will keep producing the flower that six rounds of reviewers
+have described in six different vocabularies.
+
+The target is a number, so it can be checked without a reviewer: **degree-3 ≥ 60 %, degree-5+ < 2 %,
+degree-1 (dead ends) between 5 % and 15 %.** Currently: degree-5+ is 17–24 % and dead ends are exactly
+zero. Grow streets outward from *edges* — extend, branch at T-junctions, occasionally fail and leave a
+stub — rather than emitting spokes from points. The junction renders already measure this; put those
+three numbers in their legend as a pass/fail and the next round can be self-scored before anyone looks.
+
+Then, immediately after, the two cheap ones — both of which *free* contrast budget rather than
+spending it, so neither touches the §10.3 ruling:
+
+**Desaturate the ground.** Take district fills to near-neutral (saturation < 0.10) and carry district
+identity on the boundary stroke and the label instead of on a full-chroma flood. Two thirds of
+`city-m1` is currently coloured field. Neutral ground is what separates an aerial photograph from a
+Voronoi diagram, and it costs nothing in luminance.
+
+**Put height on the roofs.** The roof band is 17 levels wide out of 255 in every render. Give it a real
+ramp — light roofs for tall, dark for short, across at least 80 levels — plus a cast shadow whose
+length scales with height. Then the tallest building is findable by eye in one second, which is the
+entire purpose of the map and is currently the one thing it does not do at any zoom.
+
+Do not answer this review with another palette change alone. The palette work needed is
+*de*saturation, and it is second, not first.
 
 ---
 

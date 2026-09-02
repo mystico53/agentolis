@@ -2690,3 +2690,573 @@ It does not hide the shortfall. `shared_faces` still counts the districts whose
 own ground could not hold their files — 1 on Django and Neovim, 3 on CPython, 0
 on the synthetic corpus — and the report prints it. `overflow` is **0** on all
 four, and `buildings = files − massed` exactly.
+
+---
+
+## ADR-0076 — A block is cut on **two** perpendicular directions, and a building is a rectangle
+
+**Context.** PRD §7.2 stage 4 says "Lots by recursive subdivision of each block
+along its longest axis until lot area falls under target", and stage 5 says
+"Buildings are lots inset by a setback". Both were implemented literally and both
+were wrong in the same way, and the result failed the visual gate five times
+running under five different names — "crazed glaze", "shards in a void",
+"cracked mud", "lichen ribbons", "gravel", "confetti", "mould on a dark plate".
+An independent reviewer finally named it, and a 5× brightened crop of the Django
+render confirmed it: **blocks resolve into asterisks.** Five to eight
+wedge-shaped buildings radiating from a seed point inside each block, at every
+zoom, in every render. Almost no building anywhere on the map was a rectangle.
+
+Two mechanisms, one artefact.
+
+*Stage 4.* `longest axis` was read as **this ring's** longest axis, recomputed at
+every level of the recursion from `geom::longest_axis` — the principal axis of
+the ring's vertices. A block from `accrete` is a Voronoi-ish cell: six or seven
+sides, no dominant direction, and a principal axis that is nearly degenerate. Cut
+it once and each half is a different polygon whose own principal axis has turned
+twenty or thirty degrees; cut those and it turns again. After three levels the
+cuts fan out from the middle of the block. The generator was not a Voronoi of
+interior seeds, but the recursion reproduced one.
+
+*Stage 5.* The footprint was the **band** of the lot's inset interior within
+`depth` of its street edge — the lot's own shape, cut off at the back. Faithful
+to the sentence, and it means a wedge-shaped lot inset by a setback is a smaller
+wedge. Every building inherited its lot's shape, so the fan was drawn as
+architecture.
+
+Measured on Django, 7 011 buildings: **46.0 %** of footprints were
+quadrilaterals, at a median area of **0.854** of their own minimum-area bounding
+rectangle. A rectangle scores 1.00; a wedge scores about 0.5.
+
+**Decision.**
+
+* **`lots::block_frame`** computes, once per block, the two perpendicular axes of
+  the block's **minimum-area bounding rectangle**, and every cut at every depth
+  of `subdivide` and `subdivide_weighted` runs along one of them. Which of the
+  two is still chosen by which way the piece is longer — that *is* PRD §7.2's
+  "along its longest axis", measured in a frame the block sets rather than one
+  that rotates under the recursion. The minimum-area rectangle and not the
+  principal axis, because its long side is always collinear with a hull edge
+  (Freeman–Shapira) and a hull edge of a block **is a road**.
+* **`buildings::fit_footprint`** returns a rectangle by construction: the largest
+  street-fronting rectangle the lot's per-edge inset interior will hold, its
+  depth fitted on a fixed grid and then bisected to the wanted area, its width
+  trimmed symmetrically only when even the shallowest allowed rectangle is
+  bigger than the file needs. `rect_span` is exact rather than sampled: the
+  region is convex, so its left boundary is convex in the depth and its right
+  boundary concave, and the extreme of each over a slab is reached at one of the
+  slab's two ends.
+* **`buildings::frontage_faces`** builds in the **parcel's own** frame — the axes
+  of its minimum-area rectangle, which for a parcel this pipeline cut are the
+  block's two axes — and lets the street choose only which of that frame's four
+  sides the building stands on. Fitting in the *road's* frame instead, inside a
+  parcel cut in the *block's* frame, wedges the rectangle between two skew sides
+  and cost median lot fill 67 % → 47 %.
+* **The ±4° is applied to the finished rectangle**, about its own centre, and
+  `shrink_into` scales it about that same centre until it is back inside the lot.
+  A uniform scale about a point maps a rectangle to a rectangle, so neither the
+  turn nor the containment guard can cost the footprint its shape. **The angle is
+  scaled by `looseness`** — zero on terraced ground, the full ±4° on detached
+  ground — because a rectangle turned 4° inside a terrace strip pulls its sides
+  in by `depth · tan 4°`, which is an order of magnitude more than `PARTY_WALL`,
+  and a terrace that has lost its party walls is gravel. A terrace cannot rotate;
+  that is what a terrace is. `Building::rotation` publishes the angle that was
+  used, never the one that was drawn.
+
+**Consequences.** Measured on Django after the change: **99.96 %** of footprints
+are quadrilaterals at a median **0.999** of their own minimum-area bounding
+rectangle, p10 0.997. The pinwheel is gone from a 5× brightened crop, and the
+dense quarters read as rows of rectangles along their streets.
+
+It is paid for in floor area, and the price is real and was measured rather than
+guessed. Blocks hold about 4.5 lots each, so nearly every lot touches the
+irregular block boundary and is a rectangle clipped by it — a trapezoid, at a
+median 0.894 of its own bounding rectangle. A rectangle cannot fill a trapezoid,
+so Django's building coverage falls **32.2 % → 27.3 %** (core 39.7 → 34.3, rim
+25.4 → 21.9). That is still above the gate's 25 % floor for a repository of that
+size, the core/rim gradient is unchanged at about 1.6×, and `on-road`,
+`outside-lot`, `unbuilt` and `overflow` all remain 0. Two thirds of that loss was
+bought back before accepting it: `MAX_DEPTH_SHARE` 0.90 → 0.97 (with rectangles
+the courtyard comes from the taper the building cannot occupy, not from a back
+garden strip), and `FACE_PREFERENCE`, which lets the cross-street orientation win
+where the plot's shape makes the road-facing one a sliver — but only when it is a
+fifth better, because a row of buildings that all face the same way is the whole
+reason a street reads as a street.
+
+Two floors exist because the shape can defeat a naive fit and a file with no
+building is the worst outcome this pipeline has. `kerb_line` steps the building
+line back over a fixed ladder on a plot that comes to a point at the street, and
+`DEPTH_FLOOR_SHARE` lets the depth grid reach below `MIN_DEPTH_RATIO`'s
+razor-strip floor — on a skewed plot, measured on a 6 × 0.9 strip whose long
+sides are not parallel, the kerb slab and the back slab do not overlap at all and
+a grid anchored at that floor has no rectangle anywhere on it.
+
+The depth is **bisected inside the grid bracket** rather than taken from the grid
+itself. Landing on the grid overshoots the wanted area by up to one step, the
+overshoot is paid sideways, and sideways is a party wall: measured on the terrace
+fixture it opened a 0.022 gap where the contract is 0.012.
+
+This invalidates every golden layout in the repository, on purpose, and they were
+regenerated.
+
+---
+
+## ADR-0077 — What a building's height means on a clean tree (PRD §17, open question 4)
+
+**Context.** PRD §7.3: "**Height** ∝ uncommitted diff lines. The city rises as
+agents work and settles when you merge. The tallest thing on the map is the
+biggest unreviewed pile." PRD §17 open question 4 asks whether that destroys the
+"recently active" reading. It is worse than that: **a freshly-cloned repository
+has no uncommitted diff at all**, and that is the common case — the map is opened
+before any agent has run. Read literally, the primary encoded quantity is then
+constant across the whole city and carries nothing.
+
+The two-register answer (settled massing from file size, work from uncommitted
+lines) was already in place and was not enough. The visual review measured the
+legend of three of four renders reading `TALLEST … H = 6.0`, no visible skyline,
+and every extrusion side-wall at the same depth. The cause was in the ramp: the
+settled register ran linearly in the fourth root from `(1/16)^¼` to `16^¼`, which
+puts a file of *exactly* the repository's median at 0.333 of the register rather
+than 0.5. File sizes are roughly log-normal, so the *typical* building sat in the
+bottom third of the only channel a clean repository has, while
+`polis_render::plan::height_ramp` spends 80 % of its tone on that register.
+Django, clean: min/median/max **1.00 / 1.92 / 4.00**, monuments at 6.00.
+
+**Decision.** Height on a clean tree is the **settled register**, and it is a
+documented combination of exactly three things:
+
+1. **File size against this repository's own median**, on a ramp that is
+   symmetric *about that median* — two straight segments in the fourth root
+   meeting at `ratio = 1` — so half the city stands above the middle of the
+   register and half below. Fourth roots and division only: no `powf`, no
+   logarithm (PRD §7.4, determinism rule 4).
+2. **A path-seeded storey of variety** (`STOREY_JITTER`), so a street of
+   same-sized files is a skyline and not a wall.
+3. **The decayed ghost of recent churn** (`BuildingSpec::ghost_lines`,
+   `GHOST_HALF_LIFE_HOURS`), which rides the *work* curve rather than a second
+   ramp — so a file merged an hour ago is still visibly taller than one untouched
+   for a year and slides down continuously instead of snapping. A repository
+   nobody has touched since the clone has none, correctly: nothing recent has
+   happened in it.
+
+The register was widened, `SETTLED_CEILING` 4.0 → 6.0, and `MONUMENT_HEIGHT`
+6.0 → 7.0 to stay above it. The ordering that makes PRD §7.3's sentence literally
+true is preserved and is now a chain with margin at every link:
+
+```text
+settled 1.0 … 6.0  <  monument 7.0  <  one uncommitted line 8.55  …  64.0
+```
+
+`work_height(1) = 7.55` already exceeds `MONUMENT_HEIGHT`, so **any** building
+with a single uncommitted line outranks **every** monument and every settled
+building, and among them the biggest pile is the tallest thing on the map.
+
+**Consequences.** Measured on Django (7 014 files). Clean tree:
+min/median/max **1.00 / 3.23 / 7.00** over 3 482 distinct heights, deciles
+1.00 · 1.07 · 1.62 · 2.25 · 2.77 · 3.23 · 3.70 · 4.14 · 4.66 · 5.39 — a skyline
+rather than a wall, with the median roof now at half the tone the renderer
+reserves for it instead of a quarter. The same tree with three files carrying
+4 041 / 1 200 / 12 uncommitted lines puts those three at **64.0 / 50.4 / 16.6**,
+each clear of the 7.00 monument ceiling, and the tallest building on the map is
+the biggest pile at 9.1× the tallest monument.
+
+On a clean tree the tallest thing on the map is therefore an **orientation
+anchor** (PRD §8), not a pile — which is the truthful answer when there is no
+pile, and it is why the monument floor sits between the two registers rather than
+inside either. PRD §7.3's sentence holds whenever there is a pile at all, and is
+never asserted when there is not.
+
+`polis_render::plan::height_ramp` reads `SETTLED_CEILING` at runtime rather than
+hard-coding it, so widening the register moved no tone. What it did move is the
+cast shadow and the massing cut, both of which scale with height in world units —
+which is the channel the review found empty.
+
+Amend PRD §17 to record open question 4 as **closed**.
+
+---
+
+## ADR-0078 — A quarter's founding floor scales with the town, or a small repository has no coastline
+
+**Context.** `m1_gate` asserted the M1 acceptance table against
+`polis_repo::synthetic` and nothing else; the real-repository test checked four
+trivial properties. Run the same table against this workspace's own hundred-file
+checkout and three criteria fail:
+
+| corpus | files | solidity | longest stroke | straight borders |
+|---|---:|---:|---:|---:|
+| `synthetic::repository(200)` | 200 | 0.763 | — | 0 |
+| **this workspace** | 112 | **0.918** | **77.6 %** | **1** |
+
+Solidity 0.918 is the coin PRD §7.2 and three M1 gates exist to prevent, on the
+first city a new user ever sees — their own repository.
+
+It is **not** a size effect, and that is the finding. `click`, a real repository
+of 166 files, measures 0.725 with the same code. Two real repositories of nearly
+the same size, one convex and one not:
+
+| repository | files | top-level packages ≥ 12 files | quarters founded | solidity |
+|---|---:|---:|---:|---:|
+| `click` | 166 | `tests` 47, `docs` 41, `examples` 39, `src` 18 | 4 | 0.725 |
+| this workspace | 112 | `docs` 30, `polis-layout` 20 | **2** | **0.918** |
+
+`accrete::QUARTER_FILES` — "smallest absolute size, in files, for a package to
+found a quarter" — was an absolute **12**. Twelve files is a quarter of a percent
+of Django and **eleven percent** of a hundred-file repository. This workspace has
+ten top-level packages and eight of them are 2–10 files, so eight of ten seed off
+the civic square, one settlement grows isotropically, and the outline of a
+compact blob is a blob.
+
+The renders say it plainly: `click` has a south-western peninsula, a western lobe
+joined by an isthmus and two deep bays; this workspace was a rounded sixteen-gon.
+
+**Decision.** The floor scales with the town, because what it is really bounding
+is the **causeway**: a quarter has to be worth the road settled out to it, and a
+causeway's length is a multiple of the separation, which scales with the town.
+
+```rust
+let causeway = QUARTER_FILES                                   // 12
+    .min(total_files.div_ceil(QUARTER_MIN_DENOM))              // 1/20 of the town
+    .max(QUARTER_FILES_FLOOR);                                 // never under 3
+let floor = causeway.max((total * QUARTER_SHARE).round());     // 1.2 % of the town
+```
+
+`QUARTER_MIN_DENOM = 20` says a package worth a road is at least a twentieth of
+the repository. `QUARTER_FILES_FLOOR = 3` stops a twenty-file repository founding
+a quarter per file, which is the same failure approached from the other side.
+
+**Consequences.** The scaled term **only binds below 240 files** (`240/20 = 12`),
+so every corpus at or above that count is byte-identical. That is checked rather
+than claimed — `pytest` (690), Neovim (3 890) and Django (7 014) produce the same
+digest either way. Measured:
+
+| repository | files | quarters before → after | solidity before → after | longest stroke |
+|---|---:|---:|---:|---:|
+| this workspace | 112 | 2 → 9 | **0.918 → 0.784** | 77.6 % → 47.9 % |
+| `click` | 166 | 4 → 5 | 0.725 → **0.680** | 38.0 % → 41.9 % |
+| `pytest` | 690 | — | 0.831 (unchanged) | 62.1 % |
+| Neovim | 3 890 | — | 0.756 (unchanged) | — |
+| Django | 7 014 | — | 0.773 (unchanged) | — |
+
+The `hamlet` and `town` golden files change and were regenerated with this
+change; `hamlet` (3 files) is unaffected because no package clears three.
+
+The wider lesson is ADR-0080's: this defect was reachable only on a *real* small
+repository, and the corpus that could not show it is the one the gate was
+asserted against.
+
+---
+
+## ADR-0079 — The block-size hierarchy bar stays a floor at 8×, and the 30× target is refused with measurements
+
+**Context.** `JUDGEMENT.md` sets a 30× target for block-size hierarchy
+(`p95 / p05` block area). `m1_gate` has asserted **8×** for three rounds without
+either meeting the target or arguing against it, which is how a number gets
+inherited.
+
+**Decision.** The bar stays a floor at 8× on the generated corpus, and it is a
+floor rather than a target because the hierarchy is a property of the
+**repository's age spread**, not of the generator. Measured with one build:
+
+| corpus | files | first-year files | p95:p05 | age gradient |
+|---|---:|---:|---:|---:|
+| `click` | 166 | 25.9 % | **56.0×** | 8.48× |
+| this workspace | 112 | 95.5 % | 19.1× | 2.48× |
+| Neovim | 3 890 | 36.3 % | 13.0× | 5.96× |
+| `synthetic::repository(5 000)` | 5 000 | 8.2 % | 9.4× | 2.35× |
+| Django | 7 014 | 3.4 % | 9.1× | 1.65× |
+| `pytest` | 690 | **0.1 %** | **7.0×** | 1.31× |
+
+`click` has a real old town — a quarter of its files are from its first year —
+and its blocks span 56×. `pytest` rewrote itself: one file of 690 survives from
+its first year, so there is no old grain for a coarse rim to contrast with, and
+it spans 7.0×.
+
+A 30× bar would fail **three of the five real repositories** measured, for having
+the wrong history. The layout cannot fix that, and the one way to manufacture it
+is the thing `polis_layout::age`'s `Uniform` case exists to forbid: ramping on
+list position, which draws `git log`'s within-commit path order as history and
+invites the operator to read alphabetical order as age.
+
+**Consequences.** The number the gate holds is "a gradient still exists",
+asserted below the generated fixture's own 9.4×, and the *response* of the ramp
+to history is asserted separately and much more strongly by
+`the_age_ramp_follows_real_commit_time`. The measured spread is now printed for
+every corpus (`POLIS_SHAPE`), so the next round argues from the table rather than
+from the target. `JUDGEMENT.md`'s 30× should be amended to "8× floor, spread
+reported": it is a real number about `click` and not a requirement any repository
+can be held to.
+
+---
+
+## ADR-0080 — The gate runs on real repositories, recorded as manifests
+
+**Context.** PRD §16 asks for "fixture repos with pinned git history". The suite
+had two, both written by `tests/make-fixtures.sh`, plus a synthetic corpus
+generator. **Every structural number in the M1 acceptance table** — solidity, the
+ruler test, coverage, the longest stroke, the junction share — was asserted
+against the generated corpus, and `the_real_repository_holds_the_gate` checked
+four trivial properties: that two runs agree, that a block exists, that a cycle
+exists and that there are twenty buildings.
+
+That is the shape of a gate a generator can flatter, and ADR-0078 is the proof
+that it did.
+
+**Decision.** Three real repositories are checked into `tests/corpora/` as
+**manifests** and the full acceptance table runs on all of them, in CI, with no
+network and no clone:
+
+| corpus | files | commits | span | what only it covers |
+|---|---:|---:|---:|---|
+| `click` | 166 | 3 333 | 12 y | the small repository, with a real old town |
+| `pytest` | 690 | 17 715 | 18 y | a history that accelerated: 0.1 % first-year files |
+| `polis-day-one` | 107 | 9 | **1 day** | a repository younger than a day |
+
+A manifest (`polis_repo::manifest`) is one line per file: logical path, size,
+class, growth index, added-at, last-touched. **That is the whole of the layout's
+input** — no file content reaches it — so the record is not an approximation of a
+real repository for layout purposes, it is the thing itself. A vendored checkout
+would add megabytes the layout never reads, another project's licence, and a
+`.git` directory that would still have to be vendored for the growth order.
+
+`polis_repo::manifest::capture` writes what `load` reads, from the product's own
+walk, classifier and growth-order reader — not a second implementation of them —
+and `the_corpus_manifests_round_trip_byte_for_byte` asserts the file survives a
+round trip.
+
+**Consequences.** What a manifest deliberately does not carry is file content, so
+a corpus fixture exercises the city and **not** PRD §9's streets; `hamlet` and
+`town` stay, and they are what covers `tree-sitter`.
+
+The live checkout is still laid out, and it is asserted at `Bars::Invariants` —
+topology, placement, contiguity, determinism — with the shape statistics
+reported, not asserted. The reason is measured: at a hundred-odd files those
+statistics have several points of sampling noise, because the convex hull and the
+junction census are decided by a handful of blocks. The same working tree, two
+files apart:
+
+| files | 4-and-5+ share | solidity | straight borders | longest stroke |
+|---:|---:|---:|---:|---:|
+| 112 | 47.2 % | 0.784 | 0 | 47.9 % |
+| 114 | 44.6 % | 0.833 | 1 | 64.9 % |
+
+This checkout gains and loses files on every commit, so a hard geometric bar on
+it fires on whoever happens to add the unlucky file. `polis-day-one.corpus` is a
+pinned capture of this same repository and it holds that ground at full bars.
+
+Two smaller consequences worth recording:
+
+* **`actions/checkout` needs `fetch-depth: 0`.** It is shallow by default, and
+  PRD §7.1 makes `git log` the growth order — so in CI the live-checkout leg was
+  about to lay out a repository whose every file was added by one commit, which
+  is the easiest case there is, and report a pass. All three jobs now fetch the
+  full history and `ci_runs_the_golden_test_on_ubuntu_and_windows` asserts it.
+* **Coverage has a scale.** The 25 % bar was only ever asserted at 5 000 files.
+  Below a thousand the same code measures lower and always has —
+  `synthetic::repository(100)` was at 21.5 % before anything in this round moved
+   — because a small repository parcels more ground than it has files to fill and
+  the remainder is PRD §7.5's vacant lots. The bound below a thousand files is
+  stated at 18 % rather than pretended to be 25 %.
+
+---
+
+## ADR-0081 — An empty face belongs to the district around it, so the metric and the renderer see one map
+
+**Context.** `blocks::assign` gives a face with no plot inside it
+`district: None`, and `blocks::publish` turned that into `LogicalPath::root`. So
+the renderer painted it in the **root district's** colour, drew a district border
+all the way round it, and counted it as root's ground when deciding which edges
+are borders — while `districts::fragmented`, which reads `BlockPlan::district`,
+skipped it entirely.
+
+Django ships ten such blocks, Neovim one, `click` three. Ten blocks of root
+scattered across a map is exactly the fragmentation the metric exists to report,
+and the metric could not see them. **A metric that measures something other than
+what is drawn is worse than no metric**, because it is evidence.
+
+**Decision.** The fallback is removed rather than the metric taught about it: an
+empty face inside a district is that district's ground, which is also what it
+looks like. `blocks::settle_open_blocks` runs at the end of `heal_districts` —
+the last word on district shape, taken on the object the metric reads — and gives
+every remaining district-less block the district beside it, by **multi-source
+breadth-first search from every seated block at once**.
+
+**Consequences.** A block is only ever given the district of a neighbour that
+already has it, so the district it joins gains a block adjacent to one of its own
+and stays one piece; the same argument covers every ancestor, so
+`fragmented_subtrees` and `fragmented_packages` are preserved too. Ties are
+broken by the seeded queue's order — block id ascending, neighbours ascending —
+so the answer is a function of the block list alone (PRD §7.4).
+
+After this, `publish`'s root fallback is unreachable on any city with a file in
+it, and the gate says so directly rather than by inspection: the published
+blocks summed over districts equal the block count, asserted on four corpora.
+
+---
+
+## ADR-0082 — The cold-start budget has two drivers, and a genuine 5 000-file repository is inside it
+
+**Context.** PRD §13.1 budgets "cold start → first frame, 5 000-file repo: < 3 s".
+Django measures at the line, and the previous round waved that away with "Django
+is 7 014 files". That is true and it is not an argument until the interpolation
+is shown.
+
+**Decision.** Measure the curve, name the two drivers, and state the answer with
+the arithmetic. Five real repositories, release build, this machine, `polis
+snapshot`; **cold** means the history and import caches deleted first. Two cold
+runs each, and they agree to within 1 %:
+
+| repository | files | commits | walk | history | imports | diff | layout | render | **cold** | warm |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| this workspace | 115 | 9 | 1 | 45 | 180 | 180 | 19 | 304 | **728** | 519 |
+| `click` | 166 | 3 333 | 1 | 76 | 162 | 62 | 25 | 289 | **614** | 384 |
+| `pytest` | 690 | 17 715 | 3 | 262 | 192 | 108 | 50 | 334 | **947** | 514 |
+| Neovim | 3 890 | 37 934 | 9 | 1 015 | 15 | 50 | 207 | 380 | **1 676** | 662 |
+| Django | 7 014 | 34 898 | 76 | 987 | 423 | 139 | 931 | 443 | **2 998** | 1 662 |
+
+Cold start has **two** independent drivers and PRD §13.1 names only one:
+
+* **`history` is driven by the commit count**, not the file count: 0.027 ms and
+  0.028 ms per commit on Neovim and Django, which have 37 934 and 34 898 commits
+  against 3 890 and 7 014 files.
+* **`layout`, `imports` and `walk` are driven by the file count.**
+
+Interpolating to a genuine 5 000-file repository, two ways that have to agree:
+
+*Bracketing on files.* Neovim (3 890) and Django (7 014) bracket 5 000, and
+Neovim has **more** commits than Django, so the history term is not being
+smuggled downward by the choice of bracket:
+
+```
+1 676 + (2 998 − 1 676) × (5 000 − 3 890) / (7 014 − 3 890)  =  2 146 ms
+```
+
+*Term by term.* walk 33 + imports 302 (Django's per-file rate, a parsed language;
+Neovim's C costs 15 ms in total) + diff 90 + layout 464 + render 402, plus
+0.028 ms per commit:
+
+```
+1 291 ms + 0.028 × commits   →   2 268 ms at Django's 34 898 commits
+                             →   inside 3 000 ms up to ~61 000 commits
+```
+
+**A genuine 5 000-file repository is inside the budget with about a quarter of it
+to spare**, by both routes, and the bound on the second driver is ~61 000
+commits — more than any of the five repositories measured has. Django, at 7 014
+files (40 % over the budgeted size) and 34 898 commits, measures 2 989–3 007 ms:
+*at* a budget it is not the subject of.
+
+**Consequences.** Two things were done rather than only argued.
+
+`History::fold_range` now folds the `git log --name-status` stream through a slot
+table instead of straight into a `BTreeMap`. Django's walk emits 155 432 file
+lines for some 12 000 distinct paths — thirteen to one — and every line was
+paying a `LogicalPath` decode (an allocation and a case fold) and an insert into
+a `BTreeMap` of twelve thousand string keys. Each raw spelling now gets a slot on
+first sight and every later line is an `ahash` lookup on the raw bytes and one
+`Vec` write. Measured:
+
+| repository | history, before | after |
+|---|---:|---:|
+| Django | 1 712 ms | **987 ms** |
+| Neovim | 1 854 ms | **1 015 ms** |
+| `pytest` | 809 ms | **262 ms** |
+
+`git log --name-status` on its own, timed at the shell on Django, is 1 131 ms, so
+the walk now costs about what git costs and the remaining term is not ours.
+Django's cold start moved from 3 787 ms to 2 998 ms on this measurement.
+
+Determinism is unaffected: the map is a lookup table that is never iterated for
+output, the slots are drained in walk order recovered from a sequence number, and
+two raw spellings that fold to one `LogicalPath` (a case-only rename, ADR-0028)
+merge exactly as before and in the same order.
+
+Two caveats, stated rather than buried. The `render` column is PNG encoding in
+`polis snapshot`; a real first frame does not pay it, so every figure above is
+pessimistic by about 400 ms. And **cold is the once-per-`HEAD` case**: the second
+launch on the same commit is the `warm` column, 1 662 ms on Django.
+
+---
+
+## ADR-0083 — `regions::partition` is a tenth of the incremental step, not its remaining lever
+
+**Context.** PRD §13.1 budgets an incremental layout step at under 50 ms.
+`tests/incremental_budget.rs` named `regions::partition` as "the remaining
+lever", and the sentence was about **churn** — how many buildings move under the
+operator (PRD §7.7) — but it was read as a performance claim and carried forward
+as one for two rounds.
+
+It is not one. Profiled directly at 5 000 files, release, one stage at a time:
+
+| stage | ms |
+|---|---:|
+| `Graph::from_cells_indexed` (weld) | 2.13 |
+| `regions::adjacency` | 0.15 |
+| **`regions::partition`** | **3.41** |
+| `Settlement::reseated` | 0.33 |
+| `districts::links_to_keep` | 0.28 |
+| `collapse_short` + `compact_nodes` | 2.68 |
+| `Graph::faces`, first pass | 0.42 |
+| `face_districts` + `border_edges` + `choose_prunes` | 3.23 |
+| `delete_edges` + `compact_nodes` + `faces` | 0.68 |
+| `classify_by_betweenness` | 1.04 |
+| `blocks::assign` | 2.58 |
+| `blocks::heal_districts` | 0.52 |
+| **graph pipeline** | **17.4** |
+| `lots::parcel_city` | 30.7 cold / ~9 warm (78 % cache hits) |
+| building seating | ~30 cold / ~2 warm (96 % cache hits) |
+
+**Decision.** Record the profile in the test file that made the claim, and say
+where the real lever is: the ~17 ms graph pipeline is recomputed in full on every
+step, including the six adds of twelve that settle no new plot at all and for
+which the cell diagram — and therefore every one of those stages — is unchanged.
+The fix is a cache keyed on the cell diagram, not an incremental partition, which
+would buy at most 3.4 ms.
+
+**Consequences.** Not taken this round, deliberately: the step is inside its
+budget and the change spans `city::assemble`, which this round's parallel work
+owns. Measured after this round's changes, release, twelve single-file adds at
+5 000 files, on an idle machine:
+
+| rayon threads | median | p95 |
+|---|---:|---:|
+| 1 | 35.0 ms | **42.4 ms** |
+| 2 | 35.4 ms | 38.5 ms |
+| 4 | 35.5 ms | 40.4 ms |
+| 24 | 35.6 ms | 38.0 ms |
+
+Every row is inside 50 ms, **including on a single core**. The gate's 57.6 ms was
+taken at one thread *under load*, and that remains true and remains unfixable by
+this file: a budget assertion cannot be made immune to a machine that is already
+busy, only given the machine, which is what the test being its own target does.
+What has changed is that the next reader has the profile and will not spend a
+round making the partition incremental for 3.4 ms.
+
+---
+
+## ADR-0084 — A stale golden and a nondeterministic one are told apart before anything is printed
+
+**Context.** PRD §16 calls the golden-layout snapshots "the most important test
+in the suite". Last round all three were **red on arrival**: the layout had
+changed and nobody regenerated them, so the first thing anyone saw was a snapshot
+diff with no explanation. The reflex is `cargo insta accept`, and that reflex is
+right exactly half the time — a layout that differs **between two runs** also
+differs from the file, and the diff looks identical.
+
+**Decision.** Each golden test generates its fixture city **twice** and classifies
+the result before `insta` sees the value (`m1_gate::classify_golden`):
+
+* Two runs disagree → `Nondeterministic`. Panics with the first differing line
+  and a list of the usual causes. It never reaches `insta`, so there is **no
+  `.snap.new` to accept** and no way to make it go away by regenerating.
+* Two runs agree and the file differs → `Changed`. Prints a banner saying how
+  many lines moved, telling the reader to look at a render first, and then lets
+  `insta` show the diff.
+
+`classify_golden` is a pure function of `(first, second, stored)` precisely so
+the alarm itself is asserted — `a_stale_golden_and_a_nondeterministic_one_are_told_apart`
+covers the case that matters most: two runs disagree *while the stored file
+matches the first one*, which a naive comparison calls a pass.
+
+**Consequences.** One extra generation of a fixture city, under two milliseconds,
+against the cost of accepting a determinism bug by reflex. The trailing-newline
+case is treated as a match, so a hand-edited snapshot does not report a layout
+change.

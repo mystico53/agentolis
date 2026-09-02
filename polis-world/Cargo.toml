@@ -11,16 +11,31 @@ repository.workspace = true
 polis-events = { workspace = true }
 polis-layout = { workspace = true }
 polis-repo = { workspace = true }
+# PRD §15 M2: `replay` and `sessions` are built on the transcript channel's
+# OFFLINE FULL READ (`polis_ingest::transcript::read_session`) and on its record
+# model, rather than on a second copy of the JSONL parser. The dependency is
+# one-directional — `polis-ingest` does not and must not depend on this crate —
+# and it is not optional because `polis-app` cannot enable a feature on it
+# without a manifest edit it does not own.
+polis-ingest = { workspace = true }
 # The lock-free snapshot the renderer reads (PRD §5).
 arc-swap = { workspace = true }
 crossbeam-channel = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
+# Channel D carries its records verbatim as `serde_json::Value` (PRD §4.4), so
+# the world is where they are finally read.
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# PRD §4.1: unknown event types are logged at debug and dropped, never fatal.
+tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# The tests drive the world from real transcripts and write session-index
+# fixtures; both want a directory that cleans itself up.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

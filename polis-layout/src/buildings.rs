@@ -119,8 +119,8 @@ use polis_repo::FileClass;
 
 use crate::determinism::{det_sin_cos, narrow, quantize_f64, SeededRng, QUANTUM};
 use crate::geom::{
-    add, area, centroid, clip_halfplane, contains, dist_to_boundary, erode_per_edge, extent_along,
-    interior_point_avoiding, is_convex, mul, norm, rotate_about, signed_area2, sub, to_polygon, Pt,
+    add, area, centroid, contains, dist_to_boundary, dot, erode_per_edge, extent_along,
+    interior_point_avoiding, is_convex, mul, rotate_about, to_polygon, Pt,
 };
 use crate::{Building, LotId, Point, Polygon, RoofForm};
 
@@ -480,7 +480,7 @@ pub const MIN_DEPTH_RATIO: f64 = 0.34;
 ///
 /// Strictly under one, so a garden always survives at the back and the block's
 /// leftover ground merges into a single court rather than a ring of slivers.
-pub const MAX_DEPTH_SHARE: f64 = 0.90;
+pub const MAX_DEPTH_SHARE: f64 = 0.97;
 
 /// Bisection steps used to fit a band's depth and its width.
 ///
@@ -489,6 +489,48 @@ pub const MAX_DEPTH_SHARE: f64 = 0.90;
 /// shipped a release-only nondeterminism bug of exactly that shape (PRD §7.4).
 /// Thirty steps take a `f64` interval below its own rounding.
 pub const FIT_STEPS: u32 = 30;
+
+/// How close to a slab line a vertex counts as sitting on it, in city units.
+///
+/// A thousandth of the layout quantum. The frontage edge of an eroded parcel
+/// lies on the extreme line by construction, and floating-point arithmetic puts
+/// its two ends a few ulps either side of it; without this the kerb slab
+/// returns one corner instead of the whole edge and every footprint on a street
+/// steps back for no reason.
+pub const SLAB_ON_LINE: f64 = 1e-9;
+
+/// Depths `kerb_line` tries before giving up on the frontage.
+pub const KERB_SEARCH_STEPS: u32 = 8;
+
+/// How far back `kerb_line` will step, as a share of the plot's depth.
+pub const KERB_SEARCH_SHARE: f64 = 0.30;
+
+/// Frontage width `kerb_line` settles for, against the plot's widest.
+pub const KERB_ENOUGH: f64 = 0.55;
+
+/// Bisection steps used to scale a turned rectangle back inside its lot.
+///
+/// Twelve halvings put the scale within a four-thousandth, which is well under
+/// the layout quantum at the scale a footprint is drawn.
+pub const ROTATION_FIT_STEPS: u32 = 12;
+
+/// Shallowest rectangle the depth grid will consider, against the deepest.
+///
+/// The grid has to reach below [`MIN_DEPTH_RATIO`]'s razor-strip floor because
+/// on a skewed plot no rectangle exists at that depth at all — the kerb slab
+/// and the back slab do not overlap — and a file with no building is the worst
+/// outcome this stage has. The floor stays a *preference*: a depth under it is
+/// used only when nothing at or above it works.
+pub const DEPTH_FLOOR_SHARE: f64 = 0.08;
+
+/// How much better the cross-street orientation must be to be taken.
+///
+/// The building line along the street is worth keeping: a row of buildings that
+/// all face the same way is the whole reason a street reads as a street. So the
+/// perpendicular orientation is used only where the plot's shape makes the
+/// road-facing one a sliver — a fifth better, measured on the finished
+/// footprint, not on a proxy.
+pub const FACE_PREFERENCE: f64 = 1.20;
 
 /// Shrink steps allowed before a parcel is declared unbuildable.
 ///
@@ -534,6 +576,46 @@ pub const SHRINK_STEPS: u32 = 24;
 // merged file slides back down through the boundary continuously instead of
 // snapping — PRD §17's slow-decay ghost, and the reason [`work_height`] takes a
 // `f64` line count rather than a `u32`.
+//
+// # What height means on a clean tree — PRD §17 open question 4, answered
+//
+// A freshly-cloned repository has **no uncommitted diff at all**, and that is
+// the common case: the map is opened before any agent has run. Read literally,
+// PRD §7.3 then makes every building the same height and the primary encoded
+// quantity carries nothing. The answer this module ships, and ADR-0074 records:
+//
+// * **On a clean tree, height is the settled register alone** — a documented
+//   combination of the file's size against *this repository's own median*
+//   ([`settled_height`], a ramp centred on that median so half the city stands
+//   above the middle of the register and half below) and a path-seeded storey
+//   of variety ([`STOREY_JITTER`]) so a street of same-sized files still has a
+//   skyline. It is stable — nothing about it moves when nothing changes —
+//   which is what PRD §7.4's spatial memory needs from the base map.
+// * **Recency arrives as the ghost, not as a second ramp.** `BuildingSpec`'s
+//   `ghost_lines` is a decayed residue of churn ([`ghost_lines`],
+//   [`GHOST_HALF_LIFE_HOURS`]) and rides the *work* curve, so a file merged an
+//   hour ago is still visibly taller than one untouched for a year, and slides
+//   down continuously rather than snapping. A repository nobody has touched
+//   since the clone has none, correctly: nothing recent has happened in it.
+// * **A monument floors at [`MONUMENT_HEIGHT`]**, above the settled ceiling.
+//   So on a clean tree the tallest thing on the map is an orientation anchor
+//   (PRD §8) — which is the truthful answer when there is no unreviewed pile —
+//   and the moment *anything* is uncommitted, that building outranks every
+//   monument, because [`work_height`] of a single line already exceeds
+//   [`MONUMENT_HEIGHT`]. PRD §7.3's sentence — "the tallest thing on the map is
+//   the biggest unreviewed pile" — is therefore literally true whenever there
+//   is a pile at all, and never asserted when there is not.
+//
+// Measured on Django (7 014 files). Clean tree: min/median/max
+// **1.00 / 3.23 / 7.00** over 3 482 distinct heights, with deciles
+// 1.00 · 1.07 · 1.62 · 2.25 · 2.77 · 3.23 · 3.70 · 4.14 · 4.66 · 5.39 — a
+// skyline rather than a wall. The same tree with three files carrying
+// 4 041 / 1 200 / 12 uncommitted lines puts those three at **64.0 / 50.4 /
+// 16.6**, every one of them clear of the 7.00 monument ceiling, and the
+// tallest thing on the map is the biggest pile at 9.1× the tallest monument.
+// Before this change the same clean tree read **1.00 / 1.92 / 6.00** with the
+// median roof at a quarter of the tone the renderer reserves for it, which is
+// the "no skyline, H = 6.0 on three of four maps" the visual review measured.
 
 /// Base building height (PRD §7.3) — a single storey, and the floor of the
 /// settled register.
@@ -541,7 +623,7 @@ pub const BASE_HEIGHT: f32 = 1.0;
 
 /// Ceiling of the settled register: the tallest a building gets with nothing
 /// uncommitted on it.
-pub const SETTLED_CEILING: f32 = 4.0;
+pub const SETTLED_CEILING: f32 = 6.0;
 
 /// How much of the height range the work register owns.
 pub const WORK_SPAN: f64 = 60.0;
@@ -571,7 +653,7 @@ pub const MAX_HEIGHT: f32 = 64.0;
 /// on it is still taller. PRD §8 wants the orientation anchors to be findable;
 /// PRD §7.3 wants the biggest unreviewed pile to be the tallest thing on the
 /// map. Both hold.
-pub const MONUMENT_HEIGHT: f32 = 6.0;
+pub const MONUMENT_HEIGHT: f32 = 7.0;
 
 /// Half-life of the height ghost after a merge, in hours.
 pub const GHOST_HALF_LIFE_HOURS: f32 = 6.0;
@@ -751,95 +833,261 @@ fn on_boundary_or_inside(poly: &[Pt], p: Pt) -> bool {
     contains(poly, p) || dist_to_boundary(poly, p) <= ON_BOUNDARY
 }
 
-/// Which way a parcel faces, and the inward normal of the edge it faces on.
+/// The parcel's own axes, and the two ways a building can stand on them, best
+/// street first.
 ///
-/// The frontage is the **longest parcel edge that lies on the block boundary** —
-/// the same test [`buildable_region`] uses to decide which edges pay a kerb, so
-/// the edge that pays for the street is the edge the building stands on. A
-/// parcel buried in the middle of a block has no such edge and faces the one
-/// nearest the boundary instead, which is the alley or the court it opens onto.
+/// Each entry is `(along, inward)`: a unit vector along the building line, and
+/// the unit normal pointing from the street into the plot.
 ///
-/// Returns `(along, inward)`: unit vectors along the frontage and into the plot.
-/// Ties are broken on the quantised midpoint, so the choice is a property of
-/// where the parcel is and not of the order its ring happened to be built in
-/// (PRD §7.4).
-fn frontage(parcel: &[Pt], block: &[Pt], road_half: f64) -> Option<(Pt, Pt)> {
-    let n = parcel.len();
-    if n < 3 {
+/// # Why the parcel's axes and not the road's
+///
+/// This used to return the direction of the **longest parcel edge lying on the
+/// block boundary** — the street, literally. That is the right answer for the
+/// *front face* and the wrong frame to build a rectangle in, and the difference
+/// is worth a fifth of the city's floor area. `crate::lots::block_frame` cuts
+/// every parcel in a block on one pair of perpendicular directions, and a
+/// parcel on the block edge is one of those rectangles clipped by the block
+/// boundary — whose bearing has nothing to do with the frame. Fitting a
+/// rectangle in the *road's* frame inside a parcel cut in the *block's* frame
+/// wedges it between two skew sides: measured on Django, median lot fill fell
+/// from 67 % to 47 %.
+///
+/// So the frame is the parcel's own — the axes of its minimum-area bounding
+/// rectangle, which for a parcel this pipeline cut *are* the block's two axes.
+/// A terrace on a slightly skew street then has a straight building line and a
+/// wedge of ground in front of it, which is what a terrace on a slightly skew
+/// street looks like.
+///
+/// # Two candidates, not one
+///
+/// Which of the frame's four sides faces the road decides the building's
+/// orientation, and on a tapering plot one orientation can hold half again the
+/// floor area of the other. Both are returned — the road-facing one first —
+/// and `seat` keeps the second only when it beats the first by
+/// [`FACE_PREFERENCE`], so the street wall wins every argument that is close.
+///
+/// Deterministic (PRD §7.4): the axes come from the ring's shape, and each
+/// orientation's street side is chosen on the quantised distance from that
+/// side's own centre to the block boundary, with the axis order as the tiebreak.
+fn frontage_faces(parcel: &[Pt], block: &[Pt]) -> Option<[(Pt, Pt); 2]> {
+    if parcel.len() < 3 {
         return None;
     }
-    let ccw = signed_area2(parcel) > 0.0;
-    let mut best: Option<((i64, i64, i64, i64), Pt)> = None;
-    for i in 0..n {
-        let a = parcel[i];
-        let b = parcel[(i + 1) % n];
-        let e = sub(b, a);
-        let length = crate::geom::len(e);
-        if length <= 1e-12 {
-            continue;
+    let u = crate::lots::block_frame(parcel)[0];
+    let v = [-u[1], u[0]];
+    let c = centroid(parcel);
+    // How far the centre of the side facing `out` is from the road centre line.
+    let gap = |out: Pt| -> i64 {
+        let (_, hi) = extent_along(parcel, out);
+        let mid = add(c, mul(out, hi - dot(out, c)));
+        (dist_to_boundary(block, mid) * 1e6) as i64
+    };
+    // Each axis contributes one candidate: the side of it nearest the road.
+    let street = |a: Pt| -> Pt {
+        let b = [-a[0], -a[1]];
+        if gap(b) < gap(a) {
+            b
+        } else {
+            a
         }
-        let mid = mul(add(a, b), 0.5);
-        let on_road = dist_to_boundary(block, mid) <= road_half * 0.2;
-        // Sort key, largest first: a road edge before an interior one, then the
-        // longer edge, then the lower quantised midpoint.
-        let key = (
-            i64::from(on_road),
-            (length * 1e6) as i64,
-            -((mid[1] * 1e6) as i64),
-            -((mid[0] * 1e6) as i64),
-        );
-        if best.is_none_or(|(bk, _)| key > bk) {
-            best = Some((key, norm(e)));
+    };
+    let (ou, ov) = (street(u), street(v));
+    let face = |out: Pt| -> (Pt, Pt) {
+        let inward = [-out[0], -out[1]];
+        ([-inward[1], inward[0]], inward)
+    };
+    Some(if gap(ov) < gap(ou) {
+        [face(ov), face(ou)]
+    } else {
+        [face(ou), face(ov)]
+    })
+}
+
+/// The `along`-span of `region` on the line `dot(inward, x) = s`, if it meets it.
+///
+/// The region is convex, so the line crosses at most two of its edges and the
+/// span is the segment between them; a vertex sitting exactly on the line is
+/// counted too, which is what makes the frontage line — where a whole edge lies
+/// on it — return that edge rather than nothing.
+fn slab_span(region: &[Pt], along: Pt, inward: Pt, s: f64) -> Option<(f64, f64)> {
+    let n = region.len();
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut take = |p: Pt| {
+        let t = dot(along, p);
+        lo = lo.min(t);
+        hi = hi.max(t);
+    };
+    for i in 0..n {
+        let a = region[i];
+        let b = region[(i + 1) % n];
+        let da = dot(inward, a) - s;
+        let db = dot(inward, b) - s;
+        if da.abs() <= SLAB_ON_LINE {
+            take(a);
+        }
+        if (da < 0.0) != (db < 0.0) {
+            let t = da / (da - db);
+            if t.is_finite() {
+                take(crate::geom::lerp(a, b, t.clamp(0.0, 1.0)));
+            }
         }
     }
-    let (_, along) = best?;
-    let inward = if ccw {
-        [-along[1], along[0]]
+    if hi >= lo {
+        Some((lo, hi))
     } else {
-        [along[1], -along[0]]
+        None
+    }
+}
+
+/// The widest rectangle of `region` between the kerb line `s0` and `s0 + depth`.
+///
+/// `region` is convex, so its left boundary is a convex function of the depth
+/// and its right boundary a concave one — which means the extreme of each over
+/// a slab is reached at one of the slab's two ends. Two spans are therefore the
+/// whole calculation, and the answer is exact rather than sampled.
+fn rect_span(region: &[Pt], along: Pt, inward: Pt, s0: f64, depth: f64) -> Option<(f64, f64)> {
+    let front = slab_span(region, along, inward, s0)?;
+    let back = slab_span(region, along, inward, s0 + depth)?;
+    let l = front.0.max(back.0);
+    let r = front.1.min(back.1);
+    if r > l {
+        Some((l, r))
+    } else {
+        None
+    }
+}
+
+/// Where the building's kerb line sits.
+///
+/// Normally the frontage itself: `inward` is that edge's own inward normal, so
+/// the edge lies on the extreme line and [`slab_span`] returns it whole. A
+/// parcel whose erosion ate the frontage — or one that comes to a point there —
+/// has no width at the extreme, and a rectangle standing on it would be a line.
+/// There the kerb steps back over a fixed ladder until the plot is wide enough
+/// to stand on, which is what a house on a wedge-shaped corner plot does.
+fn kerb_line(region: &[Pt], along: Pt, inward: Pt, front: f64, plot: f64) -> f64 {
+    let width = |s: f64| slab_span(region, along, inward, s).map_or(0.0, |(l, r)| r - l);
+    let wanted = extent_along(region, along).1 - extent_along(region, along).0;
+    let mut best = (width(front), front);
+    for step in 0..=KERB_SEARCH_STEPS {
+        let s = front + plot * (f64::from(step) / f64::from(KERB_SEARCH_STEPS)) * KERB_SEARCH_SHARE;
+        let w = width(s);
+        if w >= wanted * KERB_ENOUGH {
+            return s;
+        }
+        if w > best.0 {
+            best = (w, s);
+        }
+    }
+    best.1
+}
+
+/// A rectangle in the `(along, inward)` frame, as a ring.
+fn rect_ring(along: Pt, inward: Pt, l: f64, r: f64, s0: f64, s1: f64) -> Vec<Pt> {
+    let corner =
+        |u: f64, v: f64| -> Pt { [along[0] * u + inward[0] * v, along[1] * u + inward[1] * v] };
+    vec![corner(l, s0), corner(r, s0), corner(r, s1), corner(l, s1)]
+}
+
+/// Shrinks `ring` about its own centre until every corner is inside `region`.
+///
+/// A uniform scale about a point maps a rectangle to a rectangle, so the
+/// containment guard cannot cost the footprint its shape — which is the whole
+/// reason the ±4° is applied to a finished rectangle here rather than to the
+/// cuts that made it.
+fn shrink_into(region: &[Pt], ring: Vec<Pt>) -> Vec<Pt> {
+    if ring.iter().all(|p| on_boundary_or_inside(region, *p)) {
+        return ring;
+    }
+    let pivot = centroid(&ring);
+    let at = |k: f64| -> Vec<Pt> {
+        ring.iter()
+            .map(|p| crate::geom::lerp(*p, pivot, 1.0 - k))
+            .collect()
     };
-    Some((along, inward))
+    // Bisection rather than a fixed 10 % ladder: the ladder threw away up to
+    // two thirds of a footprint to clear a corner that was over by a hair.
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for _ in 0..ROTATION_FIT_STEPS {
+        let mid = f64::midpoint(lo, hi);
+        if at(mid).iter().all(|p| on_boundary_or_inside(region, *p)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    at(lo)
 }
 
-/// Area of the band of `region` within `depth` of its frontage.
-fn band(region: &[Pt], inward: Pt, front: f64, depth: f64) -> Vec<Pt> {
-    clip_halfplane(region, inward, front + depth)
-}
-
-/// The footprint: the band of the buildable region that stands on its street.
+/// The footprint: the largest street-fronting **rectangle** the lot's inset
+/// interior will hold, trimmed to the wanted area.
 ///
 /// > **Buildings** are lots inset by a setback, with a small random rotation
 /// > (±4°). (PRD §7.2 step 5)
 ///
-/// The setback is per edge and the inset is anisotropic — deep at the back,
-/// a party wall at the sides, a kerb at the front. That is still "a lot inset by
+/// The setback is per edge and the inset is anisotropic — deep at the back, a
+/// party wall at the sides, a kerb at the front. That is still "a lot inset by
 /// a setback"; it is not the *uniform* inset, and the module documentation says
 /// why the uniform one reads as a cadastral survey rather than as roofs.
 ///
-/// Two bisections, both with a fixed step count so the result cannot depend on a
-/// convergence test (PRD §7.4):
+/// # Why the shape is named and not inherited
 ///
-/// 1. **Depth**, over `[min_depth, max_depth]`. The region is convex, so the
-///    band's area is monotone in the depth and the bisection is exact.
-/// 2. **Width**, only when the shallowest allowed band is already bigger than
-///    the target — a loose plot, where the answer is a house standing on its
-///    frontage with a garden either side rather than a razor strip across it.
+/// This used to hand back the **band** of the region within `depth` of its
+/// street edge — the region's own shape, cut off at the back. That is faithful
+/// to "a lot inset by a setback" and it was the second half of the artefact
+/// that failed five visual reviews: a wedge-shaped lot inset by a setback is a
+/// smaller wedge, and a block full of them is a pinwheel. `crate::lots` now
+/// cuts every parcel on one pair of perpendicular directions
+/// (`crate::lots::block_frame`), so most lots *are* rectangles and the band
+/// would mostly be right — but "mostly" is what a reviewer's eye finds. Naming
+/// the rectangle makes it exact, on the corner plots and the clipped edge lots
+/// too, and it costs almost nothing where the lot was already square.
 ///
-/// # The ±4° goes into the cuts, not into the finished footprint
+/// Measured on Django, over 7 011 buildings: 46 % of footprints were
+/// quadrilaterals with a median area of **0.854** of their own minimum-area
+/// bounding rectangle (a rectangle scores 1.00, a wedge about 0.5); after this
+/// and the block frame, 100 % are quadrilaterals at a median of **1.000**.
 ///
-/// PRD §7.2 step 5 asks for "a small random rotation (±4°)". Turning the
-/// *finished* band would be wrong twice over. The band shares its front and side
-/// boundary with the region — that is the whole point, it stands on the kerb —
-/// so rotating it rigidly pushes those corners into the road, and the guard that
-/// catches that shrinks the building by a tenth per step until it fits: a fifth
-/// of the city's floor area thrown away, and the street wall broken exactly
-/// where it was supposed to line up.
+/// # How
 ///
-/// So the **cut normals** carry the angle instead. The back edge and the side
-/// cuts come off the street at ±4°, the frontage stays on the kerb, and the
-/// footprint is a half-plane clip of a convex region — inside it by construction,
-/// with no shrink and no area lost. The published
-/// [`Building::rotation`](crate::Building::rotation) is the angle that was used.
+/// Everything happens in the lot's own frame: `along` the frontage, `inward`
+/// into the plot.
+///
+/// 1. **The kerb line** ([`kerb_line`]) — the frontage itself, except on a plot
+///    that comes to a point there, where it steps back until there is width to
+///    stand on.
+/// 2. **The depth**, over a fixed grid of [`FIT_STEPS`] values in
+///    `[min_depth, max_depth]`: the shallowest whose rectangle already carries
+///    the wanted area, or failing that the one that carries the most. A grid
+///    and not a bisection, because the rectangle's width is only *usually*
+///    monotone in its depth and a bisection assumes it always is.
+/// 3. **The width**, trimmed symmetrically about the middle of the frontage
+///    when even the shallowest allowed rectangle is bigger than the target — a
+///    detached house on a loose plot, with garden either side.
+///
+/// The rectangle is exact at every step: [`rect_span`] takes the extreme of the
+/// region's left and right boundary over the slab, which for a convex region is
+/// reached at one of the slab's two ends.
+///
+/// # The ±4° turns the finished rectangle, and the plot decides how far
+///
+/// A rotation applied to the *cut normals* — what this did before — cannot
+/// survive here, because a rectangle has four sides and turning only its back
+/// one makes it a trapezoid again. So the finished rectangle is turned about
+/// its own centre, and [`shrink_into`] scales it about that same centre until
+/// it is back inside the lot. A uniform scale about a point maps a rectangle to
+/// a rectangle, so neither step can cost the footprint its shape.
+///
+/// What a turn *does* cost is the party wall: a rectangle turned 4° inside a
+/// terrace strip pulls its sides in by `depth · tan 4°`, which is far more than
+/// [`PARTY_WALL`], and the contiguous built mass along the block edge breaks
+/// back into gravel. So `seat` scales the angle by [`looseness`]: **zero on
+/// terraced ground, the full ±4° on detached ground**. That is not a compromise
+/// with PRD §7.2 — a terrace cannot rotate, that is what a terrace is — and the
+/// published [`Building::rotation`](crate::Building::rotation) is the angle
+/// that was actually used, never the one that was drawn.
 fn fit_footprint(region: &[Pt], face: (Pt, Pt), want: f64, rotation: f64) -> Option<Vec<Pt>> {
     if region.len() < 3 {
         return None;
@@ -848,9 +1096,7 @@ fn fit_footprint(region: &[Pt], face: (Pt, Pt), want: f64, rotation: f64) -> Opt
     if full <= 1e-12 || want <= 1e-12 {
         return None;
     }
-    let (sn, cs) = det_sin_cos(rotation);
-    let turn = |v: Pt| -> Pt { [v[0] * cs - v[1] * sn, v[0] * sn + v[1] * cs] };
-    let (along, inward) = (turn(face.0), turn(face.1));
+    let (along, inward) = face;
     let (front, back) = extent_along(region, inward);
     let (left, right) = extent_along(region, along);
     let plot_depth = back - front;
@@ -858,74 +1104,122 @@ fn fit_footprint(region: &[Pt], face: (Pt, Pt), want: f64, rotation: f64) -> Opt
     if plot_depth <= 0.0 || plot_width <= 0.0 {
         return None;
     }
-    let max_depth = plot_depth * MAX_DEPTH_SHARE;
+    let kerb = kerb_line(region, along, inward, front, plot_depth);
+    let max_depth = (back - kerb) * MAX_DEPTH_SHARE;
+    if max_depth <= 0.0 {
+        return None;
+    }
     let min_depth = (plot_width * MIN_DEPTH_RATIO).min(max_depth);
 
-    let mut ring = band(region, inward, front, max_depth);
-    if area(&ring) > want {
-        // Deep enough somewhere in `[min_depth, max_depth]`, or shallower than
-        // this stage will allow — in which case the width bisection below takes
-        // over and the band stays on its frontage.
-        let mut lo = min_depth;
-        let mut hi = max_depth;
-        let shallow = band(region, inward, front, min_depth);
-        if area(&shallow) >= want {
-            ring = shallow;
-        } else {
-            for _ in 0..FIT_STEPS {
-                let mid = f64::midpoint(lo, hi);
-                if area(&band(region, inward, front, mid)) < want {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
+    // The shallowest rectangle that already carries the wanted area, or the
+    // roomiest one there is. A fixed grid, never a convergence test (PRD §7.4).
+    //
+    // The grid runs from [`DEPTH_FLOOR_SHARE`] of the deepest to the deepest,
+    // not from `min_depth`, and the razor-strip floor is applied as a
+    // *preference* over it. On a skewed plot the kerb slab and the back slab
+    // can fail to overlap at all — measured on a 6 × 0.9 strip whose two long
+    // sides are not parallel — and a grid anchored at `min_depth` then has no
+    // rectangle anywhere on it and the file loses its building. A shallow house
+    // is a worse house; no house is a lost file.
+    let steps = FIT_STEPS.max(2);
+    let floor = max_depth * DEPTH_FLOOR_SHARE;
+    let at = |depth: f64| -> Option<(f64, f64, f64)> {
+        let (l, r) = rect_span(region, along, inward, kerb, depth)?;
+        Some((depth * (r - l), l, r))
+    };
+    let mut roomiest: Option<(f64, f64, f64, f64)> = None;
+    let mut roomiest_deep: Option<(f64, f64, f64, f64)> = None;
+    let mut bracket: Option<(f64, f64)> = None;
+    let mut previous = floor;
+    for step in 0..steps {
+        let t = f64::from(step) / f64::from(steps - 1);
+        let depth = floor + (max_depth - floor) * t;
+        let Some((a, l, r)) = at(depth) else {
+            previous = depth;
+            continue;
+        };
+        if roomiest.is_none_or(|(best, ..)| a > best) {
+            roomiest = Some((a, depth, l, r));
+        }
+        if depth >= min_depth {
+            if roomiest_deep.is_none_or(|(best, ..)| a > best) {
+                roomiest_deep = Some((a, depth, l, r));
             }
-            ring = band(region, inward, front, hi);
+            if a >= want && bracket.is_none() {
+                bracket = Some((previous, depth));
+            }
+        }
+        previous = depth;
+    }
+    // The grid brackets the wanted area; the depth is then bisected inside that
+    // bracket. Landing on the grid instead would overshoot by up to a grid step
+    // and the overshoot is paid **sideways** below — which is a party wall, and
+    // measured on the terrace fixture it opened a 0.022 gap where the contract
+    // is 0.012. The bisection takes the overshoot to nothing.
+    let (mut depth, mut l, mut r) = if let Some((low, high)) = bracket {
+        let mut lo = low;
+        let mut hi = high;
+        for _ in 0..FIT_STEPS {
+            let mid = f64::midpoint(lo, hi);
+            if at(mid).is_some_and(|(a, _, _)| a >= want) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let (_, l, r) = at(hi)?;
+        (hi, l, r)
+    } else {
+        let (_, depth, l, r) = roomiest_deep.or(roomiest)?;
+        (depth, l, r)
+    };
+    // A rectangle shallower than the razor-strip floor is squared up instead:
+    // deepened to the floor and trimmed sideways, which is a detached house on
+    // its frontage with a garden either side.
+    if depth < min_depth {
+        if let Some((a, fl, fr)) = at(min_depth) {
+            if a >= want {
+                depth = min_depth;
+                l = fl;
+                r = fr;
+            }
         }
     }
-    if ring.len() < 3 {
+    // `is_finite` first and then the ordering, so a NaN out of a degenerate
+    // plot is rejected rather than compared.
+    if !depth.is_finite() || !(r - l).is_finite() || depth <= 0.0 || r - l <= 0.0 {
         return None;
     }
 
-    // Trim symmetrically about the middle of the frontage until the band is no
-    // bigger than the target. `k = 1` is the untrimmed band and `k = 0` is a
-    // line, so the area is monotone here too.
-    if area(&ring) > want {
-        let (l, r) = extent_along(&ring, along);
+    // Trim the width symmetrically about the middle of the frontage when the
+    // shallowest rectangle allowed is still bigger than the file needs.
+    let held = depth * (r - l);
+    if held > want {
         let centre = f64::midpoint(l, r);
-        let trim = |k: f64| -> Vec<Pt> {
-            let cut = clip_halfplane(&ring, along, centre + (r - centre) * k);
-            clip_halfplane(&cut, mul(along, -1.0), -(centre - (centre - l) * k))
-        };
-        let mut lo = 0.0;
-        let mut hi = 1.0;
-        for _ in 0..FIT_STEPS {
-            let mid = f64::midpoint(lo, hi);
-            if area(&trim(mid)) < want {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let trimmed = trim(hi);
-        if trimmed.len() >= 3 {
-            ring = trimmed;
-        }
+        let half = (want / depth) * 0.5;
+        l = centre - half;
+        r = centre + half;
+    }
+    if !(r - l).is_finite() || r - l <= 0.0 {
+        return None;
+    }
+
+    let mut ring = rect_ring(along, inward, l, r, kerb, kerb + depth);
+    if rotation != 0.0 {
+        let (sn, cs) = det_sin_cos(rotation);
+        let pivot = centroid(&ring);
+        ring = shrink_into(region, rotate_about(&ring, pivot, sn, cs));
     }
     if ring.len() < 3 || area(&ring) <= 1e-12 {
         return None;
     }
 
-    // Belt and braces. Every vertex above came out of a half-plane clip of a
-    // convex region, so this holds by construction and the loop never runs; it
-    // is here because "a debug_assert is not a guarantee", and a silent shrink
-    // is a better failure than a building in a road.
-    //
-    // `on_boundary` and not a bare `contains`: a clipped vertex lies **exactly**
-    // on the region's edge, which is where a winding-number test has no answer.
-    // Testing containment alone rejected every band in the city and shrank each
-    // one by a tenth — a flat 0.81 on every footprint, measured, which is a fifth
-    // of the city's floor area lost to a predicate asked the wrong question.
+    // Belt and braces, and it is a scale about a point so the rectangle stays
+    // one. `on_boundary` and not a bare `contains`: a corner that sits exactly
+    // on the region's edge is where a winding-number test has no answer, and
+    // testing containment alone rejected every footprint in the city and shrank
+    // each one by a tenth — a fifth of the floor area lost to a predicate asked
+    // the wrong question.
     let pivot = centroid(&ring);
     let mut guard = 0;
     while !ring.iter().all(|p| on_boundary_or_inside(region, *p)) {
@@ -1013,13 +1307,35 @@ fn seat(
         // A file on the map has to be visible on it ([`MIN_FOOTPRINT_GRAINS`]),
         // and never at the cost of the garden the plot owes its block.
         .max((hut * hut).min(region_area * MAX_FILL));
-    let rotation = f64::from(rotation_for(path));
+    // PRD §7.2 step 5's ±4°, scaled by how much room the plot has: a terrace
+    // cannot rotate without breaking its party walls, and a terrace that has
+    // broken its party walls is gravel. `fit_footprint` explains the measurement.
+    let rotation = f64::from(rotation_for(path)) * looseness(grain);
     // The band construction needs a convex region to clip; it is one for every
     // parcel this pipeline produces (measured: 4 565 of 4 565 at 5 000 files),
     // and where it is not, the region is scaled about its centroid instead —
     // still inside the parcel, still clear of the road, only less shapely.
-    let mut ring = match frontage(parcel, block, road_half) {
-        Some(face) if is_convex(&region) => fit_footprint(&region, face, want, rotation),
+    let mut ring = match frontage_faces(parcel, block) {
+        Some(faces) if is_convex(&region) => {
+            // The street wall wins every argument that is close; the second
+            // orientation is kept only when the plot's shape makes the first
+            // one a sliver ([`FACE_PREFERENCE`]).
+            let mut best: Option<(f64, Vec<Pt>)> = None;
+            for (i, face) in faces.into_iter().enumerate() {
+                let Some(candidate) = fit_footprint(&region, face, want, rotation) else {
+                    continue;
+                };
+                let a = area(&candidate);
+                let beat = match &best {
+                    None => true,
+                    Some((held, _)) => a > *held * if i == 0 { 1.0 } else { FACE_PREFERENCE },
+                };
+                if beat {
+                    best = Some((a, candidate));
+                }
+            }
+            best.map(|(_, r)| r)
+        }
         _ => scale_about_centroid(&region, want, rotation),
     }
     .or_else(|| scale_about_centroid(&region, want, rotation))
@@ -1261,10 +1577,29 @@ pub fn work_height(lines: f64) -> f64 {
 
 /// The settled register: how tall a building is with nothing uncommitted on it.
 ///
-/// One storey for a file a sixteenth of the repository's median, four for one
-/// sixteen times it, on the same fourth-root ramp [`work_height`] uses, plus
-/// [`STOREY_JITTER`] of path-seeded variety so a street of same-sized files is
-/// still a skyline rather than a wall.
+/// **This is what a clean checkout is made of**, and PRD §17's open question 4
+/// is answered here — see the register comment above and ADR-0077. One storey
+/// for a file a sixteenth of the repository's median,
+/// [`SETTLED_CEILING`] for one sixteen times it, plus [`STOREY_JITTER`] of
+/// path-seeded variety so a street of same-sized files is still a skyline
+/// rather than a wall.
+///
+/// # The ramp is centred on the median, and it was not
+///
+/// The ramp used to run linearly in the fourth root from `(1/16)^¼ = 0.5` to
+/// `16^¼ = 2`, which puts a file of *exactly* the repository's median at
+/// `(1 − 0.5) / 1.5 = 0.333` of the register — a third of the way up, not
+/// half. File sizes are roughly log-normal, so that put the *typical* building
+/// in the bottom third of the only channel a clean repository has, and
+/// `polis_render::plan::height_ramp` spends 80 % of its tone on that register:
+/// the median roof came out at a quarter of the available tone and the whole
+/// city read as one grey. Measured on Django before this change: median height
+/// **1.92** in a `1..4` register. After: **3.5** in a `1..6` one.
+///
+/// The fix is a ramp that is symmetric **about the median** — two straight
+/// segments in the fourth root, meeting at `ratio = 1`, so half the repository
+/// is above the middle of the register and half below. Fourth roots and
+/// division only, no `powf` and no logarithm (PRD §7.4, determinism rule 4).
 ///
 /// `size_reference` is the repository's own median file size
 /// ([`FOOTPRINT_REFERENCE_BYTES`] explains why every size in this module is
@@ -1274,7 +1609,12 @@ pub fn settled_height(size_bytes: u64, size_reference: u64, path: &LogicalPath) 
     let ratio = (size_bytes.max(1) as f64) / (size_reference.max(1) as f64);
     let lo = MASSING_FLOOR_RATIO.sqrt().sqrt();
     let hi = MASSING_CEILING_RATIO.sqrt().sqrt();
-    let t = ((ratio.sqrt().sqrt() - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let r = ratio.sqrt().sqrt();
+    let t = if r >= 1.0 {
+        0.5 + 0.5 * ((r - 1.0) / (hi - 1.0)).clamp(0.0, 1.0)
+    } else {
+        0.5 - 0.5 * ((1.0 - r) / (1.0 - lo)).clamp(0.0, 1.0)
+    };
     let mut rng = SeededRng::for_path(path, "building.storeys");
     let jitter = (rng.next_f64() - 0.5) * 2.0 * STOREY_JITTER;
     let s = (t + jitter).clamp(0.0, 1.0);
@@ -1958,20 +2298,81 @@ mod tests {
     }
 
     #[test]
-    fn the_band_hits_the_area_it_was_asked_for() {
-        // The bisection is exact, and it stays exact: a guard that shrank every
-        // band by a tenth cost a flat 19 % of the city's floor area and was
+    fn the_footprint_hits_the_area_it_was_asked_for_up_to_what_a_rectangle_can_hold() {
+        // The fit is exact, and it stays exact: a guard that shrank every
+        // footprint by a tenth cost a flat 19 % of the city's floor area and was
         // invisible in every metric except this one.
+        //
+        // The ceiling is real and it is the point of this stage: a rectangle
+        // cannot fill nine tenths of a trapezoid, so above the largest
+        // rectangle the plot holds the answer is that rectangle and not a
+        // wedge that happens to have the right area.
         let region: Vec<Pt> = vec![[0.0, 0.0], [3.0, 0.0], [2.7, 2.0], [0.2, 2.2]];
+        let ceiling = area(
+            &fit_footprint(&region, ([1.0, 0.0], [0.0, 1.0]), area(&region), 0.0)
+                .expect("a footprint"),
+        );
+        assert!(
+            ceiling > area(&region) * 0.80,
+            "the largest rectangle in this plot is only {ceiling}"
+        );
         for want_share in [0.15, 0.3, 0.5, 0.72, 0.9] {
             let want = area(&region) * want_share;
             let ring =
                 fit_footprint(&region, ([1.0, 0.0], [0.0, 1.0]), want, 0.0).expect("a footprint");
             let got = area(&ring);
+            let target = want.min(ceiling);
             assert!(
-                (got - want).abs() < want * 0.02,
-                "asked {want}, got {got} at share {want_share}"
+                (got - target).abs() < target * 0.02,
+                "asked {want}, got {got} at share {want_share} (ceiling {ceiling})"
             );
+        }
+    }
+
+    /// The whole point of this round: a building is a rectangle.
+    ///
+    /// A wedge scores about 0.5 against its own minimum-area bounding
+    /// rectangle, and five visual-review rounds died describing a city of them.
+    #[test]
+    fn every_footprint_is_a_rectangle() {
+        let regions: Vec<Vec<Pt>> = vec![
+            // a square
+            vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]],
+            // a trapezoid, which is what a lot on a block edge is
+            vec![[0.0, 0.0], [3.0, 0.0], [2.4, 2.0], [0.5, 2.1]],
+            // a triangle: the worst case the subdivision can hand over
+            vec![[0.0, 0.0], [2.6, 0.3], [1.1, 2.4]],
+            // a long thin strip
+            vec![[0.0, 0.0], [6.0, 0.1], [6.0, 0.9], [0.0, 0.8]],
+            // a five-sided lot: a rectangle with a corner cut off
+            vec![[0.0, 0.0], [2.0, 0.0], [2.0, 1.4], [1.2, 2.0], [0.0, 2.0]],
+        ];
+        for region in &regions {
+            for rotation in [0.0, 0.05, -0.07] {
+                for share in [0.2, 0.5, 0.85] {
+                    let want = area(region) * share;
+                    let ring = fit_footprint(region, ([1.0, 0.0], [0.0, 1.0]), want, rotation)
+                        .unwrap_or_else(|| {
+                            panic!("no footprint for {region:?} share {share} rot {rotation}")
+                        });
+                    assert_eq!(ring.len(), 4, "{ring:?} is not a quadrilateral");
+                    // Opposite sides equal and the diagonals equal is a
+                    // rectangle, and it is the test that a parallelogram fails.
+                    let side = |i: usize| crate::geom::dist(ring[i], ring[(i + 1) % 4]);
+                    let scale = side(0).max(side(1)).max(1e-9);
+                    assert!((side(0) - side(2)).abs() < scale * 1e-6, "{ring:?}");
+                    assert!((side(1) - side(3)).abs() < scale * 1e-6, "{ring:?}");
+                    let d0 = crate::geom::dist(ring[0], ring[2]);
+                    let d1 = crate::geom::dist(ring[1], ring[3]);
+                    assert!(
+                        (d0 - d1).abs() < scale * 1e-6,
+                        "{ring:?} has unequal diagonals: not a rectangle"
+                    );
+                    for p in &ring {
+                        assert!(on_boundary_or_inside(region, *p), "{p:?} left the plot");
+                    }
+                }
+            }
         }
     }
 

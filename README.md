@@ -195,6 +195,13 @@ fixture: a fixture can be accidentally flattering and these two are not.
 `docs/city-real-5k-junctions.png` is the road graph alone with junctions coloured
 by degree — the "is it a tree?" render, which it is not.
 
+The same applies to the **gate**, and it did not until this round. The M1
+acceptance table now runs against three real repositories checked into
+`tests/corpora/` as manifests — `click` (166 files, 12 years), `pytest` (690
+files, 18 years) and a pinned capture of this repository on its first day — and
+not only against `polis_repo::synthetic`. See `tests/corpora/README.md` and
+ADR-0080; the defect that found is ADR-0078.
+
 ```sh
 polis --repo ../neovim snapshot --out city.png --junctions junctions.png
 polis snapshot --synthetic 5000 --out fixture.png   # the shipped fixture

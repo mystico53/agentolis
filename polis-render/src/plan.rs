@@ -39,18 +39,45 @@
 //! | 0 — sea, off-map terrain | 6–21 | 2–8 | drawn |
 //! | 1 — terrain, vacant lots | 15–26 | 6–10 | drawn |
 //! | 2 — city: ground, lots, roads, buildings | 9–48 | 3–20 | drawn |
-//! | 3 — clouds (territory density) | 49–96 | 20–40 | **reserved, M4** |
+//! | 3 — clouds (territory density) | 49–84 | 20–36 | **reserved, M4** |
+//! | 3t — **typography**: in-map labels | 85–96 | 36–40 | drawn |
 //! | 4 — agents: workers, trails, tethers | 97–168 | 40–68 | **reserved, M4** |
 //! | 5 — attention: the three states | 169–255 | 68–100 | **reserved, M5** |
 //!
 //! Layers 1–2 therefore occupy `L* ≤ 19.9` — the bottom fifth of the perceptual
 //! range — and four fifths of it is untouched and waiting.
 //!
+//! ## Typography gets a named sub-band, not an exemption
+//!
 //! **Text is not one of the five layers.** PRD §13 puts labels in a UI overlay
-//! rather than in the map, and a label that cannot be read is not a label. So
-//! the overlay is exempt from the ceiling, and is instead held inside the
-//! *agent* band (`L* ≈ 47–62`) so that M5's attention marks still own the top,
-//! and is area-capped by the declutterer in `draw_labels`.
+//! rather than in the map, and a label that cannot be read is not a label — so
+//! the first version simply exempted the overlay from the budget and drew it at
+//! `L* 58`, which put the word `POLIS-RENDER/SRC` **inside the agent band** and
+//! made typography the brightest thing on a map whose thesis is that the
+//! coastline is always faint and the storm gets the ink. On the very image built
+//! to validate the budget.
+//!
+//! An exemption is not an allocation, so typography now has one:
+//! [`TYPE_BAND`], carved off the **top** of layer 3. The split has a reason and
+//! it is not arbitrary — PRD §10.3 draws clouds *beneath* district outlines and
+//! labels, so a label has to stay readable **over** a cloud, which means
+//! typography must sit above every cloud tone and below every agent mark. That
+//! is exactly one place in the range, and it is where the labels now are:
+//!
+//! * clouds own `49–84`, three discrete iso tones (§10.4);
+//! * in-map typography owns `85–96` and is drawn on a near-black plate;
+//! * **no pixel inside the map frame exceeds `96`** — asserted on real pixels
+//!   in `nothing_in_the_map_frame_enters_the_agent_band`, so a live worker at
+//!   channel 132 is always brighter than the loudest label. That is the claim
+//!   the review says the render was failing, and it is now a test rather than a
+//!   paragraph.
+//!
+//! The metrics footer is chrome *outside* the map frame — a caption strip on its
+//! own plate below the image — so it is not held to the sub-band. It is still
+//! held below [`ATTENTION_BAND`], because "layer 5 owns the top of the range"
+//! has to be true of the whole PNG or it is not true at all.
+//!
+//! Label area is separately capped by the declutterer in `draw_labels`.
 //!
 //! ## Colour space
 //!
@@ -158,11 +185,22 @@ use crate::raster::{hsl, Canvas, Px, Rgb};
 /// ceiling a sound way to enforce an `L*` ceiling through arbitrary blending.
 pub const BASE_MAP_CEILING: u8 = 48;
 
-/// The lowest channel value reserved for layer 3 (clouds).
+/// The channels reserved for layer 3 (clouds — territory density).
 ///
-/// Nothing in M1 draws here. It is stated so that M4 has a documented band to
-/// land in rather than a gap it has to guess at.
-pub const CLOUD_BAND: (u8, u8) = (49, 96);
+/// Nothing in M1's map draws here; the band-validation render draws stand-ins.
+/// It is stated so that M4 has a documented band to land in rather than a gap it
+/// has to guess at.
+pub const CLOUD_BAND: (u8, u8) = (49, 84);
+
+/// The channels reserved for **in-map typography** — layer 3's top slice.
+///
+/// Labels are drawn over clouds (PRD §10.3), so they have to be brighter than
+/// every cloud tone; they are context rather than activity, so they have to be
+/// dimmer than every agent mark. `85–96` is the only window that is both, and
+/// carving it explicitly is what replaced the old "text is exempt from the
+/// budget" rule that had district labels sitting at `L 142`, inside
+/// [`AGENT_BAND`].
+pub const TYPE_BAND: (u8, u8) = (85, 96);
 
 /// The band reserved for layer 4 (agents, trails, tethers). Unused in M1.
 pub const AGENT_BAND: (u8, u8) = (97, 168);
@@ -265,17 +303,28 @@ const BORDER: Rgb = [46, 45, 40];
 const LIMIT: Rgb = [45, 47, 48];
 
 // The text overlay. Not one of §10.3's five layers (PRD §13 puts text in a UI
-// overlay), but still held below the attention band so M5 owns the top.
+// overlay), but no longer exempt from the budget either: in-map type lives in
+// [`TYPE_BAND`], and the footer chrome below the map lives below
+// [`ATTENTION_BAND`].
 /// Label plate.
-const PLATE: Rgb = [8, 9, 12];
-/// District label text.
-const LABEL: Rgb = [138, 143, 152];
-/// Monument label text.
-const LABEL_MONU: Rgb = [166, 140, 86];
-/// Footer body text.
+///
+/// Near-black and nearly opaque. Dropping the label ink from `L 142` to the top
+/// of [`TYPE_BAND`] costs contrast against the ground, and this is where it is
+/// bought back: a glyph at channel 96 on a plate at channel 5 is a ratio of
+/// 3.1 : 1, where the same glyph on open district ground would be 2.8 : 1.
+const PLATE: Rgb = [4, 5, 7];
+/// District label text. The top of [`TYPE_BAND`], and no higher.
+const LABEL: Rgb = [90, 93, 96];
+/// Monument label text: the same band, warm, so PRD §8's orientation anchors
+/// stay separable from ordinary quarters by hue rather than by brightness.
+const LABEL_MONU: Rgb = [96, 80, 46];
+/// Footer body text. Footer chrome sits outside the map frame (see the module
+/// docs), so it is held below [`ATTENTION_BAND`] rather than inside
+/// [`TYPE_BAND`].
 const FOOTER_TEXT: Rgb = [108, 113, 124];
-/// Title text.
-const TITLE: Rgb = [166, 172, 182];
+/// Title text. The brightest ink in the whole image, and still below
+/// `ATTENTION_BAND.0`.
+const TITLE: Rgb = [152, 158, 166];
 
 /// The height that maps to `ROOF_HI` and the longest shadow.
 ///
@@ -283,7 +332,28 @@ const TITLE: Rgb = [166, 172, 182];
 /// ramp rescaled per render would make a quiet repository look dramatic, and
 /// would move every building's tone the moment one file's diff changed — which
 /// is the opposite of the spatial memory PRD §7.4 exists to protect.
-pub const HEIGHT_REFERENCE: f32 = 22.0;
+///
+/// # It is derived from `polis_layout`'s registers, not chosen
+///
+/// It used to be the literal `22.0`, which was fine when the work register was
+/// short and became wrong the moment it was not: `work_height` is a fourth-root
+/// ramp over [`WORK_SPAN`](polis_layout::buildings::WORK_SPAN), so with a span of
+/// 60 a file with **seventy-five uncommitted lines already saturated the tone
+/// ramp** and every busier file was drawn identically. A hard-coded reference on
+/// one side of a crate boundary and a range on the other is a number waiting to
+/// disagree with itself, so this one is computed from the layout's own
+/// constants and moves when they move.
+///
+/// The **midpoint** of the work register, not its top, because the fourth root
+/// is steep at the bottom: reaching the register's upper half costs roughly
+/// fifteen times the diff lines of reaching its lower half, and spending half
+/// the tone ramp there would buy resolution in a case that barely occurs while
+/// flattening the case that occurs constantly. At the midpoint a file with
+/// twenty uncommitted lines is still visibly shorter than one with two hundred,
+/// and anything past a few hundred is simply "the tallest thing here", which is
+/// the editorial call PRD §7.3 is actually asking for.
+pub const HEIGHT_REFERENCE: f32 =
+    polis_layout::buildings::SETTLED_CEILING + (polis_layout::buildings::WORK_SPAN * 0.5) as f32;
 
 /// Where `polis_layout`'s **settled** register lands on the tonal ramp.
 ///
@@ -298,7 +368,32 @@ pub const HEIGHT_REFERENCE: f32 = 22.0;
 /// legible on a quiet repository, and the work register owns the top half so
 /// PRD §7.3 still holds — the tallest thing on the map is the biggest
 /// unreviewed pile.
-const SETTLED_TONE: f64 = 0.80;
+/// The split was `0.80`, and that is too much. Measured on rendered pixels with
+/// heights spread across *both* registers, the work register's 20 % of the tone
+/// range put sixteen distinct heights inside four 8-bit levels — they tie on
+/// rank, and rank ties are indistinguishable buildings. `0.70` still gives the
+/// settled register the majority (a clean checkout is the common case, and that
+/// is the whole reason the ramp is piecewise) while giving the work register
+/// half again as much room to rank inside.
+const SETTLED_TONE: f64 = 0.70;
+
+/// How far the **lit** half of a roof is pushed toward [`ROOF_TOP`], at the
+/// bottom and the top of the height ramp.
+///
+/// A named constant because [`draw_massing`] and [`delivered_roof`] must agree:
+/// the second is what the legend prints, and a legend that disagrees with the
+/// map is worse than no legend. The review measured that disagreement at roughly
+/// ten times.
+const MASS_LIT: (f64, f64) = (0.14, 0.48);
+
+/// How far the **shaded** half of a roof is pushed toward [`ROOF_EDGE`], at the
+/// bottom and the top of the ramp.
+///
+/// The slope is deliberately shallower than the lit half's. Massing spends the
+/// roof ramp's own range: whatever the shaded half gives up, the building's
+/// *mean* tone loses, and the mean is what survives the box filter down to four
+/// pixels across. So the light side does most of the talking.
+const MASS_SHADE: (f64, f64) = (0.10, 0.20);
 
 /// Sun direction, as the offset a unit of height casts its shadow along.
 ///
@@ -323,6 +418,20 @@ pub fn base_ink(colour: Rgb) -> Rgb {
         colour[0].min(BASE_MAP_CEILING),
         colour[1].min(BASE_MAP_CEILING),
         colour[2].min(BASE_MAP_CEILING),
+    ]
+}
+
+/// Clamp a colour into the typography sub-band.
+///
+/// The counterpart of [`base_ink`] for layer 3t. Every in-map glyph goes through
+/// it, so a future "just make the labels a bit brighter" cannot walk typography
+/// back into the agent band one constant at a time.
+#[must_use]
+pub fn type_ink(colour: Rgb) -> Rgb {
+    [
+        colour[0].min(TYPE_BAND.1),
+        colour[1].min(TYPE_BAND.1),
+        colour[2].min(TYPE_BAND.1),
     ]
 }
 
@@ -871,9 +980,49 @@ fn clip_half(ring: &[Px], nx: f64, ny: f64, d: f64) -> Vec<Px> {
     out
 }
 
+/// The tone of the half of a roof that is turned toward the light.
+#[must_use]
+fn lit_face(roof: Rgb, t: f64) -> Rgb {
+    mix(roof, ROOF_TOP, MASS_LIT.1.mul_add(t, MASS_LIT.0))
+}
+
+/// The tone of the half of a roof that is turned away from it.
+#[must_use]
+fn shaded_face(roof: Rgb, t: f64) -> Rgb {
+    mix(roof, ROOF_EDGE, MASS_SHADE.1.mul_add(t, MASS_SHADE.0))
+}
+
+/// The tone a building at ramp position `t` actually leaves on the map.
+///
+/// Not `mix(ROOF_LO, ROOF_HI, t)` — that is the tone the roof is *filled* with
+/// before `draw_massing` cuts it into a lit and a shaded half, and it is what
+/// the height key used to print. A building four pixels across is one averaged
+/// pixel by the time the box filter is done with it, so the average of the two
+/// halves is the number an operator can actually compare between two buildings,
+/// and it is therefore the number the key must show. The gap between the two was
+/// measured at roughly ten times the encoding: a key promising a ramp the map
+/// never delivers is a lie told in ink.
+/// The composition is carried in `f64` and rounded **once**, at the end. Doing
+/// it as three chained [`mix`] calls rounds three times and the errors compose
+/// into 1-level dips — a key that goes backwards twice on the way up, which is
+/// exactly the kind of thing nobody sees and everybody half-notices.
+#[must_use]
+pub fn delivered_roof(t: f64) -> Rgb {
+    let lift = MASS_LIT.1.mul_add(t, MASS_LIT.0);
+    let drop = MASS_SHADE.1.mul_add(t, MASS_SHADE.0);
+    let ch = |i: usize| -> u8 {
+        let lo = f64::from(ROOF_LO[i]);
+        let roof = (f64::from(ROOF_HI[i]) - lo).mul_add(t.clamp(0.0, 1.0), lo);
+        let lit = (f64::from(ROOF_TOP[i]) - roof).mul_add(lift, roof);
+        let shaded = (f64::from(ROOF_EDGE[i]) - roof).mul_add(drop, roof);
+        f64::midpoint(lit, shaded).round().clamp(0.0, 255.0) as u8
+    };
+    [ch(0), ch(1), ch(2)]
+}
+
 /// Where a building's height lands on the fixed ramp, in `[0, 1]`.
 ///
-/// Piecewise, one segment per register — see [`SETTLED_TONE`].
+/// Piecewise, one segment per register — see `SETTLED_TONE`.
 #[must_use]
 pub fn height_ramp(height: f32) -> f64 {
     let base = f64::from(polis_layout::buildings::BASE_HEIGHT);
@@ -1283,11 +1432,11 @@ fn draw_massing(
     // *away* from: the lit side.
     let lit = clip_half(ring, SUN[0], SUN[1], d);
     if lit.len() >= 3 {
-        ink.fill_polygon(&lit, mix(roof, ROOF_TOP, 0.14 + 0.42 * t), 0.92);
+        ink.fill_polygon(&lit, lit_face(roof, t), 0.92);
     }
     let shaded = clip_half(ring, -SUN[0], -SUN[1], -d);
     if shaded.len() >= 3 {
-        ink.fill_polygon(&shaded, mix(roof, ROOF_EDGE, 0.10 + 0.26 * t), 0.92);
+        ink.fill_polygon(&shaded, shaded_face(roof, t), 0.92);
     }
     // The lit rim: only the edges whose outward normal faces into the light, so
     // it is a highlight on one side of the building and never a ring around it.
@@ -1498,19 +1647,25 @@ fn draw_labels(canvas: &mut Canvas, city: &City, view: &View, unit: f64, ss: usi
             .then_with(|| a.path.cmp(b.path))
     });
 
-    // The cap is what keeps a 2 000-district repository from becoming a wall of
-    // text; the collision test is what keeps the survivors readable. Monuments
-    // get a sub-cap of their own rather than the whole budget, because a map
-    // whose every label is a file name has lost the district skeleton PRD §8
-    // asks to preserve.
+    // Three caps, and they answer three different failures. The **count** cap is
+    // what keeps a 2 000-district repository from becoming a wall of text. The
+    // **monument** sub-cap stops a map whose every label is a file name from
+    // losing the district skeleton PRD §8 asks to preserve. And the **area** cap
+    // is the one that was documented and not implemented: on a 113-file
+    // repository the count cap binds at 25 labels, the blocks are huge, the type
+    // is at its maximum size, and the review's verdict was that "text is the
+    // dominant graphic element — at mid-zoom the labels cover more area than the
+    // buildings". A count is not a share of the picture; a share is.
     let cap = (pixels / 62).clamp(8, 28);
     let monument_cap = (cap / 4).max(3);
+    let area_cap = (pixels * ss) as f64 * (pixels * ss) as f64 * LABEL_AREA_SHARE;
+    let mut plate_area = 0.0f64;
     let mut monuments_placed = 0usize;
     let size = (unit * 0.038).clamp(2.0 * ss as f64, 3.2 * ss as f64);
     let mut taken: Vec<(Px, f64, f64)> = Vec::new();
     let mut placed: BTreeSet<String> = BTreeSet::new();
     for candidate in candidates {
-        if taken.len() >= cap {
+        if taken.len() >= cap || plate_area >= area_cap {
             break;
         }
         if candidate.kind == LabelKind::Monument && monuments_placed >= monument_cap {
@@ -1533,19 +1688,24 @@ fn draw_labels(canvas: &mut Canvas, city: &City, view: &View, unit: f64, ss: usi
             monuments_placed += 1;
         }
         taken.push((at, tw, th));
+        plate_area += (tw + 8.0 * ss as f64) * (15.0 * ss as f64);
+        // The plate is the whole reason a label held inside [`TYPE_BAND`] is
+        // still readable: it is drawn nearly opaque and nearly black, so the
+        // glyph's contrast comes from the plate rather than from brightness the
+        // budget cannot afford.
         canvas.rect(
-            at[0] - tw * 0.5 - 3.0 * ss as f64,
+            at[0] - tw * 0.5 - 4.0 * ss as f64,
             at[1] - 6.0 * ss as f64,
-            at[0] + tw * 0.5 + 3.0 * ss as f64,
+            at[0] + tw * 0.5 + 4.0 * ss as f64,
             at[1] + 9.0 * ss as f64,
             PLATE,
-            0.72,
+            0.94,
         );
-        let colour = if candidate.kind == LabelKind::Monument {
+        let colour = type_ink(if candidate.kind == LabelKind::Monument {
             LABEL_MONU
         } else {
             LABEL
-        };
+        });
         canvas.text(
             at[0] - tw * 0.5,
             at[1] - 3.0 * ss as f64,
@@ -1637,10 +1797,12 @@ fn draw_footer(
     fitted_text(canvas, pad, y0 + 6.0 * u, right, title, fs * 1.45, TITLE);
 
     // The height key comes first and is drawn as a ramp rather than as two
-    // swatches, because two swatches is what the last review could not tell
-    // apart: it is a strip of the actual roof ramp with the actual cast shadow
-    // under its tall end, so the legend teaches the encoding instead of naming
-    // it.
+    // swatches, because two swatches is what an earlier review could not tell
+    // apart. It shows [`delivered_roof`] — the *mean* of the lit and shaded
+    // halves the map really paints — rather than the raw fill, so the key can be
+    // held against a building with a ruler and match. The version before this
+    // one printed the raw fill and over-promised the encoding by roughly ten
+    // times, which is the worst thing a legend can do.
     let ly = y0 + 32.0 * u;
     let key_h = 11.0 * s;
     let key_w = 62.0 * s;
@@ -1650,6 +1812,18 @@ fn draw_footer(
     canvas.text(x, ly + 2.0 * s, "LOW", fs * 0.95, FOOTER_TEXT);
     x += Canvas::text_width("LOW ", fs * 0.95);
     let ramp_x = x;
+    // A strip of lot ground under the whole key, because a cast shadow is only
+    // legible on something: on the footer's near-black plate the shadow ramp is
+    // the same tone as the plate and vanishes. This is the ground the map draws
+    // its shadows on, so the key shows the encoding in its own habitat.
+    canvas.rect(
+        ramp_x,
+        ly,
+        ramp_x + key_w,
+        ly + key_h + 5.0 * s,
+        mix(ground_tint(0.58, 0.0), LOT_LIFT, 0.35),
+        1.0,
+    );
     for step in 0..33 {
         let t = f64::from(step) / 32.0;
         let cx = ramp_x + key_w * t;
@@ -1658,29 +1832,26 @@ fn draw_footer(
             ly,
             cx + key_w / 32.0 + 1.0,
             ly + key_h,
-            mix(ROOF_LO, ROOF_HI, t),
+            delivered_roof(t),
             1.0,
         );
     }
-    // The cast shadow under the ramp is the *same* encoding the map draws, so
-    // the key shows both channels at once: the strip gets lighter and its
-    // shadow gets longer.
-    canvas.rect(
-        ramp_x,
-        ly + key_h,
-        ramp_x + key_w * 0.12,
-        ly + key_h + 1.5 * s,
-        SHADOW,
-        1.0,
-    );
-    canvas.rect(
-        ramp_x + key_w * 0.60,
-        ly + key_h,
-        ramp_x + key_w,
-        ly + key_h + 4.5 * s,
-        SHADOW,
-        1.0,
-    );
+    // The cast shadow under the ramp is the *same* encoding the map draws — the
+    // shadow reaches `0.10 + 0.80 t` of the building's own span — so the key
+    // shows both channels at once and shows them ramping together: the strip
+    // gets lighter and its shadow gets longer, step for step.
+    for step in 0..33 {
+        let t = f64::from(step) / 32.0;
+        let cx = ramp_x + key_w * t;
+        canvas.rect(
+            cx,
+            ly + key_h,
+            cx + key_w / 32.0 + 1.0,
+            0.80f64.mul_add(t, 0.10).mul_add(5.0 * s, ly + key_h),
+            SHADOW,
+            1.0,
+        );
+    }
     x = ramp_x + key_w + 4.0 * s;
     canvas.text(x, ly + 2.0 * s, "TALL", fs * 0.95, FOOTER_TEXT);
     x += Canvas::text_width("TALL", fs * 0.95) + 16.0 * s;
@@ -1733,11 +1904,16 @@ fn draw_footer(
         r.districts,
         r.fragmented_districts
     );
+    // The band table is printed on the picture because the picture is the
+    // argument, and because a typography sub-band that is not written down is
+    // an exemption wearing a hat.
     let line3 = format!(
-        "PRD 10.3 BASE MAP <= CHANNEL {} (L* 20) / 3 CLOUDS {}-{} / 4 AGENTS {}-{} / 5 ATTENTION {}-{} RESERVED",
+        "PRD 10.3 BANDS: 1-2 BASE MAP <={} (L* 20) / 3 CLOUDS {}-{} / 3T IN-MAP TYPE {}-{} / 4 AGENTS {}-{} / 5 ATTENTION {}-{}",
         BASE_MAP_CEILING,
         CLOUD_BAND.0,
         CLOUD_BAND.1,
+        TYPE_BAND.0,
+        TYPE_BAND.1,
         AGENT_BAND.0,
         AGENT_BAND.1,
         ATTENTION_BAND.0,
@@ -1899,9 +2075,71 @@ pub fn render_junctions(
 // The band validation render (PRD §10.3, settled with an image)
 // ---------------------------------------------------------------------------
 
-/// Cloud iso-band tones (PRD §10.4, layer 3), low to high, inside
+/// Cloud iso-band tones (PRD §10.4, layer 3), fringe → body → core, inside
 /// [`CLOUD_BAND`].
-const CLOUD_TONES: [Rgb; 3] = [[54, 62, 74], [70, 80, 92], [86, 92, 96]];
+///
+/// These are the tones of the **marks** — contour strokes and hatch strokes —
+/// not of a wash. Each is opaque where it is drawn and absent everywhere else,
+/// which is what lets a cloud own channels 49–84 without lifting the base map
+/// underneath it by a single level.
+const CLOUD_TONES: [Rgb; 3] = [[56, 64, 74], [64, 72, 80], [74, 80, 84]];
+
+/// The axis the cloud hatch runs along: [`RIDGE`], across the sun.
+///
+/// Deliberately not [`SUN`], which is the industrial hatch's axis (PRD §8). Two
+/// textures at the same angle are one texture; at right angles they are two, and
+/// the map already needs to say "vendored tree" and "somebody's territory" in
+/// the same square inch.
+const CLOUD_HATCH: [f64; 2] = RIDGE;
+
+/// Hatch spacing per iso band, fringe → core, in **output** pixels.
+///
+/// Spacing is the encoding: PRD §10.4 wants the reader able to say "that file is
+/// in the core of this thread's work" versus "it's at the fringe", and a
+/// tightening hatch says it the way a contour map says altitude. The coverage
+/// that follows — one stroke in 14, in 9, in 6 — is what keeps the median of the
+/// base map underneath a cloud exactly where it was: an order statistic does not
+/// move when a tenth of the pixels change.
+const CLOUD_HATCH_SPACING: [f64; 3] = [14.0, 9.0, 6.0];
+
+/// Hatch stroke width per iso band, in output pixels. Widening with the band as
+/// well as tightening the spacing is what makes a core read as a *core* after
+/// the box filter has taken the image down to thumbnail size.
+const CLOUD_HATCH_WIDTH: [f64; 3] = [1.0, 1.25, 1.5];
+
+/// Contour stroke width per iso band, in output pixels, measured inward from the
+/// boundary.
+///
+/// The **outer** contour is the boldest, which is the opposite of the hatch and
+/// deliberate: the fringe boundary is the cloud's silhouette, and a silhouette
+/// is the only part of any mark that survives being looked at from across the
+/// room (PRD §1). It costs perimeter, not area, so it buys glance-legibility
+/// without putting a single extra pixel over the city.
+const CLOUD_CONTOUR_WIDTH: [f64; 3] = [3.0, 2.0, 2.0];
+
+/// The iso thresholds, in **kernels overlapping here** (ADR-0020).
+///
+/// Absolute, never normalised against the observed field maximum: normalising
+/// collapses every ordinary territory into a single fringe band, which is the
+/// mush §10.4 forbids.
+/// The fringe threshold is above one kernel on purpose: at `0.9` a single
+/// isolated observation cleared it and the map filled with dozens of one-kernel
+/// rings, which is confetti rather than a territory. Two overlapping kernels is
+/// the cheapest honest definition of "this is a region, not a point".
+const CLOUD_ISO: [f64; 3] = [1.3, 2.8, 5.4];
+
+/// The band index meaning "outside the fringe" in the per-pixel band map.
+const NO_BAND: u8 = u8::MAX;
+
+/// The most of the canvas in-map label plates may cover.
+///
+/// PRD §10.3's argument is about how much *ink* the base map is allowed, and
+/// typography is ink even when it is not one of the five layers. Two percent is
+/// enough for a monument's name and the package skeleton at every repository
+/// size measured here, and it is what stops a small repository — where the
+/// blocks are huge and the type is at its maximum size — from being read as a
+/// caption with a diagram behind it.
+const LABEL_AREA_SHARE: f64 = 0.02;
 /// A worker whose last operation is still pending (layer 4, [`AGENT_BAND`]).
 const AGENT_PENDING: Rgb = [132, 140, 156];
 /// A worker whose last operation succeeded.
@@ -1955,35 +2193,46 @@ const CIRCLE: [[f64; 2]; 16] = [
     [0.924, -0.383],
 ];
 
-/// Blend `target` over the pixel at `(x, y)`, then hold the result at `floor`.
+/// Write one opaque cloud pixel.
 ///
-/// The floor is what makes a *band* a band. A translucent wash over a dark base
-/// map lands wherever the base map happens to be, which is exactly how a layer
-/// that is meant to own channels 49–96 ends up drawing at 40. Clamping up to the
-/// band's low end keeps the layer inside its allocation while leaving the
-/// texture above the floor intact, so the city still reads through the cloud.
-fn wash_pixel(canvas: &mut Canvas, x: usize, y: usize, target: Rgb, alpha: f64, floor: u8) {
+/// # Why this is not a wash any more
+///
+/// The first version blended a translucent tone over every pixel inside an iso
+/// band and then *lifted the result to the band's floor* so the layer stayed in
+/// its allocation. That is an area fill, and measured on the shipped image it
+/// lifted **40.5 % of the city** by more than six levels and moved the base
+/// median underneath it from `L 22` to `L 45`. Local detail survived in
+/// absolute terms and collapsed in relative terms — ±7 around 45 instead of ±9
+/// around 22 — so the map fogged into pale grey exactly where the activity was,
+/// which is backwards: the operator loses the city precisely where they need to
+/// read it.
+///
+/// PRD §10.4 asks for "discrete iso-contour bands, 2–3 levels, never a
+/// continuous blur", and the literal reading is the right one. A cloud is now a
+/// **set of marks the city shows through**: three nested contour strokes and a
+/// hatch whose spacing tightens toward the core. Marks are opaque — so the layer
+/// provably owns [`CLOUD_BAND`] with no floor-lifting trick — and they are
+/// sparse, so the base map underneath is not merely *recoverable*, it is
+/// **untouched**: nine pixels in ten are the same bytes they were before the
+/// cloud was drawn.
+fn cloud_pixel(canvas: &mut Canvas, x: usize, y: usize, tone: Rgb) {
     if x >= canvas.width || y >= canvas.height {
         return;
     }
     let i = (y * canvas.width + x) * 3;
-    let mut lifted = false;
-    for (channel, src) in canvas.pixels[i..i + 3].iter_mut().zip(target.iter()) {
-        let dst = f64::from(*channel);
-        let v = (dst + (f64::from(*src) - dst) * alpha)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        *channel = v;
-        lifted |= v >= floor;
-    }
-    if !lifted {
-        // Lift the whole pixel rather than one channel, so the band keeps its
-        // hue and the texture underneath keeps its shape.
-        let head = canvas.pixels[i..i + 3].iter().copied().max().unwrap_or(0);
-        let gain = f64::from(floor) - f64::from(head);
-        for channel in &mut canvas.pixels[i..i + 3] {
-            *channel = (f64::from(*channel) + gain).clamp(0.0, 255.0) as u8;
-        }
+    canvas.pixels[i..i + 3].copy_from_slice(&tone);
+}
+
+/// Which iso band a field value falls in, or `None` outside the fringe.
+fn iso_band(v: f64) -> Option<usize> {
+    if v >= CLOUD_ISO[2] {
+        Some(2)
+    } else if v >= CLOUD_ISO[1] {
+        Some(1)
+    } else if v >= CLOUD_ISO[0] {
+        Some(0)
+    } else {
+        None
     }
 }
 
@@ -2094,7 +2343,8 @@ pub fn render_band_validation(
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     ranked.truncate(3);
 
-    let grid = 420usize;
+    // 512², the size PRD §10.4 specifies for the offscreen density texture.
+    let grid = 512usize;
     let mut field = vec![0.0f64; grid * grid];
     let radius = (unit * 2.6).max(w as f64 * 0.022);
     for (i, (_, _, pts)) in ranked.iter().enumerate() {
@@ -2120,40 +2370,75 @@ pub fn render_band_validation(
             }
         }
     }
-    let iso = [0.9f64, 2.6, 5.4];
-    let alpha = [0.42f64, 0.52, 0.62];
-    for y in 0..(map_h as usize).min(canvas.height) {
-        let gy = ((y as f64 + 0.5) / map_h * grid as f64)
-            .floor()
-            .clamp(0.0, (grid - 1) as f64) as usize;
+    // The band index at every pixel of the map area, bilinearly interpolated off
+    // the 512² field so a contour is a smooth curve rather than a staircase of
+    // six-pixel grid cells. [`NO_BAND`] is "outside the fringe".
+    let rows = (map_h as usize).min(canvas.height);
+    let mut bands = vec![NO_BAND; rows * canvas.width];
+    let last = (grid - 1) as f64;
+    for y in 0..rows {
+        let fy = (((y as f64 + 0.5) / map_h) * grid as f64 - 0.5).clamp(0.0, last);
+        let y0 = fy.floor();
+        let ty = fy - y0;
+        let (r0, r1) = (y0 as usize, (y0 as usize + 1).min(grid - 1));
         for x in 0..canvas.width {
-            let gx = ((x as f64 + 0.5) / w as f64 * grid as f64)
-                .floor()
-                .clamp(0.0, (grid - 1) as f64) as usize;
-            let v = field[gy * grid + gx];
-            let band = if v >= iso[2] {
-                2
-            } else if v >= iso[1] {
-                1
-            } else if v >= iso[0] {
-                0
-            } else {
+            let fx = (((x as f64 + 0.5) / w as f64) * grid as f64 - 0.5).clamp(0.0, last);
+            let x0 = fx.floor();
+            let tx = fx - x0;
+            let (c0, c1) = (x0 as usize, (x0 as usize + 1).min(grid - 1));
+            let top = field[r0 * grid + c0] + (field[r0 * grid + c1] - field[r0 * grid + c0]) * tx;
+            let bot = field[r1 * grid + c0] + (field[r1 * grid + c1] - field[r1 * grid + c0]) * tx;
+            if let Some(band) = iso_band(top + (bot - top) * ty) {
+                bands[y * canvas.width + x] = band as u8;
+            }
+        }
+    }
+
+    // The clouds themselves: three nested iso-contours plus a hatch that tightens
+    // toward the core. Nothing here is a fill, so the base map under a cloud is
+    // not lifted — it is left alone, and shows through between the strokes.
+    //
+    // The contour is found by comparing a pixel's band with its neighbours a
+    // stroke-width away, which gives a closed curve of the right thickness for
+    // free and cannot ever leak: a band boundary is a boundary in the array.
+    let contour_step: [isize; 3] = [
+        (CLOUD_CONTOUR_WIDTH[0] * ss as f64).round().max(1.0) as isize,
+        (CLOUD_CONTOUR_WIDTH[1] * ss as f64).round().max(1.0) as isize,
+        (CLOUD_CONTOUR_WIDTH[2] * ss as f64).round().max(1.0) as isize,
+    ];
+    for y in 0..rows {
+        for x in 0..canvas.width {
+            let band = bands[y * canvas.width + x];
+            if band == NO_BAND {
                 continue;
+            }
+            let neighbour = |dx: isize, dy: isize| -> u8 {
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx < 0 || ny < 0 || nx >= canvas.width as isize || ny >= rows as isize {
+                    return NO_BAND;
+                }
+                bands[ny as usize * canvas.width + nx as usize]
             };
-            wash_pixel(
-                &mut canvas,
-                x,
-                y,
-                CLOUD_TONES[band],
-                alpha[band],
-                CLOUD_BAND.0,
-            );
+            let s = contour_step[band as usize];
+            let contour = neighbour(s, 0) != band
+                || neighbour(-s, 0) != band
+                || neighbour(0, s) != band
+                || neighbour(0, -s) != band;
+            let hatched = !contour && {
+                let spacing = CLOUD_HATCH_SPACING[band as usize] * ss as f64;
+                let a = CLOUD_HATCH[0].mul_add(x as f64, CLOUD_HATCH[1] * y as f64);
+                a.rem_euclid(spacing) < CLOUD_HATCH_WIDTH[band as usize] * ss as f64
+            };
+            if contour || hatched {
+                cloud_pixel(&mut canvas, x, y, CLOUD_TONES[band as usize]);
+            }
         }
     }
 
     // PRD §10.3: clouds are drawn *beneath* the district outlines so the map
     // stays readable through them, so the package skeleton goes back on top of
-    // the wash.
+    // the cloud marks.
     {
         let (_, package_edges) = borders(city);
         let mut ink = MapInk {
@@ -2271,11 +2556,23 @@ pub fn render_band_validation(
     let u = footer / 128.0;
     let y0 = w as f64 - footer;
     let mut x = 14.0 * u;
+    let base_key = format!("BASE MAP 0-{BASE_MAP_CEILING} (M1, REAL)");
+    let cloud_key = format!(
+        "CLOUDS {}-{} ISO-CONTOUR + HATCH (M4, SIM)",
+        CLOUD_BAND.0, CLOUD_BAND.1
+    );
+    let type_key = format!("IN-MAP TYPE {}-{} (M1, REAL)", TYPE_BAND.0, TYPE_BAND.1);
+    let agent_key = format!("AGENTS {}-{} (M4, SIM)", AGENT_BAND.0, AGENT_BAND.1);
+    let attn_key = format!(
+        "ATTENTION {}-{} (M5, SIM)",
+        ATTENTION_BAND.0, ATTENTION_BAND.1
+    );
     let key = [
-        ("BASE MAP 0-48 (M1, REAL)", ROOF_HI),
-        ("CLOUDS 49-96 (M4, SIMULATED)", CLOUD_TONES[1]),
-        ("AGENTS 97-168 (M4, SIMULATED)", AGENT_PENDING),
-        ("ATTENTION 169-255 (M5, SIMULATED)", ATTN_DECISION),
+        (base_key.as_str(), ROOF_HI),
+        (cloud_key.as_str(), CLOUD_TONES[1]),
+        (type_key.as_str(), LABEL),
+        (agent_key.as_str(), AGENT_PENDING),
+        (attn_key.as_str(), ATTN_DECISION),
     ];
     for (name, colour) in key {
         let size = 2.0 * u * 0.72;
@@ -2493,6 +2790,43 @@ mod tests {
         // …and the work register still owns the very top, so PRD §7.3 holds.
         assert!(height_ramp(SETTLED_CEILING) < height_ramp(HEIGHT_REFERENCE));
         assert_eq!(height_ramp(HEIGHT_REFERENCE), 1.0);
+    }
+
+    /// The tone ramp's top is read off `polis_layout`, and it has to keep two
+    /// realistic diffs apart.
+    ///
+    /// A hard-coded reference is a number waiting to disagree with the crate it
+    /// describes: at the literal `22.0` against a work register of 60, seventy-
+    /// five uncommitted lines already saturated the ramp and every busier file
+    /// was drawn the same. This is the assertion that would have caught it.
+    #[test]
+    fn the_tone_reference_tracks_the_layouts_work_register() {
+        use polis_layout::buildings::{
+            height_for_diff_lines, SETTLED_CEILING, WORK_FULL_LINES, WORK_SPAN,
+        };
+        const {
+            assert!(HEIGHT_REFERENCE > SETTLED_CEILING);
+        }
+        assert!(
+            f64::from(HEIGHT_REFERENCE) < f64::from(SETTLED_CEILING) + WORK_SPAN,
+            "the reference is above the tallest height the work register can reach"
+        );
+        // Two diffs an operator would genuinely want to tell apart, a decade
+        // apart in size and both far below `WORK_FULL_LINES`.
+        let small = height_for_diff_lines(20);
+        let large = height_for_diff_lines(400);
+        assert!(
+            large > small,
+            "the layout's own registers do not separate them"
+        );
+        let a = pixel_luma(delivered_roof(height_ramp(small)));
+        let b = pixel_luma(delivered_roof(height_ramp(large)));
+        assert!(
+            b > a + 0.8,
+            "a 20-line diff draws at L {a:.1} and a 400-line diff at L {b:.1}: \
+             the ramp saturates before the work register does \
+             (WORK_SPAN {WORK_SPAN}, WORK_FULL_LINES {WORK_FULL_LINES})"
+        );
     }
 
     /// The roof tones a real city puts on the canvas, counted.
@@ -2714,7 +3048,7 @@ mod tests {
         let s = city::measure(&c);
         let canvas = render_band_validation(&c, &s, "TEST", 400, 1);
         let map_rows = (canvas.height as f64 * (1.0 - 0.088)) as usize;
-        let mut in_band = [0usize; 4];
+        let mut in_band = [0usize; 5];
         let mut base = 0usize;
         for y in 0..map_rows {
             for x in 0..canvas.width {
@@ -2724,15 +3058,17 @@ mod tests {
                     base += 1;
                 } else if head <= CLOUD_BAND.1 {
                     in_band[1] += 1;
-                } else if head <= AGENT_BAND.1 {
+                } else if head <= TYPE_BAND.1 {
                     in_band[2] += 1;
-                } else {
+                } else if head <= AGENT_BAND.1 {
                     in_band[3] += 1;
+                } else {
+                    in_band[4] += 1;
                 }
             }
         }
         in_band[0] = base;
-        for (i, name) in ["base map", "clouds", "agents", "attention"]
+        for (i, name) in ["base map", "clouds", "typography", "agents", "attention"]
             .iter()
             .enumerate()
         {
@@ -2817,11 +3153,394 @@ mod tests {
             "the ceiling admits L* {l}, which is not the bottom fifth"
         );
         assert!(l > 15.0, "the ceiling is so low the base map cannot read");
-        // Every reserved band starts above the ceiling and they tile upward.
-        assert!(CLOUD_BAND.0 > BASE_MAP_CEILING);
-        assert!(AGENT_BAND.0 > CLOUD_BAND.1);
-        assert!(ATTENTION_BAND.0 > AGENT_BAND.1);
+        // Every reserved band starts above the ceiling and they tile upward,
+        // with typography's sub-band between the clouds and the agents.
+        assert_eq!(CLOUD_BAND.0, BASE_MAP_CEILING + 1);
+        assert_eq!(TYPE_BAND.0, CLOUD_BAND.1 + 1);
+        assert_eq!(AGENT_BAND.0, TYPE_BAND.1 + 1);
+        assert_eq!(ATTENTION_BAND.0, AGENT_BAND.1 + 1);
         assert_eq!(ATTENTION_BAND.1, 255, "attention must own the top");
+        // Typography is above every cloud tone — it is drawn *over* a cloud —
+        // and below every agent mark, which is the whole reason the sub-band is
+        // where it is rather than anywhere else in the range.
+        for tone in CLOUD_TONES {
+            let head = tone.iter().copied().max().unwrap_or(0);
+            assert!(
+                head <= CLOUD_BAND.1,
+                "a cloud tone {tone:?} leaves its band"
+            );
+            assert!(
+                head < TYPE_BAND.0,
+                "a cloud tone {tone:?} reaches typography"
+            );
+        }
+        for ink in [LABEL, LABEL_MONU] {
+            let head = ink.iter().copied().max().unwrap_or(0);
+            assert_eq!(head, TYPE_BAND.1, "{ink:?} does not use its whole sub-band");
+        }
+        for ink in [FOOTER_TEXT, TITLE] {
+            let head = ink.iter().copied().max().unwrap_or(0);
+            assert!(
+                head < ATTENTION_BAND.0,
+                "footer chrome {ink:?} is inside the attention band"
+            );
+        }
+    }
+
+    /// Typography stays out of the agent band — measured on pixels.
+    ///
+    /// The review's finding, in one assertion: district labels were sitting at
+    /// `L 142`, three times the base ceiling and *inside* the 97–168 window
+    /// PRD §10.3 reserves for live agents, so the word `POLIS-RENDER/SRC` was
+    /// louder than a worker would be. The rule now has a home ([`TYPE_BAND`]) and
+    /// a test, and the test is on the finished PNG rather than on the palette,
+    /// because a plate, an antialiased glyph edge and a box filter all happen
+    /// after the constant.
+    #[test]
+    fn nothing_in_the_map_frame_enters_the_agent_band() {
+        let c = small_city();
+        let s = city::measure(&c);
+        for (pixels, ss) in [(320usize, 1usize), (800, 2)] {
+            let canvas = render_plan(&c, &s, "POLIS / TEST REPOSITORY", pixels, ss, false);
+            let map_rows = canvas.height - (canvas.height as f64 * 0.088) as usize;
+            let mut reached_type_band = 0usize;
+            for y in 0..map_rows {
+                for x in 0..canvas.width {
+                    let i = (y * canvas.width + x) * 3;
+                    let p = [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]];
+                    let head = p.iter().copied().max().unwrap_or(0);
+                    assert!(
+                        head < AGENT_BAND.0,
+                        "map pixel ({x}, {y}) is {p:?} at {pixels}px x{ss}: \
+                         channel {head} is inside the agent band {AGENT_BAND:?}"
+                    );
+                    if head >= TYPE_BAND.0 {
+                        reached_type_band += 1;
+                    }
+                }
+            }
+            // …and the sub-band is *used*, or the assertion above is vacuous and
+            // the labels have quietly become unreadable instead.
+            assert!(
+                reached_type_band > 40,
+                "only {reached_type_band} pixels reach the typography band at {pixels}px x{ss}: \
+                 the labels have gone missing rather than gone quiet"
+            );
+            // The other half of [`LABEL_AREA_SHARE`]: typography is ink, and ink
+            // on the base map is budgeted. Glyphs alone, since the plate is
+            // deliberately near the sea's own tone.
+            let frame = canvas.width * map_rows;
+            let share = reached_type_band as f64 / frame as f64;
+            assert!(
+                share <= LABEL_AREA_SHARE,
+                "label glyphs cover {:.2}% of the map frame at {pixels}px x{ss}: \
+                 the caption is competing with the city",
+                share * 100.0
+            );
+        }
+        // Layer 5 owns the top of the range across the *whole* image, footer
+        // chrome included.
+        let canvas = render_plan(&c, &s, "POLIS / TEST REPOSITORY", 320, 1, false);
+        for (i, p) in canvas.pixels.as_chunks::<3>().0.iter().enumerate() {
+            let head = p.iter().copied().max().unwrap_or(0);
+            assert!(
+                head < ATTENTION_BAND.0,
+                "pixel {i} is {p:?}: nothing in M1 may enter the attention band"
+            );
+        }
+    }
+
+    /// A cloud is a set of marks the city shows through, not an area fill.
+    ///
+    /// The measurement the review ran by hand, run in CI: the previous cloud
+    /// layer inked 67 % of its own footprint and moved the base median under it
+    /// from `L 22` to `L 43`, which is the map fogging into mush exactly where
+    /// the activity is. PRD §10.4 says *"discrete iso-contour bands, 2–3 levels,
+    /// never a continuous blur"*, and this is that sentence as an assertion.
+    #[test]
+    fn a_cloud_is_a_contour_and_a_hatch_and_not_an_area_fill() {
+        let c = small_city();
+        let s = city::measure(&c);
+        let pixels = 480usize;
+        let canvas = render_band_validation(&c, &s, "TEST", pixels, 1);
+        let rows = (canvas.height as f64 * (1.0 - 0.088)) as usize;
+        let w = canvas.width;
+        let head = |x: usize, y: usize| -> u8 {
+            let i = (y * w + x) * 3;
+            canvas.pixels[i..i + 3].iter().copied().max().unwrap_or(0)
+        };
+        let mut cloud = vec![false; rows * w];
+        let mut tones: BTreeSet<[u8; 3]> = BTreeSet::new();
+        for y in 0..rows {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let p = [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]];
+                // Exact tone equality, not a range test: the whole claim is that
+                // a cloud is made of **discrete opaque marks**, so every cloud
+                // pixel is byte-for-byte one of three constants. A blended wash
+                // could not pass this line, and the previous one put 748 distinct
+                // tones inside the band.
+                if CLOUD_TONES.contains(&p) {
+                    cloud[y * w + x] = true;
+                    tones.insert(p);
+                    assert!(
+                        (CLOUD_BAND.0..=CLOUD_BAND.1).contains(&head(x, y)),
+                        "a cloud mark at ({x}, {y}) is {p:?}, outside {CLOUD_BAND:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            cloud.iter().filter(|c| **c).count() > 200,
+            "no cloud was drawn at all"
+        );
+        // PRD §10.4: 2–3 levels.
+        assert!(
+            (2..=3).contains(&tones.len()),
+            "the cloud layer drew {} iso levels, and §10.4 asks for 2-3",
+            tones.len()
+        );
+
+        // The cloud's *footprint*: block-dilate the marks onto an 8px lattice,
+        // so a hatch of separated strokes still bounds the region it textures.
+        let k = 8usize;
+        let (cw, ch) = (w.div_ceil(k), rows.div_ceil(k));
+        let mut cell = vec![false; cw * ch];
+        for y in 0..rows {
+            for x in 0..w {
+                if cloud[y * w + x] {
+                    cell[(y / k) * cw + x / k] = true;
+                }
+            }
+        }
+        let mut inked = 0usize;
+        let mut footprint = 0usize;
+        let mut inside: Vec<f64> = Vec::new();
+        let mut outside: Vec<f64> = Vec::new();
+        for y in 0..rows {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let p = [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]];
+                let under_cloud = cell[(y / k) * cw + x / k];
+                if under_cloud {
+                    footprint += 1;
+                    if cloud[y * w + x] {
+                        inked += 1;
+                    }
+                }
+                // Only base-map pixels are compared: the agent and attention
+                // stand-ins are a different layer and would flatter nobody.
+                if p.iter().copied().max().unwrap_or(0) > BASE_MAP_CEILING {
+                    continue;
+                }
+                // …and only *city* pixels. Open sea sits at L 4 and clouds do
+                // not fall on it evenly, so including it would compare a
+                // coastline with a downtown and call the difference fog.
+                if pixel_luma(p) <= 12.0 {
+                    continue;
+                }
+                if under_cloud {
+                    inside.push(pixel_luma(p));
+                } else {
+                    outside.push(pixel_luma(p));
+                }
+            }
+        }
+        let share = 100 * inked / footprint.max(1);
+        assert!(
+            share <= 35,
+            "the cloud inks {share}% of its own footprint: that is an area fill, not a contour"
+        );
+        assert!(
+            share >= 4,
+            "the cloud inks {share}% of its footprint: invisible"
+        );
+        inside.sort_by(f64::total_cmp);
+        outside.sort_by(f64::total_cmp);
+        let (a, b) = (percentile(&inside, 0.5), percentile(&outside, 0.5));
+        assert!(
+            (a - b).abs() <= 2.0,
+            "the base map reads L {a:.1} under a cloud and L {b:.1} outside one: \
+             the cloud is raising the floor"
+        );
+    }
+
+    /// The height key prints the tone the map delivers, not the tone it fills.
+    ///
+    /// Measured on pixels, because the claim is about pixels: fill a square with
+    /// the roof colour, mass it exactly as the map does, and the mean of what
+    /// comes out has to be what the legend swatch shows. The legend used to show
+    /// the pre-massing fill, which over-promised the encoding.
+    #[test]
+    fn the_height_key_shows_the_tone_a_building_actually_delivers() {
+        for step in 0..=4 {
+            let t = f64::from(step) / 4.0;
+            let square = [[8.0, 8.0], [72.0, 8.0], [72.0, 72.0], [8.0, 72.0]];
+            let mut canvas = Canvas::new(80, 80, [0, 0, 0]);
+            {
+                let mut ink = MapInk {
+                    canvas: &mut canvas,
+                };
+                let roof = mix(ROOF_LO, ROOF_HI, t);
+                ink.fill_polygon(&square, roof, 1.0);
+                draw_massing(&mut ink, &square, ring_centre(&square), roof, t, 60.0, 1.0);
+            }
+            // The interior only: the lit rim is a third channel and lives on the
+            // edge, and the key is about the body of the roof.
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for y in 16..64 {
+                for x in 16..64 {
+                    let i = (y * 80 + x) * 3;
+                    sum +=
+                        pixel_luma([canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]);
+                    n += 1.0;
+                }
+            }
+            let drawn = sum / n;
+            let promised = pixel_luma(delivered_roof(t));
+            assert!(
+                (drawn - promised).abs() <= 2.0,
+                "at t={t} the key promises L {promised:.1} and the map draws L {drawn:.1}"
+            );
+        }
+        // Monotone, and it must not promise the raw fill any more. The tolerance
+        // is one rounding step: the key is quantised to 8 bits, so two adjacent
+        // swatches of a 33-step ramp can land on the same byte.
+        let mut last = f64::MIN;
+        for step in 0..=32 {
+            let l = pixel_luma(delivered_roof(f64::from(step) / 32.0));
+            assert!(
+                l >= last - 0.6,
+                "the key turns back on itself at step {step}"
+            );
+            last = last.max(l);
+        }
+        let rise = pixel_luma(delivered_roof(1.0)) - pixel_luma(delivered_roof(0.0));
+        assert!(rise >= 10.0, "the key ramps only {rise:.1} levels");
+        assert!(
+            pixel_luma(delivered_roof(1.0)) < pixel_luma(ROOF_HI) - 3.0,
+            "the key is still printing the fill rather than the delivered tone"
+        );
+    }
+
+    /// Height reaches the rendered pixels as a **monotone ramp**, measured the
+    /// way a reviewer measures it: per building, over its own footprint.
+    ///
+    /// `height_reaches_the_pixels` only proves that *something* changed. The
+    /// review's charge was quantitative — "corr(height, mean roof tone) = +0.12"
+    /// — so the answer has to be quantitative too, and it has to live in CI or
+    /// the next palette change will quietly undo it.
+    #[test]
+    fn height_reaches_the_pixels_as_a_monotone_ramp() {
+        use polis_layout::buildings::{BASE_HEIGHT, SETTLED_CEILING};
+        // Two scenarios, because they are two different questions. A **clean
+        // checkout** — the common case, and the one the review says the map has
+        // to be informative on — puts every height in the settled register; a
+        // repository mid-run spreads them across both, and the work register is
+        // narrower on purpose, so it ranks less finely. Both have to be
+        // strongly positive; they do not have to be equally so.
+        let settled =
+            |i: usize| BASE_HEIGHT + (SETTLED_CEILING - BASE_HEIGHT) * (i % 16) as f32 / 15.0;
+        let both = |i: usize| 1.0 + (i % 16) as f32 * 1.4;
+        for (name, heights, floor) in [
+            ("a clean checkout", &settled as &dyn Fn(usize) -> f32, 0.80),
+            ("a repository mid-run", &both as &dyn Fn(usize) -> f32, 0.70),
+        ] {
+            ramp_correlation(name, heights, floor);
+        }
+    }
+
+    /// One scenario of [`height_reaches_the_pixels_as_a_monotone_ramp`].
+    fn ramp_correlation(name: &str, heights: &dyn Fn(usize) -> f32, floor: f64) {
+        let mut c = small_city();
+        let keys: Vec<LogicalPath> = c.layout.buildings.keys().cloned().collect();
+        for (i, k) in keys.iter().enumerate() {
+            if let Some(b) = c.layout.buildings.get_mut(k) {
+                b.height = heights(i);
+            }
+        }
+        let pixels = 700usize;
+        let canvas = render_base_map(&c, pixels, 2, false);
+        let (lo, hi) = world_bounds(&c);
+        let view = View::fit(lo, hi, pixels * 2, pixels * 2, (pixels * 2) as f64 * 0.022);
+        let mut rows: Vec<(f64, f64)> = Vec::new();
+        for building in c.layout.buildings.values() {
+            let ring = view.ring(&building.footprint.vertices);
+            if ring.len() < 3 {
+                continue;
+            }
+            let centre = ring_centre(&ring);
+            // Centre plus the ring pulled 45 % of the way in: enough of the roof
+            // to average its lit and shaded halves, none of its keyline.
+            let mut samples: Vec<f64> = Vec::new();
+            for p in std::iter::once(centre).chain(ring.iter().map(|p| {
+                [
+                    centre[0] + (p[0] - centre[0]) * 0.45,
+                    centre[1] + (p[1] - centre[1]) * 0.45,
+                ]
+            })) {
+                let (x, y) = ((p[0] / 2.0) as usize, (p[1] / 2.0) as usize);
+                if x >= canvas.width || y >= canvas.height {
+                    continue;
+                }
+                let i = (y * canvas.width + x) * 3;
+                samples.push(pixel_luma([
+                    canvas.pixels[i],
+                    canvas.pixels[i + 1],
+                    canvas.pixels[i + 2],
+                ]));
+            }
+            if samples.is_empty() {
+                continue;
+            }
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            rows.push((f64::from(building.height), mean));
+        }
+        assert!(rows.len() > 60, "only {} buildings sampled", rows.len());
+        // Spearman: the encoding is a monotone ramp, not a linear one — the tone
+        // ramp is piecewise (two height registers) and the massing curve bends
+        // it — so rank correlation is the honest statistic.
+        let rank = |mut idx: Vec<usize>, key: &dyn Fn(usize) -> f64| -> Vec<f64> {
+            idx.sort_by(|a, b| key(*a).total_cmp(&key(*b)));
+            let mut out = vec![0.0; idx.len()];
+            for (r, i) in idx.into_iter().enumerate() {
+                out[i] = r as f64;
+            }
+            out
+        };
+        let ids: Vec<usize> = (0..rows.len()).collect();
+        let rh = rank(ids.clone(), &|i| rows[i].0);
+        let rt = rank(ids, &|i| rows[i].1);
+        let n = rows.len() as f64;
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / n;
+        let (mh, mt) = (mean(&rh), mean(&rt));
+        let cov: f64 = rh.iter().zip(&rt).map(|(a, b)| (a - mh) * (b - mt)).sum();
+        let sh: f64 = rh.iter().map(|a| (a - mh) * (a - mh)).sum::<f64>().sqrt();
+        let st: f64 = rt.iter().map(|b| (b - mt) * (b - mt)).sum::<f64>().sqrt();
+        let rho = cov / (sh * st);
+        assert!(
+            rho >= floor,
+            "on {name}, corr(height, rendered roof tone) is {rho:+.3}, under {floor}: \
+             the map is not showing its own quantity"
+        );
+        // And the range has to be worth ranking: the tallest decile has to be
+        // visibly lighter than the shortest.
+        let mut by_height = rows.clone();
+        by_height.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let d = (by_height.len() / 10).max(1);
+        let low: f64 = by_height[..d].iter().map(|r| r.1).sum::<f64>() / d as f64;
+        let high: f64 = by_height[by_height.len() - d..]
+            .iter()
+            .map(|r| r.1)
+            .sum::<f64>()
+            / d as f64;
+        assert!(
+            high - low >= 8.0,
+            "on {name}: shortest decile L {low:.1}, tallest decile L {high:.1}: \
+             {:.1} levels is not a ramp",
+            high - low
+        );
     }
 
     /// PRD §7.3's primary encoded quantity has to be visible.

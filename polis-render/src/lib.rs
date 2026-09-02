@@ -31,10 +31,18 @@
 //! The budget — layers 1–2 inside the bottom fifth of the contrast range, the
 //! rest reserved for layers 4–5 — is **defined and enforced in [`plan`]**, in
 //! 8-bit sRGB channel space, as [`plan::BASE_MAP_CEILING`] plus the reserved
-//! bands [`plan::CLOUD_BAND`], [`plan::AGENT_BAND`] and
+//! bands [`plan::CLOUD_BAND`], [`plan::TYPE_BAND`], [`plan::AGENT_BAND`] and
 //! [`plan::ATTENTION_BAND`]. Read that module before adding any colour to this
 //! crate; the ceiling is a channel bound precisely so that it survives blending
 //! and downsampling, which is what makes it enforceable rather than aspirational.
+//!
+//! [`plan::TYPE_BAND`] is the one that is easy to skip past and is the one a
+//! review caught: text is not one of §10.3's five layers, and the first version
+//! read that as an exemption and drew district labels at `L 142` — inside the
+//! band reserved for live agents, on the image built to validate the budget. It
+//! now has an allocation of its own between the clouds and the agents, and
+//! `plan`'s `nothing_in_the_map_frame_enters_the_agent_band` asserts it on
+//! rendered pixels. The wgpu overlay owes the same rule.
 //!
 //! ADR-0021 asked for the colour-space convention to be settled before that
 //! tuning, and for the PNG path it now is: the CPU rasteriser writes sRGB bytes
