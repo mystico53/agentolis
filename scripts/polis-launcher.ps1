@@ -1,5 +1,5 @@
 <#
-  Polis launcher — the friendly front door.
+  Polis launcher - the friendly front door.
 
   Nobody should need to know a command line to see their repository as a city.
   This finds the binary (offering to build it), finds git repositories on this
@@ -80,44 +80,70 @@ if ($Repo) {
 
 if (-not $chosen) {
 
-Title 'Looking for git repositories'
+# One folder that contains your repositories - asked once, then remembered.
+# Deliberately not a scan of the whole drive: it is slow, it surprises people,
+# and everyone already keeps their code in one place.
 
-$seen  = [System.Collections.Generic.HashSet[string]]::new()
+$ConfigDir  = Join-Path $env:LOCALAPPDATA 'polis'
+$ConfigFile = Join-Path $ConfigDir 'code-directory.txt'
+
+$CodeDir = $null
+if (Test-Path $ConfigFile) {
+  $saved = (Get-Content -LiteralPath $ConfigFile -Raw -ErrorAction SilentlyContinue).Trim()
+  if ($saved -and (Test-Path $saved)) { $CodeDir = $saved }
+}
+
+if (-not $CodeDir) {
+  $guess = Split-Path $Root -Parent
+  Title 'Where do you keep your code?'
+  Say ''
+  Say '  Give the folder your repositories live in - the one that contains them,'
+  Say '  not a repository itself. Asked once, then remembered.'
+  Say ''
+  Say "  Press Enter for: $guess" 'DarkGray'
+  Say ''
+  $typed = (Read-Host '  Folder').Trim('"', ' ')
+  if (-not $typed) { $typed = $guess }
+  if (-not (Test-Path $typed)) { Say ''; Say "  No such folder: $typed" 'Yellow'; Pause-Exit 1 }
+  $CodeDir = (Resolve-Path -LiteralPath $typed).Path
+  try {
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    Set-Content -LiteralPath $ConfigFile -Value $CodeDir -Encoding utf8
+    Say ''
+    Say "  Remembered. To change it later, delete:" 'DarkGray'
+    Say "    $ConfigFile" 'DarkGray'
+  } catch { }
+}
+
+Title "Repositories in $CodeDir"
+
 $repos = [System.Collections.Generic.List[object]]::new()
 
 function Add-Repo([string]$path) {
   if (-not $path) { return }
   try { $full = (Resolve-Path -LiteralPath $path -ErrorAction Stop).Path } catch { return }
   if (-not (Test-Path (Join-Path $full '.git'))) { return }
-  if (-not $seen.Add($full.ToLowerInvariant())) { return }
+  # git ls-files is far faster than walking the tree and it already honours
+  # .gitignore, so the count matches what Polis will actually map.
   $files = 0
-  try { $files = @(Get-ChildItem -LiteralPath $full -Recurse -File -Force -ErrorAction SilentlyContinue |
-                   Where-Object { $_.FullName -notmatch '\\(\.git|node_modules|target|dist|build|\.venv)\\' }).Count } catch {}
+  try {
+    $out = & git -C $full ls-files 2>$null
+    if ($LASTEXITCODE -eq 0 -and $out) { $files = @($out).Count }
+  } catch { }
   $repos.Add([pscustomobject]@{ Path = $full; Name = Split-Path $full -Leaf; Files = $files })
 }
 
-# The obvious places people keep code, plus wherever this repo lives.
-$roots = @(
-  (Split-Path $Root -Parent)
-  (Join-Path $env:USERPROFILE 'source\repos')
-  (Join-Path $env:USERPROFILE 'Documents\GitHub')
-  (Join-Path $env:USERPROFILE 'Projects')
-  (Join-Path $env:USERPROFILE 'code')
-  (Join-Path $env:USERPROFILE 'dev')
-  'C:\coding'
-  'C:\src'
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
-
-Add-Repo $Root
-foreach ($r in $roots) {
-  try {
-    Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue |
-      ForEach-Object { Add-Repo $_.FullName }
-  } catch {}
-}
+try {
+  Get-ChildItem -LiteralPath $CodeDir -Directory -ErrorAction SilentlyContinue |
+    ForEach-Object { Add-Repo $_.FullName }
+} catch { }
+# The folder itself may be a repository.
+Add-Repo $CodeDir
 
 if ($repos.Count -eq 0) {
-  Say '  None found automatically.' 'Yellow'
+  Say ''
+  Say '  No git repositories directly inside that folder.' 'Yellow'
+  Say '  You can still type a path below.'
 } else {
   Say "  Found $($repos.Count)." 'DarkGray'
 }
@@ -139,7 +165,7 @@ for ($i = 0; $i -lt $max; $i++) {
 Write-Host ''
 Write-Host '    P. type a path myself' -ForegroundColor DarkGray
 Write-Host ''
-Say '  Bigger repositories with years of history make better cities —' 'DarkGray'
+Say '  Bigger repositories with years of history make better cities -' 'DarkGray'
 Say '  the old, dense core is literally the code you wrote first.' 'DarkGray'
 Write-Host ''
 
@@ -175,7 +201,7 @@ Say "  Road graph    $junc"
 Write-Host ''
 Say '  Opening the city plan now.' 'DarkGray'
 Say '  In it: every building is a file, every district a directory, and the' 'DarkGray'
-Say '  tallest building is the file with the most uncommitted work — so the' 'DarkGray'
+Say '  tallest building is the file with the most uncommitted work - so the' 'DarkGray'
 Say '  skyline points at whatever most needs reviewing.' 'DarkGray'
 Write-Host ''
 Say '  The second image is the road network alone, with junctions coloured by' 'DarkGray'
