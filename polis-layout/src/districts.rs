@@ -129,8 +129,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use polis_events::LogicalPath;
 
-use crate::accrete::{FileRec, Params};
-use crate::age::AgeRamp;
+use crate::accrete::FileRec;
 use crate::blocks::{district_of, BlockPlan};
 use crate::territory::{Demand, Territory};
 
@@ -139,20 +138,9 @@ use crate::territory::{Demand, Territory};
 /// The list is grouped and sorted here, so the order the caller happened to
 /// collect the files in cannot reach the partition (PRD §7.4).
 ///
-/// A district is weighed at **its own age**, not at each file's: a directory
-/// founded in the first month and still receiving files keeps the fine mesh it
-/// was founded with, so the polygon it is given is sized for the grain its plots
-/// will actually be settled at. Weighing late files at rim spacing inside a
-/// core-sized polygon is what makes the territory constraint unsatisfiable.
-///
-/// That age comes from `ramp` — real commit time (PRD §7.1, [`crate::age`]) —
-/// and the partition and the accretion **must** read the same ramp, or a
-/// district is given ground sized for one grain and settled at another.
-pub(crate) fn demands(
-    files: &[FileRec],
-    params: &Params,
-    ramp: &AgeRamp,
-) -> Vec<(LogicalPath, Demand)> {
+/// The count is what the tree is weighed by and the growth index is what it is
+/// ordered by; neither depends on the order the files arrived in.
+pub(crate) fn demands(files: &[FileRec]) -> Vec<(LogicalPath, Demand)> {
     let mut by_district: BTreeMap<LogicalPath, (usize, u32)> = BTreeMap::new();
     for f in files {
         let entry = by_district
@@ -164,12 +152,11 @@ pub(crate) fn demands(
     by_district
         .into_iter()
         .map(|(path, (count, oldest))| {
-            let t = ramp.at(oldest);
             (
                 path,
                 Demand {
                     oldest,
-                    area: params.district_demand(count, t),
+                    files: u32::try_from(count).unwrap_or(u32::MAX),
                 },
             )
         })
@@ -269,7 +256,7 @@ pub(crate) fn links_to_keep(
             }
         }
     }
-    let depth = depths(territory);
+    let depth = territory.depths();
     // Candidates, deepest common directory first and longest first within that.
     // The length is quantised before it is compared so two runs cannot order two
     // near-equal boundaries differently, and the edge index breaks the remaining
@@ -337,22 +324,11 @@ pub(crate) fn links_to_keep(
     (mask, already)
 }
 
-/// Depth of every district in the directory tree; the repository root is 0.
-fn depths(territory: &Territory) -> Vec<u32> {
-    let mut out = vec![0u32; territory.nodes.len()];
-    // Parents are always created before their children, so one forward pass is
-    // enough and there is no recursion to bound.
-    for (i, node) in territory.nodes.iter().enumerate() {
-        out[i] = node.parent.map_or(0, |p| out[p as usize] + 1);
-    }
-    out
-}
-
 /// Depth of the lowest directory that contains both districts.
 ///
 /// `u32::MAX` for two cells of the same district, so a district's own boundaries
 /// always sort before any boundary it shares with a neighbour.
-fn common_depth(territory: &Territory, depth: &[u32], first: u32, second: u32) -> u32 {
+pub(crate) fn common_depth(territory: &Territory, depth: &[u32], first: u32, second: u32) -> u32 {
     if first == second {
         return u32::MAX;
     }
@@ -527,7 +503,9 @@ pub(crate) fn fragmented_subtrees(blocks: &[BlockPlan], territory: &Territory) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accrete::Params;
     use crate::accrete::{self, Settlement};
+    use crate::age::AgeRamp;
     use crate::geom::dist;
     use crate::terrain::TerrainField;
     use crate::territory;
@@ -565,14 +543,8 @@ mod tests {
         let params = Params::for_file_count(files.len());
         let terrain = TerrainField::generate(0x51, 100.0);
         let ramp = ramp_of(&files);
-        let t = territory::build(
-            &demands(&files, &params, &ramp),
-            &|p| p.as_str().starts_with("vendor"),
-            &terrain,
-            params.plot_area_at(0.0),
-            9,
-        );
-        accrete::grow(files, t, params, ramp)
+        let t = territory::build(&demands(&files), &|p| p.as_str().starts_with("vendor"));
+        accrete::grow(files, t, params, ramp, terrain)
     }
 
     /// A tree with a deep unbalanced spine — the shape that exposed the
@@ -603,19 +575,17 @@ mod tests {
 
     #[test]
     fn demands_do_not_depend_on_the_order_the_files_arrived_in() {
-        let params = Params::for_file_count(19);
         let files = corpus(&deep_tree());
-        let ramp = ramp_of(&files);
-        let forward = demands(&files, &params, &ramp);
+        let forward = demands(&files);
         let mut shuffled = files;
         shuffled.reverse();
         shuffled.rotate_left(5);
-        let backward = demands(&shuffled, &params, &ramp);
+        let backward = demands(&shuffled);
         assert_eq!(forward.len(), backward.len());
         for (a, b) in forward.iter().zip(backward.iter()) {
             assert_eq!(a.0, b.0);
             assert_eq!(a.1.oldest, b.1.oldest);
-            assert_eq!(a.1.area, b.1.area);
+            assert_eq!(a.1.files, b.1.files);
         }
     }
 
@@ -655,73 +625,65 @@ mod tests {
         );
     }
 
-    /// Rule **T**, likewise: every plot is inside the polygon of the district
-    /// that owns it.
+    /// **Every district is one place on the map**, on the real pipeline.
+    ///
+    /// This is the property the territory polygon used to buy and the graph
+    /// partition now buys instead, and it is checked the way the map is read:
+    /// over the plot adjacency graph, district by district. The polygon test it
+    /// replaces asserted something weaker — that a plot was inside a polygon —
+    /// which was true on a city that measured 0.9975 solidity and read as a pie
+    /// chart.
     #[test]
-    fn every_plot_settles_inside_its_own_districts_polygon() {
+    fn every_district_is_one_connected_piece_of_ground() {
         let s = settle(corpus(&deep_tree()));
-        let mut outside = 0usize;
-        for p in &s.plots {
-            let face = &s.territory.nodes[p.district as usize].face;
-            if face.len() >= 3 && !crate::geom::contains(face, p.pos) {
-                outside += 1;
-            }
+        let positions = s.positions();
+        let cells = crate::voronoi::build(&positions, s.params.sep_rim, 0x51);
+        let (graph, cell_edges) =
+            crate::roads::Graph::from_cells_indexed(&cells.cells, crate::roads::WELD_TOLERANCE);
+        let adjacency = crate::regions::adjacency(&cell_edges, graph.edges.len());
+        let seating = crate::regions::partition(&s, &adjacency);
+        let mut by_district: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (i, d) in seating.plot_district.iter().enumerate() {
+            by_district
+                .entry(*d)
+                .or_default()
+                .push(u32::try_from(i).expect("fits"));
         }
-        let bent = s.relaxed.fringe + s.relaxed.ancestor + s.relaxed.anywhere + s.relaxed.detached;
-        assert_eq!(
-            outside, bent,
-            "{outside} plots left their district but {bent} relaxations were counted"
-        );
-    }
-
-    /// **More demand, more ground** — at every depth, on a deep unbalanced tree.
-    ///
-    /// This is the regression test for the bug that produced the confetti. The
-    /// partition solved for the area each side of a cut should get and then
-    /// chose which *half* to hand to which group by a second criterion, so on an
-    /// unbalanced split each group could receive the area computed for the
-    /// other. Measured at 5 000 files, a 769-file district was handed 0.03
-    /// square units and every one of its 129 plots relaxed into an ancestor's
-    /// territory; 636 of 1 198 plots settled outside their own district.
-    ///
-    /// Stated as a monotonicity rather than as a fixed ratio, so it holds at
-    /// every depth and does not have to be re-tuned when the demand model moves.
-    #[test]
-    fn a_district_that_asks_for_more_ground_gets_more_ground() {
-        let files = corpus(&deep_tree());
-        let params = Params::for_file_count(files.len());
-        let asked = demands(&files, &params, &ramp_of(&files));
-        let t = territory::build(
-            &asked,
-            &|_| false,
-            &TerrainField::generate(0x51, 100.0),
-            params.plot_area_at(0.0),
-            9,
-        );
-        let got: Vec<(&LogicalPath, f64, f64)> = asked
-            .iter()
-            .filter_map(|(path, d)| {
-                let id = t.get(path)?;
-                let face = &t.nodes[id as usize].face;
-                (face.len() >= 3).then(|| (path, d.area, crate::geom::area(face)))
-            })
-            .collect();
-        assert!(got.len() >= 6, "only {} districts got ground", got.len());
-        for (pa, da, aa) in &got {
-            for (pb, db, ab) in &got {
-                // A margin wider than the quantisation the partition rounds
-                // subtree weight to, so only a real inversion trips this.
-                if *da > *db * 1.6 {
-                    assert!(
-                        aa > ab,
-                        "{} asked for {da:.3} and got {aa:.3}, while {} asked for \
-                         {db:.3} and got {ab:.3}",
-                        pa.as_str(),
-                        pb.as_str()
-                    );
+        assert!(by_district.len() > 4, "the corpus made no districts");
+        for (d, plots) in &by_district {
+            let inside: BTreeSet<u32> = plots.iter().copied().collect();
+            let mut seen: BTreeSet<u32> = BTreeSet::new();
+            let mut stack = vec![plots[0]];
+            seen.insert(plots[0]);
+            while let Some(u) = stack.pop() {
+                for &v in &adjacency[u as usize] {
+                    if inside.contains(&v) && seen.insert(v) {
+                        stack.push(v);
+                    }
                 }
             }
+            assert_eq!(
+                seen.len(),
+                plots.len(),
+                "district {d} came out in more than one piece"
+            );
         }
+    }
+
+    /// Every file is on a plot of its own district, and no file is lost.
+    #[test]
+    fn every_file_sits_on_its_own_districts_ground() {
+        let s = settle(corpus(&deep_tree()));
+        let positions = s.positions();
+        let cells = crate::voronoi::build(&positions, s.params.sep_rim, 0x51);
+        let (graph, cell_edges) =
+            crate::roads::Graph::from_cells_indexed(&cells.cells, crate::roads::WELD_TOLERANCE);
+        let adjacency = crate::regions::adjacency(&cell_edges, graph.edges.len());
+        let seating = crate::regions::partition(&s, &adjacency);
+        assert_eq!(seating.file_plot.len(), s.files.len());
+        let seated: usize = seating.plot_files.iter().map(Vec::len).sum();
+        assert_eq!(seated, s.files.len(), "a file was dropped by the seating");
+        assert_eq!(seating.faceless, 0, "a district was given no ground at all");
     }
 
     /// A root with `kids` children, which is enough tree for the ordering tests.
@@ -736,11 +698,11 @@ mod tests {
             children: Vec::new(),
             own_units: 1,
             subtree_units: 1,
+            own_files: 1,
+            subtree_files: 1,
             own_oldest: 0,
             oldest: 0,
             industrial: false,
-            face: Vec::new(),
-            subtree_face: Vec::new(),
         };
         let mut t = Territory {
             nodes: vec![node("", None)],

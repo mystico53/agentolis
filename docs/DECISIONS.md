@@ -2472,3 +2472,221 @@ is corrected by 0 %. The M1 gate's four-history test still produces four
 different cities, and it must: the blend is a function of the *distribution*, so
 a young repository and an accelerating one get different weights on top of
 different calendars.
+
+---
+
+## ADR-0074 — The district partition is a partition of the plot **graph**, not of the plane
+
+**Status.** Accepted. It removes `territory.rs`'s polygon layer entirely and adds
+`polis-layout/src/regions.rs`.
+
+M1 failed three gates on the same picture. The renderer was retoned twice, and an
+independent reviewer measured the structural edge difference between two of those
+rounds at 2.3 % RMSE: the geometry had not moved. What was measured, on five
+corpora, was
+
+* silhouette solidity **0.9947–0.9994**, where a convex outline is 1.00;
+* four to nine district borders per city running dead straight from inside 5 % of
+  the radius out past 90 % of it, within two degrees of radial;
+* on every real repository, one stroke passing within 2.3 % of the radius of the
+  civic square with its ends on opposite bearings — two avenues fused into a
+  boulevard across the middle, which `territory.rs`'s own documentation claimed
+  the civic square prevented.
+
+### The cause was structural, and it was written down as a virtue
+
+`territory::build` made the root face a wobbled 19-gon's **convex hull** and
+fanned it into up to nine sectors around the civic square, then chord-split each
+sector down the directory tree. The module called root convexity "load-bearing",
+and it was: a plot could settle only inside its own district's polygon, so the
+partition had to tile the city, and a convex region cut by chords has a convex
+silhouette and straight borders. Every property the gate failed on is a theorem
+about that construction rather than a tuning miss. No parameter reaches it.
+
+### The decision
+
+Contiguity is a property of a **graph**. The plots are already settled, and their
+Voronoi cells already have an adjacency relation — the one the finished map draws
+as roads. So:
+
+> Grow freely, with two hard rules and no polygon: the packing distance, and a
+> connectivity reach from the nearest settled plot. Then partition the **plot
+> adjacency graph** recursively down the directory tree, balanced by plot
+> capacity.
+
+`regions::partition` is that partition. A split picks two seeds — the oldest
+ground in the set, and the vertex furthest from it by shortest path — runs
+Dijkstra from each, and cuts on the difference `d_a - d_b`. **Both halves of such
+a cut are connected for any threshold**, and the proof is three lines in the
+module. So the cut point is free to be chosen purely for balance: connectivity is
+not traded against it, it is free. Distances are integers in thousandths of a
+world unit, so the sort key is exact and two runs cannot disagree in the last bit
+(PRD §7.4).
+
+Nothing in `regions.rs` touches a coordinate. There is no centre and no radius
+anywhere in it. The outline of the city is the outline of the ground the growth
+settled, and every district border is a chain of Voronoi bisectors between two
+settled plots.
+
+`territory.rs` survives as the directory tree and nothing else: `RIM_SIDES`,
+`WEDGES`, `fan`, `ray_to_rim`, `AVENUE_SPLAY`, the civic-square fan, the ring
+roads, the quarter-clipped Voronoi, `conform_avenues` and `avenue_masks` are all
+gone. The Voronoi is bounded by a **phantom lattice** rather than by a city
+limit: the boundary between a real cell and a phantom one is the perimeter road,
+so the town has an edge without anything having drawn one.
+
+### What it bought, measured on four corpora
+
+| | synthetic 5 000 | Django | Neovim | CPython |
+|---|---|---|---|---|
+| solidity, was 0.995–0.999 | **0.825** | **0.809** | **0.773** | **0.764** |
+| radial spokes, was 4–9 | **0** | **0** | **0** | **0** |
+| boulevards through the middle, was 1 | **0** | **0** | **0** | **0** |
+| longest dead-straight district border | **11.1 %** | 8.5 % | 8.4 % | 6.7 % |
+| 4-and-5+ junction share, was 45–57 % | 66.9 % | 67.9 % | 66.1 % | 65.5 % |
+| through-streets past a quarter of the diameter | 21 | 27 | 25 | 10 |
+
+### Why the *third* row is in the table
+
+It is the row that did not exist before this round, and it is the one that
+decided which of two competing geometries landed.
+
+The other attempt kept a partition of the plane and replaced the radial fan with
+balanced recursive **chord** subdivision — children split at the index that best
+balances quantised weight, on a normal perpendicular to the longest axis. It
+scores `radial_spokes = 0`, honestly. Its longest dead-straight district border is
+**60.0 %** of the city diameter on the synthetic corpus, 59.5 % on Django and
+54.4 % on Neovim, against 46.3 / 93.4 / 45.6 % for the radial partition it
+replaced. Its Django render is one green half and one purple half divided by a
+ruled line running edge to edge.
+
+A chord of a convex face is a straight border whatever bearing it is given, so a
+test that only asks whether the ruler pointed at the middle can be answered by
+turning the ruler. `Structure::straight_border` and `straight_borders` ask the
+question with the bearing taken out of it, and the M1 gate asserts the count at
+**zero**. The two populations are an order of magnitude apart — 6.7–11.1 % for
+bisector borders against 46–93 % for chord and wedge ones — so
+`STRAIGHT_BORDER_SHARE` is set at a fifth of the diameter, in the gap between
+them and beside neither.
+
+### The costs, stated
+
+**`fragmented_subtrees` is a rate now, not zero.** Districts and packages — the
+two contiguity properties PRD §8 and §9 name — are **0 on every corpus**, and
+`regions` guarantees them by construction at the level where packages are
+divided. An *intermediate* directory is a union of districts, and below the
+package level the cut goes where the balance wants it, so a sibling's parcel can
+land between two branches of the same middling directory. Measured 25 of 312 at
+5 000 files, against 102 of 276 *districts* in the design bake-off's prototype.
+The gate holds `fragmented_subtrees × 8 ≤ districts` and the number is printed.
+
+**`settled_nonadjacent` rose from 1 to 138 of 999 plots.** It is no longer a
+contiguity guarantee — `regions` provides that on the graph — but a shaping
+number: how much work the partition has to do. It is asserted as a rate,
+`× 5 ≤ plots`, rather than deleted. `settled_on_fringe` is asserted at **exactly
+zero** and kept, because there is no longer a polygon to be on the fringe of: a
+non-zero value would mean one had come back.
+
+**The growth is the expensive stage.** Free frontier growth evaluates roughly
+2.7 million candidate positions on Django where the polygon-constrained search
+evaluated far fewer. Cold start on Django is 2 559 ms against the previous
+1 932 ms and PRD §13.1's 3 000 ms budget, and the whole of the difference is
+`accrete::grow`. Half of what it cost when the graft first landed was recovered
+by letting the candidate scan stop at the first plot inside the packing distance:
+the verdict cannot change afterwards, so the early exit is exactly equivalent,
+and the layout digest is unchanged across it.
+
+**Incremental reuse fell.** A growth step that founds a new plot moves its
+neighbourhood, and a moved block ring is a different cache key, so building reuse
+on a founding step is 34–38 % where the polygon-clipped Voronoi kept 87 %. Steps
+that only fill an existing plot still reuse 99–100 %. At the scale the budget is
+written against, `tests/incremental_budget.rs` measures 62 % of cuts and 76 % of
+buildings with seven of 1 003 nodes moved, median 45.7 ms and p95 49.4 ms against
+the 50 ms bar. `a_warm_cache_and_a_cold_one_build_the_same_city` now reads reuse
+after **every** step and asserts the mean, because reading only the last one
+measured whichever kind step five happened to be — a coin toss, not a property of
+the caches.
+
+### Determinism
+
+Unchanged and re-proved. The synthetic 5 000-file layout is byte-identical across
+two fresh release processes, a **debug** build, and a run under
+`TZ=Pacific/Kiritimati LC_ALL=tr_TR.UTF-8`: digest `e02c2e3daee995f6`, layout
+sha256 `ed8a580b…`, PNG sha256 `48b1b487…`. The three new pieces were written to
+keep it: `regions` sorts on integer distances; the phantom lattice is anchored at
+the origin rather than on the settlement's bounding box, so one added file cannot
+move the whole edge of town; and `accrete`'s spatial hash is a hand-written
+open-addressing table with a fixed integer mix rather than a `HashMap`, because
+`std`'s `RandomState` is seeded per process — which is the hazard the crate's
+`BTreeMap` rule exists to prevent. Nothing iterates it: both readers reduce to
+minima and counts, and the one that returns a list sorts it.
+
+---
+
+## ADR-0075 — A district that settled ground appears on the ground, and a file the block has no room for takes a parcel next door
+
+**Status.** Accepted. Two defects found by instrumentation once ADR-0074's
+partition met the reworked age ramp and lot subdivision. Both fixed at the cause.
+
+### A district with plots but no face
+
+`blocks::assign` gives each face to the district whose plots sit deepest inside
+it. The vote is taken one face at a time, so a district every one of whose faces
+also holds a deeper-voting neighbour can win **none** of them. `regions` cannot
+prevent it: it guarantees a connected set of *plots*, and this is a fact about
+*faces*, which the collapse and the prune have moved since.
+
+It was invisible until the age ramp began seating 999 plots on the 5 000-file
+corpus where it had seated 955. Two districts of 312 lost their ground, and eight
+files of `core/media/user/account` became buildings standing in a stranger's
+quarter — which PRD §8 draws as a directory that is simply not on the map.
+
+`blocks::seat_unseated_districts` runs the same rule once more with the winners
+fixed: each unseated district takes the one face where its own plots voted
+highest, and only from an owner that keeps at least one other face. That second
+clause is what makes it terminate and what stops it unseating anyone in turn —
+the number of seated districts strictly rises and no district is ever emptied.
+Every directory that owns a file now has ground, on all four corpora. (311 of 312
+districts are drawn at 5 000 files; the one that is not,
+`vendor/store/pool/buffer`, owns no file of its own, and all of its children are
+present.)
+
+### Two files on one parcel
+
+Measured at 11 files of 7 014 on Django and 21 of 6 138 on CPython. A file
+sharing a parcel has no building, and a file with no building has silently left
+the map.
+
+Instrumented rather than swept, and the print is the whole diagnosis:
+
+```text
+DIAG block=1540 plots=1 caps=[(5, 43)] files=43 viable=12 area=1.0274 verts=3
+```
+
+One plot, whose capacity is five, carrying **43** files, in a triangular face of
+area 1.03 against a median block of 4.81. `django/utils` is 43 files, and
+`regions` gave it a single plot: the partition divides plot capacity down the
+tree, but every district also has a **floor** of one plot, and Django is 2 076
+directories over 2 472 plots — so for most leaf directories the floor, not the
+balance, is what they get. The face has room for twelve buildings at the local
+grain, and twelve is what it produced.
+
+The subdivision and the densify loop were both instrumented before anything was
+changed, and both had run to exhaustion: every parcel the ground can hold already
+existed. Raising the densify round budget from a constant to one that scales with
+the file count was tried first and changed the layout digest not at all, which is
+what ruled that cause out — the budget is now demand-scaled anyway, because a
+bound on work that ignores the demand is the wrong shape of bound.
+
+So the fix is not there. `lots::rehouse_overflow_next_door` walks outward over the
+road graph from the crowded face and gives the surplus file the nearest **vacant**
+parcel, preferring one in its own district, then one in its own top-level package,
+then any, up to four rings of blocks. The ground exists: Django's map has 3 249
+vacant parcels. This is the relaxation ladder PRD §7.2 already applies to plots,
+applied one level down to parcels, and it is strictly better than what it
+replaces — a parcel of its own on a neighbour's ground beats no building at all.
+
+It does not hide the shortfall. `shared_faces` still counts the districts whose
+own ground could not hold their files — 1 on Django and Neovim, 3 on CPython, 0
+on the synthetic corpus — and the report prints it. `overflow` is **0** on all
+four, and `buildings = files − massed` exactly.

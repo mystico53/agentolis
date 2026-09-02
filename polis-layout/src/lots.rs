@@ -1185,6 +1185,8 @@ pub(crate) fn parcel_city(
         );
     }
 
+    rehouse_overflow_next_door(&mut out, blocks, s);
+
     // Every file is accounted for: a plot that fell in no block at all (the
     // face walk dropped its cell) leaves its files unhoused, and that is
     // counted rather than silently lost.
@@ -1215,6 +1217,168 @@ pub(crate) fn parcel_city(
     out.report.unoccupied = out.parcels.iter().filter(|p| p.occupant.is_none()).count();
     out
 }
+
+/// Give every file the block had no room for a vacant parcel next door.
+///
+/// # The failure this exists to remove
+///
+/// Two files on one parcel means one of them has no building, and a file with
+/// no building is a file that has silently left the map — the worst outcome in
+/// this pipeline. It was measured at 11 files of 7 014 on Django and 21 of 6 138
+/// on `CPython`, and instrumenting it gave one cause, exactly:
+///
+/// ```text
+/// DIAG block=1540 plots=1 caps=[(5, 43)] files=43 viable=12 area=1.0274 verts=3
+/// ```
+///
+/// One plot, whose capacity is five, carrying **43** files, in a triangular face
+/// of area 1.03 against a median block of 4.81. `django/utils` is 43 files and
+/// [`crate::regions`] gave it a single plot: its partition divides plot
+/// *capacity* down the tree, but every district also has a floor of one plot,
+/// and Django is 2 076 directories over 2 472 plots — so the floor, not the
+/// balance, is what most leaf directories get. The files then all land on that
+/// one plot, and the face it sits in has room for twelve buildings at the local
+/// grain. Twelve fit. The subdivision is not at fault and neither is the
+/// densify loop: both were instrumented first and both had run to exhaustion,
+/// having produced every parcel the ground can hold.
+///
+/// # Why next door, and why this is not a papered-over crack
+///
+/// The ground the file needs exists a few metres away: Django's map has 3 260
+/// vacant parcels. So the surplus walks outward over the road graph and takes
+/// the nearest vacant parcel, preferring one in its own district, then one in
+/// its own top-level package, then any. That is the relaxation ladder PRD §7.2
+/// already applies to plots, applied one level down to parcels, and it is
+/// strictly better than the alternative it replaces — a real parcel of its own
+/// on a neighbour's ground beats no building at all.
+///
+/// It does not hide the shortfall: `shared_faces` still counts the districts
+/// whose ground could not hold them, and a file rehoused here is a file whose
+/// building stands outside its own district, which the report prints.
+///
+/// Deterministic: the overflow list is built in block order then file order, the
+/// walk is a breadth-first search over blocks in index order, and ties inside a
+/// ring go to the lowest parcel index (PRD §7.4).
+fn rehouse_overflow_next_door(out: &mut Parcelling, blocks: &[BlockPlan], s: &Settlement) {
+    if out.overflow.is_empty() {
+        return;
+    }
+    // Which blocks share a road edge.
+    let mut sides: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    for (i, b) in blocks.iter().enumerate() {
+        for &h in &b.half_edges {
+            sides
+                .entry(h / 2)
+                .or_default()
+                .push(u32::try_from(i).expect("block count fits in u32"));
+        }
+    }
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); blocks.len()];
+    for list in sides.values() {
+        if list.len() == 2 {
+            adj[list[0] as usize].push(list[1]);
+            adj[list[1] as usize].push(list[0]);
+        }
+    }
+    for list in &mut adj {
+        list.sort_unstable();
+        list.dedup();
+    }
+    // Vacant parcels per block, lowest index first.
+    let mut vacant: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (i, p) in out.parcels.iter().enumerate() {
+        if p.occupant.is_none() && (p.block as usize) < blocks.len() {
+            vacant[p.block as usize].push(i);
+        }
+    }
+    let packages = crate::districts::package_of(&s.territory);
+    let file_of: BTreeMap<&LogicalPath, u32> = s
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (&f.path, u32::try_from(i).expect("file count fits in u32")))
+        .collect();
+
+    let pending = std::mem::take(&mut out.overflow);
+    let mut still: Vec<Overflow> = Vec::new();
+    for entry in pending {
+        let Some(&fi) = file_of.get(&entry.path) else {
+            still.push(entry);
+            continue;
+        };
+        let from = entry
+            .shares
+            .and_then(|l| out.parcels.get(l.0 as usize))
+            .map(|p| p.block);
+        let Some(from) = from.filter(|b| (*b as usize) < blocks.len()) else {
+            still.push(entry);
+            continue;
+        };
+        let want = s.district_of_file(fi);
+        let package = |d: Option<u32>| d.and_then(|d| packages.get(&d).copied());
+        let mine = package(Some(want));
+        // Breadth-first over the road graph's faces, taking the best parcel in
+        // the nearest ring that has one: same district, then same package, then
+        // anything. Bounded, so a city with no vacant ground cannot walk it all.
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut ring: Vec<u32> = vec![from];
+        seen.insert(from);
+        let mut taken: Option<usize> = None;
+        for _ in 0..REHOUSE_RINGS {
+            let mut best: Option<(u8, usize)> = None;
+            for &b in &ring {
+                let Some(&pi) = vacant[b as usize].first() else {
+                    continue;
+                };
+                let d = blocks[b as usize].district;
+                let rank = if d == Some(want) {
+                    0
+                } else if package(d) == mine && mine.is_some() {
+                    1
+                } else {
+                    2
+                };
+                if best.is_none_or(|(r, p)| (rank, pi) < (r, p)) {
+                    best = Some((rank, pi));
+                }
+            }
+            if let Some((_, pi)) = best {
+                taken = Some(pi);
+                break;
+            }
+            let mut next: Vec<u32> = Vec::new();
+            for &b in &ring {
+                for &n in &adj[b as usize] {
+                    if seen.insert(n) {
+                        next.push(n);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            next.sort_unstable();
+            ring = next;
+        }
+        if let Some(pi) = taken {
+            let block = out.parcels[pi].block as usize;
+            vacant[block].retain(|&x| x != pi);
+            out.parcels[pi].occupant = Some(fi);
+            out.report.placed += 1;
+            out.report.overflow -= 1;
+        } else {
+            still.push(entry);
+        }
+    }
+    out.overflow = still;
+}
+
+/// How far a homeless file may walk for a parcel, in rings of blocks.
+///
+/// Four. Far enough to cross a crowded quarter, near enough that the building
+/// is still recognisably next to where it belongs; and it bounds the search on a
+/// city with no vacant ground at all.
+const REHOUSE_RINGS: usize = 4;
 
 /// Seat one block's files on its parcels.
 #[allow(clippy::too_many_arguments)]
@@ -1253,13 +1417,33 @@ fn seat_block(
     // files that fell off the end became `overflow` — a file drawn nowhere,
     // which is the worst outcome this stage has. Measured on the 1 200-file
     // fixture, breaking out gave 4 overflow files and striking off gives 0.
+    //
+    // **The budget is set by the demand, not by a constant.** It used to be
+    // `MAX_DENSIFY_ROUNDS * 3` — twenty-four — which is a bound on *work* while
+    // the work required is set by how many files the face has to seat. Measured
+    // once the district partition moved onto the plot adjacency graph and faces
+    // stopped being carved out of a territory polygon: one face of
+    // `django/utils`, a triangle of area 1.03 against a median block of 4.81,
+    // had to seat 43 files. Twenty-four rounds cannot produce 43 parcels from
+    // four, so eleven files ran out of *budget* rather than out of room and were
+    // drawn sharing a neighbour's parcel — the failure mode this stage exists to
+    // prevent. CPython's `PCbuild` was the same shape at 21 files.
+    //
+    // The bound below is a real one rather than a hope. Each round either splits
+    // a parcel, which strictly increases `viable` and so can happen at most
+    // `files.len()` times before the loop condition ends it, or strikes one off
+    // into `refused`, which is never retried and is bounded by the number of
+    // parcels that have ever existed. Two rounds per file plus the old constant
+    // covers both halves; `largest_untried` returning `None` is what actually
+    // ends the loop in practice.
     let mut rounds = 0;
+    let budget = files.len() * 2 + MAX_DENSIFY_ROUNDS * 3;
     let mut refused: BTreeSet<(i64, i64)> = BTreeSet::new();
     let key = |ring: &[Pt]| -> (i64, i64) {
         let c = centroid(ring);
         ((c[1] * 1e6) as i64, (c[0] * 1e6) as i64)
     };
-    while viable.len() < files.len() && rounds < MAX_DENSIFY_ROUNDS * 3 {
+    while viable.len() < files.len() && rounds < budget {
         rounds += 1;
         let Some(idx) = largest_untried(&viable, &refused, &key) else {
             break;

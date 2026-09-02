@@ -80,6 +80,7 @@ pub(crate) mod districts;
 pub(crate) mod geom;
 pub mod lots;
 pub(crate) mod memo;
+pub(crate) mod regions;
 pub mod roads;
 pub mod terrain;
 pub(crate) mod territory;

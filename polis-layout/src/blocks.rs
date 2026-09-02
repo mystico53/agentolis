@@ -45,12 +45,12 @@
     clippy::too_many_lines
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use polis_events::LogicalPath;
 
 use crate::accrete::Settlement;
-use crate::geom::{area, bounds, centroid, contains, dist, to_polygon, Pt};
+use crate::geom::{area, bounds, centroid, contains, dist, dist_to_boundary, to_polygon, Pt};
 use crate::roads::Face;
 use crate::{Block, BlockId};
 
@@ -276,7 +276,10 @@ pub(crate) fn assign(
         }
     }
 
-    for b in &mut blocks {
+    // The per-face tallies are kept, not consumed: `seat_unseated_districts`
+    // below needs to know how strongly a district voted on a face it lost.
+    let mut tallies: Vec<BTreeMap<u32, i64>> = vec![BTreeMap::new(); blocks.len()];
+    for (bi, b) in blocks.iter_mut().enumerate() {
         if b.plots.is_empty() {
             continue;
         }
@@ -287,16 +290,41 @@ pub(crate) fn assign(
             .map(|&pi| s.plots[pi as usize].birth)
             .min()
             .unwrap_or(u32::MAX);
-        let mut tally: BTreeMap<u32, u32> = BTreeMap::new();
+        // Whose face is this? A **depth-weighted** vote, not a head count.
+        //
+        // A plot votes with how far inside the face it sits. Its own cell's
+        // face has it well inside; a plot that ended up in a *neighbour's* face
+        // — because the collapse moved a boundary a fraction of a separation
+        // past it — sits right against the edge and votes with almost nothing.
+        //
+        // A head count cannot tell those apart, and on a two-plot face it lets
+        // the stray win the tie outright. This is a tie-break with a reason
+        // rather than a fix for a measured failure — the district fragmentation
+        // it was first written against turned out to come from `regions` and is
+        // fixed there — but it is the right rule either way: a face belongs to
+        // the cell that made it.
+        let mut tally: BTreeMap<u32, i64> = BTreeMap::new();
         for &pi in &b.plots {
-            *tally.entry(s.plots[pi as usize].district).or_insert(0) += 1;
+            let depth = dist_to_boundary(&b.ring, s.plots[pi as usize].pos).max(0.0);
+            let weight = (crate::determinism::quantize_f64(depth) * 1_000.0).round() as i64;
+            *tally.entry(s.plots[pi as usize].district).or_insert(0) += weight.max(1);
         }
-        // Majority district, ties to the lowest territory index — creation
-        // order, which is a property of the directory tree.
+        // Ties to the lowest territory index — creation order, which is a
+        // property of the directory tree and not of iteration.
         b.district = tally
             .iter()
             .max_by_key(|(d, c)| (**c, std::cmp::Reverse(**d)))
             .map(|(d, _)| *d);
+        tallies[bi] = tally;
+    }
+
+    seat_unseated_districts(&mut blocks, &tallies, s);
+
+    // Industrial is read off the district, so it is settled after the seats are.
+    for b in &mut blocks {
+        if b.plots.is_empty() {
+            continue;
+        }
         let industrial_plots = b
             .plots
             .iter()
@@ -313,6 +341,212 @@ pub(crate) fn assign(
     }
     (blocks, plot_block, off_face)
 }
+
+/// A district that settled ground must appear on the ground.
+///
+/// The vote in [`assign`] is taken one face at a time, so a district every one
+/// of whose faces also holds a deeper-voting neighbour can win *none* of them.
+/// [`crate::regions`] cannot prevent it — it guarantees the district a connected
+/// set of **plots**, and this is a fact about **faces**, which the collapse and
+/// the prune have moved since.
+///
+/// It is rare and it was invisible until the age ramp began seating 999 plots on
+/// the 5 000-file corpus where it had seated 955: two districts of 312 lost
+/// their ground and eight files became buildings standing in a stranger's
+/// quarter, which PRD §8 draws as a directory that is simply not on the map.
+///
+/// The repair is the same rule run once more with the winners fixed: each
+/// unseated district takes the one face where its own plots voted highest, and
+/// only from an owner that keeps at least one other face. That second clause is
+/// what makes this terminate and what stops it unseating someone in turn — the
+/// number of seated districts strictly rises and no district is ever emptied.
+///
+/// Order is by territory index over a `BTreeMap`, never by iteration (PRD §7.4).
+fn seat_unseated_districts(
+    blocks: &mut [BlockPlan],
+    tallies: &[BTreeMap<u32, i64>],
+    s: &Settlement,
+) {
+    // How many faces each district holds, and which districts have plots.
+    let mut seats: BTreeMap<u32, usize> = BTreeMap::new();
+    for b in blocks.iter() {
+        if let Some(d) = b.district {
+            *seats.entry(d).or_insert(0) += 1;
+        }
+    }
+    let mut wanting: BTreeSet<u32> = BTreeSet::new();
+    for p in &s.plots {
+        if !seats.contains_key(&p.district) {
+            wanting.insert(p.district);
+        }
+    }
+    for &d in &wanting {
+        // The face where this district's own plots sit deepest, among those
+        // whose current owner can spare it.
+        let mut best: Option<(i64, usize)> = None;
+        for (bi, t) in tallies.iter().enumerate() {
+            let Some(&mine) = t.get(&d) else { continue };
+            let Some(owner) = blocks[bi].district else {
+                continue;
+            };
+            if owner == d || seats.get(&owner).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            // Ties to the lowest block index, which is a face of the road graph
+            // and so a property of the geometry rather than of this loop.
+            if best.is_none_or(|(w, _)| mine > w) {
+                best = Some((mine, bi));
+            }
+        }
+        if let Some((_, bi)) = best {
+            if let Some(owner) = blocks[bi].district {
+                *seats.entry(owner).or_insert(1) -= 1;
+            }
+            blocks[bi].district = Some(d);
+            seats.insert(d, 1);
+        }
+    }
+}
+
+/// Put every district that came out in more than one piece back together, on
+/// the **blocks** rather than on the plots.
+///
+/// [`crate::regions`] guarantees that a district's *plots* are one connected
+/// part of the plot adjacency graph, and that is where the guarantee belongs —
+/// but it is not quite the thing the map shows. A block is a face of the road
+/// graph after the collapse and the prune, and the collapse moves boundaries: a
+/// plot can end up a hair inside its neighbour's face, take that face's label
+/// with it if the face is small enough, and cut the district next door in two.
+/// Measured on a 200-file fixture, that was one district of thirty-two.
+///
+/// So the last word on district shape is taken here, on the object the metric
+/// reads. A district keeps the piece holding its oldest block — the old town
+/// stays where it was — and each stray piece is given to the neighbour that
+/// already borders it most, preferring one in its own top-level package,
+/// because a stray handed to a cousin heals one district and splits the
+/// directory above it.
+///
+/// Giving a stray away cannot break the receiving district: the stray borders
+/// it, so the union stays connected. Each pass therefore strictly reduces the
+/// number of pieces.
+pub(crate) fn heal_districts(blocks: &mut [BlockPlan], territory: &crate::territory::Territory) {
+    let depth = territory.depths();
+    let n = blocks.len();
+    if n == 0 {
+        return;
+    }
+    // Which two faces each road edge separates.
+    let mut sides: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    for (i, b) in blocks.iter().enumerate() {
+        for &h in &b.half_edges {
+            sides
+                .entry(h / 2)
+                .or_default()
+                .push(u32::try_from(i).expect("block count fits in u32"));
+        }
+    }
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for list in sides.values() {
+        if list.len() != 2 {
+            continue;
+        }
+        adj[list[0] as usize].push(list[1]);
+        adj[list[1] as usize].push(list[0]);
+    }
+    for list in &mut adj {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    for _pass in 0..HEAL_PASSES {
+        let mut moved = false;
+        let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (i, b) in blocks.iter().enumerate() {
+            if let Some(d) = b.district {
+                groups
+                    .entry(d)
+                    .or_default()
+                    .push(u32::try_from(i).expect("fits"));
+            }
+        }
+        for (d, members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            let inside: BTreeSet<u32> = members.iter().copied().collect();
+            let mut seen: BTreeSet<u32> = BTreeSet::new();
+            let mut comps: Vec<Vec<u32>> = Vec::new();
+            for &start in &members {
+                if !seen.insert(start) {
+                    continue;
+                }
+                let mut comp = vec![start];
+                let mut stack = vec![start];
+                while let Some(u) = stack.pop() {
+                    for &v in &adj[u as usize] {
+                        if inside.contains(&v) && seen.insert(v) {
+                            comp.push(v);
+                            stack.push(v);
+                        }
+                    }
+                }
+                comps.push(comp);
+            }
+            if comps.len() < 2 {
+                continue;
+            }
+            let age = |c: &Vec<u32>| {
+                c.iter()
+                    .map(|&b| (blocks[b as usize].birth, b))
+                    .min()
+                    .unwrap_or((u32::MAX, u32::MAX))
+            };
+            let keep = (0..comps.len())
+                .min_by_key(|&i| age(&comps[i]))
+                .unwrap_or(0);
+            for (i, comp) in comps.iter().enumerate() {
+                if i == keep {
+                    continue;
+                }
+                let mut tally: BTreeMap<u32, usize> = BTreeMap::new();
+                for &b in comp {
+                    for &v in &adj[b as usize] {
+                        let Some(e) = blocks[v as usize].district else {
+                            continue;
+                        };
+                        if e != d {
+                            *tally.entry(e).or_insert(0) += 1;
+                        }
+                    }
+                }
+                // The **nearest relative** that borders the stray: the
+                // neighbour sharing the deepest directory with it. That keeps
+                // every subtree in one piece and not only the district and the
+                // package — a stray handed to a cousin heals a district and
+                // splits the directory above it.
+                let Some((&target, _)) = tally.iter().max_by_key(|(e, c)| {
+                    (
+                        crate::districts::common_depth(territory, &depth, d, **e),
+                        **c,
+                        std::cmp::Reverse(**e),
+                    )
+                }) else {
+                    continue;
+                };
+                for &b in comp {
+                    blocks[b as usize].district = Some(target);
+                }
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// How many times [`heal_districts`] sweeps before it gives up.
+const HEAL_PASSES: usize = 4;
 
 /// PRD §8's civic square: open ground at the historic centre.
 ///

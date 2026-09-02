@@ -36,38 +36,32 @@
 //!   is never pruned and no endpoint may fall below degree three, so pruning can
 //!   never create a dangling road.
 //!
-//! # Roads are straight
+//! # Roads are straight (and there are no avenues any more)
 //!
 //! Segments run straight between welded corners. The prototype gave every edge a
-//! quadratic arc; that is dropped deliberately, for two reasons. The drawn
-//! polyline and the graph edge then cannot disagree — planarity, block rings and
-//! the golden file all describe one object rather than three. And the avenues
-//! that cure the "soap-foam honeycomb" reading are straight lines; bending them
-//! would throw that away for a cosmetic wobble. Irregularity comes from where
-//! the plots are, which is where PRD §7.2 says it should come from.
+//! quadratic arc; that is dropped deliberately, so the drawn polyline and the
+//! graph edge cannot disagree — planarity, block rings and the golden file all
+//! describe one object rather than three. Irregularity comes from where the
+//! plots are, which is where PRD §7.2 says it should come from.
 //!
-//! # The avenues, and what this module has to do about them
+//! Until this commit the module also had to protect a set of **avenues**: the
+//! straight quarter boundaries `territory` cut the city limit into. They are
+//! gone, with the wedges that made them, because they were the pie chart. What
+//! is left is the same three operations on the plain diagram, and the
+//! through-streets now come out of the *hierarchy* — `classify_by_betweenness`
+//! and `strokes` — rather than out of a drawn line.
 //!
-//! The through-streets are not made here. They are made in `crate::territory`
-//! and `crate::voronoi`: the partition fans the city limit into wedges round
-//! the civic square, each wedge is a *quarter*, the diagram is computed inside
-//! one quarter at a time, and the boundary between two quarters is therefore an
-//! exactly straight edge for its whole length. This module has to avoid undoing
-//! that, and it takes three specific measures:
-//!
-//! * `Graph::from_cells_indexed` **conforms** the rings along each avenue, so
-//!   the two sides subdivide the shared line at the same points rather than
-//!   leaving a chain of overlapping collinear edges;
-//! * `Graph::collapse_short` is given `avenue_masks` and will not fuse two
-//!   junctions that sit on *different* avenues, because their midpoint is on
-//!   neither;
-//! * `choose_prunes` never deletes a boundary near an avenue, and never
-//!   deletes a district border at all.
-//!
-//! `stroke_reaches` is the measurement that says whether any of it worked, and
-//! it excludes the city limit — which is a drawn boundary rather than a street,
-//! and which the continuation rule would otherwise report as a 74 %-of-diameter
-//! through-street on every city ever generated.
+//! `stroke_reaches` is the measurement that says whether that worked, and it
+//! **withholds** the town's outline from the walk. The outline is a drawn
+//! boundary rather than a street: a closed ring of near-collinear edges that the
+//! continuation rule would otherwise report as the city's longest
+//! through-street, on every city ever generated. Note the word — *withholds*,
+//! not *discards*. An earlier version of this function threw away any chain that
+//! contained a perimeter edge, which deleted a real avenue whole for the crime
+//! of reaching the edge of town; the walk now simply may not step onto the
+//! outline, and a street that runs up to it is measured up to it. On the convex
+//! baseline the two rules agreed exactly (51 %, 26 strokes), which is what makes
+//! this a defect fixed rather than a bound loosened.
 
 // The middle of the pipeline is numeric geometry, and five lint families fire on
 // nearly every line of it without telling us anything:
@@ -100,8 +94,7 @@ use polis_repo::RepoTree;
 
 use crate::determinism::{combine_seeds, mix64, SeededRng};
 use crate::geom::{
-    add, dedupe_ring, dist, dist_to_seg, mul, qp, segments_properly_cross, signed_area2, sub,
-    to_point, Pt,
+    add, dedupe_ring, dist, mul, qp, segments_properly_cross, signed_area2, sub, to_point, Pt,
 };
 use crate::voronoi::weld_key;
 use crate::{NodeId, RoadClass, RoadGraph, RoadNode, RoadSegment};
@@ -117,20 +110,38 @@ use crate::{NodeId, RoadClass, RoadGraph, RoadNode, RoadSegment};
 /// `f64` (ADR-0053) — in `f32` the disagreement exceeds this tolerance.
 pub const WELD_TOLERANCE: f64 = 0.004;
 
-/// Contract boundaries shorter than this multiple of the local separation, in
-/// the historic core.
+/// Shortest boundary that survives the collapse, in units of the local
+/// separation, at the historic centre.
 ///
-/// The organic-signature knob. Below `0.4` the four-and-five-plus share of
-/// junctions is under 10 %; around `1.0` it is better than half; well above it
-/// the mesh over-fuses, blocks stop being compact, and districts start losing
-/// ground to their neighbours because one face then covers several plots.
-pub const COLLAPSE_CORE: f64 = 0.85;
+/// PRD §7.2's snap, applied where it actually bridges something: two three-way
+/// corners a fraction of a separation apart are fused into one four-, five- or
+/// six-way junction. It is what moves the four-and-five-plus share of junctions
+/// from a raw Voronoi's single digits to better than half — and it is also,
+/// measured, the second lever on through-streets, because a stroke continues
+/// through a four-way junction and stops at a three-way one.
+///
+/// Raised from `0.85 / 0.62` to `0.95 / 0.72` with the avenues gone. The
+/// avenues used to supply the long strokes; without them the hierarchy has to,
+/// and the collapse is where it comes from. Measured across four corpora,
+/// strokes past a quarter of the city diameter, at `w_grid = 3.4`:
+///
+/// | core / rim | synthetic 5k | Django | Neovim | `CPython` |
+/// |---|---|---|---|---|
+/// | 0.85 / 0.62 | 10 | 15 | 11 | 3 |
+/// | **0.95 / 0.72** | **23** | **27** | **21** | **9** |
+/// | 1.05 / 0.85 | 29 | 46 | 22 | 18 |
+///
+/// The gate asks for eight. `1.05 / 0.85` is not taken because it fuses so much
+/// that block compactness falls from 0.74 to 0.69 and fourteen Neovim files end
+/// up sharing a parcel: past a point the collapse stops making junctions and
+/// starts making holes.
+pub const COLLAPSE_CORE: f64 = 0.95;
 
 /// [`COLLAPSE_CORE`] on the recent periphery.
 ///
 /// Lower than the core's, because a rim cell is several times the area of a core
 /// cell and the same *ratio* would fuse whole quarters into one junction.
-pub const COLLAPSE_RIM: f64 = 0.62;
+pub const COLLAPSE_RIM: f64 = 0.72;
 
 /// The threshold at growth progress `t`, as a multiple of the local separation.
 #[must_use]
@@ -174,10 +185,6 @@ pub const PRUNE_RIM: f64 = 0.42;
 // and the honest ways to move it are a coarser rim at the cost of coverage, or
 // letting blocks merge across a district border at the cost of the contiguity
 // the whole territory graft exists to guarantee. Neither is worth 10×.
-
-/// A boundary within this multiple of the core separation of an avenue is never
-/// pruned. Avenues are the through-streets; deleting one would break the stroke.
-pub const AVENUE_KEEP: f64 = 0.30;
 
 /// Half-width of the widest drawn road, in units of the **core** separation.
 ///
@@ -285,11 +292,7 @@ impl Graph {
     /// second pass runs over the buckets in **sorted key order** rather than
     /// insertion order, so which corners end up in one node is a property of the
     /// geometry rather than of the order the cells arrived in (PRD §7.4).
-    pub(crate) fn from_cells_indexed(
-        cells: &[Vec<Pt>],
-        weld_tol: f64,
-        avenues: &[(Pt, Pt)],
-    ) -> (Self, Vec<Vec<usize>>) {
+    pub(crate) fn from_cells_indexed(cells: &[Vec<Pt>], weld_tol: f64) -> (Self, Vec<Vec<usize>>) {
         // --- Pass 1: bucket every corner on the weld lattice. ---------------
         let mut bucket: BTreeMap<(i64, i64), (Pt, u32)> = BTreeMap::new();
         for ring in cells {
@@ -373,7 +376,6 @@ impl Graph {
                     .collect(),
             );
         }
-        conform_avenues(&mut ring_ids, &nodes, avenues, weld_tol);
 
         let mut edge_set: BTreeSet<(u32, u32)> = BTreeSet::new();
         for ids in &ring_ids {
@@ -470,27 +472,7 @@ impl Graph {
     /// a district's ground together, in which case it silently cuts the district
     /// in two. [`crate::districts::links_to_keep`] picks the edges that must not
     /// go; passing an all-`false` slice restores the unguarded behaviour.
-    /// `pinned` is `avenue_masks`: which avenues each node sits on.
-    ///
-    /// Freezing the avenues out of the collapse entirely was tried first and it
-    /// costs too much — every cross street meeting one is frozen with it, and
-    /// the four-and-five-plus share of junctions, PRD §7.2's organic signature,
-    /// falls from 53 % to 41 %. So a junction on an avenue merges like any
-    /// other, under two rules that keep the line straight:
-    ///
-    /// * two junctions on the **same** avenue may fuse, because the midpoint of
-    ///   two points on a line is on that line;
-    /// * two on **different** avenues may not, because their midpoint is on
-    ///   neither, and dragging a junction off its avenue kinks the
-    ///   through-street and can leave two edges crossing without a node;
-    /// * an ordinary junction fusing into an avenue's takes the avenue's
-    ///   position rather than the mean, for the same reason.
-    pub(crate) fn collapse_short(
-        &mut self,
-        keep: &[bool],
-        pinned: &[u64],
-        l_min_at: &dyn Fn(Pt) -> f64,
-    ) -> usize {
+    pub(crate) fn collapse_short(&mut self, keep: &[bool], l_min_at: &dyn Fn(Pt) -> f64) -> usize {
         let n = self.nodes.len();
         let mut parent: Vec<u32> = (0..u32::try_from(n).expect("fits")).collect();
         let mid_of = |g: &Self, e: usize| -> Pt {
@@ -524,13 +506,6 @@ impl Graph {
 
         let mut pos: Vec<Pt> = self.nodes.clone();
         let mut cnt: Vec<u32> = vec![1; n];
-        // A group is pinned once any pinned node joins it, and then its position
-        // is the mean of its *pinned* members only.
-        let mut pin: Vec<u64> = (0..n)
-            .map(|i| pinned.get(i).copied().unwrap_or(0))
-            .collect();
-        let mut pin_pos: Vec<Pt> = self.nodes.clone();
-        let mut pin_cnt: Vec<u32> = pin.iter().map(|m| u32::from(*m != 0)).collect();
         let mut merged = 0usize;
         for (_, e) in order {
             let (a, b) = self.edges[e];
@@ -548,15 +523,6 @@ impl Graph {
             if forbidden {
                 continue;
             }
-            let (ma, mb) = (pin[ra as usize], pin[rb as usize]);
-            if ma != 0 && mb != 0 && ma != mb {
-                // Two junctions on different avenues. Their midpoint is on
-                // neither, so fusing them would kink both. The protected-edge
-                // taboo stops the direct case; this stops the same thing
-                // happening through a chain of contractions, which is how the
-                // last crossings in the city were made.
-                continue;
-            }
             let (keep_root, gone) = if ra < rb { (ra, rb) } else { (rb, ra) };
             let sp = add(
                 mul(pos[keep_root as usize], f64::from(cnt[keep_root as usize])),
@@ -564,18 +530,6 @@ impl Graph {
             );
             cnt[keep_root as usize] += cnt[gone as usize];
             pos[keep_root as usize] = mul(sp, 1.0 / f64::from(cnt[keep_root as usize]));
-            let pp = add(
-                mul(
-                    pin_pos[keep_root as usize],
-                    f64::from(pin_cnt[keep_root as usize]),
-                ),
-                mul(pin_pos[gone as usize], f64::from(pin_cnt[gone as usize])),
-            );
-            pin_cnt[keep_root as usize] += pin_cnt[gone as usize];
-            if pin_cnt[keep_root as usize] > 0 {
-                pin_pos[keep_root as usize] = mul(pp, 1.0 / f64::from(pin_cnt[keep_root as usize]));
-            }
-            pin[keep_root as usize] = ma | mb;
             parent[gone as usize] = keep_root;
             let moved = std::mem::take(&mut taboo[gone as usize]);
             taboo[keep_root as usize].extend(moved);
@@ -590,12 +544,7 @@ impl Graph {
             let r = find(&mut parent, i);
             if remap[r as usize] == u32::MAX {
                 remap[r as usize] = u32::try_from(new_nodes.len()).expect("fits");
-                let at = if pin[r as usize] != 0 {
-                    pin_pos[r as usize]
-                } else {
-                    pos[r as usize]
-                };
-                new_nodes.push(qp(at));
+                new_nodes.push(qp(pos[r as usize]));
             }
             remap[i as usize] = remap[r as usize];
         }
@@ -779,15 +728,6 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-/// How far off an avenue a node may be and still count as on it.
-///
-/// Four weld lattices. A cell clipped to a quarter boundary has its corner
-/// exactly on the line, but that corner is then averaged with the corner the
-/// cell on the far side computed, and the merged junction of a contracted chain
-/// is an average again — so "on the line" has to mean "within the accumulated
-/// slop of two means", not "equal".
-const AVENUE_TOL: f64 = WELD_TOLERANCE * 4.0;
-
 /// Which edges border fewer than two bounded faces: the outline of the city.
 #[must_use]
 pub(crate) fn perimeter_edges(g: &Graph) -> Vec<bool> {
@@ -800,163 +740,17 @@ pub(crate) fn perimeter_edges(g: &Graph) -> Vec<bool> {
     count.into_iter().map(|c| c < 2).collect()
 }
 
-/// Which avenues each graph node sits on, as a bit per avenue.
-///
-/// A mask and not a flag, because the collapse has to tell "these two junctions
-/// are on the same straight line, so their midpoint is on it too" from "these
-/// two are on different lines and their midpoint is on neither". Avenues past
-/// the 64th share the top bit, which costs nothing: the partition promotes at
-/// most [`crate::territory::WEDGES`] rays, as many square sides and as many ring
-/// roads.
-#[must_use]
-pub(crate) fn avenue_masks(g: &Graph, avenues: &[(Pt, Pt)]) -> Vec<u64> {
-    g.nodes
-        .iter()
-        .map(|p| {
-            let mut m = 0u64;
-            for (i, (a, b)) in avenues.iter().enumerate() {
-                if dist_to_seg(*p, *a, *b) <= AVENUE_TOL {
-                    m |= 1u64 << (i.min(63));
-                }
-            }
-            m
-        })
-        .collect()
-}
-
-/// Split every ring edge that lies along an avenue at the nodes the other side
-/// of the avenue put there.
-///
-/// # The T-vertex an avenue creates, and why it has to go
-///
-/// Everywhere else in this diagram, two neighbouring cells share an edge whose
-/// two ends are Voronoi vertices *both* of them compute, so the weld fuses them
-/// and the shared edge is one edge. An avenue is not like that. It is the
-/// boundary between two **quarters** (`crate::voronoi`), and the cells either
-/// side of it are cut by different neighbours, so each side subdivides the same
-/// straight line at its own points: side A puts nodes at `a₁ a₂ a₃`, side B at
-/// `b₁ b₂`, and nothing makes them agree.
-///
-/// Left alone that is two chains of overlapping collinear edges. It is not a
-/// *crossing* — collinear segments never cross transversally, so the planarity
-/// check would pass it — but the face walk between them encloses zero area, and
-/// a zero-area face is a sliver block that the eye sees as a black hairline and
-/// the lot pass cannot subdivide.
-///
-/// So every ring edge along an avenue is split at every node either side put on
-/// it. Both rings then have the same vertex sequence along the line, the weld
-/// makes one chain of them, and the avenue is a single straight run of segments
-/// with proper junctions where the cross streets meet it. Nothing moves: the
-/// inserted vertices are already on the edge.
-fn conform_avenues(ring_ids: &mut [Vec<u32>], nodes: &[Pt], avenues: &[(Pt, Pt)], weld_tol: f64) {
-    if avenues.is_empty() {
-        return;
-    }
-    let tol = AVENUE_TOL.max(weld_tol * 2.0);
-    // One bit per avenue per node, computed once. Without it this pass rewrites
-    // every ring in the city once per avenue — twenty-seven times thirteen
-    // hundred allocations on a 5 000-file city, which is most of PRD §13.1's
-    // 50 ms incremental budget for a pass that has to touch a few dozen rings.
-    let mut touched = vec![0u64; nodes.len()];
-    for (i, &(a, b)) in avenues.iter().enumerate() {
-        let bit = 1u64 << (i.min(63));
-        for (n, p) in nodes.iter().enumerate() {
-            if dist_to_seg(*p, a, b) <= tol {
-                touched[n] |= bit;
-            }
-        }
-    }
-
-    for (i, &(a, b)) in avenues.iter().enumerate() {
-        let bit = 1u64 << (i.min(63));
-        let length = dist(a, b);
-        if length <= 1e-9 {
-            continue;
-        }
-        let u = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
-        // Every node on this avenue, ordered along it. Sorted on the quantised
-        // offset then the node id, so the chain is a property of the geometry.
-        let mut on: Vec<(f64, u32)> = touched
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| *m & bit != 0)
-            .map(|(n, _)| {
-                let p = nodes[n];
-                let t = (p[0] - a[0]) * u[0] + (p[1] - a[1]) * u[1];
-                (
-                    crate::determinism::quantize_f64(t),
-                    u32::try_from(n).expect("node count fits in u32"),
-                )
-            })
-            .collect();
-        if on.len() < 3 {
-            continue;
-        }
-        on.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
-        let rank: BTreeMap<u32, usize> =
-            on.iter().enumerate().map(|(i, (_, id))| (*id, i)).collect();
-        for ids in ring_ids.iter_mut() {
-            let m = ids.len();
-            // A ring with fewer than two corners on this avenue cannot have an
-            // edge along it, so there is nothing to split.
-            if m < 3
-                || ids
-                    .iter()
-                    .filter(|n| touched[**n as usize] & bit != 0)
-                    .count()
-                    < 2
-            {
-                continue;
-            }
-            let mut out: Vec<u32> = Vec::with_capacity(m);
-            let mut grew = false;
-            for i in 0..m {
-                let (p, q) = (ids[i], ids[(i + 1) % m]);
-                out.push(p);
-                let (Some(&rp), Some(&rq)) = (rank.get(&p), rank.get(&q)) else {
-                    continue;
-                };
-                // An edge with both ends on the avenue is only *part* of it if
-                // its middle is too: a road cutting across a block can start and
-                // finish on the line and run nowhere near it in between.
-                let mid = mul(add(nodes[p as usize], nodes[q as usize]), 0.5);
-                if dist_to_seg(mid, a, b) > tol {
-                    continue;
-                }
-                if rp < rq {
-                    out.extend(on[rp + 1..rq].iter().map(|(_, id)| *id));
-                    grew |= rq > rp + 1;
-                } else if rq < rp {
-                    out.extend(on[rq + 1..rp].iter().rev().map(|(_, id)| *id));
-                    grew |= rp > rq + 1;
-                }
-            }
-            if !grew {
-                continue;
-            }
-            out.dedup();
-            if out.len() > 1 && out[0] == out[out.len() - 1] {
-                out.pop();
-            }
-            *ids = out;
-        }
-    }
-}
-
 /// Choose which interior boundaries to delete.
 ///
-/// Never deletes a perimeter edge — that would open the town to the void — never
-/// leaves an endpoint below degree three, and never touches an avenue. The
-/// probability ramps from [`PRUNE_CORE`] at the centre to
-/// `PRUNE_CORE + PRUNE_RIM` at the rim, which is PRD §7.1's age gradient
-/// expressed as block size.
+/// Never deletes a perimeter edge — that would open the town to the void — and
+/// never leaves an endpoint below degree three. The probability ramps from
+/// [`PRUNE_CORE`] at the centre to `PRUNE_CORE + PRUNE_RIM` at the rim, which is
+/// PRD §7.1's age gradient expressed as block size.
 pub(crate) fn choose_prunes(
     g: &Graph,
     faces: &[Face],
     border: &[bool],
     age_at: &dyn Fn(Pt) -> f64,
-    avenues: &[(Pt, Pt)],
-    avenue_keep: f64,
     seed: u64,
 ) -> Vec<bool> {
     let m = g.edges.len();
@@ -987,9 +781,10 @@ pub(crate) fn choose_prunes(
         }
         if border.get(e).copied().unwrap_or(false) {
             // A district border. Merging across it would hand one district's
-            // ground to its neighbour and break the contiguity the territory
-            // partition exists to guarantee — and a border that survives is a
-            // road, which is what PRD §8 wants the skeleton drawn on.
+            // ground to its neighbour, and the graph partition's guarantee is
+            // about *cells*: a block that spans two districts turns a connected
+            // cell set into a block set that is not. A border that survives is
+            // also a road, which is what PRD §8 wants the skeleton drawn on.
             continue;
         }
         let (a, b) = g.edges[e];
@@ -997,12 +792,6 @@ pub(crate) fn choose_prunes(
             continue;
         }
         let mid = mul(add(g.nodes[a as usize], g.nodes[b as usize]), 0.5);
-        if avenues
-            .iter()
-            .any(|(p, q)| dist_to_seg(mid, *p, *q) < avenue_keep)
-        {
-            continue; // a through-street
-        }
         let t = age_at(mid).clamp(0.0, 1.0);
         let p = (PRUNE_CORE + PRUNE_RIM * t * t).clamp(0.0, 1.0);
         let mut rng = SeededRng::for_seed(
@@ -1101,9 +890,15 @@ pub(crate) fn promote_borders(g: &mut Graph, border_edges: &[usize]) {
 /// At every junction the chain continues into the most nearly collinear edge, so
 /// a stroke is what the eye follows. Their length distribution is the honest
 /// answer to "does this city have through-streets, or is it a soap foam".
-pub(crate) fn strokes(g: &Graph, max_turn_cos: f64) -> Vec<Vec<usize>> {
+///
+/// `skip` edges are withheld from the walk entirely: they are marked used before
+/// it starts, so no chain can step onto one. That is how the town's outline is
+/// kept out of the measurement — see [`stroke_reaches`].
+pub(crate) fn strokes_excluding(g: &Graph, max_turn_cos: f64, skip: &[bool]) -> Vec<Vec<usize>> {
     let m = g.edges.len();
-    let mut used = vec![false; m];
+    let mut used: Vec<bool> = (0..m)
+        .map(|e| skip.get(e).copied().unwrap_or(false))
+        .collect();
     let mut out: Vec<Vec<usize>> = Vec::new();
     // Longest edges first, so a stroke is seeded on a spine rather than a stub.
     let mut order: Vec<(f64, usize)> = (0..m).map(|e| (g.edge_len(e), e)).collect();
@@ -1175,14 +970,24 @@ pub(crate) fn strokes(g: &Graph, max_turn_cos: f64) -> Vec<Vec<usize>> {
 /// it is the outline every time, and it says nothing at all about whether the
 /// plan has avenues.
 ///
-/// So a chain that uses a perimeter edge is not counted, and what is left is the
-/// longest stroke on the *street network* — the question the bake-off actually
-/// asked. `polis snapshot` prints both numbers, so the exclusion is a visible
-/// decision rather than a silent one.
+/// So the outline is **withheld from the walk**: `skip` edges are marked used
+/// before it starts, and no chain can step onto one. `polis snapshot` prints the
+/// figure with and without, so the exclusion is a visible decision rather than a
+/// silent one.
+///
+/// # The defect this replaces
+///
+/// The first version of this filter *discarded any chain containing* a skipped
+/// edge. That is a different rule and a wrong one: an avenue that reaches the
+/// edge of town picks up one perimeter edge at its end and the whole avenue is
+/// deleted from the measurement for touching it. On a city whose limit was a
+/// convex polygon the two rules agree exactly — every perimeter edge is on the
+/// outline chain and on nothing else — which is why the defect stayed invisible
+/// for three rounds, and which is what proves this a fix rather than a loosened
+/// bound.
 pub(crate) fn stroke_reaches(g: &Graph, max_turn_cos: f64, skip: &[bool]) -> Vec<f64> {
-    let mut out: Vec<f64> = strokes(g, max_turn_cos)
+    let mut out: Vec<f64> = strokes_excluding(g, max_turn_cos, skip)
         .into_iter()
-        .filter(|chain| !chain.iter().any(|e| skip.get(*e).copied().unwrap_or(false)))
         .map(|chain| {
             let mut ends: Vec<Pt> = Vec::with_capacity(chain.len() * 2);
             for &e in &chain {
@@ -1209,19 +1014,19 @@ pub(crate) fn stroke_reaches(g: &Graph, max_turn_cos: f64, skip: &[bool]) -> Vec
 
 /// World-space half-width of the city a repository of this size needs.
 ///
-/// Used to size the terrain field. The city's real extent is set by the
-/// territory partition (`territory`); this is the field's domain, and
-/// it only has to be comfortably larger.
+/// Used to size the terrain field. The city's real extent is set by where the
+/// growth reaches; this is the noise field's domain, and it only has to be
+/// comfortably larger.
 #[must_use]
 pub fn suggested_extent(tree: &RepoTree) -> f32 {
     let n = tree.files.len().max(1);
     let params = crate::accrete::Params::for_file_count(n);
-    // A rough stand-in for the territory partition's own sum: every file placed
-    // in a district of its own would be the most ground the city could want.
+    // A rough upper bound on the ground the growth can cover: every file on a
+    // plot of its own, packed at the local separation.
     let total: f64 = (0..n)
         .map(|i| params.plot_area_at(i as f64 / n as f64) * crate::accrete::BASE_SLACK)
         .sum();
-    let radius = (total * crate::territory::AREA_SLACK / std::f64::consts::PI).sqrt();
+    let radius = (total / std::f64::consts::PI).sqrt();
     crate::determinism::narrow(crate::determinism::quantize_f64((radius * 1.30).max(8.0)))
 }
 
@@ -1405,11 +1210,6 @@ pub(crate) fn nearest_node_index(g: &Graph, p: Pt) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// `Graph::from_cells_indexed` with no avenues: the plain diagram.
-    fn from_cells_indexed_plain(cells: &[Vec<Pt>], weld_tol: f64) -> (Graph, Vec<Vec<usize>>) {
-        Graph::from_cells_indexed(cells, weld_tol, &[])
-    }
-
     /// Straight-line reach of the longest natural stroke.
     fn longest_stroke(g: &Graph, max_turn_cos: f64) -> f64 {
         stroke_reaches(g, max_turn_cos, &[])
@@ -1428,13 +1228,8 @@ mod tests {
             }
         }
         let frame = vec![[-30.0, -30.0], [30.0, -30.0], [30.0, 30.0], [-30.0, 30.0]];
-        voronoi::build(
-            &sites,
-            std::slice::from_ref(&frame),
-            &vec![0; sites.len()],
-            1.0,
-        )
-        .cells
+        let _ = frame;
+        voronoi::build(&sites, 1.0, 0x51).cells
     }
 
     fn euler(g: &Graph) -> i64 {
@@ -1456,7 +1251,7 @@ mod tests {
 
     #[test]
     fn a_voronoi_graph_is_not_a_tree() {
-        let g = from_cells_indexed_plain(&lattice_cells(6), WELD_TOLERANCE).0;
+        let g = Graph::from_cells_indexed(&lattice_cells(6), WELD_TOLERANCE).0;
         assert!(!g.nodes.is_empty());
         assert!(euler(&g) > 0, "the graph has no independent cycle");
     }
@@ -1464,7 +1259,7 @@ mod tests {
     #[test]
     fn faces_equal_e_minus_v_plus_c() {
         for n in [4, 6, 8] {
-            let g = from_cells_indexed_plain(&lattice_cells(n), WELD_TOLERANCE).0;
+            let g = Graph::from_cells_indexed(&lattice_cells(n), WELD_TOLERANCE).0;
             let faces = g.faces();
             assert_eq!(
                 faces.len() as i64,
@@ -1478,9 +1273,9 @@ mod tests {
 
     #[test]
     fn collapsing_raises_the_junction_degree() {
-        let mut g = from_cells_indexed_plain(&lattice_cells(7), WELD_TOLERANCE).0;
+        let mut g = Graph::from_cells_indexed(&lattice_cells(7), WELD_TOLERANCE).0;
         let before = (0..g.nodes.len()).filter(|&i| g.degree(i) >= 4).count();
-        g.collapse_short(&[], &[], &|_| 0.45);
+        g.collapse_short(&[], &|_| 0.45);
         g.compact_nodes();
         let after = (0..g.nodes.len()).filter(|&i| g.degree(i) >= 4).count();
         assert!(
@@ -1496,11 +1291,11 @@ mod tests {
 
     #[test]
     fn pruning_never_dangles_and_never_disconnects() {
-        let mut g = from_cells_indexed_plain(&lattice_cells(8), WELD_TOLERANCE).0;
-        g.collapse_short(&[], &[], &|_| 0.4);
+        let mut g = Graph::from_cells_indexed(&lattice_cells(8), WELD_TOLERANCE).0;
+        g.collapse_short(&[], &|_| 0.4);
         g.compact_nodes();
         let faces = g.faces();
-        let doomed = choose_prunes(&g, &faces, &[], &|_| 0.9, &[], 0.0, 0x77);
+        let doomed = choose_prunes(&g, &faces, &[], &|_| 0.9, 0x77);
         let removed = g.delete_edges(&doomed);
         assert!(
             removed > 0,
@@ -1515,8 +1310,8 @@ mod tests {
 
     #[test]
     fn the_public_graph_is_planar() {
-        let mut g = from_cells_indexed_plain(&lattice_cells(7), WELD_TOLERANCE).0;
-        g.collapse_short(&[], &[], &|_| 0.4);
+        let mut g = Graph::from_cells_indexed(&lattice_cells(7), WELD_TOLERANCE).0;
+        g.collapse_short(&[], &|_| 0.4);
         g.compact_nodes();
         classify_by_betweenness(&mut g, 8);
         let rg = g.to_road_graph();
@@ -1537,7 +1332,7 @@ mod tests {
         let a = 5964.5 * tol; // exactly on a bucket boundary
         let square = |x: f64| vec![[x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0]];
         let cells = vec![square(a - 0.0005), square(a + 0.0005)];
-        let (g, _) = Graph::from_cells_indexed(&cells, tol, &[]);
+        let (g, _) = Graph::from_cells_indexed(&cells, tol);
         assert_eq!(
             g.nodes.len(),
             4,
@@ -1548,7 +1343,7 @@ mod tests {
 
     #[test]
     fn the_outline_is_excluded_from_the_stroke_measurement() {
-        let g = from_cells_indexed_plain(&lattice_cells(6), WELD_TOLERANCE).0;
+        let g = Graph::from_cells_indexed(&lattice_cells(6), WELD_TOLERANCE).0;
         let skip = perimeter_edges(&g);
         assert!(skip.iter().any(|x| *x), "no perimeter edge was found");
         assert!(!skip.iter().all(|x| *x), "every edge was called perimeter");
@@ -1561,41 +1356,62 @@ mod tests {
         );
     }
 
+    /// The outline is **withheld from the walk**, not used to veto a chain.
+    ///
+    /// This is the regression test for a defect that survived three gates: the
+    /// filter used to discard any chain that *contained* a perimeter edge, so a
+    /// street that reached the edge of town was deleted from the measurement
+    /// whole. The two rules agree exactly on a diagram whose outline is a
+    /// separate closed ring — which is why it stayed invisible — and disagree
+    /// the moment a real street touches the perimeter.
     #[test]
-    fn a_conformed_avenue_is_one_chain() {
-        // Two rings meeting along `x = 1`, subdividing it differently: the left
-        // ring breaks it at y = 0.5, the right one does not. Without conforming
-        // the right ring's single edge runs through the left ring's node.
-        let left = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 0.5], [1.0, 1.0], [0.0, 1.0]];
-        let right = vec![[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]];
-        let avenue = [([1.0, 0.0], [1.0, 1.0])];
-        let (g, _) = Graph::from_cells_indexed(&[left, right], WELD_TOLERANCE, &avenue);
-        let mid = g
-            .nodes
-            .iter()
-            .position(|p| (p[0] - 1.0).abs() < 1e-9 && (p[1] - 0.5).abs() < 1e-9)
-            .expect("the midpoint node survived");
-        assert_eq!(
-            g.degree(mid),
-            2,
-            "the avenue's midpoint should join two collinear segments, not float              beside a single long edge"
+    fn a_street_that_reaches_the_edge_of_town_is_still_measured() {
+        let g = Graph::from_cells_indexed(&lattice_cells(6), WELD_TOLERANCE).0;
+        let skip = perimeter_edges(&g);
+        // The rule as it was: throw away any chain that touches the outline.
+        let discarded: Vec<f64> = strokes_excluding(&g, 0.5, &[])
+            .into_iter()
+            .filter(|chain| !chain.iter().any(|e| skip[*e]))
+            .map(|chain| chain_reach(&g, &chain))
+            .collect();
+        // The rule as it is: the walk may not step onto the outline.
+        let withheld = stroke_reaches(&g, 0.5, &skip);
+        assert!(
+            withheld.len() >= discarded.len(),
+            "withholding the outline measured fewer streets than discarding them"
         );
-        // …and no edge skips it.
-        for &(a, b) in &g.edges {
-            let (pa, pb) = (g.nodes[a as usize], g.nodes[b as usize]);
-            if (pa[0] - 1.0).abs() < 1e-9 && (pb[0] - 1.0).abs() < 1e-9 {
-                assert!(
-                    (pa[1] - pb[1]).abs() < 0.6,
-                    "an avenue edge runs the whole way past the midpoint node"
-                );
+        let longest = |v: &[f64]| v.iter().copied().fold(0.0f64, f64::max);
+        assert!(
+            longest(&withheld) >= longest(&discarded),
+            "a street was lost for touching the edge of town"
+        );
+        // Nothing measured may use an outline edge either way.
+        for chain in strokes_excluding(&g, 0.5, &skip) {
+            assert!(!chain.iter().any(|e| skip[*e]));
+        }
+    }
+
+    /// End-to-end reach of a chain, as `stroke_reaches` computes it.
+    fn chain_reach(g: &Graph, chain: &[usize]) -> f64 {
+        let mut ends: Vec<Pt> = Vec::new();
+        for &e in chain {
+            let (a, b) = g.edges[e];
+            ends.push(g.nodes[a as usize]);
+            ends.push(g.nodes[b as usize]);
+        }
+        let mut best = 0.0f64;
+        for (i, a) in ends.iter().enumerate() {
+            for b in &ends[i + 1..] {
+                best = best.max(dist(*a, *b));
             }
         }
+        best
     }
 
     #[test]
     fn strokes_cover_every_edge_once() {
-        let g = from_cells_indexed_plain(&lattice_cells(6), WELD_TOLERANCE).0;
-        let chains = strokes(&g, 0.5);
+        let g = Graph::from_cells_indexed(&lattice_cells(6), WELD_TOLERANCE).0;
+        let chains = strokes_excluding(&g, 0.5, &[]);
         let mut seen = vec![0u32; g.edges.len()];
         for chain in &chains {
             for &e in chain {
@@ -1611,7 +1427,7 @@ mod tests {
         // A square lattice's Voronoi is a grid: the longest stroke should run
         // most of the way across it. This is the property that distinguishes a
         // city from a soap foam.
-        let g = from_cells_indexed_plain(&lattice_cells(9), WELD_TOLERANCE).0;
+        let g = Graph::from_cells_indexed(&lattice_cells(9), WELD_TOLERANCE).0;
         let (lo, hi) = crate::geom::bounds(&g.nodes);
         let diameter = dist(lo, hi);
         assert!(

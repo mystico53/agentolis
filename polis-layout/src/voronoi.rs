@@ -7,11 +7,11 @@
 //! and full of closed faces **by construction** rather than by tuning a snap
 //! radius. Every cell contributes one independent cycle; there is no parameter
 //! setting at which it degenerates into a tree, which is exactly the failure
-//! mode PRD §7.2 warns about and the previous M1 attempt hit.
+//! mode PRD §7.2 warns about and the first M1 attempt hit.
 //!
 //! # Half-plane clipping, not a triangulation
 //!
-//! A cell is built by starting from the city limit and clipping by the
+//! A cell is built by starting from a fixed frame and clipping by the
 //! perpendicular bisector with every neighbour inside a query radius, widening
 //! the radius until it provably covers the cell (`2 · rmax ≤ radius`). No
 //! degenerate predicates, no insertion-order sensitivity, and the neighbour set
@@ -19,69 +19,36 @@
 //!
 //! **This is the code that must stay `f64`** (ADR-0053). See [`crate::geom`].
 //!
-//! # The city limit is the frame, and there are no phantom sites
+//! # The edge of town is where the ground stops, not a drawn limit
 //!
-//! The design this port is based on bounded its outer cells with a ring of
-//! *phantom* plots laid wherever the ground was empty, and discarded their
-//! cells. That has two costs, both of which showed up on measurement. Empty
-//! ground **inside** the settlement also grows phantoms, so a gap between two
-//! quarters becomes a hole in the map and, if the gap is wide enough, splits the
-//! road graph — eleven components at 5 000 files, where the whole design turns
-//! on there being one. And the outer boundary follows wherever the growth
-//! happened to reach, which is the ragged fringe and the tentacles the bake-off
-//! called out.
+//! An earlier port of this module bounded every cell by clipping it to a convex
+//! *city limit* polygon — a wobbled nineteen-gon's hull — and computed the
+//! diagram inside a fan of wedges cut out of it. Both are gone, and the reason
+//! is that they were the whole of the "pie chart on a coin": the limit made the
+//! silhouette convex (solidity 0.9975, where a circle is 1.00) and the wedges
+//! made four to nine district boundaries exactly straight lines from the middle
+//! of the city to its edge.
 //!
-//! Clipping every cell to [`crate::territory::Territory::rim`] instead costs
-//! nothing and gives both properties for free: every cell is bounded, the union
-//! of the cells **is** the city limit, so the real cells are mutually adjacent
-//! and `components = 1` is structural rather than measured; and the drawn edge
-//! of town is the drawn city limit. Unsettled ground inside the limit becomes a
-//! larger cell rather than a hole, which is what open country on the edge of a
-//! town actually looks like.
+//! The boundary is now what the prototype in `docs/design/accretion` used and
+//! what the accretion actually produces: a ring of **phantom** plots laid on a
+//! lattice wherever the ground is empty but within `[PHANTOM_NEAR, PHANTOM_FAR]`
+//! separations of the settlement. Phantom cells are computed and discarded; the
+//! boundary between a real cell and a phantom one is the town's perimeter road.
+//! The silhouette is therefore the outline of the settled ground — lobed,
+//! concave, with inlets where a quarter grew round a fold of terrain.
 //!
-//! # Quarters: where an avenue comes from
+//! **The lattice is anchored at the world origin, never at the bounding box.** A
+//! bbox-anchored lattice would shift every boundary phantom the moment the town
+//! grew by one plot on the far side, and PRD §7.7 forbids exactly that.
 //!
-//! A plain Voronoi diagram of accreted plots has no straight line in it. Every
-//! boundary is the bisector of two irregularly-placed sites, so it bends within
-//! a cell or two, and the map reads as soap foam — the bake-off's second named
-//! defect, and the reason `junctions-large.png` has no long line anywhere.
-//!
-//! Graft 2 asks for through-streets by *seeding*: pull the plots near a district
-//! border onto a lattice aligned to it, and a run of collinearly-seeded sites
-//! gives a run of collinear boundaries. That was built and measured first, and
-//! the measurement is why this module looks the way it does. A boundary segment
-//! on the line needs a **facing pair** — two plots mirrored across it — and the
-//! two sides of a cut are different districts, settled at different times, so a
-//! run needs the second district to choose exactly the rungs the first one used,
-//! over and over. The share of lattice slots that can be filled at all is
-//! `pitch² × plot density`, which at 5 000 files is about a quarter; the best
-//! measured run of consecutive facing pairs, with the lattice slots reserved
-//! from before the first file and a bonus for completing a pair, was **five**,
-//! against the eighteen cells a 46 %-of-diameter avenue spans. Seeding alone
-//! cannot get there at this plot density, and the sweep says so at every pitch
-//! from 1.0 to 4.0 × `sep`.
-//!
-//! So the avenue is made structural instead, in the one way that does not draw a
-//! road: the diagram is computed **per quarter**. The partition promotes a few
-//! of its cuts to avenues ([`crate::territory`]) and those cuts divide the city
-//! limit into convex *quarters*; a plot's cell starts from its own quarter's
-//! polygon and is clipped only against plots of the same quarter. Each quarter
-//! is therefore tiled exactly by its own cells, the quarters tile the city
-//! limit, and the shared edge between two quarters is the chord itself — one
-//! exactly straight road, for its whole length, with no coordination between the
-//! two sides at all.
-//!
-//! This is *not* treemap's chord-splitting. Treemap made every cut at every
-//! depth a road, which is the crazed-glaze artefact, and added city-spanning
-//! arterials on top. Here a cut is promoted only when it is between a quarter
-//! and a half of the city diameter — long enough to read as a through-street,
-//! never long enough to cross the city — there are at most
-//! [`crate::territory::MAX_AVENUES`] of them against some three hundred cuts,
-//! and every other road in the city is still the bisector of two accreted plots.
-//!
-//! The lattice seeding is kept, because it is what makes the frontage along an
-//! avenue regular and the cross streets meet it squarely. It is no longer what
-//! makes the avenue straight.
+//! The two costs the previous port named for phantoms were real and are paid
+//! elsewhere: an interior gap wide enough to grow phantoms in becomes a hole in
+//! the map, and a settlement that grows in disconnected islands becomes a
+//! disconnected road graph. [`crate::accrete`] answers both with a hard rule —
+//! a new plot must be no further than
+//! [`crate::accrete::Params::touch_max`] separations from the nearest settled
+//! plot — so there is no gap to grow a phantom in and no island to disconnect.
+//! `components = 1` is measured, and the rule is why.
 
 // The middle of the pipeline is numeric geometry, and five lint families fire on
 // nearly every line of it without telling us anything:
@@ -108,9 +75,9 @@
     clippy::too_many_lines
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::determinism::quantize_f64;
+use crate::determinism::{quantize_f64, SeededRng};
 use crate::geom::{
     add, clip_halfplane, dedupe_ring, dist, dist2, dot, len, mul, qp, signed_area2, sub, Pt,
 };
@@ -118,20 +85,53 @@ use crate::geom::{
 /// Radius, in units of `sep`, within which a new plot can disturb a cell.
 const AFFECT_RADIUS: f64 = 3.6;
 
+/// Lattice pitch of the phantom ring, in units of `sep`.
+///
+/// Below one separation the ring is denser than the town it bounds and the
+/// perimeter road turns into a fringe of tiny cells; above it, gaps open and a
+/// real cell escapes to the frame. `0.80` is the prototype's measured value and
+/// it holds at both scales here.
+const PHANTOM_PITCH: f64 = 0.80;
+
+/// How far a lattice site jitters, as a fraction of the pitch.
+///
+/// Seeded from the site's own integer coordinates and the layout seed, so the
+/// jitter is a property of the *place* and not of the growth order: a phantom
+/// that appears, vanishes and reappears comes back to the same point.
+const PHANTOM_JITTER: f64 = 0.55;
+
+/// Nearest a phantom may sit to real ground, in separations.
+///
+/// Any closer and the phantom's bisector cuts into the real cell it is supposed
+/// to bound, shaving frontage off the outermost parcels.
+const PHANTOM_NEAR: f64 = 1.02;
+
+/// Furthest a phantom may sit from real ground, in separations.
+///
+/// Any further and it is open country, not the edge of town: it would draw a
+/// road round nothing.
+const PHANTOM_FAR: f64 = 2.15;
+
+/// How far past the settlement the lattice is swept, in separations.
+const PHANTOM_MARGIN: f64 = 3.0;
+
 /// The territories of the settled plots.
 // `cells.cells` reads oddly and is the honest name for it: the struct is the
 // diagram, the field is the rings.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Cells {
-    /// One ring per plot, counter-clockwise, quantised. Empty only when the
+    /// One ring per real plot, counter-clockwise, quantised. Empty only when the
     /// plot coincides with another, which the separation rule prevents.
     pub(crate) cells: Vec<Vec<Pt>>,
-    /// The convex frame each quarter's cells start from. One entry; the whole
-    /// city limit when the partition promoted no avenue at all.
-    frames: Vec<Vec<Pt>>,
-    /// Which quarter each plot's cell is computed in.
-    quarter: Vec<u32>,
+    /// Phantom positions, in lattice-key order.
+    phantoms: Vec<Pt>,
+    /// Which lattice sites are currently phantoms.
+    phantom_keys: BTreeSet<(i64, i64)>,
+    /// Lattice pitch in world units.
+    pitch: f64,
+    /// The layout seed the lattice jitter is drawn from.
+    seed: u64,
 }
 
 impl Cells {
@@ -188,39 +188,131 @@ impl SiteGrid {
         }
         out.sort_unstable();
     }
+
+    /// Distance to the nearest site, or infinity when none is within `r`.
+    fn nearest(&self, p: Pt, r: f64, scratch: &mut Vec<u32>) -> f64 {
+        self.query(p, r, scratch);
+        scratch
+            .iter()
+            .map(|&i| dist(self.pts[i as usize], p))
+            .fold(f64::INFINITY, f64::min)
+    }
 }
 
-/// Build the territory of every plot, each inside its own quarter.
-///
-/// `frames` are the quarter polygons and `quarter[i]` is the quarter plot `i`
-/// belongs to. Passing a single frame and all-zero quarters is the plain
-/// city-limit-clipped diagram.
-pub(crate) fn build(real: &[Pt], frames: &[Vec<Pt>], quarter: &[u32], sep: f64) -> Cells {
+/// Position of lattice site `(ix, iy)`.
+fn lattice(ix: i64, iy: i64, pitch: f64, seed: u64) -> Pt {
+    let mut rng = SeededRng::for_seed(
+        seed ^ (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (iy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+        "phantom.jitter",
+    );
+    let jx = (rng.next_f64() - 0.5) * pitch * PHANTOM_JITTER;
+    let jy = (rng.next_f64() - 0.5) * pitch * PHANTOM_JITTER;
+    qp([ix as f64 * pitch + jx, iy as f64 * pitch + jy])
+}
+
+/// Lay phantom plots wherever the ground is empty but close enough to the
+/// settlement to bound it.
+fn phantom_ring(real: &[Pt], sep: f64, pitch: f64, seed: u64) -> BTreeSet<(i64, i64)> {
+    let mut out = BTreeSet::new();
+    if real.is_empty() {
+        return out;
+    }
+    let mut lo = real[0];
+    let mut hi = real[0];
+    for p in real {
+        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+    }
+    let margin = sep * PHANTOM_MARGIN;
+    let grid = SiteGrid::build(real.to_vec(), sep * 1.4);
+    let mut scratch = Vec::new();
+    let ix0 = ((lo[0] - margin) / pitch).floor() as i64;
+    let ix1 = ((hi[0] + margin) / pitch).ceil() as i64;
+    let iy0 = ((lo[1] - margin) / pitch).floor() as i64;
+    let iy1 = ((hi[1] + margin) / pitch).ceil() as i64;
+    let near = sep * PHANTOM_NEAR;
+    let far = sep * PHANTOM_FAR;
+    for iy in iy0..=iy1 {
+        for ix in ix0..=ix1 {
+            let c = lattice(ix, iy, pitch, seed);
+            let nearest = grid.nearest(c, far, &mut scratch);
+            if nearest >= near && nearest <= far {
+                out.insert((ix, iy));
+            }
+        }
+    }
+    out
+}
+
+/// Build the territory of every real plot, bounded by a phantom ring.
+pub(crate) fn build(real: &[Pt], sep: f64, seed: u64) -> Cells {
+    let pitch = sep * PHANTOM_PITCH;
+    let keys = phantom_ring(real, sep, pitch, seed);
     let mut cells = Cells {
         cells: vec![Vec::new(); real.len()],
-        frames: frames.to_vec(),
-        quarter: quarter.to_vec(),
+        phantoms: keys
+            .iter()
+            .map(|&(a, b)| lattice(a, b, pitch, seed))
+            .collect(),
+        phantom_keys: keys,
+        pitch,
+        seed,
     };
-    cells.quarter.resize(real.len(), 0);
     let which: Vec<usize> = (0..real.len()).collect();
     compute_cells(real, sep, &mut cells, &which);
     cells
 }
 
+/// Re-test the lattice around a newly settled plot and return every phantom
+/// position that appeared or vanished. Only this window can change.
+pub(crate) fn update_phantoms(cells: &mut Cells, real: &[Pt], at: Pt, sep: f64) -> Vec<Pt> {
+    let pitch = cells.pitch;
+    if pitch <= 0.0 {
+        return Vec::new();
+    }
+    let seed = cells.seed;
+    let win = sep * (PHANTOM_FAR + PHANTOM_MARGIN);
+    let ix0 = ((at[0] - win) / pitch).floor() as i64;
+    let ix1 = ((at[0] + win) / pitch).ceil() as i64;
+    let iy0 = ((at[1] - win) / pitch).floor() as i64;
+    let iy1 = ((at[1] + win) / pitch).ceil() as i64;
+    let grid = SiteGrid::build(real.to_vec(), sep * 1.4);
+    let near = sep * PHANTOM_NEAR;
+    let far = sep * PHANTOM_FAR;
+    let mut scratch = Vec::new();
+    let mut changed = Vec::new();
+    let mut dirty = false;
+    for iy in iy0..=iy1 {
+        for ix in ix0..=ix1 {
+            let c = lattice(ix, iy, pitch, seed);
+            let nearest = grid.nearest(c, far, &mut scratch);
+            let want = nearest >= near && nearest <= far;
+            let had = cells.phantom_keys.contains(&(ix, iy));
+            if want != had {
+                changed.push(c);
+                dirty = true;
+                if want {
+                    cells.phantom_keys.insert((ix, iy));
+                } else {
+                    cells.phantom_keys.remove(&(ix, iy));
+                }
+            }
+        }
+    }
+    if dirty {
+        cells.phantoms = cells
+            .phantom_keys
+            .iter()
+            .map(|&(a, b)| lattice(a, b, pitch, seed))
+            .collect();
+    }
+    changed
+}
+
 /// Recompute only the listed plots' territories, reusing the rest.
-///
-/// `quarter` must cover every plot: a new plot's quarter is decided by the
-/// caller (by point location, [`crate::city`]), never inferred here.
-pub(crate) fn rebuild_subset(
-    real: &[Pt],
-    quarter: &[u32],
-    sep: f64,
-    cells: &mut Cells,
-    which: &[usize],
-) {
+pub(crate) fn rebuild_subset(real: &[Pt], sep: f64, cells: &mut Cells, which: &[usize]) {
     cells.cells.resize(real.len(), Vec::new());
-    cells.quarter = quarter.to_vec();
-    cells.quarter.resize(real.len(), 0);
     compute_cells(real, sep, cells, which);
 }
 
@@ -238,18 +330,25 @@ pub(crate) fn affected(real: &[Pt], moved: &[Pt], sep: f64) -> Vec<usize> {
 
 /// The clipping itself.
 fn compute_cells(real: &[Pt], sep: f64, cells: &mut Cells, which: &[usize]) {
-    let grid = SiteGrid::build(real.to_vec(), sep * 1.4);
-    let frames = cells.frames.clone();
-    let quarter = cells.quarter.clone();
+    let n_real = real.len();
+    let mut all: Vec<Pt> = Vec::with_capacity(n_real + cells.phantoms.len());
+    all.extend_from_slice(real);
+    all.extend_from_slice(&cells.phantoms);
+    let grid = SiteGrid::build(all.clone(), sep * 1.4);
+
+    // A fixed frame, not the settlement's bounding box: a box that grows with
+    // the town would perturb every boundary cell on every growth step. It is
+    // never reached — the phantom ring bounds every real cell long before this
+    // — and it exists only so the clip has somewhere to start.
+    let far = (sep * 4096.0).max(4096.0);
+    let frame = vec![[-far, -far], [far, -far], [far, far], [-far, far]];
+
     let mut scratch = Vec::new();
     for &i in which {
-        let s = real[i];
-        let q = quarter.get(i).copied().unwrap_or(0) as usize;
-        let Some(frame) = frames.get(q) else {
-            cells.cells[i].clear();
+        if i >= n_real {
             continue;
-        };
-        let frame = frame.clone();
+        }
+        let s = all[i];
         let mut radius = sep * 3.2;
         let mut ring;
         loop {
@@ -259,13 +358,7 @@ fn compute_cells(real: &[Pt], sep: f64, cells: &mut Cells, which: &[usize]) {
                 if j as usize == i {
                     continue;
                 }
-                // Only against the plots of the same quarter: an avenue is where
-                // one quarter's ground stops, so a plot on the far side of it
-                // must not cut this cell.
-                if quarter.get(j as usize).copied().unwrap_or(0) as usize != q {
-                    continue;
-                }
-                let o = real[j as usize];
+                let o = all[j as usize];
                 let d = sub(o, s);
                 let l = len(d);
                 if l < 1e-12 {
@@ -322,19 +415,7 @@ mod tests {
     use super::*;
     use crate::geom::{area, contains};
 
-    /// The one-quarter diagram: every site clipped to the same frame.
-    fn plain(sites: &[Pt], f: &[Pt]) -> Cells {
-        build(
-            sites,
-            std::slice::from_ref(&f.to_vec()),
-            &vec![0; sites.len()],
-            1.0,
-        )
-    }
-
-    fn frame(r: f64) -> Vec<Pt> {
-        vec![[-r, -r], [r, -r], [r, r], [-r, r]]
-    }
+    const SEED: u64 = 0x5EED_0001;
 
     fn lattice_sites(n: i32, step: f64) -> Vec<Pt> {
         let mut out = Vec::new();
@@ -349,7 +430,7 @@ mod tests {
     #[test]
     fn every_cell_is_bounded_and_contains_its_site() {
         let sites = lattice_sites(6, 1.0);
-        let cells = plain(&sites, &frame(40.0));
+        let cells = build(&sites, 1.0, SEED);
         assert_eq!(cells.cells.len(), sites.len());
         for (i, ring) in cells.cells.iter().enumerate() {
             assert!(ring.len() >= 3, "cell {i} is degenerate");
@@ -358,49 +439,58 @@ mod tests {
         }
     }
 
+    /// The whole point of the phantom ring: no real cell runs away to the frame.
     #[test]
-    fn the_cells_tile_the_frame_exactly() {
-        let sites = lattice_sites(5, 1.0);
-        let f = frame(9.0);
-        let cells = plain(&sites, &f);
-        let total: f64 = cells.cells.iter().map(|r| area(r)).sum();
-        assert!(
-            (total - area(&f)).abs() < area(&f) * 1e-9,
-            "cells sum to {total}, the city limit is {}",
-            area(&f)
-        );
-        // A site is inside its own cell and no other's.
-        for (i, s) in sites.iter().enumerate() {
-            for (j, ring) in cells.cells.iter().enumerate() {
-                if i != j {
-                    assert!(!contains(ring, *s), "site {i} is inside cell {j}");
-                }
+    fn the_phantom_ring_bounds_every_cell() {
+        let sites = lattice_sites(6, 1.0);
+        let cells = build(&sites, 1.0, SEED);
+        assert!(!cells.phantoms.is_empty(), "no phantoms were laid");
+        let mut worst = 0.0f64;
+        for (i, ring) in cells.cells.iter().enumerate() {
+            for v in ring {
+                worst = worst.max(dist(*v, sites[i]));
             }
         }
+        assert!(
+            worst < 4.0,
+            "a cell reached {worst} from its site: the ring did not bound it"
+        );
     }
 
+    /// The silhouette follows the ground, so a settlement with a bite out of it
+    /// has a bite out of its outline. This is the property the convex city limit
+    /// destroyed.
     #[test]
-    fn no_cell_escapes_the_city_limit() {
-        let sites = lattice_sites(4, 1.0);
-        let cells = plain(&sites, &frame(6.0));
-        for ring in &cells.cells {
-            for v in ring {
-                assert!(
-                    v[0] >= -6.001 && v[0] <= 6.001 && v[1] >= -6.001 && v[1] <= 6.001,
-                    "a cell vertex left the city limit at {v:?}"
-                );
+    fn the_outline_is_concave_when_the_ground_is() {
+        // An L-shaped settlement: a full 6x6 block with the top-right quadrant
+        // removed.
+        let mut sites = Vec::new();
+        for y in 0..6 {
+            for x in 0..6 {
+                if x >= 3 && y >= 3 {
+                    continue;
+                }
+                sites.push(qp([f64::from(x), f64::from(y)]));
             }
+        }
+        let cells = build(&sites, 1.0, SEED);
+        // No cell may reach into the missing quadrant's far corner.
+        let hole = [4.6, 4.6];
+        for (i, ring) in cells.cells.iter().enumerate() {
+            assert!(
+                !contains(ring, hole),
+                "cell {i} covered ground nobody settled"
+            );
         }
     }
 
     #[test]
     fn a_rebuilt_subset_matches_a_full_rebuild() {
         let sites = lattice_sites(5, 1.0);
-        let f = frame(40.0);
-        let full = plain(&sites, &f);
-        let mut partial = plain(&sites, &f);
+        let full = build(&sites, 1.0, SEED);
+        let mut partial = build(&sites, 1.0, SEED);
         let which: Vec<usize> = (0..sites.len()).step_by(3).collect();
-        rebuild_subset(&sites, &vec![0; sites.len()], 1.0, &mut partial, &which);
+        rebuild_subset(&sites, 1.0, &mut partial, &which);
         for i in which {
             assert_eq!(full.cells[i], partial.cells[i], "cell {i} moved");
         }
@@ -409,14 +499,16 @@ mod tests {
     #[test]
     fn a_new_plot_disturbs_only_its_neighbourhood() {
         let mut sites = lattice_sites(7, 1.0);
-        let f = frame(40.0);
-        let before = plain(&sites, &f);
+        let before = build(&sites, 1.0, SEED);
         let at = qp([3.5, 3.5]);
         sites.push(at);
         let mut after = before.clone();
-        let which = affected(&sites, &[at], 1.0);
-        rebuild_subset(&sites, &vec![0; sites.len()], 1.0, &mut after, &which);
-        let reference = plain(&sites, &f);
+        let moved = update_phantoms(&mut after, &sites, at, 1.0);
+        let mut touched = vec![at];
+        touched.extend(moved);
+        let which = affected(&sites, &touched, 1.0);
+        rebuild_subset(&sites, 1.0, &mut after, &which);
+        let reference = build(&sites, 1.0, SEED);
         for i in 0..sites.len() - 1 {
             assert_eq!(
                 after.cells[i], reference.cells[i],
@@ -429,30 +521,14 @@ mod tests {
         );
     }
 
-    /// A quarter boundary is a straight road because the cells stop at it.
-    /// Two properties have to hold together: every cell stays on its own side,
-    /// and the two sides still tile the frame between them.
+    /// The lattice is anchored at the origin, so a phantom is a property of the
+    /// place: the same site comes back to the same point whatever else moved.
     #[test]
-    fn cells_stop_at_a_quarter_boundary() {
-        let f = frame(4.0);
-        let left = vec![[-4.0, -4.0], [0.0, -4.0], [0.0, 4.0], [-4.0, 4.0]];
-        let right = vec![[0.0, -4.0], [4.0, -4.0], [4.0, 4.0], [0.0, 4.0]];
-        // Two sites either side, deliberately *not* mirror images: a plain
-        // diagram would put a tilted bisector between them.
-        let sites = vec![qp([-1.0, -2.0]), qp([-1.5, 2.0]), qp([1.0, 0.4])];
-        let cells = build(&sites, &[left.clone(), right.clone()], &[0, 0, 1], 1.0);
-        let total: f64 = cells.cells.iter().map(|r| area(r)).sum();
-        assert!(
-            (total - area(&f)).abs() < area(&f) * 1e-9,
-            "the cells sum to {total} against a frame of {}",
-            area(&f)
-        );
-        for (i, ring) in cells.cells.iter().enumerate() {
-            for v in ring {
-                let inside = if i < 2 { v[0] <= 1e-9 } else { v[0] >= -1e-9 };
-                assert!(inside, "cell {i} crossed the quarter boundary at {v:?}");
-            }
-        }
+    fn the_phantom_lattice_is_anchored_at_the_origin() {
+        let a = lattice(3, -4, 0.8, SEED);
+        let b = lattice(3, -4, 0.8, SEED);
+        assert_eq!(a, b);
+        assert!(dist(a, [3.0 * 0.8, -4.0 * 0.8]) < 0.8 * PHANTOM_JITTER);
     }
 
     #[test]

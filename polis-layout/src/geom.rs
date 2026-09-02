@@ -661,40 +661,6 @@ pub(crate) fn convex_hull(pts: &[Pt]) -> Vec<Pt> {
     lower
 }
 
-/// Where the line `dot(n, x) = c` enters and leaves a convex ring.
-///
-/// Returns `None` when the line misses the ring or only grazes a vertex.
-pub(crate) fn chord_of(poly: &[Pt], n: Pt, c: f64) -> Option<(Pt, Pt)> {
-    let m = poly.len();
-    if m < 3 {
-        return None;
-    }
-    let mut hits: Vec<Pt> = Vec::new();
-    for i in 0..m {
-        let a = poly[i];
-        let b = poly[(i + 1) % m];
-        let da = dot(n, a) - c;
-        let db = dot(n, b) - c;
-        if (da <= 0.0 && db > 0.0) || (da > 0.0 && db <= 0.0) {
-            let t = da / (da - db);
-            if t.is_finite() {
-                hits.push(lerp(a, b, t.clamp(0.0, 1.0)));
-            }
-        }
-    }
-    if hits.len() < 2 {
-        return None;
-    }
-    let dirv = perp(n);
-    hits.sort_by(|a, b| dot(dirv, *a).total_cmp(&dot(dirv, *b)));
-    let (p, q) = (hits[0], hits[hits.len() - 1]);
-    if dist2(p, q) < 1e-12 {
-        None
-    } else {
-        Some((p, q))
-    }
-}
-
 /// A proper segment crossing, excluding shared endpoints.
 ///
 /// This is the planarity check: a crossing without a node.

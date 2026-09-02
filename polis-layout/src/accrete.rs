@@ -11,53 +11,66 @@
 //! so PRD §7.2's non-negotiable ordering — roads, then blocks, then lots, then
 //! buildings — is preserved rather than worked around.
 //!
-//! # The three hard constraints
+//! # The two hard constraints
 //!
-//! Everything else is a weight; these three are absolute, and they are rejects
+//! Everything else is a weight; these two are absolute, and they are rejects
 //! inside the candidate loop rather than penalties on the score, so no amount of
 //! weight can outvote them.
 //!
 //! 1. **Never closer than `sep` to a settled plot.** This is what bounds cell
 //!    size, and therefore block size.
-//! 2. **Never outside its own district's territory** ([`crate::territory`],
-//!    [`crate::districts`] rule T). This is the graft from `treemap-arterials`.
-//! 3. **Never out of contact with its own district's ground**
-//!    ([`crate::districts`] rule A): after a district's first plot, the nearest
-//!    plot in the whole city must be one of its own. The nearest-neighbour graph
-//!    is a subgraph of the Delaunay graph, so this makes the new cell share an
-//!    edge with a sibling's — and a district's blocks one connected region.
+//! 2. **Never further than [`Params::touch_max`] separations from the nearest
+//!    settled plot.** A new quarter cannot be founded across a gap. This single
+//!    rule is why `components = 1`, and it is also why the phantom ring in
+//!    [`crate::voronoi`] has no interior pocket to grow a hole in.
 //!
-//! Rules 2 and 3 together are what turn "districts are contiguous" from a
-//! measurement into a property of the construction; [`crate::districts`] carries
-//! the argument in full.
+//! # What is *not* a constraint any more, and why
 //!
-//! # Why contact is with a *sibling*, and why the city is still connected
+//! Until this commit there was a third: a plot could settle only inside its own
+//! district's polygon, cut out of a convex city limit by
+//! [`crate::territory`]. It was there to make districts contiguous and it did —
+//! at the cost of the two things three M1 gates rejected: a silhouette that was
+//! the polygon (solidity 0.9975, convex is 1.00) and district borders that were
+//! exactly straight lines from the middle of the city to its edge.
 //!
-//! The design this port is based on had a contact rule too, but a different one:
-//! a new plot had to be within `1.75 × sep` of an existing plot **of any
-//! district**. That rule is what gave it one connected component — and it is
-//! also, on measurement, what stopped the territory constraint from ever
-//! binding. A district whose polygon had not yet been reached by the growth
-//! front failed the contact test inside its own ground and settled in an
-//! ancestor's instead: **83 % of plots at 5 000 files**, which left districts as
-//! fragmented as they were without a partition at all.
+//! Contiguity is now obtained where it belongs, on the **graph** rather than on
+//! the plane: [`crate::regions`] partitions the plot adjacency graph down the
+//! same directory tree, and every part of that partition is connected by
+//! construction. The growth is free again, so the town's outline is the outline
+//! of the ground people settled.
 //!
-//! Rule 3 asks the opposite question. Contact with a *foreign* plot is what a
-//! district must be free to do without, so that it can start its own quarter on
-//! its own ground; contact with its *own* is always available, because the
-//! district's previous plot is right there. The rule that used to fight the
-//! partition now serves it.
+//! The district *shape* is still steered here, by weights — hug the settlement,
+//! stay near the district's centre of mass, do not interleave with a neighbour,
+//! prefer contact with the district's own ground — because a partition that
+//! starts from blobby input moves far fewer plots than one that starts from
+//! confetti. Weights shape it; the graph partition guarantees it.
 //!
-//! Global connectivity does not depend on either version. The faces **tile** the
-//! city limit, every face belongs to a district that has files, and each face is
-//! laid out at [`crate::territory::AREA_SLACK`] times the ground its plots need — so the
-//! finished settlement covers the whole limit at a density whose nearest-
-//! neighbour spacing is a small multiple of `sep`, and no gap wide enough to
-//! separate two Voronoi cells can open. `components = 1` is now a property of
-//! the partition rather than of a radius, and it is asserted rather than hoped
-//! for. Hugging the settlement survives as a *weight*, which is what makes the
-//! ground fill inward from a district's border with its neighbour rather than
-//! starting in the middle of its own polygon.
+//! # Where the through-streets come from
+//!
+//! A plain Voronoi diagram of scattered plots has no long road in it. Every
+//! junction is three-way at about 120°, the stroke rule's 40° continuation limit
+//! stops there, and the plan reads as soap foam — the accretion prototype's own
+//! honest complaint about itself: *"no road runs more than a couple of blocks
+//! straight."*
+//!
+//! A road here is the perpendicular bisector of two neighbouring plots, so a
+//! **run of collinear roads needs a run of facing pairs**: plots in two parallel
+//! rows. The previous attempt at that drew the rows on straight cuts out of a
+//! partition of the plane, which is where the avenues — and the pie chart — came
+//! from.
+//!
+//! This grows them instead, off the terrain. The local street frame is the
+//! **contour direction and the fall line** ([`Settlement::grid_frame`]): a
+//! candidate is rewarded for sitting one separation from the nearest settled
+//! plot *along* one of those two axes rather than at some angle between them.
+//! The terrain is low-frequency fbm, so the frame turns slowly — one quarter's
+//! streets are square to each other, the next quarter's are square to each other
+//! on a different bearing, and where a valley bends the grid bends with it.
+//! That is what a hill town does, it has no centre and no radius in it anywhere,
+//! and it is measured: at 5 000 files it takes the strokes past a quarter of the
+//! city diameter from **7 to 20**, and the longest stroke from 37 % of the
+//! diameter to 45 %. The wavelength the frame is read at is the whole of it —
+//! see [`FRAME_SCALE`] for the table, and for the one setting that overshot.
 //!
 //! # The age gradient is structural
 //!
@@ -92,15 +105,11 @@
     clippy::too_many_lines
 )]
 
-use std::collections::BTreeMap;
-
 use polis_events::{LogicalPath, WallTime};
 
 use crate::age::AgeRamp;
 use crate::determinism::{combine_seeds, det_sin_cos, quantize_f64, SeededRng, TAU};
-use crate::geom::{
-    add, contains, dist, dist_to_boundary, dist_to_seg, dot, mul, norm, qp, sub, Pt,
-};
+use crate::geom::{add, dist, mul, qp, sub, Pt};
 use crate::terrain::TerrainField;
 use crate::territory::Territory;
 
@@ -113,86 +122,89 @@ pub(crate) const PACKING: f64 = 1.18;
 /// Frontier a district is given beyond the ground its plots occupy.
 pub(crate) const BASE_SLACK: f64 = 1.10;
 
-/// Width of the border band a district loses to its neighbours, in units of
-/// `sep`, per unit of perimeter. See [`Params::district_demand`].
-pub(crate) const BORDER_BAND: f64 = 1.30;
-
-/// Where a plot aligned on the **city limit** wants to sit, in units of `sep`.
-const AVENUE_OFFSET: f64 = 0.5;
-
-/// Beyond this distance, in units of `sep`, the city limit exerts no pull.
-const AVENUE_REACH: f64 = 1.55;
-
-/// Beyond this distance, in units of the lattice pitch, a desire line exerts no
-/// pull.
+/// Coordinate scale the street frame's orientation field is sampled at.
 ///
-/// The brief's "~1.5× the local separation": two rows either side of the line at
-/// ±pitch/2, and nothing beyond them.
-const DESIRE_REACH: f64 = 1.5;
-
-/// Rungs either side of an anchor's own that the lattice offers as candidates.
-const DESIRE_RUNGS: i64 = 3;
-
-/// Lattice pitch, as a multiple of the coarsest separation on the line.
+/// The frame comes from the terrain gradient, and the terrain is sized for
+/// *relief* — hills a few blocks across, which is what makes a slope worth
+/// avoiding. Read at that scale the frame turns within one block, neighbouring
+/// plots inherit different bearings, and no row of facing pairs ever forms.
+/// Sampling the same field at `0.15` of the coordinate stretches its wavelength
+/// by a factor of seven, so the bearing is near-constant across a quarter and
+/// drifts across the city.
 ///
-/// **Not 1.** A rung's two slots can only be filled by plots that are there to
-/// fill them, and the count is `pitch² / (1.18 · sep²)` plots per slot: at
-/// `pitch = sep` that is 0.85, so most slots go empty, runs of two are the best
-/// the line can do, and the avenue never forms. Measured at 5 000 files with
-/// `1.0`: 223 plots exactly on a lattice, 44 facing pairs, **longest run 2**.
+/// Measured at 5 000 files — strokes past a quarter of the diameter, and the
+/// longest as a share of it, against the 8 and the 35-70 % the gate asks for:
 ///
-/// The cost is that the parcels fronting an avenue are `LATTICE_PITCH²` times
-/// the ground of an ordinary parcel of the same age — which is what a main road
-/// looks like anyway, and is a good part of where the block size hierarchy comes
-/// from.
-const LATTICE_PITCH: f64 = 1.80;
-
-/// Extra weight on a lattice point whose mirror across the line is settled.
+/// | scale | `w_grid` | through-streets | longest |
+/// |---|---|---|---|
+/// | - | 0.0 | 7 | 37.0 % |
+/// | 1.00 | 2.6 | 6 | 31.6 % |
+/// | 1.00 | 6.0 | 12 | 48.7 % |
+/// | 0.22 | 2.6 | 13 | 39.5 % |
+/// | 0.15 | 2.0 | 14 | 41.4 % |
+/// | **0.15** | **2.6** | **20** | **44.8 %** |
+/// | 0.15 | 4.0 | 19 | 50.9 % |
+/// | 0.15 | 1.5 | 24 | 74.7 % - *past the ceiling* |
+/// | 0.10 | 2.6 | 14 | 48.9 % |
 ///
-/// Completing a facing pair is what puts a segment of the desire line itself on
-/// the map, so it is worth more than merely being on the lattice.
-const FACING_BONUS: f64 = 1.90;
+/// The wavelength is what matters and the weight is second order: every setting
+/// at `0.15` clears the bar, and the one at `1.00` with the same weight does
+/// not. `1.5` is excluded not for being weak but for making one stroke run three
+/// quarters of the way across the city, which is a boulevard and not a street.
+const FRAME_SCALE: f64 = 0.15;
 
-/// Extra weight on a lattice point next to a settled one on the same side.
-const ALONG_BONUS: f64 = 1.30;
+/// How many settled plots one round of the search grows its candidates from.
+const SEARCH_HOSTS: usize = 32;
 
-/// How far a plot must keep off an avenue, in units of `sep`.
+/// How far the search may work outward before it gives up on this rung.
+const SEARCH_ROUNDS: usize = 4;
+
+/// How much further each round reaches than the one before it.
 ///
-/// An avenue is a quarter boundary, and a quarter's cells are clipped to it
-/// exactly ([`crate::voronoi`]). A plot that settles right against one therefore
-/// gets a cell squeezed between its own bisectors and the line — a sliver, whose
-/// long thin edge runs a hair off the avenue and crosses it. Measured at 3 000
-/// files: seven slivers and seven crossings, all of them one plot pressed
-/// against a quarter boundary.
+/// Three, so five rounds cover `3⁴ = 81` bands — past the far side of any city
+/// this pipeline builds — in five queries rather than nine. A query at radius
+/// `r` costs a scan of every plot inside it, so the round count is the cost.
+const ROUND_GROWTH: f64 = 3.0;
+
+/// Largest the normalised terrain height can be, in units of the relief.
 ///
-/// Half a separation, which is where the lattice would have put the plot anyway.
-const AVENUE_KEEPOUT: f64 = 0.30;
+/// The noise is a sum of octaves normalised to `[-1, 1]`, and the district
+/// biases are applied after the growth, so one is the bound with a little
+/// headroom. It is used to prune candidates that cannot win — see
+/// [`Settlement::evaluate`] — so it must be an over-estimate and never an
+/// under-estimate.
+const HEIGHT_BOUND: f64 = 1.05;
 
-/// Desire lines a single anchor may draw candidates from.
+/// Directions tried when asking whether a plot still has room beside it.
+const OPEN_PROBES: u32 = 16;
+
+/// How far out those probes sit, in units of the coarsest separation.
 ///
-/// Two, not one: cuts cross, and the plot at a crossing should be offered both
-/// lattices rather than only whichever happens to be marginally nearer.
-const DESIRE_LINES_PER_ANCHOR: usize = 2;
+/// Inside the legal band: a plot that has room at `1.35 · sep_rim` has room for
+/// a neighbour of any grain, and one that does not is enclosed.
+const OPEN_RADIUS: f64 = 1.35;
 
-/// How many rings the placement search sweeps outward.
-const RADIAL_STEPS: usize = 72;
+/// Rings across the legal band round each host plot.
+const BAND_RINGS: u32 = 3;
 
-/// A plot closer than this to a district border, in units of `sep`, is rejected
-/// on the first attempt: its cell would straddle the border.
-const BORDER_KEEPOUT: f64 = 0.12;
-
-/// How far outside its own polygon a plot may settle, in units of `sep`, before
-/// the search gives up and hands it to an ancestor.
+/// Positions per ring.
 ///
-/// A district's polygon is sized for the ground its plots need, but the plots of
-/// the district next door press up against the shared border, and a plot may
-/// come no closer than `sep` to one of them. For a small district that exclusion
-/// band is most of its polygon, and the search fails inside ground that is
-/// genuinely its own. Letting the *centre* sit half a separation over the line
-/// costs nothing — the block still takes its district from the plot, not from
-/// the geometry — and it is the difference between the territory constraint
-/// binding on a third of the plots and on nearly all of them.
-const FRINGE: f64 = 0.55;
+/// Sixteen is 22.5°, which at one separation is 0.39 of a separation between
+/// neighbouring candidates — finer than the quantisation the packing rule can
+/// tell apart once the four exact frame slots are in the list too.
+const BAND_ANGLES: u32 = 10;
+
+/// How many of a district's own outermost plots anchor its search.
+const ANCHOR_FRONTIER: usize = 6;
+
+/// How many of the town's outermost plots anchor the last rung of the ladder.
+const TOWN_FRONTIER: usize = 24;
+
+/// Radius of the neighbour query around a candidate, in units of `sep`.
+///
+/// Must exceed [`Params::touch_max`], or the connectivity rule would be decided
+/// on a neighbour set that does not contain the neighbour that satisfies it.
+const NEIGHBOUR_WINDOW: f64 = 1.9;
 
 /// One file as the growth simulation sees it.
 #[derive(Debug, Clone)]
@@ -266,21 +278,68 @@ pub(crate) struct Params {
     /// Weight on staying near the district's own centre of mass.
     pub(crate) w_compact: f64,
     /// Weight on hugging the existing settlement.
+    ///
+    /// **Low, and that is the coastline.** A town that hugs itself hard fills
+    /// its own convex hull; one that only prefers to stay in touch grows round
+    /// what the ground puts in its way. Measured across four corpora, solidity
+    /// (built area over convex hull; a coin is 1.00) at `w_slope = 6`,
+    /// `w_noise = 2.5`:
+    ///
+    /// | `w_hug` | synthetic 5k | Django | Neovim | `CPython` |
+    /// |---|---|---|---|---|
+    /// | 2.20 | 0.786 | 0.837 | — | — |
+    /// | **1.00** | **0.862** | **0.859** | **0.762** | **0.756** |
+    ///
+    /// The gate asks for under 0.90 and the previous convex city limit measured
+    /// 0.9947–0.9994.
     pub(crate) w_hug: f64,
     /// Weight on avoiding steep ground.
+    ///
+    /// The other half of the coastline, and the physical one: a town does not
+    /// build on a cliff, so a ridge is an edge of town and a valley floor is a
+    /// gap in it. At `2.6` the synthetic measured 0.822 solidity and Django
+    /// 0.903 — over the bar; at `6.0` they are 0.862 and 0.859.
+    ///
+    /// The term did nothing at all until this commit, and not because it was
+    /// small: [`Settlement::new`] was handed `TerrainField::default()`, whose
+    /// relief is zero, and the real field was attached to the settlement
+    /// *after* the growth had finished. Every plot in every city this pipeline
+    /// has ever built was placed on ground it could not see.
     pub(crate) w_slope: f64,
     /// Weight on not interleaving with a neighbouring district.
     pub(crate) w_foreign: f64,
-    /// Weight on the path-seeded irregularity.
+    /// Weight on high ground.
+    ///
+    /// Positive: settle the shoulders and the ridges, leave the wet ground.
+    /// With [`Params::w_slope`] this is what makes the outline follow the
+    /// terrain rather than a circle, and it is why the same field that bends the
+    /// streets ([`FRAME_SCALE`]) also shapes the coast.
     pub(crate) w_noise: f64,
     /// Weight on touching the district's own ground.
     pub(crate) w_adjacent: f64,
     /// Bonus when the nearest plot of all is a sibling.
     pub(crate) w_touch: f64,
-    /// Weight on lining up along the city limit.
-    pub(crate) w_avenue: f64,
-    /// Weight on sitting exactly on a desire line's lattice (Graft 2).
-    pub(crate) w_lattice: f64,
+    /// Weight on sitting square to the local street frame.
+    ///
+    /// The through-street term. Zero gives the accretion prototype's soap foam.
+    /// It is second order to the wavelength the frame is read at — see
+    /// [`FRAME_SCALE`] for the measured table of both together.
+    pub(crate) w_grid: f64,
+    /// Furthest a new plot may sit from the **nearest settled plot of any
+    /// district**, in units of `sep`.
+    ///
+    /// The connectivity rule, and the one the prototype in
+    /// `docs/design/accretion` used: a new quarter buds onto the town rather
+    /// than being founded across a gap. It is what makes `components = 1` and
+    /// what keeps the phantom ring ([`crate::voronoi`]) to the outside of the
+    /// settlement, where a hole in the map is the edge of town rather than a
+    /// void in the middle of it.
+    ///
+    /// `1.75` is the prototype's measured value. Below about `1.5` the frontier
+    /// has too few legal positions and the growth crawls along a one-plot-wide
+    /// tendril; above about `2.1` a plot can settle far enough out to leave a
+    /// pocket the phantom lattice fills, which is a hole.
+    pub(crate) touch_max: f64,
 }
 
 impl Default for Params {
@@ -292,14 +351,14 @@ impl Default for Params {
             cap_rim: 9,
             terrain_seed: 0x504f_4c49_5300_0001,
             w_compact: 2.20,
-            w_hug: 2.20,
-            w_slope: 2.60,
+            w_hug: 1.00,
+            w_slope: 6.00,
             w_foreign: 3.40,
-            w_noise: 0.85,
+            w_noise: 2.50,
             w_adjacent: 2.00,
             w_touch: 1.60,
-            w_avenue: 3.60,
-            w_lattice: 4.40,
+            w_grid: 3.40,
+            touch_max: 1.75,
         }
     }
 }
@@ -339,45 +398,118 @@ impl Params {
         let sep = self.sep_at(t);
         sep * sep * PACKING
     }
-
-    /// Ground a district of `files` files founded at age `t` needs.
-    ///
-    /// Three terms, and leaving out either of the last two is what makes the
-    /// territory constraint unsatisfiable for small districts:
-    ///
-    /// * the plots themselves — **`ceil(files / cap)`**, not `files / cap`; a
-    ///   district of three files with a capacity of five still needs one whole
-    ///   plot, and rounding that down under-sizes every small district in the
-    ///   repository;
-    /// * a slack factor, so there is frontier to grow into;
-    /// * a **border band**, because a plot may come no closer than one
-    ///   separation to a plot on the other side of the border, so a district
-    ///   effectively loses half a separation around its whole perimeter. The
-    ///   band scales with the perimeter, which is why it is a square root: it
-    ///   costs a two-plot district most of its polygon and a hundred-plot
-    ///   district almost nothing.
-    pub(crate) fn district_demand(&self, files: usize, t: f64) -> f64 {
-        let plots = files.div_ceil(self.cap_at(t).max(1) as usize).max(1) as f64;
-        let occupied = plots * self.plot_area_at(t);
-        occupied * BASE_SLACK + BORDER_BAND * occupied.sqrt() * self.sep_at(t)
-    }
 }
 
 /// Uniform spatial hash over plot positions.
 ///
-/// Iterated only in a fixed cell order, and every query sorts its result, so no
-/// iteration order can reach the output (PRD §7.4).
+/// # Why this is not a `BTreeMap`
+///
+/// The rest of this crate uses `BTreeMap` because iteration order reaches the
+/// output and PRD §7.4 forbids that. **Nothing iterates this one.** Both readers
+/// look up a fixed rectangle of cells by key and reduce what they find to
+/// minima and counts, which are order-independent to the last bit, and the one
+/// reader that returns a list sorts it. So the ordering guarantee a tree buys is
+/// worth nothing here, and its `O(log n)` lookup is worth a great deal: the
+/// growth's candidate loop is the hot path of the whole pipeline — Django's
+/// 2 413 plots evaluate **20.8 million candidates**, each scanning a few dozen
+/// cells — and a tree walk per cell was two thirds of a twelve-second
+/// generation.
+///
+/// It is a hand-written open-addressing table rather than a `HashMap` for two
+/// reasons: the workspace pins no hash crate for `polis-layout`, and `std`'s
+/// `RandomState` is seeded per process, which is exactly the hazard the
+/// `BTreeMap` rule exists to prevent. The hash here is a fixed integer mix, so
+/// two runs probe the table in the same order — and even if they did not, the
+/// answer would be the same.
+#[derive(Debug, Clone, Default)]
+struct CellMap {
+    /// Slot keys; `None` for an empty slot.
+    keys: Vec<Option<(i32, i32)>>,
+    /// Plot ids per slot.
+    vals: Vec<Vec<u32>>,
+    /// Occupied slots.
+    len: usize,
+}
+
+impl CellMap {
+    fn new() -> Self {
+        Self {
+            keys: vec![None; 64],
+            vals: vec![Vec::new(); 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn hash(k: (i32, i32)) -> u64 {
+        let x = (i64::from(k.0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let y = (i64::from(k.1) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        crate::determinism::mix64(x ^ y.rotate_left(31))
+    }
+
+    #[inline]
+    fn slot(&self, k: (i32, i32)) -> usize {
+        let mask = self.keys.len() - 1;
+        let mut i = (Self::hash(k) as usize) & mask;
+        loop {
+            match self.keys[i] {
+                None => return i,
+                Some(other) if other == k => return i,
+                Some(_) => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    fn push(&mut self, k: (i32, i32), id: u32) {
+        if (self.len + 1) * 2 > self.keys.len() {
+            self.grow();
+        }
+        let i = self.slot(k);
+        if self.keys[i].is_none() {
+            self.keys[i] = Some(k);
+            self.len += 1;
+        }
+        self.vals[i].push(id);
+    }
+
+    #[inline]
+    fn get(&self, k: (i32, i32)) -> Option<&Vec<u32>> {
+        let i = self.slot(k);
+        if self.keys[i].is_some() {
+            Some(&self.vals[i])
+        } else {
+            None
+        }
+    }
+
+    fn grow(&mut self) {
+        let bigger = self.keys.len() * 2;
+        let old_keys = std::mem::replace(&mut self.keys, vec![None; bigger]);
+        let old_vals = std::mem::replace(&mut self.vals, vec![Vec::new(); bigger]);
+        self.len = 0;
+        for (k, v) in old_keys.into_iter().zip(old_vals) {
+            if let Some(k) = k {
+                let i = self.slot(k);
+                self.keys[i] = Some(k);
+                self.vals[i] = v;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+/// Uniform spatial hash over plot positions.
 #[derive(Debug, Clone)]
 struct Grid {
     cell: f64,
-    buckets: BTreeMap<(i32, i32), Vec<u32>>,
+    buckets: CellMap,
 }
 
 impl Grid {
     fn new(cell: f64) -> Self {
         Self {
             cell: cell.max(1e-6),
-            buckets: BTreeMap::new(),
+            buckets: CellMap::new(),
         }
     }
 
@@ -391,21 +523,51 @@ impl Grid {
 
     fn insert(&mut self, p: Pt, id: u32) {
         let k = self.key(p);
-        self.buckets.entry(k).or_default().push(id);
+        self.buckets.push(k, id);
+    }
+
+    /// Fold over every plot id within `r` of `p`, without allocating.
+    ///
+    /// **No order is imposed and none is needed.** The caller reduces to minima
+    /// and counts, and both are order-independent to the last bit — a minimum of
+    /// a set of `f64` is the same however the set is walked, and a count is a
+    /// count.
+    fn scan(&self, p: Pt, r: f64, mut f: impl FnMut(u32)) {
+        self.scan_while(p, r, |i| {
+            f(i);
+            true
+        });
+    }
+
+    /// [`Self::scan`], but the visitor may stop the walk by returning `false`.
+    ///
+    /// The growth's candidate loop rejects a position the instant it finds a
+    /// settled plot inside the packing distance, and that verdict cannot be
+    /// changed by anything else in the window — so finishing the scan is pure
+    /// waste, and it is waste paid 2.7 million times on Django, where the dense
+    /// core makes most candidates collide on one of the first plots visited.
+    /// Stopping early cannot move the city: `collision` is a property of the
+    /// set, not of the order it is visited in (PRD §7.4).
+    fn scan_while(&self, p: Pt, r: f64, mut f: impl FnMut(u32) -> bool) {
+        let n = (r / self.cell).ceil() as i32;
+        let (kx, ky) = self.key(p);
+        for dy in -n..=n {
+            for dx in -n..=n {
+                if let Some(b) = self.buckets.get((kx + dx, ky + dy)) {
+                    for &i in b {
+                        if !f(i) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Every plot id within `r` of `p`, in ascending id order.
     fn query(&self, p: Pt, r: f64, out: &mut Vec<u32>) {
         out.clear();
-        let n = (r / self.cell).ceil() as i32;
-        let (kx, ky) = self.key(p);
-        for dy in -n..=n {
-            for dx in -n..=n {
-                if let Some(b) = self.buckets.get(&(kx + dx, ky + dy)) {
-                    out.extend_from_slice(b);
-                }
-            }
-        }
+        self.scan(p, r, |i| out.push(i));
         out.sort_unstable();
     }
 }
@@ -413,21 +575,23 @@ impl Grid {
 /// How far a placement had to bend the rules.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Relaxations {
-    /// Placed inside the district's own face, keeping every rule. The good case.
+    /// Touching the district's own ground, and the town's. The good case.
     pub(crate) clean: usize,
-    /// Placed inside the district's own face, but **not** touching its own
-    /// ground — [`crate::districts`]'s rule A had to be dropped.
+    /// Touching the town but **not** its own district's ground.
     ///
-    /// This is the only placement left that can split a district in two, so it
-    /// is counted separately from every other kind: it is the number that says
-    /// how far "districts are contiguous by construction" is from literally
-    /// true. It is 0 on the 5 000-file corpus and 0 on this repository.
+    /// The growth's shaping weights could not find a legal position beside a
+    /// sibling, so the plot budded onto a stranger. It is not a failure — the
+    /// graph partition in [`crate::regions`] fixes district shape afterwards and
+    /// does not care where a plot came from — but it is the number that says how
+    /// hard the partition has to work, so it is counted.
     pub(crate) nonadjacent: usize,
-    /// Placed within [`FRINGE`] of its own face, on the shared border.
+    /// Unused since the territory constraint was removed. Kept at zero so the
+    /// report's shape does not change.
     pub(crate) fringe: usize,
-    /// Placed inside an ancestor's face: the district's own was full.
+    /// Unused since the territory constraint was removed.
     pub(crate) ancestor: usize,
-    /// Placed anywhere inside the city limit: no ancestor face had room.
+    /// Placed on the town's own frontier, because nothing near the district's
+    /// own ground was legal. See [`Settlement::frontier_anchors`].
     pub(crate) anywhere: usize,
     /// Placed with no territory at all, because nothing else fitted.
     pub(crate) detached: usize,
@@ -444,7 +608,7 @@ pub(crate) struct Settlement {
     pub(crate) files: Vec<FileRec>,
     /// `files[i]` lives in `plots[file_plot[i]]`.
     pub(crate) file_plot: Vec<u32>,
-    /// The territory map every plot is constrained by.
+    /// The directory tree the growth reads and [`crate::regions`] partitions.
     pub(crate) territory: Territory,
     /// The height field the growth reads (PRD §7.2 step 1).
     pub(crate) terrain: TerrainField,
@@ -455,128 +619,51 @@ pub(crate) struct Settlement {
     /// Growth index to age of the ground, calibrated on real commit time
     /// (PRD §7.1). Frozen at generation: see [`crate::age`].
     pub(crate) ramp: AgeRamp,
-    /// Segments plots line up along: the city limit.
-    alignments: Vec<(Pt, Pt)>,
-    /// The district skeleton, promoted to desire lines (Graft 2).
-    desire: Vec<DesireLine>,
     grid: Grid,
+    /// Running sum of every plot position, for the town's own centre of mass.
+    town_sum: Pt,
+    /// Furthest any plot is from it.
+    town_radius: f64,
+    /// Which plots still have room beside them at the coarsest grain.
+    ///
+    /// The **frontier**, maintained rather than searched for. A district
+    /// founded last month is settled at five times the separation of the old
+    /// town (PRD §7.1's ramp), so no position anywhere in the old town is legal
+    /// for it and it has to reach the edge. Finding the edge by sorting the
+    /// whole settlement by distance, once per such plot, is what made Django
+    /// take eleven seconds; this is the same answer for the cost of re-testing
+    /// a handful of plots whenever one is settled.
+    open_rim: Vec<bool>,
     step: u32,
     scratch: Vec<u32>,
-    probe: Vec<u32>,
-}
-
-/// A trimmed partition cut, with the lattice plots settle onto.
-///
-/// # Why a lattice and not a pull
-///
-/// The bake-off's second defect was that the longest natural road stroke was
-/// 28 % of the city diameter and every edge bent within a cell or two — the
-/// soap-foam tell. Graft 2 is the accretion author's own answer to it: promote
-/// the district territory boundaries to desire lines before accretion begins,
-/// and let a plot near one settle **on a lattice aligned to that line**.
-///
-/// The straightness is emergent, which is the whole point. Nothing here draws a
-/// road. A road in this city is the perpendicular bisector of two neighbouring
-/// plots, and the bisector of `(t, −pitch/2)` and `(t, +pitch/2)` *is* the line,
-/// exactly, for any `t`. A run of facing pairs on consecutive rungs therefore
-/// shares one straight boundary — an avenue — and the same-side neighbours at
-/// `t` and `t + pitch` give the cross streets that meet it. That is a street
-/// grid falling out of where the plots are, not a chord drawn across the map,
-/// which is why it does not reintroduce `treemap-arterials`' artefact.
-///
-/// Two properties are load-bearing:
-///
-/// * **Both sides share one lattice.** The pitch is a property of the *line*,
-///   fixed before any plot settles, not of the plot's own district — a cut
-///   separates an older half from a younger half by construction, so the two
-///   sides have different separations, and a lattice keyed on the plot would put
-///   the two rows out of phase and tilt every bisector.
-/// * **The pitch is the coarser side's separation** ([`Settlement::new`]). The
-///   packing rule rejects any plot within `sep` of another, so a lattice finer
-///   than the coarser neighbour's `sep` would simply be rejected on that side
-///   and the avenue would stop at the district border.
-#[derive(Debug, Clone, Copy)]
-struct DesireLine {
-    /// The phase origin: one end of the trimmed cut.
-    o: Pt,
-    /// Unit vector along the line.
-    u: Pt,
-    /// Unit normal, `u` turned left.
-    n: Pt,
-    /// Length of the trimmed cut.
-    len: f64,
-    /// Row separation across the line and rung spacing along it.
-    pitch: f64,
-}
-
-impl DesireLine {
-    /// A point in the line's frame: distance along, signed distance across.
-    fn frame(&self, p: Pt) -> (f64, f64) {
-        let v = sub(p, self.o);
-        (dot(v, self.u), dot(v, self.n))
-    }
-
-    /// How near this line's lattice a point is, in `[0, 1]`; 1 is exactly on it.
-    ///
-    /// Zero outside the line's own span, so a desire line pulls along the cut it
-    /// came from and nowhere else.
-    fn lattice_fit(&self, p: Pt) -> f64 {
-        let (t, d) = self.frame(p);
-        if t < -self.pitch || t > self.len + self.pitch {
-            return 0.0;
-        }
-        let across = ((d.abs() - self.pitch * 0.5).abs() / (self.pitch * 0.5)).min(1.0);
-        let rung = t / self.pitch;
-        let along = ((rung - rung.round()).abs() / 0.25).min(1.0);
-        (1.0 - across) * (1.0 - along)
-    }
-
-    /// The lattice point on rung `j`, `side` being −1 or +1.
-    fn point(&self, j: i64, side: f64) -> Pt {
-        let t = (j as f64) * self.pitch;
-        qp(add(
-            add(self.o, mul(self.u, t)),
-            mul(self.n, side * self.pitch * 0.5),
-        ))
-    }
 }
 
 impl Settlement {
-    /// An empty settlement over a fixed territory map.
+    /// An empty settlement over a fixed district tree.
     pub(crate) fn new(
         territory: Territory,
         params: Params,
-        total_hint: u32,
+        terrain: TerrainField,
         ramp: AgeRamp,
+        total_files: u32,
     ) -> Self {
-        // The city limit aligns the outer ring of plots, which is what makes the
-        // edge of town a drawn boundary rather than a ragged fringe. It is a
-        // *pull* and not a lattice: the rim is a closed convex ring rather than
-        // a cut between two quarters, so there is no "other side" to line up
-        // with.
-        let mut alignments = Vec::with_capacity(territory.rim.len());
-        let rim = &territory.rim;
-        for i in 0..rim.len() {
-            alignments.push((rim[i], rim[(i + 1) % rim.len()]));
-        }
-        let total = total_hint.max(1);
-        let desire = desire_lines(&territory, &params, total);
         let ground = vec![DistrictGround::default(); territory.nodes.len()];
+        let _ = total_files;
         Self {
             plots: Vec::new(),
             ground,
             files: Vec::new(),
             file_plot: Vec::new(),
             territory,
-            terrain: TerrainField::default(),
+            terrain,
             relaxed: Relaxations::default(),
             ramp,
-            alignments,
-            desire,
             grid: Grid::new(params.sep_rim * 1.25),
+            town_sum: [0.0, 0.0],
+            town_radius: 0.0,
+            open_rim: Vec::new(),
             step: 0,
             scratch: Vec::new(),
-            probe: Vec::new(),
             params,
         }
     }
@@ -606,171 +693,41 @@ impl Settlement {
         self.params.sep_at(self.district_age(did))
     }
 
-    /// Height at a point, normalised by the field's relief.
-    fn height(&self, p: Pt) -> f64 {
-        let relief = f64::from(self.terrain.relief()).max(1e-9);
-        self.terrain.height_f64(p[0], p[1]) / relief
-    }
-
-    /// Slope at a point, in units of `sep` of rise per `sep` of run.
-    fn slope(&self, p: Pt) -> f64 {
-        self.terrain.slope_f64(p[0], p[1])
-    }
-
-    /// The desire line whose lattice `p` fits best, and how well, in `[0, 1]`.
+    /// The local street frame: `(along the contour, up the fall line)`.
     ///
-    /// A reward, never a rule: a plot that cannot sit on a lattice settles where
-    /// it would have settled anyway.
-    fn lattice_best(&self, p: Pt, sep: f64) -> Option<(usize, f64)> {
-        let mut best: Option<(usize, f64)> = None;
-        for (i, line) in self.desire.iter().enumerate() {
-            let reach = line.pitch.max(sep) * DESIRE_REACH;
-            let (a, b) = (line.o, add(line.o, mul(line.u, line.len)));
-            if p[0] < a[0].min(b[0]) - reach
-                || p[0] > a[0].max(b[0]) + reach
-                || p[1] < a[1].min(b[1]) - reach
-                || p[1] > a[1].max(b[1]) + reach
-            {
-                continue;
-            }
-            let fit = line.lattice_fit(p);
-            if fit > 0.0 && best.is_none_or(|(_, bf)| fit > bf) {
-                best = Some((i, fit));
-            }
+    /// No angle is ever formed — the two axes come straight out of the terrain
+    /// gradient, one normalised and one its perpendicular — so there is no
+    /// `atan2` and no trigonometry in the growth's hot loop at all (PRD §7.4).
+    ///
+    /// On genuinely flat ground the gradient vanishes and the frame falls back
+    /// to the world axes, which is the right answer: a plain has no reason to
+    /// prefer one bearing, and a whole quarter agreeing on one is what a grid
+    /// laid out on a plain looks like.
+    fn grid_frame(gx: f64, gy: f64) -> (Pt, Pt) {
+        let l = (gx * gx + gy * gy).sqrt();
+        if l < 1e-9 {
+            return ([1.0, 0.0], [0.0, 1.0]);
         }
-        best
+        let up = [gx / l, gy / l];
+        ([-up[1], up[0]], up)
     }
 
-    /// The lattice term in the placement score.
+    /// How square a candidate sits to the local frame, in `[0, 1]`.
     ///
-    /// # Why sitting on the lattice is not enough
-    ///
-    /// Rewarding the lattice alone puts a fifth of the plots on one — and buys
-    /// almost no street. Measured at 5 000 files: 235 plots exactly on a
-    /// lattice, **40 facing pairs, and the longest run of consecutive occupied
-    /// rungs was 2**. A road needs a *run*: the boundary between rung `j`'s two
-    /// plots is a segment of the desire line, and the avenue is what you get
-    /// when rungs `j`, `j+1`, `j+2` … all have both sides filled. Scattered
-    /// lattice plots give scattered one-cell segments, which is the foam again.
-    ///
-    /// The two bonuses are what turn occupancy into a street, and each is a
-    /// property of the *street*, not of the plot:
-    ///
-    /// * **facing** — the mirror position across the line is already settled, so
-    ///   taking this one puts a segment of the line itself on the map. A cut is
-    ///   a district border, so the two sides are always different districts and
-    ///   neither can place both halves: the pair can only ever be completed by
-    ///   the second district arriving later and choosing the rung the first one
-    ///   used. Nothing but this bonus would make it choose that rung.
-    /// * **along** — a neighbouring rung on this side is already settled, so
-    ///   taking this one extends an existing row rather than starting a new one.
-    ///   This is ribbon development, and it is what makes runs longer than two.
-    fn lattice_score(&mut self, c: Pt, sep: f64) -> f64 {
-        let Some((i, fit)) = self.lattice_best(c, sep) else {
-            return 0.0;
-        };
-        if fit <= 0.0 {
+    /// One is exactly a whole number of separations from the anchor along both
+    /// axes; zero is diagonal to both. The anchor is the **nearest settled
+    /// plot**, so the frame is inherited from the neighbour rather than from an
+    /// absolute lattice: separations ramp with age, and an absolute lattice
+    /// would go out of phase the moment the grain changed.
+    fn frame_fit(v: Pt, along: Pt, up: Pt, pitch: f64) -> f64 {
+        if pitch <= 1e-9 {
             return 0.0;
         }
-        let line = self.desire[i];
-        let (t, d) = line.frame(c);
-        let j = (t / line.pitch).round() as i64;
-        let side = if d < 0.0 { -1.0 } else { 1.0 };
-        let tol = line.pitch * 0.35;
-        let mut w = 1.0;
-        if self.occupied(line.point(j, -side), tol) {
-            w += FACING_BONUS;
-        }
-        if self.occupied(line.point(j - 1, side), tol)
-            || self.occupied(line.point(j + 1, side), tol)
-        {
-            w += ALONG_BONUS;
-        }
-        fit * w
-    }
-
-    /// Whether the segment `a`–`b` crosses desire line `i`.
-    fn crosses_desire(&self, i: usize, a: Pt, b: Pt) -> bool {
-        let l = &self.desire[i];
-        crate::geom::segments_properly_cross(a, b, l.o, add(l.o, mul(l.u, l.len)))
-    }
-
-    /// Whether `c` is too close to an avenue to have a cell of its own.
-    fn too_near_avenue(&self, c: Pt, sep: f64) -> bool {
-        let keep = sep * AVENUE_KEEPOUT;
-        self.desire.iter().any(|line| {
-            let (a, b) = (line.o, add(line.o, mul(line.u, line.len)));
-            dist_to_seg(c, a, b) < keep
-        })
-    }
-
-    /// Whether a plot already sits within `tol` of `p`.
-    fn occupied(&mut self, p: Pt, tol: f64) -> bool {
-        self.grid.query(p, tol, &mut self.probe);
-        self.probe
-            .iter()
-            .any(|&i| dist(self.plots[i as usize].pos, p) <= tol)
-    }
-
-    /// Lattice positions worth trying, for a plot searching around `anchors`.
-    ///
-    /// Each anchor contributes the rungs nearest it on the [two][
-    /// `DESIRE_LINES_PER_ANCHOR`] desire lines it is nearest, both sides. The
-    /// result is sorted and deduplicated so the candidate order is a property of
-    /// the geometry rather than of the anchor list (PRD §7.4), and every point
-    /// still has to pass [`Settlement::evaluate`] — the lattice proposes, the
-    /// rules dispose.
-    fn lattice_candidates(&self, anchors: &[(Pt, f64)], sep: f64) -> Vec<Pt> {
-        if self.desire.is_empty() {
-            return Vec::new();
-        }
-        let mut out: Vec<Pt> = Vec::new();
-        for (anchor, _) in anchors {
-            let mut near: Vec<(f64, usize)> = Vec::new();
-            for (i, line) in self.desire.iter().enumerate() {
-                let (t, d) = line.frame(*anchor);
-                let reach = line.pitch.max(sep) * (DESIRE_REACH + f64::from(DESIRE_RUNGS as i32));
-                if t < -reach || t > line.len + reach || d.abs() > reach {
-                    continue;
-                }
-                near.push((quantize_f64(d.abs()), i));
-            }
-            near.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            near.truncate(DESIRE_LINES_PER_ANCHOR);
-            for (_, i) in near {
-                let line = &self.desire[i];
-                let (t, _) = line.frame(*anchor);
-                let home = (t / line.pitch).round() as i64;
-                let last = (line.len / line.pitch).floor() as i64;
-                for j in (home - DESIRE_RUNGS)..=(home + DESIRE_RUNGS) {
-                    if j < 0 || j > last {
-                        continue;
-                    }
-                    out.push(line.point(j, -1.0));
-                    out.push(line.point(j, 1.0));
-                }
-            }
-        }
-        out.sort_by(|a, b| a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])));
-        out.dedup();
-        out
-    }
-
-    /// Distance from `p` to the nearest alignment segment, or infinity.
-    fn alignment_distance(&self, p: Pt, reach: f64) -> f64 {
-        let mut best = f64::INFINITY;
-        for (a, b) in &self.alignments {
-            // Cheap reject on the bounding box before the exact test.
-            if p[0] < a[0].min(b[0]) - reach
-                || p[0] > a[0].max(b[0]) + reach
-                || p[1] < a[1].min(b[1]) - reach
-                || p[1] > a[1].max(b[1]) + reach
-            {
-                continue;
-            }
-            best = best.min(dist_to_seg(p, *a, *b));
-        }
-        best
+        let u = (v[0] * along[0] + v[1] * along[1]) / pitch;
+        let w = (v[0] * up[0] + v[1] * up[1]) / pitch;
+        let fu = (u - u.round()).abs();
+        let fw = (w - w.round()).abs();
+        (1.0 - 2.0 * fu).max(0.0) * (1.0 - 2.0 * fw).max(0.0)
     }
 
     /// The district a file belongs to: its parent directory, or the nearest
@@ -800,14 +757,12 @@ impl Settlement {
         if !self.plots.is_empty() || self.territory.nodes.is_empty() {
             return;
         }
-        let root = self.territory.get(&LogicalPath::root()).unwrap_or(0);
-        let face = &self.territory.nodes[root as usize].face;
-        let at = if face.len() >= 3 {
-            qp(crate::geom::centroid(face))
-        } else {
-            [0.0, 0.0]
-        };
-        self.settle_plot(root, at, 0);
+        let root = self.territory.root();
+        // The origin, because the origin is where the first file would have
+        // settled anyway: the growth starts from nothing and hugs itself, so the
+        // oldest ground is the ground around the first plot. There is no city
+        // limit to take a centroid of any more, and there does not need to be.
+        self.settle_plot(root, [0.0, 0.0], 0);
         // Counted like any other placement, so the ladder's tallies add up to
         // the plot count exactly and a plot can never go unaccounted for.
         self.relaxed.clean += 1;
@@ -856,101 +811,42 @@ impl Settlement {
 
     /// Find ground for a new plot of `did`, relaxing in a fixed order.
     ///
-    /// The ladder drops [`crate::districts`]'s two rules one at a time, hardest
-    /// last: first adjacency (rule A), then territory (rule T). Each rung is
-    /// counted, so "the constraint is binding" is a number in the report rather
-    /// than a claim in a comment.
+    /// Two rungs, not six. The hard rules — the packing distance and
+    /// [`Params::touch_max`] — hold on both; what is dropped between them is the
+    /// *preference* for budding onto the district's own ground. Each rung is
+    /// counted, so "the district shaping is binding" is a number in the report
+    /// rather than a claim in a comment.
     fn settle_position(&mut self, did: u32, seed: u64) -> Pt {
         let anchors = self.anchors(did, seed);
-        // A district's very first plot has no ground of its own to touch, so
-        // rule A does not apply to it — it is the root of the induction, not an
-        // exception to it.
+        // A district's very first plot has no ground of its own to touch, so the
+        // sibling rule does not apply to it — it is the root of the induction,
+        // not an exception to it.
         let rooted = !self.ground[did as usize].plots.is_empty();
-
-        // 1. Both rules: inside the district's own face, clear of its border,
-        //    and touching the district's own ground.
-        let own = self.territory.nodes[did as usize].face.clone();
-        if own.len() >= 3 {
-            // Rungs 1 and 2 are run twice: once with the street plan binding —
-            // the lattice slots along the desire lines held open for the
-            // district on the other side of the cut — and once without. A
-            // reservation must never be the reason a plot leaves its own
-            // territory, so it is dropped before rule T is.
-            for plan in [true, false] {
-                if let Some(p) = self.search(did, &anchors, seed, &own, true, 0.0, rooted, plan) {
-                    self.relaxed.clean += 1;
-                    return p;
-                }
-                // 2. Both rules, allowed right up to the border.
-                if rooted {
-                    if let Some(p) = self.search(did, &anchors, seed, &own, false, 0.0, true, plan)
-                    {
-                        self.relaxed.clean += 1;
-                        return p;
-                    }
-                }
+        if rooted {
+            if let Some(p) = self.search(did, &anchors, seed, true) {
+                self.relaxed.clean += 1;
+                return p;
             }
-            // 3. Rule A kept, rule T bent: half a separation over its own
-            //    border, still in contact with its own ground.
-            //
-            //    This rung comes *before* dropping rule A on purpose. A plot
-            //    whose centre sits 0.55 `sep` outside its polygon is still in
-            //    its own quarter — the block takes its district from the plot,
-            //    not from the geometry — whereas a plot out of contact with its
-            //    own ground is a second piece of the district. Ordered the other
-            //    way round, the 200-file corpus loses rule A once; ordered this
-            //    way it never does, at any scale measured.
-            let fringe = self.sep_of(did) * FRINGE;
+        }
+        if let Some(p) = self.search(did, &anchors, seed, false) {
             if rooted {
-                if let Some(p) = self.search(did, &anchors, seed, &own, false, fringe, true, false)
-                {
-                    self.relaxed.fringe += 1;
-                    return p;
-                }
-            }
-            // 4. Rule T only: inside its own ground, but out of contact with the
-            //    rest of it. This is the one placement left that can split a
-            //    district, so it is counted apart from every other.
-            if let Some(p) = self.search(did, &anchors, seed, &own, true, 0.0, false, false) {
                 self.relaxed.nonadjacent += 1;
-                return p;
+            } else {
+                self.relaxed.clean += 1;
             }
-            if let Some(p) = self.search(did, &anchors, seed, &own, false, 0.0, false, false) {
-                self.relaxed.nonadjacent += 1;
-                return p;
-            }
-            // 5. Neither: on the fringe and out of contact.
-            if let Some(p) = self.search(did, &anchors, seed, &own, false, fringe, false, false) {
-                self.relaxed.fringe += 1;
-                return p;
-            }
+            return p;
         }
-        // 6. The nearest ancestor whose whole subtree has room. Its subtree
-        //    face, not its own: a district that has run out of ground belongs
-        //    with its siblings inside the same quarter, and measurement says so
-        //    — steering these plots onto the parent's own ground instead put the
-        //    fragmented-district count up by half.
-        let mut up = self.territory.nodes[did as usize].parent;
-        while let Some(a) = up {
-            let face = self.territory.nodes[a as usize].subtree_face.clone();
-            if face.len() >= 3 {
-                if let Some(p) = self.search(did, &anchors, seed, &face, false, 0.0, false, false) {
-                    self.relaxed.ancestor += 1;
-                    return p;
-                }
-            }
-            up = self.territory.nodes[a as usize].parent;
+        // Nothing legal near its own ground: take the edge of town, which always
+        // has room. See [`Settlement::frontier_anchors`].
+        let edge = self.frontier_anchors();
+        if let Some(p) = self.search(did, &edge, seed, false) {
+            self.relaxed.anywhere += 1;
+            return p;
         }
-        // 7. Anywhere inside the city limit.
-        let rim = self.territory.rim.clone();
-        if rim.len() >= 3 {
-            if let Some(p) = self.search(did, &anchors, seed, &rim, false, 0.0, false, false) {
-                self.relaxed.anywhere += 1;
-                return p;
-            }
-        }
+        // Nothing legal anywhere at all. Counted, and never silent — this is
+        // asserted to be zero at every scale, on every corpus.
         self.relaxed.detached += 1;
-        qp(anchors.first().map_or([0.0, 0.0], |a| a.0))
+        qp(anchors.first().copied().unwrap_or([0.0, 0.0]))
     }
 
     /// Anchors for the frontier search.
@@ -962,240 +858,378 @@ impl Settlement {
     /// second ring pre-advanced to the frontier so a full district does not
     /// re-scan its own interior, plus a few sampled parcels so a quarter can
     /// still bulge where there is room.
-    fn anchors(&self, did: u32, seed: u64) -> Vec<(Pt, f64)> {
-        let sep = self.sep_of(did);
+    fn anchors(&self, did: u32, seed: u64) -> Vec<Pt> {
         let ground = &self.ground[did as usize];
         if ground.plots.is_empty() {
             return self.seed_anchors(did);
         }
         let c = ground.centroid();
-        let mut out = vec![(c, 0.0)];
-        if ground.radius > sep * 1.4 {
-            out.push((c, ground.radius - sep * 1.1));
+        let mut out = vec![qp(c)];
+        // The district's own outermost plots — its frontier — plus a few
+        // sampled from the interior so a quarter can still bulge where there is
+        // room. Outermost rather than a ring of empty space: the candidate
+        // generator works outward from *plots*, so an anchor that is not near
+        // one buys nothing.
+        let mut ranked: Vec<(f64, u32)> = ground
+            .plots
+            .iter()
+            .map(|&pi| (quantize_f64(dist(self.plots[pi as usize].pos, c)), pi))
+            .collect();
+        ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+        for (_, pi) in ranked.iter().take(ANCHOR_FRONTIER) {
+            out.push(self.plots[*pi as usize].pos);
         }
         let n = ground.plots.len();
         let mut rng = SeededRng::for_seed(seed, "frontier.pick");
         for _ in 0..3.min(n) {
             let idx = (rng.next_f64() * n as f64) as usize % n;
-            out.push((self.plots[ground.plots[idx] as usize].pos, 0.0));
+            out.push(self.plots[ground.plots[idx] as usize].pos);
         }
+        out.sort_by(|a, b| a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])));
+        out.dedup();
         out
+    }
+
+    /// Centre of mass of the whole settlement.
+    fn town_centre(&self) -> Pt {
+        if self.plots.is_empty() {
+            [0.0, 0.0]
+        } else {
+            qp(mul(self.town_sum, 1.0 / self.plots.len() as f64))
+        }
+    }
+
+    /// Anchors on the **town's** own frontier, where there is always room.
+    ///
+    /// The last rung of the ladder, and the one that makes "every plot has a
+    /// legal position" true rather than hoped for. A district deep inside a
+    /// crowded quarter can have no legal position anywhere near its own ground:
+    /// every ring around its centre of mass is either inside one separation of a
+    /// neighbour or past [`Params::touch_max`] from any plot at all. Measured on
+    /// Django — 7 014 files in 1 950 directories, the densest tree of the three
+    /// real repositories — that was 125 of 2 413 plots placed on top of their
+    /// own district's centre of mass, which is not a position, it is a
+    /// collision.
+    ///
+    /// The edge of town always has room, because it has open country on one
+    /// side. Sweeping it is the difference between a plot that had to found a
+    /// new quarter and a plot with no place to be.
+    fn frontier_anchors(&self) -> Vec<Pt> {
+        if self.plots.is_empty() {
+            return vec![[0.0, 0.0]];
+        }
+        let c = self.town_centre();
+        let mut ranked: Vec<(f64, u32)> = self
+            .plots
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    quantize_f64(dist(p.pos, c)),
+                    u32::try_from(i).expect("plot count fits in u32"),
+                )
+            })
+            .collect();
+        ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+        ranked.truncate(TOWN_FRONTIER);
+        ranked
+            .into_iter()
+            .map(|(_, pi)| self.plots[pi as usize].pos)
+            .collect()
     }
 
     /// Where a district with no ground yet should start looking.
     ///
-    /// Inside its own face, as close as possible to ground that already exists —
-    /// so a quarter buds onto the town that made it rather than being founded in
-    /// the wilderness. With no settlement at all, the face's centroid: that is
-    /// the repository root, and it is the civic square (PRD §8).
-    fn seed_anchors(&self, did: u32) -> Vec<(Pt, f64)> {
-        let face = &self.territory.nodes[did as usize].face;
-        let probe = if face.len() >= 3 {
-            face_probes(face)
-        } else {
-            vec![[0.0, 0.0]]
-        };
+    /// On its **parent's** frontier, so `polis-layout/src` buds onto
+    /// `polis-layout` and siblings fan around the directory that made them
+    /// (PRD §9). Failing that, on the frontier of the nearest ancestor that has
+    /// ground; failing that, on the town's own frontier; and with no settlement
+    /// at all, the origin — which is the civic square.
+    fn seed_anchors(&self, did: u32) -> Vec<Pt> {
         if self.plots.is_empty() {
-            let mut out: Vec<(Pt, f64)> = probe.iter().map(|p| (*p, 0.0)).collect();
-            out.truncate(4);
-            return out;
+            return vec![[0.0, 0.0]];
         }
-        let mut ranked: Vec<(f64, Pt)> = probe
-            .into_iter()
-            .map(|p| {
-                let mut nearest = f64::INFINITY;
-                for pl in &self.plots {
-                    nearest = nearest.min(dist(p, pl.pos));
-                }
-                (quantize_f64(nearest), p)
-            })
-            .collect();
-        ranked.sort_by(|a, b| {
-            a.0.total_cmp(&b.0)
-                .then_with(|| qp(a.1)[0].total_cmp(&qp(b.1)[0]))
-                .then_with(|| qp(a.1)[1].total_cmp(&qp(b.1)[1]))
-        });
-        ranked.truncate(4);
-        ranked.into_iter().map(|(_, p)| (p, 0.0)).collect()
+        let mut up = self.territory.nodes[did as usize].parent;
+        while let Some(a) = up {
+            let g = &self.ground[a as usize];
+            if !g.plots.is_empty() {
+                let c = g.centroid();
+                let mut ranked: Vec<(f64, u32)> = g
+                    .plots
+                    .iter()
+                    .map(|&pi| (quantize_f64(dist(self.plots[pi as usize].pos, c)), pi))
+                    .collect();
+                ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+                ranked.truncate(ANCHOR_FRONTIER);
+                return ranked
+                    .into_iter()
+                    .map(|(_, pi)| self.plots[pi as usize].pos)
+                    .collect();
+            }
+            up = self.territory.nodes[a as usize].parent;
+        }
+        // No ancestor has ground: bud onto the town itself.
+        self.frontier_anchors()
     }
 
-    /// Score candidate positions on rings around the anchors and take the best.
+    /// Score every legal position near the anchors and take the best.
     ///
-    /// `allowed`, `keep_out` and `fringe` are [`crate::districts`]'s rule T;
-    /// `touch` is its rule A. Both are hard rejects inside the candidate loop —
-    /// a candidate that fails either is never scored, so no weight can outvote
-    /// them and no build profile can skip them.
-    #[allow(clippy::too_many_arguments)] // one argument per rule, plus the search's own four
-    fn search(
-        &mut self,
-        did: u32,
-        anchors: &[(Pt, f64)],
-        seed: u64,
-        allowed: &[Pt],
-        keep_out: bool,
-        fringe: f64,
-        touch: bool,
-        plan: bool,
-    ) -> Option<Pt> {
+    /// # Where the candidates come from, and why not from rings round the anchor
+    ///
+    /// A plot may sit no closer than `sep` to a settled plot and no further than
+    /// [`Params::touch_max`] separations from the nearest one. That is a **band
+    /// round every existing plot**, and it is the whole of the legal set — so
+    /// the generator enumerates it directly: for each plot near an anchor, a few
+    /// rings inside the band, plus the four slots square to the local street
+    /// frame.
+    ///
+    /// The previous generator swept seventy-two rings outward from the anchor
+    /// itself and tested each. It found the same positions and it cost, at
+    /// Django's 2 413 plots, **12.9 seconds of a 13.1-second generation** — four
+    /// times PRD §13.1's whole cold-start budget — because all but a handful of
+    /// those rings lie outside the band and were generated and rejected one
+    /// candidate at a time.
+    ///
+    /// `touch` asks that the nearest settled plot be one of the district's own.
+    /// The packing distance and the reach are hard rejects inside the candidate
+    /// loop, so no weight can outvote them and no build profile can skip them.
+    fn search(&mut self, did: u32, anchors: &[Pt], seed: u64, touch: bool) -> Option<Pt> {
         let sep = self.sep_of(did);
-        let mut rng = SeededRng::for_seed(seed, "plot.position");
-        let base = rng.next_f64() * TAU;
         let dcent = self.ground[did as usize].centroid();
         let has_ground = !self.ground[did as usize].plots.is_empty();
-        let keep_out_d = if keep_out { sep * BORDER_KEEPOUT } else { 0.0 };
-
-        let ctx = Candidate {
+        let mut ctx = Candidate {
             did,
             sep,
-            keep_out_d,
-            fringe,
             touch,
             has_ground,
             dcent,
-            home: anchors.first().map_or([0.0, 0.0], |a| a.0),
-            plan,
+            home: anchors.first().copied().unwrap_or([0.0, 0.0]),
+            along: [1.0, 0.0],
+            up: [0.0, 1.0],
         };
-
+        let mut rng = SeededRng::for_seed(seed, "plot.position");
+        let base = rng.next_f64() * TAU;
         let mut best: Option<(f64, Pt)> = None;
-        let mut found = 0u32;
-        // Graft 2, step one: the lattice points. A plot whose search window
-        // straddles a desire line is offered the positions *on that line's
-        // lattice* before anything else, and they are scored by exactly the same
-        // function as every other candidate — so a lattice point wins on merit
-        // or not at all, and can never override rule T, rule A or the packing
-        // distance. See [`Settlement::lattice_candidates`].
-        let lattice = self.lattice_candidates(anchors, sep);
-        for c in lattice {
-            if let Some(score) = self.evaluate(c, &ctx, allowed) {
-                found += 1;
-                accept(&mut best, score, c);
-            }
-        }
-
-        // The radial schedule has to sample **just outside one separation**
-        // densely. A coarse one — the prototype stepped 0, 0.42, 0.95, 1.58 —
-        // has no ring between 0.95 and 1.58 sep, so a candidate at 1.05 sep from
-        // its neighbour is never generated at all. In a small district polygon
-        // that is every legal position there is, the search fails, and the plot
-        // relaxes into somebody else's territory. Measured: it was 70 % of them.
-        for step in 0..RADIAL_STEPS {
-            let rf = 0.18 * (step as f64).powf(1.12);
-            for (ai, (anchor, abias)) in anchors.iter().enumerate() {
-                let r = rf * sep + abias;
-                let count = if r < 1e-9 {
-                    1
-                } else {
-                    (TAU * r / (sep * 0.40)).ceil().clamp(12.0, 72.0) as u32
-                };
-                for k in 0..count {
-                    let ang =
-                        base + TAU * f64::from(k) / f64::from(count) + (ai as f64) * 0.271_828;
-                    let (sn, cs) = det_sin_cos(ang);
-                    let c = qp([anchor[0] + cs * r, anchor[1] + sn * r]);
-                    if let Some(score) = self.evaluate(c, &ctx, allowed) {
-                        found += 1;
-                        accept(&mut best, score, c);
-                    }
+        if self.plots.is_empty() {
+            for a in anchors {
+                if let Some(score) = self.evaluate(*a, &ctx, f64::NEG_INFINITY) {
+                    accept(&mut best, score, *a);
                 }
             }
-            if found >= 16 && step >= 8 {
+            return best.map(|(_, p)| p);
+        }
+        // Two passes, and the split is what keeps the cost down.
+        //
+        // **The near pass** grows candidates from the plots within one band of
+        // an anchor. Almost every plot settles here: it is the ground the
+        // district is already on, and it costs one small spatial query.
+        //
+        // **The far pass** is for the plot that has no legal position near its
+        // own ground at all — which is not rare and is not a failure. PRD §7.1's
+        // ramp means a directory founded last month is settled at five times the
+        // separation of the old town, and *no* position in the old town is five
+        // separations from every plot in it. Such a district has to reach the
+        // edge, and the far pass sorts the whole neighbourhood by distance
+        // **once** and then strides outward through it in widening prefixes.
+        //
+        // Sorting once rather than once per round is the difference between
+        // Django generating in 2 seconds and in 8: a query at a large radius
+        // costs a scan of everything inside it, and the previous shape of this
+        // loop paid that for every round.
+        let band = sep * (self.params.touch_max + 1.0);
+        let mut near: Vec<u32> = Vec::new();
+        for a in anchors {
+            self.grid.query(*a, band, &mut self.scratch);
+            near.extend_from_slice(&self.scratch);
+        }
+        near.sort_unstable();
+        near.dedup();
+        if near.len() > SEARCH_HOSTS {
+            // Nearest the district's own centre of mass. A cap, not a choice:
+            // the near pass runs for every plot in the city and a big district's
+            // anchors can reach a hundred plots, most of which are the same
+            // ground seen from two anchors.
+            let home = ctx.home;
+            let mut ranked: Vec<(f64, u32)> = near
+                .iter()
+                .map(|&pi| (quantize_f64(dist(self.plots[pi as usize].pos, home)), pi))
+                .collect();
+            ranked.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
+            ranked.truncate(SEARCH_HOSTS);
+            near = ranked.into_iter().map(|(_, pi)| pi).collect();
+            near.sort_unstable();
+        }
+        self.try_hosts(&near, base, &mut ctx, &mut best);
+        if best.is_some() {
+            return best.map(|(_, p)| p);
+        }
+        let mut done: Vec<u32> = near;
+
+        // The far pass: the frontier plots nearest the district's own ground,
+        // widening until one of them has room. `open_rim` is maintained by the
+        // growth, so this is a scan of a flag array and a sort of a few hundred
+        // entries rather than a sort of the whole settlement.
+        let mut ranked: Vec<(f64, u32)> = self
+            .open_rim
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| **o)
+            .map(|(i, _)| {
+                (
+                    quantize_f64(dist(self.plots[i].pos, ctx.home)),
+                    u32::try_from(i).expect("plot count fits in u32"),
+                )
+            })
+            .filter(|(_, pi)| done.binary_search(pi).is_err())
+            .collect();
+        ranked.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
+        let mut radius = band;
+        for round in 0..SEARCH_ROUNDS {
+            radius *= ROUND_GROWTH;
+            let inside = ranked.partition_point(|(d, _)| *d <= radius);
+            let inside = if round + 1 == SEARCH_ROUNDS {
+                ranked.len()
+            } else {
+                inside
+            };
+            if inside == 0 {
+                continue;
+            }
+            // A **stride** through the prefix, not its nearest fortieth: the
+            // nearest open plots are all on one side of the district, and a
+            // district that cannot fit there should try the other side before it
+            // tries forty more positions on this one.
+            let stride = inside.div_ceil(SEARCH_HOSTS).max(1);
+            let batch: Vec<u32> = ranked[..inside]
+                .iter()
+                .step_by(stride)
+                .map(|(_, pi)| *pi)
+                .collect();
+            self.try_hosts(&batch, base, &mut ctx, &mut best);
+            if best.is_some() {
                 break;
             }
+            done.extend_from_slice(&batch);
+            done.sort_unstable();
         }
         best.map(|(_, p)| p)
     }
 
+    /// Offer every legal position round each host plot and keep the best.
+    fn try_hosts(
+        &mut self,
+        hosts: &[u32],
+        base: f64,
+        ctx: &mut Candidate,
+        best: &mut Option<(f64, Pt)>,
+    ) {
+        let sep = ctx.sep;
+        for (hi, &pi) in hosts.iter().enumerate() {
+            let q = self.plots[pi as usize].pos;
+            // Square to the local street frame first: the four positions that
+            // make a straight bisector, offered exactly rather than approached.
+            let (_, gx, gy) = self.terrain.sample(q[0] * FRAME_SCALE, q[1] * FRAME_SCALE);
+            let (along, up) = Self::grid_frame(gx, gy);
+            ctx.along = along;
+            ctx.up = up;
+            for axis in [along, up] {
+                for sign in [1.0f64, -1.0] {
+                    let c = qp([q[0] + axis[0] * sep * sign, q[1] + axis[1] * sep * sign]);
+                    if let Some(score) =
+                        self.evaluate(c, ctx, best.map_or(f64::NEG_INFINITY, |(b, _)| b))
+                    {
+                        accept(best, score, c);
+                    }
+                }
+            }
+            // …then the rest of the band.
+            for step in 0..BAND_RINGS {
+                let t = f64::from(step) / f64::from(BAND_RINGS - 1);
+                let r = sep * (1.0 + (self.params.touch_max - 1.0) * t);
+                for k in 0..BAND_ANGLES {
+                    let ang = base
+                        + TAU * f64::from(k) / f64::from(BAND_ANGLES)
+                        + (hi as f64) * 0.271_828;
+                    let (sn, cs) = det_sin_cos(ang);
+                    let c = qp([q[0] + cs * r, q[1] + sn * r]);
+                    if let Some(score) =
+                        self.evaluate(c, ctx, best.map_or(f64::NEG_INFINITY, |(b, _)| b))
+                    {
+                        accept(best, score, c);
+                    }
+                }
+            }
+        }
+    }
+
     /// Score one candidate position, or reject it.
     ///
-    /// `None` means the candidate broke a rule — rule T (`allowed`, `fringe`,
-    /// `keep_out_d`), rule A (`touch`) or the packing distance — and those are
-    /// tested before any weight is consulted, so no score can outvote them.
-    fn evaluate(&mut self, c: Pt, ctx: &Candidate, allowed: &[Pt]) -> Option<f64> {
+    /// `None` means the candidate broke a hard rule — the packing distance,
+    /// [`Params::touch_max`], or the sibling-contact preference when it is
+    /// binding — and those are tested before any weight is consulted, so no
+    /// score can outvote them.
+    fn evaluate(&mut self, c: Pt, ctx: &Candidate, floor: f64) -> Option<f64> {
         let sep = ctx.sep;
-        let inside = contains(allowed, c);
-        if !inside && (ctx.fringe <= 0.0 || dist_to_boundary(allowed, c) > ctx.fringe) {
-            return None;
-        }
-        if ctx.keep_out_d > 0.0 && inside && dist_to_boundary(allowed, c) < ctx.keep_out_d {
-            return None;
-        }
-        // The street plan: keep off the avenues on the first pass. See
-        // [`AVENUE_KEEPOUT`].
-        if ctx.plan && self.too_near_avenue(c, sep) {
-            return None;
-        }
-        // Which avenues run through the search window. Usually none, and then
-        // the visibility test below costs nothing.
-        let window = sep * 2.6;
-        let near_lines: Vec<usize> = self
-            .desire
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| dist_to_seg(c, l.o, add(l.o, mul(l.u, l.len))) <= window)
-            .map(|(i, _)| i)
-            .collect();
-
-        self.grid.query(c, window, &mut self.scratch);
+        // Wide enough that the connectivity rule is decided inside it: the
+        // window is 2.6 separations and `touch_max` is 1.75, so a plot that
+        // would satisfy the rule can never be outside the query.
+        let window = sep * NEIGHBOUR_WINDOW;
         let mut nearest = f64::INFINITY;
         let mut nearest_same = f64::INFINITY;
-        let mut nearest_seen = f64::INFINITY;
         let mut foreign = 0.0f64;
         let mut samey = 0.0f64;
-        for &pi in &self.scratch {
-            let pl = &self.plots[pi as usize];
+        let mut anchor: Option<Pt> = None;
+        let mut collision = false;
+        let plots = &self.plots;
+        let did = ctx.did;
+        self.grid.scan_while(c, window, |pi| {
+            let pl = &plots[pi as usize];
             let dd = dist(c, pl.pos);
             if dd < sep - 1e-6 {
-                return None;
+                collision = true;
+                return false;
             }
             if dd < window {
-                if pl.district == ctx.did {
+                if pl.district == did {
                     samey += 1.0;
-                    nearest_same = nearest_same.min(dd);
                 } else {
                     foreign += 1.0;
                 }
             }
-            nearest = nearest.min(dd);
-            // Rule A asks whether the new cell will share an edge with a
-            // sibling's, and the nearest-neighbour-is-a-Delaunay-edge argument
-            // it rests on only holds **inside a quarter**: a plot on the far
-            // side of an avenue is not a Voronoi neighbour at all, because the
-            // diagram is computed per quarter and the avenue is where the cells
-            // stop. Counting one as "the nearest plot" makes rule A fail for a
-            // plot whose cell is perfectly well attached to its own district.
-            if near_lines
-                .iter()
-                .all(|&i| !self.crosses_desire(i, c, pl.pos))
-            {
-                nearest_seen = nearest_seen.min(dd);
+            if pl.district == did {
+                nearest_same = nearest_same.min(dd);
+            }
+            if dd < nearest {
+                nearest = dd;
+                anchor = Some(pl.pos);
+            }
+            true
+        });
+        if collision {
+            return None;
+        }
+        if !self.plots.is_empty() {
+            // The connectivity rule. Measured against the plot's own separation,
+            // so the coarse rim is allowed the same *relative* reach as the fine
+            // core rather than being held to the core's absolute distance.
+            if !nearest.is_finite() || nearest > sep * self.params.touch_max {
+                return None;
             }
         }
-        let nearest_visible = nearest_seen;
-        // Rule A. `nearest` and `nearest_same` were measured over the same
-        // window, so a sibling that wins inside it wins outright: nothing
-        // outside the window can be nearer than something inside it.
-        if ctx.touch && !crate::districts::touches_own(nearest_visible, nearest_same) {
+        // The sibling preference. `nearest` and `nearest_same` were measured
+        // over the same window, so a sibling that wins inside it wins outright:
+        // nothing outside the window can be nearer than something inside it.
+        if ctx.touch && !crate::districts::touches_own(nearest, nearest_same) {
             return None;
         }
         if !nearest.is_finite() {
             nearest = 0.0; // the first plot in the world
         }
         let p = self.params;
-        let mut score =
-            -p.w_hug * (nearest / sep) - p.w_slope * self.slope(c) + p.w_noise * self.height(c);
-        // Line up along the city limit.
-        let ad = self.alignment_distance(c, sep * AVENUE_REACH);
-        if ad.is_finite() && ad < sep * AVENUE_REACH {
-            score -= p.w_avenue * (ad / sep - AVENUE_OFFSET).abs();
+        let mut score = -p.w_hug * (nearest / sep);
+        if let Some(a) = anchor {
+            score += p.w_grid * Self::frame_fit(sub(c, a), ctx.along, ctx.up, sep);
         }
-        // …and, on a desire line, along the line as well as across it. The
-        // across-the-line term above is what the prototype had, and on its own
-        // it buys nothing: two plots facing each other at ±sep/2 but at
-        // different distances *along* the line have a perpendicular bisector
-        // that is tilted, so the boundary they share is a wiggle. Rewarding the
-        // along-line lattice is what makes a run of facing pairs share one
-        // straight bisector.
-        score += p.w_lattice * self.lattice_score(c, sep);
         if ctx.has_ground {
             score -= p.w_compact * (dist(c, ctx.dcent) / sep) * 0.55;
             let tot = foreign + samey;
@@ -1213,7 +1247,25 @@ impl Settlement {
         } else {
             score -= 0.30 * (dist(c, ctx.home) / sep);
         }
-        Some(score)
+        // The terrain is the expensive half of the score and the last thing
+        // computed, because a candidate that cannot win even with the best
+        // ground in the world does not need it.
+        //
+        // The bound is **exact**, not a heuristic: the slope term is a penalty
+        // and can only lower the score, and the height term is at most
+        // `w_noise · HEIGHT_BOUND` because the noise is normalised. A candidate
+        // pruned here would have scored below the incumbent whatever the ground
+        // under it, so the city is bit-for-bit the one the unpruned loop builds
+        // — and at Django's scale it is the difference between five seconds and
+        // two. The comparison is strict, so a tie still goes to `accept`'s
+        // lexicographic rule (PRD §7.4).
+        if score + p.w_noise * HEIGHT_BOUND < floor {
+            return None;
+        }
+        let (h, gx, gy) = self.terrain.sample(c[0], c[1]);
+        let relief = f64::from(self.terrain.relief()).max(1e-9);
+        let slope = (gx * gx + gy * gy).sqrt();
+        Some(score - p.w_slope * slope + p.w_noise * (h / relief))
     }
 
     /// Record a new plot.
@@ -1231,6 +1283,14 @@ impl Settlement {
             birth: self.territory.nodes[did as usize].own_oldest,
         });
         self.grid.insert(pos, id);
+        // Optimistic: the refresh below tests it properly.
+        self.open_rim.push(true);
+        self.town_sum = add(self.town_sum, pos);
+        // Updated with the new plot only, never rescanned: the centre drifts by
+        // less than a separation per plot, so a running maximum is within one
+        // plot of the true frontier and this stays a constant-time step
+        // (PRD §13.1).
+        self.town_radius = self.town_radius.max(dist(pos, self.town_centre()));
         let g = &mut self.ground[did as usize];
         g.plots.push(id);
         g.sum = add(g.sum, pos);
@@ -1240,7 +1300,48 @@ impl Settlement {
             r = r.max(dist(self.plots[pi as usize].pos, c));
         }
         self.ground[did as usize].radius = r;
+        self.refresh_open(pos);
         id
+    }
+
+    /// Re-test which plots near `at` still have room beside them.
+    ///
+    /// **Only the ones still marked open.** Settling a plot can take a free
+    /// position away and can never give one back, so openness is monotone and a
+    /// plot that has been enclosed stays enclosed. In a dense old quarter that
+    /// is nearly every plot in range, which is what makes this a handful of
+    /// tests per growth step rather than a few hundred. See
+    /// [`Settlement::open_rim`].
+    fn refresh_open(&mut self, at: Pt) {
+        let sep = self.params.sep_rim;
+        let band = sep * (self.params.touch_max + 1.0);
+        let mut touched: Vec<u32> = Vec::new();
+        self.grid.query(at, band + sep, &mut touched);
+        for &pi in &touched {
+            if !self.open_rim[pi as usize] {
+                continue;
+            }
+            let q = self.plots[pi as usize].pos;
+            let mut open = false;
+            for k in 0..OPEN_PROBES {
+                let ang = TAU * f64::from(k) / f64::from(OPEN_PROBES);
+                let (sn, cs) = det_sin_cos(ang);
+                let r = sep * OPEN_RADIUS;
+                let c = qp([q[0] + cs * r, q[1] + sn * r]);
+                let mut blocked = false;
+                let plots = &self.plots;
+                self.grid.scan(c, sep, |oi| {
+                    if dist(c, plots[oi as usize].pos) < sep - 1e-6 {
+                        blocked = true;
+                    }
+                });
+                if !blocked {
+                    open = true;
+                    break;
+                }
+            }
+            self.open_rim[pi as usize] = open;
+        }
     }
 
     /// Growth progress of the plot nearest a point, in `[0, 1]`.
@@ -1269,6 +1370,46 @@ impl Settlement {
         best.map_or(0.0, |(_, b)| self.ramp.at(b))
     }
 
+    /// The district a file belongs to, by its path.
+    pub(crate) fn district_of_file(&self, fi: u32) -> u32 {
+        self.district_of(&self.files[fi as usize].path)
+    }
+
+    /// This settlement with [`crate::regions`]' partition applied.
+    ///
+    /// A copy, deliberately. The raw growth is what the next incremental step
+    /// continues from, so the partition must not be able to feed back into it:
+    /// a city grown one file at a time and one generated from scratch would
+    /// then be different cities, and PRD §7.7 forbids that.
+    pub(crate) fn reseated(&self, seating: &crate::regions::Seating) -> Self {
+        let mut out = self.clone();
+        for (i, plot) in out.plots.iter_mut().enumerate() {
+            if let Some(&d) = seating.plot_district.get(i) {
+                plot.district = d;
+            }
+            if let Some(files) = seating.plot_files.get(i) {
+                plot.files = files.clone();
+            }
+        }
+        out.file_plot = seating.file_plot.clone();
+        out.ground = vec![DistrictGround::default(); out.territory.nodes.len()];
+        for (i, plot) in out.plots.iter().enumerate() {
+            let id = u32::try_from(i).expect("plot count fits in u32");
+            let g = &mut out.ground[plot.district as usize];
+            g.plots.push(id);
+            g.sum = add(g.sum, plot.pos);
+        }
+        for d in 0..out.ground.len() {
+            let c = out.ground[d].centroid();
+            let mut r = 0.0f64;
+            for &pi in &out.ground[d].plots {
+                r = r.max(dist(out.plots[pi as usize].pos, c));
+            }
+            out.ground[d].radius = r;
+        }
+        out
+    }
+
     /// Every plot position, in plot order.
     pub(crate) fn positions(&self) -> Vec<Pt> {
         self.plots.iter().map(|p| p.pos).collect()
@@ -1280,8 +1421,9 @@ impl Default for Settlement {
         Self::new(
             Territory::default(),
             Params::default(),
-            1,
+            TerrainField::default(),
             AgeRamp::default(),
+            1,
         )
     }
 }
@@ -1302,16 +1444,13 @@ fn accept(best: &mut Option<(f64, Pt)>, score: f64, c: Pt) {
 /// Bundled so [`Settlement::evaluate`] can be one function shared by the radial
 /// sweep and the lattice, rather than two copies of the rule set that a later
 /// change could let drift apart.
+#[derive(Clone, Copy)]
 struct Candidate {
     /// The district asking for ground.
     did: u32,
     /// Its plot separation.
     sep: f64,
-    /// Rule T's border keep-out, or zero.
-    keep_out_d: f64,
-    /// How far outside `allowed` a candidate may sit, or zero.
-    fringe: f64,
-    /// Rule A: the nearest plot of all must be a sibling.
+    /// Ask that the nearest plot of all be a sibling.
     touch: bool,
     /// Whether the district has ground already.
     has_ground: bool,
@@ -1319,80 +1458,15 @@ struct Candidate {
     dcent: Pt,
     /// The first anchor, used only before the district has ground.
     home: Pt,
-    /// Whether the held-open lattice slots are binding on this rung of the
-    /// ladder. Dropped once the search starts relaxing, so a reservation can
-    /// never be the reason a plot ends up outside its own district.
-    plan: bool,
-}
-
-/// Promote the partition's trimmed cuts to desire lines (Graft 2).
-///
-/// The one judgement call is the pitch, and it is made here rather than in
-/// `territory` because it needs [`Params`]: see [`DesireLine`] for why it is the
-/// **coarsest** separation of any district whose ground reaches the line.
-///
-/// A district reaches the line when one of its face's corners is inside the
-/// band. The faces are convex and the cuts are their own edges, so a district
-/// that runs along a cut always has two corners on it; the test is cheap and
-/// errs toward including a district, which errs toward a legal lattice.
-fn desire_lines(territory: &Territory, params: &Params, total: u32) -> Vec<DesireLine> {
-    let mut out = Vec::with_capacity(territory.avenues.len());
-    for &(a, b) in &territory.avenues {
-        let len = dist(a, b);
-        if len <= 1e-6 {
-            continue;
-        }
-        let u = norm(sub(b, a));
-        let n = [-u[1], u[0]];
-        let mut pitch = params.sep_core;
-        for node in &territory.nodes {
-            if node.own_units == 0 || node.face.len() < 3 {
-                continue;
-            }
-            let age = if node.own_oldest == u32::MAX {
-                1.0
-            } else {
-                (f64::from(node.own_oldest) / f64::from(total.max(1))).clamp(0.0, 1.0)
-            };
-            let sep = params.sep_at(age);
-            if sep <= pitch {
-                continue;
-            }
-            let band = sep * DESIRE_REACH;
-            if node.face.iter().any(|&v| dist_to_seg(v, a, b) <= band) {
-                pitch = sep;
-            }
-        }
-        // Quantised: the pitch sets a lattice phase, and a lattice phase is the
-        // last place an unrounded `f64` should reach (PRD §7.4).
-        let pitch = quantize_f64(pitch * LATTICE_PITCH);
-        if pitch <= 1e-6 || len < pitch * 2.0 {
-            continue; // too short to carry even one straight run
-        }
-        out.push(DesireLine {
-            o: qp(a),
-            u: qp(u),
-            n: qp(n),
-            len: quantize_f64(len),
-            pitch,
-        });
-    }
-    out
-}
-
-/// A spread of points inside a convex face: the centroid, the vertices pulled
-/// inward, and the edge midpoints pulled inward.
-fn face_probes(face: &[Pt]) -> Vec<Pt> {
-    let c = crate::geom::centroid(face);
-    let mut out = vec![qp(c)];
-    let n = face.len();
-    for i in 0..n {
-        let a = face[i];
-        let b = face[(i + 1) % n];
-        out.push(qp(crate::geom::lerp(a, c, 0.30)));
-        out.push(qp(crate::geom::lerp(mul(add(a, b), 0.5), c, 0.25)));
-    }
-    out
+    /// The local street frame, along the contour and up the fall line.
+    ///
+    /// Carried rather than sampled per candidate. It is read off a field
+    /// stretched to seven times the terrain's wavelength ([`FRAME_SCALE`]), so
+    /// it is constant to three decimal places across one plot's neighbourhood —
+    /// and sampling it per candidate doubled the cost of the growth's hot loop
+    /// for an answer that did not change.
+    along: Pt,
+    up: Pt,
 }
 
 /// Replay a file list in growth order.
@@ -1404,10 +1478,11 @@ pub(crate) fn grow(
     territory: Territory,
     params: Params,
     ramp: AgeRamp,
+    terrain: TerrainField,
 ) -> Settlement {
     files.sort_by(|a, b| (a.growth_index, a.path.as_str()).cmp(&(b.growth_index, b.path.as_str())));
     let total = u32::try_from(files.len()).unwrap_or(u32::MAX);
-    let mut s = Settlement::new(territory, params, total, ramp);
+    let mut s = Settlement::new(territory, params, terrain, ramp, total);
     for f in files {
         s.add_file(f);
     }
@@ -1459,14 +1534,10 @@ mod tests {
         // that sizes the territory differently from production is testing a
         // city nobody ships.
         let ramp = ramp_of(&files);
-        let t = territory::build(
-            &crate::districts::demands(&files, &params, &ramp),
-            &|p| p.as_str().starts_with("vendor"),
-            &terrain,
-            params.plot_area_at(0.0),
-            9,
-        );
-        grow(files, t, params, ramp)
+        let t = territory::build(&crate::districts::demands(&files), &|p| {
+            p.as_str().starts_with("vendor")
+        });
+        grow(files, t, params, ramp, terrain)
     }
 
     fn sample_paths() -> Vec<&'static str> {
@@ -1518,44 +1589,35 @@ mod tests {
     }
 
     #[test]
-    fn the_territory_constraint_actually_binds() {
+    fn every_placement_is_counted() {
         let s = settle(&sample_paths());
         assert_eq!(
             s.relaxed.detached, 0,
-            "a plot was placed with no territory at all"
+            "a plot was placed with no legal position at all"
         );
-        // Every plot is accounted for by exactly one rung of the ladder.
         assert_eq!(
-            s.relaxed.clean
-                + s.relaxed.nonadjacent
-                + s.relaxed.fringe
-                + s.relaxed.ancestor
-                + s.relaxed.anywhere
-                + s.relaxed.detached,
+            s.relaxed.clean + s.relaxed.nonadjacent + s.relaxed.detached,
             s.plots.len(),
             "a plot was placed without being counted"
         );
-        assert_eq!(
-            s.relaxed.anywhere, 0,
-            "a plot was placed with no relation to its own directory at all"
-        );
     }
 
+    /// The rule that makes `components = 1` structural: no plot is founded
+    /// across a gap.
     #[test]
-    fn plots_settle_inside_their_own_district() {
+    fn every_plot_after_the_first_touches_the_town() {
         let s = settle(&sample_paths());
-        let mut outside = 0;
-        for p in &s.plots {
-            let face = &s.territory.nodes[p.district as usize].face;
-            if face.len() >= 3 && !contains(face, p.pos) {
-                outside += 1;
-            }
+        let reach = s.params.sep_rim * s.params.touch_max;
+        for (i, p) in s.plots.iter().enumerate().skip(1) {
+            let nearest = s.plots[..i]
+                .iter()
+                .map(|q| dist(p.pos, q.pos))
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest <= reach + 1e-6,
+                "plot {i} settled {nearest} from the nearest ground, past {reach}"
+            );
         }
-        assert!(
-            outside <= s.relaxed.fringe + s.relaxed.ancestor + s.relaxed.anywhere,
-            "{outside} plots left their district but only {} relaxations were recorded",
-            s.relaxed.fringe + s.relaxed.ancestor + s.relaxed.anywhere
-        );
     }
 
     #[test]
@@ -1585,9 +1647,19 @@ mod tests {
         assert!(p.sep_at(0.0) < p.sep_at(1.0));
         assert!(p.cap_at(0.0) <= p.cap_at(1.0));
         assert!(p.plot_area_at(1.0) > p.plot_area_at(0.0));
-        assert!(p.district_demand(10, 1.0) > p.district_demand(10, 0.0));
-        // One file still needs one whole plot, plus its border band.
-        assert!(p.district_demand(1, 0.0) > p.plot_area_at(0.0));
+    }
+
+    /// The street frame is a pair of perpendicular unit axes, and a candidate
+    /// square to it scores 1 while a diagonal one scores nothing.
+    #[test]
+    fn the_street_frame_rewards_a_square_neighbour() {
+        let (along, up) = Settlement::grid_frame(0.0, 2.0);
+        assert!((along[0].abs() - 1.0).abs() < 1e-9 || (along[1].abs() - 1.0).abs() < 1e-9);
+        assert!((along[0] * up[0] + along[1] * up[1]).abs() < 1e-9);
+        let square = Settlement::frame_fit([0.0, 1.0], along, up, 1.0);
+        let diagonal = Settlement::frame_fit([0.707, 0.707], along, up, 1.0);
+        assert!(square > 0.99, "a square neighbour scored {square}");
+        assert!(diagonal < 0.2, "a diagonal neighbour scored {diagonal}");
     }
 
     #[test]

@@ -250,6 +250,19 @@ fn report(city: &City, s: &Structure, phases: Phases) -> String {
         "            longest stroke including the city limit = {:.1}% (the outline is not a street)",
         city::longest_stroke_with_limit(city) * 100.0
     );
+    // Is it a place, or a diagram? The two numbers three M1 gates were failed
+    // on, printed where the rest of the structure is (PRD §15).
+    let _ = writeln!(
+        out,
+        "            solidity={:.4} (area / convex hull; a coin is 1.00) radial spokes={} boulevards-through-the-middle={}",
+        s.solidity, s.radial_spokes, s.radial_strokes
+    );
+    let _ = writeln!(
+        out,
+        "            longest dead-straight district border={:.1}% of diameter, past a fifth of it={} (a ruler, whatever its bearing)",
+        s.straight_border * 100.0,
+        s.straight_borders
+    );
     let _ = writeln!(
         out,
         "BLOCKS      count={} open={} slivers={} area p05/med/p95={:.3}/{:.3}/{:.3} p95:p05={:.1}x compactness={:.3}",

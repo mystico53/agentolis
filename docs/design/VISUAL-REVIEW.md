@@ -1,5 +1,173 @@
 # Polis — Visual Review (fresh eyes, no implementer claims read)
 
+> **ROUND 5 is the current review. Round 4 is archived below the double rule.**
+
+---
+
+# Round 5 — the pie is gone; the map is now invisible
+
+Reviewer: independent visual pass, told nothing except the PRD intent. Method: squint test
+(downsample to 180 px — "across the room") before anything else; then full frame; then 1:1
+mid-zoom crops; then measurement — junction-dot extraction, radial spacing law, edge-map
+comparison against the previous round's committed PNGs, and a luminance census.
+
+## Verdict up front
+
+**Two answers, and they point in opposite directions.**
+
+1. **The geometry genuinely changed this round. This is not a recolour.** Measured against the
+   previous round's committed images: edge-map IoU **0.22–0.25**, **37–45 %** of pixels moved by
+   more than 8 levels. Side by side, the convex 12-gon is gone, the pie wedges are gone, the ruled
+   radial spokes are gone. The outline is now ragged, lobed, with peninsulas and an isthmus. After
+   four rounds of "the artefact was repainted", this one is real work. Say so.
+
+2. **It still does not read as a city at a glance — but not because of the layout.
+   Because you cannot see it.** 98.5 % of every map lies below sRGB channel 48. The legend
+   admits it: `PRD 10.3 LAYERS 1-2 <= L* 20 (CHANNEL 48)`. §10.3 asks for a coastline on a
+   weather chart: *always visible, always faint.* You have delivered faint and deleted visible.
+   At 180 px, three of the four renders read as **mould on a dark plate**. Not a pie chart any
+   more — a stain.
+
+So: **no, it does not yet look like a city — for a new and much cheaper reason than last time.**
+
+## The new artefact, named
+
+Every previous round had one geometric tell. This round has three, and the first is the pie
+chart's ghost.
+
+### 1. THE DRAIN — a density singularity with a radial gradient
+
+Extracted every junction dot from the three junction renders and measured nearest-neighbour
+spacing against distance from the densest point:
+
+| render | accumulation point | spacing at centre | spacing at rim | corr(radius, spacing) |
+|---|---|---|---|---|
+| `city-real-5k-junctions.png` | (810, 665) | 18.4 px | 42.8 px | **+0.584** |
+| `city-m1-large-junctions.png` | (1064, 729) | 18.0 px | 38.0 px | **+0.553** |
+| `city-m1-junctions.png` | (931, 736) | 54.1 px | 110.8 px | **+0.558** |
+
+A grown city has block size varying by *district* — correlation with distance-to-a-point near
+zero. Here block size is a smooth monotone function of radius from one interior point, in all
+three renders, at the same strength. At that point the nodes collapse into a visible clot of
+overlapping dots. **The wedges were deleted; the centre they converged on was not.** Zoom into
+the middle of `city-real-5k-junctions.png` and you can trace curved chains of dots spiralling out
+of the clot — the sunflower from round 1, still breathing under two rounds of paint.
+
+This is the highest-priority geometric defect. It is not literally a Vogel spiral any more
+(sqrt-k radius-law residual 31 %; a true spiral is under 6 %), so it is not "the same bug" —
+but it is the same *family*: one origin, everything graded outward from it.
+
+### 2. THE COG — a sunburst fringe around the coast
+
+Brighten any large render 4× and look at the shore. Outside the built land is a ring of dark
+triangular spikes, all pointing outward, evenly spaced around the entire perimeter. Those are the
+unbounded Voronoi cells of the coastal sites, rendered as terrain. The island wears a gear.
+Visible unboosted too, as a slightly different black. Also: the coast is **facetted at exactly
+one scale** — every shoreline segment is a straight chord of roughly 30–60 px with obtuse
+corners. Real coastlines have detail at every scale; this has detail at one.
+
+### 3. THE ROSETTE — ROOT parked at the geometric centre
+
+In all three large renders, `ROOT`/`DOCS` is a pale grey mass sitting at the middle of the
+landmass with the top-level directories wrapped concentrically around it. Django reduces to
+green-left / magenta-right / grey-core meeting at the centre — the same tripartite structure as
+last round, just with the wedge boundaries smoothed off. Repositories do not have a middle.
+Cities have a historic core *and a direction they grew in*; this has an origin.
+
+## Squint test at 180 px, unboosted (the PRD §1 test)
+
+| Render | What the thumbnail is |
+|---|---|
+| `city-m1.png` | A pile of cardboard boxes on coloured paper, buried under text. **Object.** |
+| `city-m1-large.png` | A dark lobed landmass with a lake. **The one that passes.** Place, barely. |
+| `city-real-5k.png` | A lichen patch / a butterfly-shaped stain. Place-ish, unreadable. |
+| `city-real-django.png` | **A two-tone pill.** Green half, magenta half, near-circular. Object. |
+| `city-m1-junctions.png` | A rhombic lattice of dots inside a ring of big empty cells. |
+| `city-m1-large-junctions.png` | A dot mesh with a bright clot off-centre. |
+| `city-real-5k-junctions.png` | **A sunflower head.** Unmistakable. |
+| `design/accretion/large.png` (ref) | A lobed island with coloured districts and peninsulas. **The most place-like image in the repo — and it is the one you rejected.** |
+
+Read that last row again. The archived round-4 reference still beats every current render on the
+squint test, because it is bright enough to have a silhouette. This round has the better geometry
+and the worse image.
+
+## Can you see building height? No.
+
+- Legend swatches `BUILDING LOW` and `BUILDING TALL` are both dark olive-grey and are, at a
+  glance, **the same colour**.
+- Buildings now do have extrusion — a pale roof plus a darker side face. That is new and it is
+  right. But the tonal range is so compressed that you cannot rank two neighbours, let alone find
+  the tallest in a 5 000-file repo.
+- The tallest is disclosed **only as text in the legend** — `TALLEST CORE/MEDIA/INDEX/METR…` —
+  and it is *still clipped by the right edge of the canvas*, exactly as flagged last round.
+- In `city-m1.png`, height is drawn as **nested concentric rectangles**: the tall building is a
+  bullseye. It reads as a target or a picture frame, not a tower, and comparing two heights means
+  counting rings.
+
+Height is the primary quantity the map exists to show. It is the least visible thing in the image.
+
+## Mid-zoom: this is where the round succeeds
+
+At 1:1 the fabric is genuinely good and deserves saying so. The off-centre crop of
+`city-m1-large.png` — TOOLS / MOBILE / PACKAGES — looks like a night aerial of a dense old
+European town: irregular blocks, varied footprints set along street frontages, streets that bend
+and T, a black void that reads as a park. `city-real-django.png` holds up the same way. No tiling,
+no repeat, no visible grain.
+
+Two mid-zoom faults: the **centre crops are visibly finer and mushier** than the off-centre ones
+(the drain again), and several district cells are **completely bald** — a flat coloured polygon
+with no buildings at all (`CMAKE` in 5k, several on the django rim).
+
+## Is the base map faint enough for a bright overlay?
+
+Overwhelmingly yes, and that is the problem. Land pixels above channel 48: **1.1–1.6 %**. Above
+channel 120: **0.5–0.7 %** — and all of that is label text, not city. An agent trail would stand
+out against this like a flare; so would a single lit pixel. §10.3 wants a coastline you can always
+see. You have a coastline you can never see.
+
+## The single worst thing in each image
+
+| Image | Worst thing |
+|---|---|
+| `city-m1.png` | Buildings the size of city blocks, and labels wider than the districts they name. A label cloud with a map behind it. |
+| `city-m1-large.png` | It is the best geometry in the set and it is invisible. Contrast p95−p5 = **28** out of 255. |
+| `city-real-5k.png` | The centre is a mush of the finest blocks on the map, sitting exactly where the eye lands first. |
+| `city-real-django.png` | Bisected disc — green half, magenta half, clean seam through a grey core. Reads as a pill, not a place. |
+| `city-m1-junctions.png` | A lattice core inside a ring of huge empty polygons: two unrelated fabrics with a hard join. |
+| `city-m1-large-junctions.png` | The bright accumulation clot right of centre, with dot spacing graded smoothly outward from it. |
+| `city-real-5k-junctions.png` | **A sunflower head.** This image is the diagnosis; do not ship geometry that produces it. |
+
+## The highest-value change to the IMAGE
+
+**Raise the base map's ceiling from L\* 20 to roughly L\* 45–55, and spend every bit of the new
+range on building height.**
+
+Concretely: leave terrain, district fill and roads near their current tone — they are already
+right, and they are what §10.3 is protecting. Then give roofs a full ramp from near-background to
+near-white driven by uncommitted diff lines, and give each building a cast shadow whose *length*
+grows with height. Two encodings of the same quantity, both legible at 180 px. The tallest
+building should be findable across the room without reading the legend.
+
+That one change fixes the squint test and the missing primary quantity together, and it does not
+touch the layout — which, for the first time in five rounds, mostly does not need touching.
+
+**Second, and only second: kill the drain.** Block size must be a property of the district, not a
+function of distance to an origin. Target corr(radius, junction spacing) below ±0.15. Until that
+number moves, every render will keep having a middle.
+
+**Third, cheap:** clip the shore against the land mask so the outward Voronoi spikes stop drawing
+a gear around the island, and stop clipping the `TALLEST …` caption at the canvas edge — that has
+now survived two reviews.
+
+**Do not answer this review by darkening anything.**
+
+---
+---
+
+# ARCHIVE — Round 4
+
+## Polis — Visual Review, round 4 (as written at the time)
+
 Reviewer: independent visual pass. Method: full-frame look, squint test (downsample to ~180px
 wide and view — this is "across the room"), then 1:1 mid-zoom crops at the scale an operator
 actually works at. Plus a pixel-colour census to check what the render is actually made of.

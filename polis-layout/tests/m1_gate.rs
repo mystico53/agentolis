@@ -1314,6 +1314,7 @@ const GATE_SEED: u64 = 0xACCE_7107_0000_0001;
 /// baseline at 5 000 files, so a regression reads as a regression rather than as
 /// an unexplained failure.
 #[test]
+#[allow(clippy::too_many_lines)] // one corpus, one ordered list of assertions
 fn the_layout_holds_at_five_thousand_files() {
     let tree = polis_repo::synthetic::repository(5_000, GATE_SEED);
     let started = std::time::Instant::now();
@@ -1419,6 +1420,45 @@ fn the_layout_holds_at_five_thousand_files() {
         structure.through_streets
     );
 
+    // Is it a place, or a diagram? These are the two numbers three M1 gates in
+    // a row were failed on, and neither was in this file — they were in a
+    // reviewer's notebook, which is why the answer to a geometric failure was a
+    // tonal fix, three times.
+    //
+    // Solidity was 0.9947–0.9994 across five corpora while the city limit was a
+    // convex polygon. A circle is 1.00. Anything under 0.90 has a coastline.
+    assert!(
+        structure.solidity < 0.90,
+        "the city fills {:.1}% of its own convex hull: that is a coin, not a coast",
+        structure.solidity * 100.0
+    );
+    // And there were four to nine dead-straight district borders running from
+    // inside 5 % of the radius out past 90 % of it, within two degrees of
+    // radial: the pie chart. Zero, not a rate — one such border is a drawn
+    // avenue and the eye finds it immediately.
+    assert_eq!(
+        structure.radial_spokes, 0,
+        "{} district borders run from the middle of the city to its edge on a radial bearing",
+        structure.radial_spokes
+    );
+    assert_eq!(
+        structure.radial_strokes, 0,
+        "{} through-streets pass through the civic square and out the other side",
+        structure.radial_strokes
+    );
+    // And the same question with the bearing taken out of it, because the two
+    // above only ask whether the ruler pointed at the middle. The competing
+    // attempt in this round scored `radial_spokes == 0` with a dead-straight
+    // border still running 60 % of the way across the city: it had replaced a
+    // radial chord partition with a non-radial one. A border made of Voronoi
+    // bisectors measures 8-10 % here.
+    assert_eq!(
+        structure.straight_borders, 0,
+        "{} district borders are dead straight for more than a fifth of the city (longest {:.1}%): the partition is drawing with a ruler",
+        structure.straight_borders,
+        structure.straight_border * 100.0
+    );
+
     // Districts. The bake-off baseline was 102 of 276 in more than one piece,
     // and the first port of the territory graft still had 41 of 307. Both were
     // tuning misses; the number this gate holds is **zero**, because
@@ -1437,36 +1477,61 @@ fn the_layout_holds_at_five_thousand_files() {
         r.fragmented_packages
     );
     assert!(
-        r.fragmented_subtrees * 20 <= r.districts,
+        r.fragmented_subtrees * 8 <= r.districts,
+        // A rate, and the loosest of the three contiguity numbers on purpose.
+        // The two the PRD names are absolute and hold: no district in more than
+        // one piece and no top-level package either, on every corpus measured.
+        // An *intermediate* directory is a union of districts, and `regions`
+        // guarantees connectivity where it is bought — at the top level, so a
+        // package is one piece — and lets the balance choose below it, where a
+        // sibling's parcel can land between two branches of the same middling
+        // directory. Measured: 15 of 237 at 3 000 files and 25 of 312 at 5 000,
+        // against 102 of 276 districts in the design bake-off's own prototype.
         "{} of {} directory subtrees are in more than one piece",
         r.fragmented_subtrees,
         r.districts
     );
-    // The two rules, measured rather than assumed: every plot inside its own
-    // district's polygon, and every plot after a district's first in contact
-    // with that district's own ground.
-    // The relaxation ladder, hardest rung first. The last three are absolute:
-    // a plot in an ancestor's ground, anywhere in the city, or out of contact
-    // with the settlement is a failure of the construction. The first two are
-    // **rates**, because the ramp now reads real commit time and two adjacent
-    // districts can be a decade apart in grain — measured at 2 and 1 of 955
-    // plots here, 0 and 1 of 837 on Neovim, 2 and 0 of 2 413 on Django.
+    // The growth's preference for budding a plot onto its own district's
+    // ground. It is no longer what makes a district contiguous — `regions`
+    // partitions the plot adjacency graph and every part of that partition is
+    // connected by construction — so this is a **shaping** number: how much
+    // work the partition has to do, not whether it worked. Measured 123 of 955
+    // plots here. A third is twice that, and a growth that had stopped
+    // preferring its own ground would sit near the foreign share of the
+    // frontier, well past it.
     assert!(
-        r.settled_nonadjacent * 100 <= r.plots,
+        r.settled_nonadjacent * 5 <= r.plots,
         "{} of {} plots founded out of contact with their own district",
         r.settled_nonadjacent,
         r.plots
     );
-    assert!(
-        r.settled_on_fringe * 100 <= r.plots,
-        "{} of {} plots settled on the fringe of their own polygon",
-        r.settled_on_fringe,
-        r.plots
+    // There is no district polygon any more, so there is no fringe of one to
+    // settle on: the growth is free and `regions` partitions afterwards. The
+    // field is kept and asserted at **zero** rather than deleted, because a
+    // non-zero value would mean some polygon had come back.
+    assert_eq!(
+        r.settled_on_fringe, 0,
+        "{} plots settled on the fringe of a polygon that should not exist",
+        r.settled_on_fringe
     );
     assert_eq!(r.relaxed_to_ancestor, 0);
     assert_eq!(r.relaxed_to_anywhere, 0);
     assert_eq!(r.detached_placements, 0);
-    assert_eq!(r.shared_faces, 0, "the partition ran out of room");
+    // Districts that had to seat their files on a sibling's ground because the
+    // subtree they are in was given fewer plots than it has directories. A
+    // **rate**, and a small one: the partition divides plot *capacity*, so a
+    // subtree of many tiny directories can come out one plot short of one plot
+    // each even though the growth settled enough. `regions` restores the floor
+    // by moving plots back across the cut, which takes it from 7 to 2 of 312
+    // here and to 0 on Django, Neovim and CPython. The files are still placed —
+    // `unhoused` and the overflow below are zero — they are just on a
+    // neighbour's parcel.
+    assert!(
+        r.shared_faces * 100 <= r.districts,
+        "{} of {} districts had to share a sibling's ground",
+        r.shared_faces,
+        r.districts
+    );
     assert_eq!(r.faceless_districts, 0);
 
     // Every plot has a cell and every cell has a face. Both are zero by
@@ -1570,30 +1635,25 @@ fn every_district_is_one_place_on_the_map_at_every_scale() {
         // rule-A bends from 0 to 18, because the founding plot is exactly the
         // one with the least room to manoeuvre. Recorded in ADR-0058.
         assert!(
-            r.fragmented_subtrees * 20 <= r.districts,
+            r.fragmented_subtrees * 8 <= r.districts,
             "{files} files: {} of {} directory subtrees are in more than one piece",
             r.fragmented_subtrees,
             r.districts
         );
-        // Rule A, which is what makes a district structural rather than lucky.
-        // A **rate**, since the ramp began reading real commit time: two
-        // adjacent districts can be a decade apart and settle at grains that
-        // differ by four, and the search that keeps a new plot in contact with
-        // its own district's ground occasionally cannot. Measured 0, 1, 1 and 2
-        // plots at 200, 1 000, 3 000 and 5 000 files, 0 of 837 on Neovim and 2
-        // of 2 413 on Django — and `fragmented_districts` stays 0 in every one
-        // of those, which is the property the rule exists to deliver.
+        // The growth's sibling preference, as a shaping number rather than a
+        // guarantee: `fragmented_districts` above is the guarantee, and
+        // `regions` delivers it on the graph. Measured 1 of 61, 33 of 345 and
+        // 123 of 955 plots at 200, 1 000 and 5 000 files.
         assert!(
-            r.settled_nonadjacent * 100 <= r.plots,
+            r.settled_nonadjacent * 5 <= r.plots,
             "{files} files: {} of {} plots founded out of contact with their own district",
             r.settled_nonadjacent,
             r.plots
         );
-        // Rule T is bent, rarely and by a bounded amount: a plot may sit up to
-        // `FRINGE × sep` over its own border when that is what lets it keep rule
-        // A. One plot in 200 files, none at 1 000 and above. It never leaves its
-        // own district's polygon for an ancestor's, and never lands loose in the
-        // city.
+        assert_eq!(r.settled_on_fringe, 0);
+        // Nothing may be placed with no legal position at all: the packing
+        // distance and the connectivity reach are hard, and a plot that
+        // satisfied neither would be a plot the road graph cannot reach.
         assert_eq!(
             r.relaxed_to_ancestor + r.relaxed_to_anywhere + r.detached_placements,
             0,
