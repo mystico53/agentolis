@@ -677,6 +677,9 @@ pub fn transport(
 
     ui.horizontal(|ui| {
         let mut fraction = progress.fraction();
+        // A scrubber over a 26-hour session at `Slider`'s 100-point default is
+        // 15 minutes per pixel. It gets the width that is left.
+        ui.spacing_mut().slider_width = (ui.available_width() - 620.0).max(160.0);
         let scrubber = ui.add(
             egui::Slider::new(&mut fraction, 0.0..=1.0)
                 .show_value(false)

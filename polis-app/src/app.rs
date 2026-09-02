@@ -141,6 +141,9 @@ pub struct PolisApp {
     started: Instant,
     /// Process start to the first frame that drew a city, in milliseconds.
     first_frame_ms: Option<f64>,
+    /// Whether this frame rebuilt the base map and so is not a steady-state
+    /// frame.
+    skip_frame: bool,
     /// Ring of recent frame times, in milliseconds.
     frames: Vec<f64>,
     frame_cursor: usize,
@@ -290,6 +293,7 @@ impl PolisApp {
             last_frame: None,
             adapter,
             first_frame_ms: None,
+            skip_frame: false,
             last_editor: None,
             repaint: Repaint::Loading,
         }
@@ -406,7 +410,11 @@ impl eframe::App for PolisApp {
         }
 
         let frame_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
-        self.record_frame(frame_ms);
+        if std::mem::take(&mut self.skip_frame) {
+            // A base-map rebuild. Counted in the cold-start line instead.
+        } else {
+            self.record_frame(frame_ms);
+        }
         if std::env::var_os("POLIS_DEBUG_FRAMES").is_some() {
             eprintln!("frame {frame_ms:.2} ms  repaint={}", self.repaint.label());
         }
@@ -451,7 +459,17 @@ impl PolisApp {
                 .repo
                 .clone()
                 .unwrap_or_else(|| session.project_dir.clone());
-            self.stage = spawn_load(repo, Some(session.session_dir()), 4.0);
+            // The main transcript, not `session_dir()`. The sidecar directory
+            // holds the subagent transcripts and only exists when the session
+            // spawned one — 91 of 147 sessions in one project on this machine
+            // have none, so passing the stem rejected most real sessions.
+            // `ReplaySchedule::open` finds the sidecar from the transcript
+            // itself, so subagents are still picked up.
+            self.stage = spawn_load(repo, Some(session.transcript.clone()), 4.0);
+            // PRD §13.1's cold start is "how long until there is a frame", and
+            // the operator reading the picker is not part of it.
+            self.started = Instant::now();
+            self.first_frame_ms = None;
             self.repaint = Repaint::Loading;
         }
     }
@@ -507,11 +525,26 @@ impl PolisApp {
             scene.timing.basemap_ms = base.render_ms;
             scene.base = Some(base);
             scene.camera = None;
+            // PRD §13.1's 16.6 ms is a budget for a *steady-state* frame. The
+            // frame that rasterises the base map is a layout change, which PRD
+            // §13 explicitly says happens "on the order of seconds" and is
+            // supposed to be cached — letting it into the ring would make the
+            // p99 a report on how long a cache miss takes.
+            self.skip_frame = true;
             if self.first_frame_ms.is_none() {
                 self.first_frame_ms = Some(self.started.elapsed().as_secs_f64() * 1_000.0);
             }
         }
         let base = scene.base.as_ref().expect("just built");
+
+        // --- The status bar reserves the bottom line first, so the transport
+        //     sits above it rather than under it. Panels stack outside-in.
+        let mut status_slot = None;
+        egui::Panel::bottom("polis-status")
+            .exact_size(26.0)
+            .show(ui, |ui| {
+                status_slot = Some(ui.available_rect_before_wrap());
+            });
 
         // --- Transport, before the world is advanced ------------------------
         let mut action = ui::TransportAction::default();
@@ -608,13 +641,6 @@ impl PolisApp {
                         }
                     });
                 });
-            });
-
-        let mut status_slot = None;
-        egui::Panel::bottom("polis-status")
-            .exact_size(26.0)
-            .show(ui, |ui| {
-                status_slot = Some(ui.available_rect_before_wrap());
             });
 
         if self.overlay.rail {
@@ -822,8 +848,12 @@ struct Keys {
 }
 
 fn read_keys(ctx: &egui::Context) -> Keys {
-    if ctx.memory(|m| m.focused().is_some()) {
-        // A filter box has the keyboard; `t` is a letter, not a command.
+    // A text field has the keyboard: `t` is a letter, not a command. The test is
+    // `egui_wants_keyboard_input` and **not** "something has focus" — clicking any
+    // button gives it focus, and the first version of this guard therefore
+    // disabled every keyboard shortcut in the window the moment the operator
+    // clicked a speed button.
+    if ctx.egui_wants_keyboard_input() {
         return Keys::default();
     }
     ctx.input(|i| Keys {
@@ -930,15 +960,23 @@ fn load(repo: &Path, transcript: Option<&Path>, speed: f32) -> anyhow::Result<Lo
             speed,
         });
     };
-    if !transcript.exists() {
-        anyhow::bail!(
-            "no such transcript: {} (expected a .jsonl file or a <session-id> directory)",
+    let transcript = &crate::session::resolve_transcript(transcript).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no such transcript: {} (tried it, and {}.jsonl)",
+            transcript.display(),
             transcript.display()
-        );
-    }
+        )
+    })?;
+    let transcript = transcript.as_path();
     let mapper = PathMapper::new(repo).unwrap_or_default();
+    // PRD §15 M2 wants a session watchable in one sitting, and a real one is
+    // mostly dead air: this machine's 26.1-hour session is 18.4 minutes at the
+    // 2 s cap, with 25.8 hours of nothing removed. The world still ages by real
+    // session time across each compressed gap, so decay and TTLs are unaffected
+    // — only the operator's wall clock is.
     let schedule = ReplaySchedule::open(transcript, &mapper)
-        .with_context(|| format!("reading {}", transcript.display()))?;
+        .with_context(|| format!("reading {}", transcript.display()))?
+        .with_idle_gap_cap(Some(polis_world::replay::DEFAULT_IDLE_GAP_CAP));
     let label = format!(
         "{} · {} events · {} files · {} parsed, {} bad json, {} unknown type",
         transcript.file_name().map_or_else(

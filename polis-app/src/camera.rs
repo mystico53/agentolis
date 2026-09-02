@@ -36,7 +36,7 @@ pub use polis_render::camera::ZoomTier;
 /// drawn individually — is only honest once a building really is a few pixels
 /// across, and on a 120-file repository that does not happen until the city is
 /// small on screen.
-pub const MIN_ZOOM_FACTOR: f32 = 0.2;
+pub const MIN_ZOOM_FACTOR: f32 = 0.15;
 
 /// How far in the camera may zoom, as a multiple of the fit scale.
 pub const MAX_ZOOM_FACTOR: f32 = 60.0;
@@ -268,11 +268,13 @@ pub fn apply_input(
     let (scroll, pointer) = ui.input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
     if hovering && scroll.abs() > 0.0 {
         let anchor = pointer.unwrap_or_else(|| camera.viewport().center());
-        camera.zoom_by(ZOOM_STEP.powf(scroll / 50.0), anchor);
+        camera.zoom_by(ZOOM_STEP.powf(scroll / 22.0), anchor);
         out.moved = true;
     }
 
-    if ui.memory(|m| m.focused().is_some()) {
+    // Same rule as `crate::app::read_keys`: a *text field* takes the keyboard,
+    // a focused button does not.
+    if ui.ctx().egui_wants_keyboard_input() {
         return out;
     }
 

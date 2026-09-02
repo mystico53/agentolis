@@ -22,7 +22,7 @@
 //! omits a session the operator remembers running is a picker they stop
 //! trusting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, Color32, RichText};
@@ -294,6 +294,102 @@ fn row(ui: &mut egui::Ui, session: &SessionSummary) -> bool {
         );
     }
     hit.clicked() && replayable
+}
+
+/// Resolves whatever a human or a picker hands us to a path `ReplaySchedule`
+/// can open.
+///
+/// A session has two spellings on disk: the main transcript
+/// `<munged-cwd>/<id>.jsonl`, and a `<munged-cwd>/<id>/` sidecar directory
+/// holding its subagent transcripts. Only the first always exists — on this
+/// machine 91 of 147 sessions in one project have no sidecar at all — so a
+/// bare `exists()` check rejects most real sessions when given the stem.
+///
+/// Accepted, in order: the path as given; the same path with `.jsonl`
+/// appended (the stem of a session with no sidecar); and the stem of a path
+/// that was handed to us with the extension already on it. `ReplaySchedule`
+/// resolves sidecar-versus-main itself, so anything returned here is openable.
+pub fn resolve_transcript(path: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        return Some(path.to_path_buf());
+    }
+    // `<id>` given, `<id>.jsonl` on disk — the session-picker case.
+    let with_ext = path.with_extension("jsonl");
+    if with_ext.is_file() {
+        return Some(with_ext);
+    }
+    // `<id>.jsonl` given but only the `<id>/` sidecar survives.
+    if path.extension().is_some_and(|e| e == "jsonl") {
+        let stem = path.with_extension("");
+        if stem.is_dir() {
+            return Some(stem);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_transcript;
+
+    /// The picker handed `load` the `<session-id>` stem, which only exists when
+    /// the session spawned a subagent. 91 of 147 sessions in one real project
+    /// on this machine have no sidecar directory, so most real sessions failed
+    /// to open with "no such transcript" while the `.jsonl` sat beside it.
+    #[test]
+    fn a_session_id_stem_resolves_to_the_transcript_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = "f2b94e93-eb55-4064-8668-861ab55c2241";
+        let transcript = dir.path().join(format!("{id}.jsonl"));
+        std::fs::write(&transcript, "{}\n").expect("write");
+
+        // No sidecar directory — the common case.
+        let stem = dir.path().join(id);
+        assert!(
+            !stem.exists(),
+            "the stem must not exist for this to be the bug"
+        );
+        assert_eq!(
+            resolve_transcript(&stem).as_deref(),
+            Some(transcript.as_path())
+        );
+
+        // The full path still resolves to itself.
+        assert_eq!(
+            resolve_transcript(&transcript).as_deref(),
+            Some(transcript.as_path())
+        );
+    }
+
+    #[test]
+    fn a_sidecar_directory_is_preferred_when_it_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar = dir.path().join("abc");
+        std::fs::create_dir(&sidecar).expect("mkdir");
+        // Given the stem and a real directory, the directory wins: it carries
+        // the subagent transcripts and ReplaySchedule finds the main file itself.
+        assert_eq!(
+            resolve_transcript(&sidecar).as_deref(),
+            Some(sidecar.as_path())
+        );
+    }
+
+    #[test]
+    fn a_jsonl_path_falls_back_to_a_surviving_sidecar_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar = dir.path().join("abc");
+        std::fs::create_dir(&sidecar).expect("mkdir");
+        assert_eq!(
+            resolve_transcript(&dir.path().join("abc.jsonl")).as_deref(),
+            Some(sidecar.as_path())
+        );
+    }
+
+    #[test]
+    fn a_typo_is_still_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(resolve_transcript(&dir.path().join("nope")).is_none());
+    }
 }
 
 #[cfg(test)]

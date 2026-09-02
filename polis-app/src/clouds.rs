@@ -240,10 +240,15 @@ fn splat(field: &mut [f32], rect: Rect, per_texel: f32, centre: Pos2, radius: f3
 /// "never a continuous blur" is the whole reason this layer is bands at all.
 fn threshold(field: &[f32]) -> egui::ColorImage {
     let bands = palette::cloud_bands();
+    // Alpha, not tone, for this one layer: a cloud is context and has to let
+    // the city read through it — PRD §10.3 puts clouds *beneath* district
+    // outlines and labels for exactly that reason. The three steps are far
+    // enough apart that "core" and "fringe" are still distinguishable at a
+    // glance, which is the whole point of bands over a blur.
     let colours = [
-        bands[0].alpha(0.30),
-        bands[1].alpha(0.42),
-        bands[2].alpha(0.54),
+        bands[0].alpha(0.42),
+        bands[1].alpha(0.56),
+        bands[2].alpha(0.70),
     ];
     let pixels = field
         .iter()

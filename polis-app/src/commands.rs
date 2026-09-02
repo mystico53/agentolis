@@ -589,12 +589,16 @@ pub fn replay(cli: &Cli, args: &ReplayArgs) -> anyhow::Result<()> {
     // which on the command line renders exactly like a real but empty
     // recording and exits 0. Catch it here, where the argument came from a
     // human, rather than loosening the tailer.
-    if !path.exists() {
-        anyhow::bail!(
-            "no such transcript: {} (expected a .jsonl file or a <session-id> directory)",
+    // Accept the stem too: `polis replay <session-id>` is what an operator
+    // copies out of the picker or a directory listing, and the `.jsonl` is
+    // easy to leave off.
+    let path = &crate::session::resolve_transcript(path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no such transcript: {} (tried it, and {}.jsonl)",
+            path.display(),
             path.display()
-        );
-    }
+        )
+    })?;
 
     let replay = if path.is_dir() {
         polis_ingest::transcript::read_session(path, &mapper)

@@ -243,7 +243,7 @@ pub fn draw(
     }
 
     // --- 2b. The wayfinding skeleton, which survives every declutter --------
-    draw_districts(&painter, base, camera, vis, tier);
+    draw_districts(&painter, base, camera, snapshot, vis, tier);
 
     // --- 4. Agents: trails, tethers, workers, operation glyphs --------------
     let mut animating = draw_agents(&painter, base, camera, snapshot, state, tier);
@@ -256,6 +256,16 @@ pub fn draw(
     if let Some(p) = pointer {
         let map = camera.to_map(p);
         out.hovered = base.geometry.building_at(map).cloned();
+    }
+    if std::env::var_os("POLIS_DEBUG_PICK").is_some() {
+        eprintln!(
+            "pick: rect={rect:?} hovered_rect={} ctx_pointer={:?} pointer={:?} map={:?} hit={:?}",
+            response.hovered(),
+            ui.ctx().pointer_hover_pos(),
+            pointer,
+            pointer.map(|p| camera.to_map(p)),
+            out.hovered.as_ref().map(polis_events::LogicalPath::as_str),
+        );
     }
     for (path, ink, width) in [
         (state.selected.as_ref(), palette::selection(), 2.4),
@@ -410,21 +420,75 @@ fn draw_districts(
     painter: &egui::Painter,
     base: &BaseMap,
     camera: &Camera,
+    snapshot: &WorldSnapshot,
     vis: Rect,
     tier: ZoomTier,
 ) {
-    for shape in base.geometry.districts.values() {
+    for (path, shape) in &base.geometry.districts {
         if !vis.intersects(shape.bounds) {
             continue;
         }
+        let ring = project_ring(shape, camera);
+        // At City tier the buildings are sub-pixel and are not drawn at all, so
+        // the district *is* the unit: it gets a filled silhouette in its own
+        // hue and a skyline bar for the live mass inside it. That is a different
+        // representation, not the same one at a smaller scale.
+        if tier == ZoomTier::City {
+            if let Some(rgb) = base.geometry.district_colours.get(path) {
+                painter.add(egui::Shape::convex_polygon(
+                    ring.clone(),
+                    palette::Ink::base(*rgb).alpha(0.55),
+                    Stroke::NONE,
+                ));
+            }
+            skyline(painter, shape, camera, snapshot, path);
+        }
         painter.add(egui::Shape::closed_line(
-            project_ring(shape, camera),
+            ring,
             Stroke::new(
                 if tier == ZoomTier::City { 1.6 } else { 1.0 },
                 palette::district_edge().color(),
             ),
         ));
     }
+}
+
+/// PRD §8's skyline profile, as one bar per district.
+///
+/// At [`ZoomTier::City`] no building is drawn, so the mass a district is
+/// carrying has to be readable some other way. The bar's height is the live diff
+/// mass inside the district — PRD §7.3's *"the tallest thing on the map is the
+/// biggest unreviewed pile"*, aggregated to the only unit this tier draws.
+fn skyline(
+    painter: &egui::Painter,
+    shape: &MapShape,
+    camera: &Camera,
+    snapshot: &WorldSnapshot,
+    district: &LogicalPath,
+) {
+    let mass: u32 = snapshot
+        .files
+        .iter()
+        .filter(|(path, _)| path.starts_with(district))
+        .map(|(_, file)| file.diff_lines)
+        .sum();
+    if mass == 0 {
+        return;
+    }
+    let width = shape.bounds.width() * camera.scale() * 0.5;
+    if width < 6.0 {
+        return;
+    }
+    let height = (f64::from(mass).sqrt() as f32 * 2.5).min(shape.bounds.height() * camera.scale());
+    let base = camera.to_screen(Pos2::new(shape.centre.x, shape.bounds.max.y));
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(base.x - width * 0.5, base.y - height),
+            Pos2::new(base.x + width * 0.5, base.y),
+        ),
+        0.0,
+        palette::trail().alpha(0.5),
+    );
 }
 
 /// Layer 4 (PRD §10.3): trails, tethers, workers and operation glyphs.
@@ -735,7 +799,7 @@ fn draw_labels(
             placer,
             camera.to_screen(*at),
             name,
-            FontId::proportional(12.0),
+            FontId::proportional(if tier == ZoomTier::City { 10.0 } else { 12.0 }),
             palette::monument_label(),
             Priority::Anchor,
         );
@@ -744,6 +808,12 @@ fn draw_labels(
     // 2. Districts — the rest of the wayfinding skeleton.
     for (path, shape) in &base.geometry.districts {
         if !vis.intersects(shape.bounds) || path.is_root() {
+            continue;
+        }
+        // At City tier only the top-level packages are named: a `src` inside
+        // every crate is six identical words over a map whose whole job at this
+        // zoom is telling the packages apart.
+        if tier == ZoomTier::City && path.depth() > 1 {
             continue;
         }
         // A district smaller than its own label is noise at this zoom.

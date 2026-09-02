@@ -1,5 +1,6 @@
 //! The command line (PRD §4.2, §15).
 
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
@@ -8,8 +9,25 @@ use polis_events::{Channel, DEFAULT_HOOK_PORT};
 use polis_ingest::{default_otlp_addr, ChannelSet};
 
 /// `polis` — a live, glanceable city map of what your coding agents are doing.
+///
+/// Four commands are the whole product for a first-time user, and they are
+/// listed first in the help for that reason: `watch` (replay a session you
+/// already have), `map` (this repository as a city), `run` (launch an agent with
+/// the map watching) and `connect` (let Polis see agents you start yourself).
+/// Everything else is for operating it.
 #[derive(Debug, Parser)]
-#[command(name = "polis", version, about)]
+#[command(
+    name = "polis",
+    version,
+    about,
+    after_help = "Start here:\n  \
+      polis                  the first run explains itself\n  \
+      polis watch            pick a past session and watch it replay\n  \
+      polis map              this repository, drawn as a city\n  \
+      polis run -- claude    start an agent with the map watching\n  \
+      polis connect          let Polis see agents you start yourself\n  \
+      polis doctor           what is wrong, and how to fix it"
+)]
 pub struct Cli {
     /// Repository to map. Defaults to the current directory.
     #[arg(long, short = 'C', global = true)]
@@ -23,6 +41,35 @@ pub struct Cli {
 /// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Launch an agent with Polis already watching. The one-command connect.
+    ///
+    /// `polis run -- claude` starts the receiver, opens the map and launches
+    /// Claude Code as a child process with the telemetry environment set on it —
+    /// no exports, no shell configuration, nothing to remember. Everything after
+    /// `--` is passed to the agent untouched, and its exit code becomes this
+    /// command's.
+    Run(RunArgs),
+
+    /// Open this repository as a city. No recording, no picker.
+    ///
+    /// What bare `polis` does once the machine has run Polis before, and what
+    /// `polis run` opens in its second process.
+    Map,
+
+    /// Pick one of this machine's own past sessions and watch it replay.
+    ///
+    /// The same window as `polis replay` with no argument, under the name
+    /// somebody looking for it would guess.
+    Watch,
+
+    /// Register Polis's hooks with Claude Code, with explicit consent.
+    ///
+    /// Shows the exact file, a line diff of what changes in it, and the backup
+    /// it takes, then asks. `--uninstall` reverses it and is tested to put the
+    /// file back. Never registers `WorktreeCreate`, which would break every
+    /// worktree on the machine.
+    Connect(ConnectArgs),
+
     /// Print the normalized event stream to stdout. No graphics.
     ///
     /// PRD §15 M0's deliverable, and the way to prove the hook meets its budget
@@ -56,12 +103,92 @@ pub enum Command {
     /// PRD §15 M1's gate: byte-identical layout across two runs and two machines.
     Snapshot(SnapshotArgs),
 
-    /// Report environment, channel health and the injected agent env block.
+    /// Every problem on this machine, with the command that fixes it.
     ///
-    /// Prints the environment variables an operator must set for an agent Polis
-    /// did not launch — the common case, since operators start `claude`
-    /// themselves and the endpoint env var only reaches Polis's own children.
-    Doctor,
+    /// Not a status dump: each line that is not `ok` carries the exact command
+    /// to run, and `--fix` applies the ones Polis can apply safely.
+    Doctor(DoctorArgs),
+}
+
+/// `polis run` — the one-command connect.
+#[derive(Debug, clap::Args)]
+pub struct RunArgs {
+    /// Do not open the map window; just set the environment and run the agent.
+    #[arg(long)]
+    pub no_window: bool,
+
+    /// Also write every event to a Polis recording, which `polis replay` reads.
+    #[arg(long, value_name = "PATH")]
+    pub record: Option<PathBuf>,
+
+    /// OTLP/gRPC bind address. **Only** change this for tests: agents export to
+    /// 4317, so another port yields an empty stream that looks healthy.
+    #[arg(long, default_value_t = default_otlp_addr())]
+    pub otlp_addr: SocketAddr,
+
+    /// The agent to launch and its arguments. Defaults to `claude`.
+    ///
+    /// Everything after `--` is passed through untouched, flags included, so
+    /// `polis run -- claude --resume` reaches the agent as `claude --resume`.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub command: Vec<OsString>,
+}
+
+/// `polis connect` — PRD §4.2, with consent.
+///
+/// Six switches, five of them boolean, which `clippy::struct_excessive_bools`
+/// flags and which is nevertheless right: these are command-line flags, and the
+/// suggested remedy — folding them into two-variant enums — would make the
+/// `clap` derive spell out what `--uninstall` already says.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, clap::Args)]
+pub struct ConnectArgs {
+    /// Remove Polis's registrations and put the file back.
+    #[arg(long)]
+    pub uninstall: bool,
+
+    /// Write to `~/.claude/settings.json` — every repository — rather than this
+    /// one's `.claude/settings.json`.
+    #[arg(long)]
+    pub user: bool,
+
+    /// Show everything and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Answer yes. For scripts; interactively, the prompt is the point.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Replace handler arrays Polis did not write. Without it a conflict is
+    /// reported by name and nothing is written.
+    #[arg(long)]
+    pub force: bool,
+
+    /// The `polis-hook` executable to register. Found next to `polis`, then in
+    /// `target/hook`, `target/release` and `target/debug`, when not given.
+    #[arg(long, value_name = "PATH")]
+    pub hook_binary: Option<PathBuf>,
+
+    /// Write this settings file instead of the project or user one.
+    #[arg(long, value_name = "PATH")]
+    pub settings: Option<PathBuf>,
+}
+
+/// `polis doctor`.
+#[derive(Debug, clap::Args)]
+pub struct DoctorArgs {
+    /// Apply the fixes Polis can apply itself, asking first.
+    #[arg(long)]
+    pub fix: bool,
+
+    /// With `--fix`, do not ask. For scripts.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `polis tail` — PRD §15 M0.
@@ -375,6 +502,8 @@ pub fn strip_verbatim(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory as _;
+
     use super::*;
 
     #[test]
@@ -417,9 +546,67 @@ mod tests {
             vec!["polis", "env", "--shell", "powershell"],
             vec!["polis", "replay", "session.jsonl", "--json"],
             vec!["polis", "doctor"],
+            vec!["polis", "doctor", "--fix", "--yes"],
+            vec!["polis", "map"],
+            vec!["polis", "watch"],
+            vec!["polis", "connect"],
+            vec!["polis", "connect", "--uninstall", "--yes"],
+            vec!["polis", "connect", "--user", "--dry-run"],
+            vec!["polis", "run"],
+            vec!["polis", "run", "--no-window", "--", "claude"],
             vec!["polis", "-C", ".", "tail", "--json", "--duration", "3"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    /// `polis run -- claude --resume -p "…"` has to reach the agent verbatim.
+    /// A flag `polis` also happens to define must not be eaten on the way.
+    #[test]
+    fn run_passes_every_argument_after_the_separator_through_untouched() {
+        let cli = Cli::parse_from([
+            "polis",
+            "run",
+            "--no-window",
+            "--",
+            "claude",
+            "--resume",
+            "--version",
+            "-p",
+            "fix the tests",
+        ]);
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(args.no_window);
+        assert_eq!(
+            args.command,
+            ["claude", "--resume", "--version", "-p", "fix the tests"].map(OsString::from)
+        );
+        assert_eq!(args.otlp_addr.to_string(), polis_ingest::DEFAULT_OTLP_ADDR);
+
+        // And with nothing after it at all, which is the common case.
+        let cli = Cli::parse_from(["polis", "run"]);
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(args.command.is_empty(), "the agent defaults to claude");
+        assert!(!args.no_window, "the window is the point");
+    }
+
+    /// The help an operator sees with no arguments has to name the four
+    /// commands that are the product, not only the ones that operate it.
+    #[test]
+    fn the_help_starts_with_the_commands_a_first_time_user_needs() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in [
+            "polis watch",
+            "polis map",
+            "polis run -- claude",
+            "polis connect",
+            "polis doctor",
+        ] {
+            assert!(help.contains(command), "help never mentions {command}");
         }
     }
 
