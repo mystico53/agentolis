@@ -54,6 +54,7 @@ use std::sync::OnceLock;
 use polis_events::{LogicalPath, WallTime, WorktreeId};
 use serde::{Deserialize, Serialize};
 
+use crate::neighborhoods::{NeighborhoodConfig, NeighborhoodOptions, Neighborhoods};
 use crate::{FileClass, FileMeta, ImportEdge, Language, RepoDelta, RepoTree};
 
 // ---------------------------------------------------------------------------
@@ -141,6 +142,43 @@ impl RepoIndex {
     /// after a refresh.
     pub fn districts(&self) -> DistrictTree {
         DistrictTree::from_repo(&self.tree, self.options.industrial())
+    }
+
+    /// The neighborhoods over the current files: districts at a readable size,
+    /// each with a [`crate::kinds::CodeKind`] and a name (PRD §8).
+    ///
+    /// The coarser, labelled layer over [`RepoIndex::districts`], which stays as
+    /// it is — every directory that holds a file — because `polis-layout` places
+    /// plots at that granularity and PRD §9's "the tree determines placement"
+    /// applies to placement, not to labelling.
+    ///
+    /// Reads `<repo>/.polis/neighborhoods.json` if there is one and nothing
+    /// else. **No descriptions**: those need the checkout, and separating the
+    /// two is what lets the partition be tested from a
+    /// [`crate::manifest`] corpus that carries no file content.
+    pub fn neighborhoods(&self) -> Neighborhoods {
+        let config = NeighborhoodConfig::for_repo(&self.tree.root);
+        Neighborhoods::build(&self.tree, &NeighborhoodOptions::from_config(&config))
+    }
+
+    /// [`RepoIndex::neighborhoods`], with monuments and descriptions filled in
+    /// from the checkout (PRD §8, §12).
+    ///
+    /// `inbound` is what [`crate::imports::ImportGraph::inbound_counts`]
+    /// returns; pass an empty slice when there is no import graph yet, and the
+    /// descriptions simply lose one of their four sources.
+    ///
+    /// Reads at most [`crate::describe::READ_LIMIT_BYTES`] from a handful of
+    /// files per neighborhood — a README, a manifest, an anchor file — and never
+    /// from an industrial tree. Cached in the platform state directory
+    /// ([`crate::describe::default_cache_path`]), keyed on a content digest, so
+    /// the second launch reads nothing that has not changed.
+    pub fn neighborhoods_described(&self, inbound: &[(LogicalPath, u32)]) -> Neighborhoods {
+        let mut hoods = self.neighborhoods();
+        hoods.set_monuments(inbound);
+        let cache = crate::describe::default_cache_path(&self.tree.root);
+        hoods.describe(&self.tree.root, &self.tree, cache.as_deref());
+        hoods
     }
 
     /// Applies new commits and working-tree changes without recomputing the

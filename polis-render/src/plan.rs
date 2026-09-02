@@ -166,7 +166,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use polis_events::LogicalPath;
+use polis_events::{Glyph, LogicalPath};
 use polis_layout::city::{City, Structure};
 use polis_layout::{Point, RoadClass, RoofForm};
 
@@ -639,7 +639,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 /// The bounding box of every block.
-fn world_bounds(city: &City) -> ([f64; 2], [f64; 2]) {
+///
+/// Public because the live layer has to build **the same** [`View`] the base
+/// map was drawn with; a second, nearly-identical bounds function is a frame
+/// whose agents land a few pixels off the buildings they are on.
+pub fn world_bounds(city: &City) -> ([f64; 2], [f64; 2]) {
     let mut lo = [f64::INFINITY, f64::INFINITY];
     let mut hi = [f64::NEG_INFINITY, f64::NEG_INFINITY];
     for block in &city.layout.blocks {
@@ -1067,7 +1071,8 @@ pub fn render_plan(
     let w = pixels * ss;
     let footer = w as f64 * 0.088;
     let mut canvas = Canvas::new(w, w, SEA_DEEP);
-    let view = draw_map(&mut canvas, city, w, w - footer as usize, streets, ss);
+    let view = map_view(city, w, w - footer as usize);
+    draw_map(&mut canvas, city, &view, streets, ss);
     draw_labels(&mut canvas, city, &view, map_unit(city, &view), ss, pixels);
     draw_footer(&mut canvas, city, structure, title, w, footer);
     canvas.downsample(ss)
@@ -1082,13 +1087,142 @@ pub fn render_base_map(city: &City, pixels: usize, supersample: usize, streets: 
     let ss = supersample.max(1);
     let w = pixels * ss;
     let mut canvas = Canvas::new(w, w, SEA_DEEP);
-    draw_map(&mut canvas, city, w, w, streets, ss);
+    draw_map(&mut canvas, city, &map_view(city, w, w), streets, ss);
     canvas.downsample(ss)
+}
+
+/// The base map at **output** resolution, with its in-map type kept separate.
+///
+/// This is what [`crate::frame`] composites a live frame on top of, and the
+/// separation is PRD §10.3's layer order made mechanical:
+///
+/// > **Clouds** — territory density fields. **Rendered beneath district
+/// > outlines and labels** so the map stays readable.
+///
+/// A cached base map with the labels already burnt in cannot honour that: the
+/// clouds are drawn per frame and the labels are not, so the labels would end up
+/// underneath. [`MapFrame::labels`] therefore hands back the label pixels as a
+/// sparse list — typically a fraction of a percent of the canvas — which the
+/// live path re-stamps after its cloud pass, at a cost proportional to the type
+/// rather than to the map.
+///
+/// The returned [`View`] and unit are the base map's own, so a live mark placed
+/// with them lands exactly on the building it belongs to. Deriving a second view
+/// from the same bounds would be *nearly* right, which on a map is worse than
+/// wrong.
+#[must_use]
+pub fn render_map_frame(
+    city: &City,
+    pixels: usize,
+    supersample: usize,
+    streets: bool,
+    focus: Option<Focus>,
+) -> MapFrame {
+    let ss = supersample.max(1);
+    let w = pixels * ss;
+    let mut canvas = Canvas::new(w, w, SEA_DEEP);
+    let view_ss = focus.map_or_else(|| map_view(city, w, w), |f| focus_view(f, w, w));
+    draw_map(&mut canvas, city, &view_ss, streets, ss);
+    let mut typeset = canvas.clone();
+    draw_labels(
+        &mut typeset,
+        city,
+        &view_ss,
+        map_unit(city, &view_ss),
+        ss,
+        pixels,
+    );
+    let bare = canvas.downsample(ss);
+    let typeset = typeset.downsample(ss);
+    let mut labels = Vec::new();
+    for (i, (a, b)) in bare
+        .pixels
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(typeset.pixels.as_chunks::<3>().0.iter())
+        .enumerate()
+    {
+        if a != b {
+            labels.push((i as u32, *b));
+        }
+    }
+    // The view divides exactly: `View::fit` is linear in its width, height and
+    // margin, and all three were scaled by `ss`. Rebuilding it at output scale
+    // is therefore the same transform, not an approximation of it.
+    let view = focus.map_or_else(
+        || map_view(city, pixels, pixels),
+        |f| focus_view(f, pixels, pixels),
+    );
+    let unit = map_unit(city, &view);
+    MapFrame {
+        map: bare,
+        labels,
+        view,
+        unit,
+    }
+}
+
+/// The base map, its type, and the transform they were drawn with.
+#[derive(Debug, Clone)]
+pub struct MapFrame {
+    /// Layers 0–2 at output resolution, with **no** text of any kind.
+    pub map: Canvas,
+    /// The in-map labels as `(pixel index, colour)`, to be stamped over the
+    /// clouds. Every colour is inside [`TYPE_BAND`].
+    pub labels: Vec<(u32, Rgb)>,
+    /// World-to-pixel transform for [`MapFrame::map`].
+    pub view: View,
+    /// The median block diameter in pixels — the unit every live mark is sized
+    /// from.
+    pub unit: f64,
+}
+
+/// The whole-city view: every block fitted into `width × height`.
+#[must_use]
+pub fn map_view(city: &City, width: usize, height: usize) -> View {
+    let (lo, hi) = world_bounds(city);
+    View::fit(lo, hi, width, height, width as f64 * 0.022)
+}
+
+/// A view onto one square of city space — PRD §12's district tier.
+///
+/// > **Semantic zoom**, three tiers, each a genuinely different representation
+/// > rather than a scale factor.
+///
+/// This is the *transform* half of that. The whole-city view is honest about
+/// structure and useless for reading a glyph: on a repository whose block graph
+/// is mostly a vendored tree, the source quarter is a few dozen pixels across
+/// and PRD §10.1's six shapes are six identical smudges. The renderer has to be
+/// able to look at a district or the notation cannot be evaluated at all.
+#[must_use]
+pub fn focus_view(focus: Focus, width: usize, height: usize) -> View {
+    let e = f64::from(focus.extent.max(1e-3));
+    let (cx, cy) = (f64::from(focus.centre.x), f64::from(focus.centre.y));
+    View::fit(
+        [cx - e, cy - e],
+        [cx + e, cy + e],
+        width,
+        height,
+        width as f64 * 0.022,
+    )
+}
+
+/// Where to point the camera, in city space.
+#[derive(Debug, Clone, Copy)]
+pub struct Focus {
+    /// Centre.
+    pub centre: Point,
+    /// Half-width of the square to show.
+    pub extent: f32,
 }
 
 /// Every stroke is a fraction of the median block's diameter, so the drawing
 /// reads the same at 90 files and at 5 000.
-fn map_unit(city: &City, view: &View) -> f64 {
+///
+/// Public for the same reason as [`world_bounds`]: the live layer sizes its
+/// glyphs off this unit so a mark and a building agree about scale.
+pub fn map_unit(city: &City, view: &View) -> f64 {
     let mut d: Vec<f64> = city
         .layout
         .blocks
@@ -1106,17 +1240,9 @@ fn map_unit(city: &City, view: &View) -> f64 {
 /// 5 000 files the whole road hierarchy dissolved into the ground and the base
 /// map lost the brightest ink it has. Every line therefore gets a floor of
 /// roughly one output pixel — [`hairline`] — rather than one supersampled one.
-fn draw_map(
-    canvas: &mut Canvas,
-    city: &City,
-    w: usize,
-    map_height: usize,
-    streets: bool,
-    ss: usize,
-) -> View {
+fn draw_map(canvas: &mut Canvas, city: &City, view: &View, streets: bool, ss: usize) {
     let hairline = ss as f64 * 0.95;
-    let (lo, hi) = world_bounds(city);
-    let view = View::fit(lo, hi, w, map_height, w as f64 * 0.022);
+    let view = *view;
     let colours = district_colours(city);
     let unit = map_unit(city, &view);
     let industrial_hosts: BTreeSet<&LogicalPath> =
@@ -1376,7 +1502,6 @@ fn draw_map(
             ink.polyline(&line, width, STREET, 0.60);
         }
     }
-    view
 }
 
 /// The signed area of a ring in device space. Sign is the winding.
@@ -2075,61 +2200,16 @@ pub fn render_junctions(
 // The band validation render (PRD §10.3, settled with an image)
 // ---------------------------------------------------------------------------
 
-/// Cloud iso-band tones (PRD §10.4, layer 3), fringe → body → core, inside
-/// [`CLOUD_BAND`].
-///
-/// These are the tones of the **marks** — contour strokes and hatch strokes —
-/// not of a wash. Each is opaque where it is drawn and absent everywhere else,
-/// which is what lets a cloud own channels 49–84 without lifting the base map
-/// underneath it by a single level.
-const CLOUD_TONES: [Rgb; 3] = [[56, 64, 74], [64, 72, 80], [74, 80, 84]];
-
-/// The axis the cloud hatch runs along: [`RIDGE`], across the sun.
-///
-/// Deliberately not [`SUN`], which is the industrial hatch's axis (PRD §8). Two
-/// textures at the same angle are one texture; at right angles they are two, and
-/// the map already needs to say "vendored tree" and "somebody's territory" in
-/// the same square inch.
-const CLOUD_HATCH: [f64; 2] = RIDGE;
-
-/// Hatch spacing per iso band, fringe → core, in **output** pixels.
-///
-/// Spacing is the encoding: PRD §10.4 wants the reader able to say "that file is
-/// in the core of this thread's work" versus "it's at the fringe", and a
-/// tightening hatch says it the way a contour map says altitude. The coverage
-/// that follows — one stroke in 14, in 9, in 6 — is what keeps the median of the
-/// base map underneath a cloud exactly where it was: an order statistic does not
-/// move when a tenth of the pixels change.
-const CLOUD_HATCH_SPACING: [f64; 3] = [14.0, 9.0, 6.0];
-
-/// Hatch stroke width per iso band, in output pixels. Widening with the band as
-/// well as tightening the spacing is what makes a core read as a *core* after
-/// the box filter has taken the image down to thumbnail size.
-const CLOUD_HATCH_WIDTH: [f64; 3] = [1.0, 1.25, 1.5];
-
-/// Contour stroke width per iso band, in output pixels, measured inward from the
-/// boundary.
-///
-/// The **outer** contour is the boldest, which is the opposite of the hatch and
-/// deliberate: the fringe boundary is the cloud's silhouette, and a silhouette
-/// is the only part of any mark that survives being looked at from across the
-/// room (PRD §1). It costs perimeter, not area, so it buys glance-legibility
-/// without putting a single extra pixel over the city.
-const CLOUD_CONTOUR_WIDTH: [f64; 3] = [3.0, 2.0, 2.0];
-
-/// The iso thresholds, in **kernels overlapping here** (ADR-0020).
-///
-/// Absolute, never normalised against the observed field maximum: normalising
-/// collapses every ordinary territory into a single fringe band, which is the
-/// mush §10.4 forbids.
-/// The fringe threshold is above one kernel on purpose: at `0.9` a single
-/// isolated observation cleared it and the map filled with dozens of one-kernel
-/// rings, which is confetti rather than a territory. Two overlapping kernels is
-/// the cheapest honest definition of "this is a region, not a point".
-const CLOUD_ISO: [f64; 3] = [1.3, 2.8, 5.4];
-
-/// The band index meaning "outside the fringe" in the per-pixel band map.
-const NO_BAND: u8 = u8::MAX;
+// The live layer's notation — layers 3, 4 and 5 — is defined once, in
+// [`crate::live`], and imported here. This render's clouds and marks are
+// stand-ins for M4 and M5 data, but they are not stand-in *ink*: an image built
+// to validate PRD §10.3's allocation has to be drawn with the very constants
+// the live path will use, or it validates nothing.
+use crate::live::{
+    cloud_pixel, draw_glyph, iso_band, kernel, AGENT_DONE, AGENT_FAILED, AGENT_PENDING,
+    AGENT_TETHER, AGENT_TRAIL, ATTN_CONTENTION, ATTN_DECISION, ATTN_DONE, CLOUD_CONTOUR_WIDTH,
+    CLOUD_HATCH, CLOUD_HATCH_SPACING, CLOUD_HATCH_WIDTH, CLOUD_TONES, NO_BAND,
+};
 
 /// The most of the canvas in-map label plates may cover.
 ///
@@ -2140,159 +2220,6 @@ const NO_BAND: u8 = u8::MAX;
 /// blocks are huge and the type is at its maximum size — from being read as a
 /// caption with a diagram behind it.
 const LABEL_AREA_SHARE: f64 = 0.02;
-/// A worker whose last operation is still pending (layer 4, [`AGENT_BAND`]).
-const AGENT_PENDING: Rgb = [132, 140, 156];
-/// A worker whose last operation succeeded.
-const AGENT_DONE: Rgb = [96, 168, 150];
-/// A worker whose last operation failed.
-const AGENT_FAILED: Rgb = [168, 98, 92];
-/// The tether tying a worker to its thread.
-const AGENT_TETHER: Rgb = [100, 110, 130];
-/// A thread's trail (PRD §12).
-const AGENT_TRAIL: Rgb = [110, 122, 144];
-/// Needs-decision (PRD §11.2a). Layer 5 owns the top of the range.
-const ATTN_DECISION: Rgb = [255, 188, 62];
-/// Done, unverified (PRD §11.2b).
-const ATTN_DONE: Rgb = [118, 236, 206];
-/// Contention (PRD §11.2c) — a relation, drawn as a link.
-const ATTN_CONTENTION: Rgb = [255, 92, 78];
-
-/// Which of PRD §10.1's glyphs a mark uses.
-#[derive(Debug, Clone, Copy)]
-enum Glyph {
-    /// Hollow circle.
-    Read,
-    /// Circle with a bar through.
-    Edit,
-    /// Filled square.
-    Write,
-    /// Filled triangle.
-    Run,
-    /// Concentric circles.
-    Verify,
-}
-
-/// A 16-gon on the unit circle, from a constant table: no trigonometry reaches
-/// the image (PRD §7.4).
-const CIRCLE: [[f64; 2]; 16] = [
-    [1.000, 0.000],
-    [0.924, 0.383],
-    [0.707, 0.707],
-    [0.383, 0.924],
-    [0.000, 1.000],
-    [-0.383, 0.924],
-    [-0.707, 0.707],
-    [-0.924, 0.383],
-    [-1.000, 0.000],
-    [-0.924, -0.383],
-    [-0.707, -0.707],
-    [-0.383, -0.924],
-    [0.000, -1.000],
-    [0.383, -0.924],
-    [0.707, -0.707],
-    [0.924, -0.383],
-];
-
-/// Write one opaque cloud pixel.
-///
-/// # Why this is not a wash any more
-///
-/// The first version blended a translucent tone over every pixel inside an iso
-/// band and then *lifted the result to the band's floor* so the layer stayed in
-/// its allocation. That is an area fill, and measured on the shipped image it
-/// lifted **40.5 % of the city** by more than six levels and moved the base
-/// median underneath it from `L 22` to `L 45`. Local detail survived in
-/// absolute terms and collapsed in relative terms — ±7 around 45 instead of ±9
-/// around 22 — so the map fogged into pale grey exactly where the activity was,
-/// which is backwards: the operator loses the city precisely where they need to
-/// read it.
-///
-/// PRD §10.4 asks for "discrete iso-contour bands, 2–3 levels, never a
-/// continuous blur", and the literal reading is the right one. A cloud is now a
-/// **set of marks the city shows through**: three nested contour strokes and a
-/// hatch whose spacing tightens toward the core. Marks are opaque — so the layer
-/// provably owns [`CLOUD_BAND`] with no floor-lifting trick — and they are
-/// sparse, so the base map underneath is not merely *recoverable*, it is
-/// **untouched**: nine pixels in ten are the same bytes they were before the
-/// cloud was drawn.
-fn cloud_pixel(canvas: &mut Canvas, x: usize, y: usize, tone: Rgb) {
-    if x >= canvas.width || y >= canvas.height {
-        return;
-    }
-    let i = (y * canvas.width + x) * 3;
-    canvas.pixels[i..i + 3].copy_from_slice(&tone);
-}
-
-/// Which iso band a field value falls in, or `None` outside the fringe.
-fn iso_band(v: f64) -> Option<usize> {
-    if v >= CLOUD_ISO[2] {
-        Some(2)
-    } else if v >= CLOUD_ISO[1] {
-        Some(1)
-    } else if v >= CLOUD_ISO[0] {
-        Some(0)
-    } else {
-        None
-    }
-}
-
-/// A quartic kernel with compact support: `(1 - r²)²` inside the radius.
-///
-/// PRD §10.4 splats Gaussians; a Gaussian needs `exp`, and nothing in this file
-/// reaches for a transcendental (PRD §7.4). The quartic has the same bell shape,
-/// has *finite* support — which makes the splat cheaper, not dearer — and is a
-/// polynomial, so the same bytes come out on every libm.
-fn kernel(r2: f64) -> f64 {
-    if r2 >= 1.0 {
-        return 0.0;
-    }
-    let k = 1.0 - r2;
-    k * k
-}
-
-/// Stroke a circle of `radius` about `at`.
-fn stroke_circle(canvas: &mut Canvas, at: Px, radius: f64, width: f64, colour: Rgb) {
-    let pts: Vec<Px> = CIRCLE
-        .iter()
-        .map(|c| [c[0].mul_add(radius, at[0]), c[1].mul_add(radius, at[1])])
-        .collect();
-    canvas.stroke_polygon(&pts, width, colour, 1.0);
-}
-
-/// Draw one of PRD §10.1's operation glyphs.
-///
-/// Shape encodes *what*, colour encodes *how it went*, and the two are never
-/// conflated (PRD §10).
-fn draw_glyph(canvas: &mut Canvas, at: Px, r: f64, glyph: Glyph, colour: Rgb) {
-    match glyph {
-        Glyph::Read => stroke_circle(canvas, at, r, r * 0.42, colour),
-        Glyph::Edit => {
-            stroke_circle(canvas, at, r, r * 0.42, colour);
-            canvas.segment(
-                [at[0] - r, at[1]],
-                [at[0] + r, at[1]],
-                r * 0.42,
-                colour,
-                1.0,
-            );
-        }
-        Glyph::Write => canvas.rect(at[0] - r, at[1] - r, at[0] + r, at[1] + r, colour, 1.0),
-        Glyph::Run => canvas.fill_polygon(
-            &[
-                [at[0], at[1] - r],
-                [at[0] + r, at[1] + r * 0.8],
-                [at[0] - r, at[1] + r * 0.8],
-            ],
-            colour,
-            1.0,
-        ),
-        Glyph::Verify => {
-            stroke_circle(canvas, at, r, r * 0.34, colour);
-            stroke_circle(canvas, at, r * 0.5, r * 0.34, colour);
-        }
-    }
-}
-
 /// The M1 base map with **simulated** M4 clouds and M5 marks on top of it.
 ///
 /// This render exists to settle one argument with an image instead of a
@@ -2319,7 +2246,8 @@ pub fn render_band_validation(
     let w = pixels * ss;
     let footer = w as f64 * 0.088;
     let mut canvas = Canvas::new(w, w, SEA_DEEP);
-    let view = draw_map(&mut canvas, city, w, w - footer as usize, false, ss);
+    let view = map_view(city, w, w - footer as usize);
+    draw_map(&mut canvas, city, &view, false, ss);
     let unit = map_unit(city, &view);
     let map_h = w as f64 - footer;
 
@@ -2467,11 +2395,11 @@ pub fn render_band_validation(
 
     // --- layer 4: agents -------------------------------------------------
     let glyphs = [
-        Glyph::Edit,
-        Glyph::Read,
-        Glyph::Write,
-        Glyph::Run,
-        Glyph::Verify,
+        Glyph::BarredCircle,
+        Glyph::HollowCircle,
+        Glyph::FilledSquare,
+        Glyph::FilledTriangle,
+        Glyph::ConcentricCircles,
     ];
     let r = (unit * 0.30).max(3.0 * ss as f64);
     let mut anchors: Vec<Px> = Vec::new();
@@ -2528,7 +2456,13 @@ pub fn render_band_validation(
         );
     }
     if let Some(at) = anchors.get(1).copied() {
-        draw_glyph(&mut canvas, at, r * 1.7, Glyph::Verify, ATTN_DONE);
+        draw_glyph(
+            &mut canvas,
+            at,
+            r * 1.7,
+            Glyph::ConcentricCircles,
+            ATTN_DONE,
+        );
     }
     if anchors.len() >= 2 {
         let a = anchors[0];

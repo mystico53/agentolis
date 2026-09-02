@@ -11,7 +11,39 @@
 //! | [`git`] | §7.1, §7.6 — growth order from `git log`, worktrees, diff counts |
 //! | [`imports`] | §9 — tree-sitter import extraction and the streets it becomes |
 //! | [`corpus`] | §6.1 — the TF-IDF ubiquity discount |
+//! | [`kinds`] | §8 — what kind of code a file is, which is what hue should mean |
+//! | [`neighborhoods`] | §3, §8 — districts at a size a person can read, named and labelled |
+//! | [`describe`] | §12 — what a neighborhood does, quoted from the repository |
 //! | [`manifest`] | §16 — a real repository, recorded so CI can lay it out without a clone |
+//!
+//! # The labelled layer, for a renderer
+//!
+//! Three calls, in the order a caller wants them (ADR-0085, ADR-0086, ADR-0087):
+//!
+//! ```no_run
+//! use polis_repo::tree::RepoIndex;
+//! use polis_repo::imports::ImportGraph;
+//!
+//! let index = RepoIndex::open(std::path::Path::new("."))?;
+//! let graph = ImportGraph::build(index.tree());
+//! let hoods = index.neighborhoods_described(&graph.inbound_counts());
+//!
+//! for hood in hoods.all() {
+//!     // `name` is the shortest unambiguous label; `kind` is the hue;
+//!     // `mix` is the composition behind it; `label()` is the one-line
+//!     // description, and `None` means the repository had nothing to say.
+//!     println!("{} [{}] {} files — {}",
+//!         hood.name, hood.kind, hood.file_count, hood.label().unwrap_or(""));
+//! }
+//! # Ok::<(), anyhow::Error>(())
+//! ```
+//!
+//! [`tree::RepoIndex::neighborhoods`] is the same partition without the I/O, and
+//! [`RepoTree::neighborhoods`] the same again without even the configuration
+//! read — the one to call from a test or from a [`manifest`] corpus.
+//! [`tree::RepoIndex::districts`] is unchanged and still returns *every*
+//! directory: that is the granularity `polis-layout` places plots at, and PRD
+//! §9's "the tree determines placement" is about placement, not labelling.
 //!
 //! # Determinism reaches this crate, not just `polis-layout`
 //!
@@ -40,9 +72,12 @@
 //! them in is not.
 
 pub mod corpus;
+pub mod describe;
 pub mod git;
 pub mod imports;
+pub mod kinds;
 pub mod manifest;
+pub mod neighborhoods;
 pub mod synthetic;
 pub mod tree;
 
@@ -103,6 +138,34 @@ impl RepoTree {
         self.files
             .values()
             .filter(move |f| f.path.starts_with(&district))
+    }
+
+    /// What kind of code one file is (PRD §8) — the second colour axis.
+    ///
+    /// Derived, never stored, and that is the whole design: [`kinds::kind_of`]
+    /// is a pure function of the path, so there is no field to fall out of step
+    /// with the file it describes, no migration when a rule changes, and nothing
+    /// extra in a serialized [`RepoTree`]. A renderer that wants to tint one
+    /// building calls this; one that wants a whole district's composition reads
+    /// [`kinds::KindMix`] off its [`neighborhoods::Neighborhood`].
+    ///
+    /// Uses the shipped rules. Call [`kinds::kind_of_with`] directly to apply an
+    /// operator's own.
+    pub fn kind_of(&self, path: &LogicalPath) -> kinds::CodeKind {
+        kinds::kind_of(path)
+    }
+
+    /// The labelled districts of this tree (PRD §8), under the given options.
+    ///
+    /// Pure: no I/O, no descriptions. [`tree::RepoIndex::neighborhoods`] is the
+    /// call that reads the repository's own configuration, and
+    /// [`tree::RepoIndex::neighborhoods_described`] the one that reads the
+    /// checkout.
+    pub fn neighborhoods(
+        &self,
+        options: &neighborhoods::NeighborhoodOptions,
+    ) -> neighborhoods::Neighborhoods {
+        neighborhoods::Neighborhoods::build(self, options)
     }
 }
 

@@ -227,21 +227,48 @@ pub struct EnvArgs {
 pub struct ReplayArgs {
     /// A `.jsonl` transcript, or a `<session-id>` sidecar directory, in which
     /// case the whole forest is read: main transcript plus every subagent file.
-    pub transcript: PathBuf,
-    /// Playback speed multiplier. Ignored while there is no renderer: the
-    /// offline read is as fast as it parses, which is the point of M2.
-    #[arg(long, default_value = "1.0")]
+    ///
+    /// Optional, and that is the first-run experience: with no argument the
+    /// window opens on the session picker, which lists this machine's own
+    /// recordings most-recent first with their repository, duration and counts.
+    /// Zero configuration — the operator picks one and watches it.
+    pub transcript: Option<PathBuf>,
+
+    /// Playback speed multiplier. Clamped to `polis_world::replay::SPEED_RANGE`.
+    #[arg(long, default_value = "4.0")]
     pub speed: f32,
+
+    /// Print the reconstructed event stream to stdout instead of opening the
+    /// window.
+    ///
+    /// The M2 window is the product; this is the same read with no graphics,
+    /// which is what a test, a pipe or a machine without a display wants.
+    #[arg(long)]
+    pub print: bool,
+
     /// One `RecordedEvent` JSON object per line, preceded by the header
-    /// (ADR-0049). This is exactly `Replay::write_jsonl`.
+    /// (ADR-0049). This is exactly `Replay::write_jsonl`. Implies `--print`.
     #[arg(long)]
     pub json: bool,
-    /// Stop after this many events.
+
+    /// Stop after this many events. Implies `--print`.
     #[arg(long, value_name = "N")]
     pub limit: Option<u64>,
-    /// Write to a file instead of stdout.
+
+    /// Write to a file instead of stdout. Implies `--print`.
     #[arg(long, value_name = "PATH")]
     pub out: Option<PathBuf>,
+}
+
+impl ReplayArgs {
+    /// Whether this invocation is the text one rather than the window.
+    ///
+    /// Any flag that only makes sense for a stream — `--json`, `--limit`,
+    /// `--out` — selects it, so an existing pipeline keeps working without
+    /// having to learn a new flag.
+    pub fn is_text(&self) -> bool {
+        self.print || self.json || self.limit.is_some() || self.out.is_some()
+    }
 }
 
 /// A [`Channel`] as spelled on the command line.

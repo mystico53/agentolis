@@ -58,6 +58,46 @@ pub struct ChannelConfig {
     pub subagent_traces: bool,
 }
 
+/// What a click on a building runs (PRD §12).
+///
+/// > **Click a building** → open in `$EDITOR` via the configured command.
+/// > Nothing more.
+///
+/// `$EDITOR` is not on its own enough — it names an *editor*, not a command that
+/// takes a file and a line — so three sources are tried in order:
+///
+/// 1. `POLIS_EDITOR`, a whole command template with `{path}` and `{line}`. This
+///    is the one an operator sets when their editor wants arguments in a
+///    particular shape, and it is what a test sets to something harmless.
+/// 2. `VISUAL`, then `EDITOR`: a bare editor name, given the path as its only
+///    argument. This is what PRD §12 literally names, and honouring it is why
+///    the default is not simply hardcoded.
+/// 3. VS Code's `--goto`, which is the common case on this platform.
+///
+/// An empty template disables the launch entirely, which is the setting for an
+/// operator who wants the map to be a map and nothing else.
+pub fn default_editor_command() -> String {
+    editor_command_from(|name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
+}
+
+/// [`default_editor_command`]'s rule, against an arbitrary environment.
+///
+/// Split out so the rule can be tested without mutating the process
+/// environment, which is a global other tests share.
+pub fn editor_command_from(get: impl Fn(&str) -> Option<String>) -> String {
+    if let Some(template) = get("POLIS_EDITOR") {
+        return template;
+    }
+    for name in ["VISUAL", "EDITOR"] {
+        if let Some(editor) = get(name) {
+            if !editor.trim().is_empty() {
+                return format!("{} {{path}}", editor.trim());
+            }
+        }
+    }
+    "code --goto {path}:{line}".to_owned()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -65,10 +105,7 @@ impl Default for Config {
             // for every real run, and a `Default` that reads the filesystem is a
             // `Default` that can fail.
             repo_root: PathBuf::from("."),
-            // `$EDITOR` is not enough on its own — it names an editor, not a
-            // command that takes a file — so the default spells the whole thing
-            // and an operator with a different editor replaces one string.
-            editor_command: "code --goto {path}:{line}".to_owned(),
+            editor_command: default_editor_command(),
             // PRD §17 open question 1: unanswered against a real fleet, so this
             // is a starting value and not a finding. Forty threads means forty
             // systems and the map vanishes under haze (PRD §10.4).
@@ -183,6 +220,42 @@ mod tests {
         assert_eq!(
             Config::load(Some(&missing)).editor_command,
             Config::default().editor_command
+        );
+    }
+
+    #[test]
+    fn the_editor_command_prefers_polis_editor_then_visual_then_editor() {
+        let env = |pairs: Vec<(&'static str, &'static str)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        assert_eq!(
+            editor_command_from(env(vec![
+                ("POLIS_EDITOR", "ed {path} +{line}"),
+                ("EDITOR", "vi")
+            ])),
+            "ed {path} +{line}"
+        );
+        assert_eq!(
+            editor_command_from(env(vec![("VISUAL", "nvim"), ("EDITOR", "vi")])),
+            "nvim {path}"
+        );
+        assert_eq!(
+            editor_command_from(env(vec![("EDITOR", "vi")])),
+            "vi {path}"
+        );
+        // A blank $EDITOR is not a choice, so it falls through.
+        assert_eq!(
+            editor_command_from(env(vec![("EDITOR", "   ")])),
+            "code --goto {path}:{line}"
+        );
+        assert_eq!(
+            editor_command_from(env(vec![])),
+            "code --goto {path}:{line}"
         );
     }
 

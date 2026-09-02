@@ -1709,16 +1709,25 @@ struct Extractor {
     cursor: QueryCursor,
 }
 
+/// The loaded grammar for one [`Language`].
+///
+/// The single place the four grammar crates are named. `crate::describe` needs
+/// the same parsers to read module doc comments, and a second copy of this match
+/// is how one module ends up on a different grammar from the other.
+pub(crate) fn ts_language(language: Language) -> tree_sitter::Language {
+    match language {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+    }
+}
+
 impl Extractor {
     /// Loads a grammar and compiles its import query.
     fn new(language: Language) -> Result<Self, GrammarError> {
-        let ts_language: tree_sitter::Language = match language {
-            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Language::Python => tree_sitter_python::LANGUAGE.into(),
-        };
+        let ts_language = ts_language(language);
 
         let mut parser = Parser::new();
         parser
@@ -2269,7 +2278,7 @@ impl ParseCache {
 /// Written out rather than reached for, for the same reason every other hash in
 /// this workspace is: a `DefaultHasher` is seeded per process and a cache key
 /// that changes between runs is not a cache key.
-fn content_digest(bytes: &[u8]) -> (u64, u64) {
+pub(crate) fn content_digest(bytes: &[u8]) -> (u64, u64) {
     const OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME_A: u64 = 0x0000_0100_0000_01b3;
     const OFFSET_B: u64 = 0x9E37_79B9_7F4A_7C15;

@@ -16,9 +16,11 @@
 //!    serde label** rather than dropping the event. A Claude Code release adding
 //!    an event name must show up as a line saying so, not as a missing line.
 
+use std::time::Duration;
+
 use polis_events::{
     Channel, ControlEvent, Event, FsEvent, LogicalPath, MetricName, OtelEvent, Outcome, Payload,
-    PromptId, SessionId, ToolCall, TranscriptSource, WorkerId, WorktreeId,
+    PromptId, SessionId, ToolCall, TranscriptSource, WallTime, WorkerId, WorktreeId,
 };
 use serde::Serialize;
 
@@ -474,6 +476,71 @@ fn variant_label<T: Serialize>(value: &T) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Clocks, for the window (PRD §12)
+// ---------------------------------------------------------------------------
+
+/// A wall-clock stamp as `YYYY-MM-DD HH:MM`, in UTC.
+///
+/// UTC and not local time, deliberately: there is no time-zone database in the
+/// dependency set, and a stamp silently rendered in the wrong zone is worse than
+/// one honestly labelled `Z`. Session identity is what the operator recognises
+/// a recording by (ADR-0014), so this is display only and nothing computes on it.
+pub fn wall_time(at: WallTime) -> String {
+    let ms = at.unix_millis();
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm) = (rem / 3_600_000, (rem % 3_600_000) / 60_000);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}Z")
+}
+
+/// A duration as `1h 04m`, `4m 12s`, or `820ms`.
+pub fn duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3_600 {
+        return format!("{}m {:02}s", secs / 60, secs % 60);
+    }
+    format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
+}
+
+/// A byte count as `1.2 MB`.
+pub fn bytes(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)] // a display string, not a computation
+    let f = n as f64;
+    if n < 1_024 {
+        format!("{n} B")
+    } else if n < 1_024 * 1_024 {
+        format!("{:.0} kB", f / 1_024.0)
+    } else if n < 1_024 * 1_024 * 1_024 {
+        format!("{:.1} MB", f / (1_024.0 * 1_024.0))
+    } else {
+        format!("{:.2} GB", f / (1_024.0 * 1_024.0 * 1_024.0))
+    }
+}
+
+/// Howard Hinnant's `civil_from_days`, which is exact for every representable
+/// day and needs no table.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use polis_events::{
@@ -590,5 +657,40 @@ mod tests {
             rendered.find("otel"),
             "\n{head}\n{rendered}"
         );
+    }
+
+    #[test]
+    fn the_epoch_and_a_leap_day_render_correctly() {
+        assert_eq!(
+            wall_time(WallTime::from_unix_millis(0)),
+            "1970-01-01 00:00Z"
+        );
+        // 2024-02-29T13:45:00Z
+        assert_eq!(
+            wall_time(WallTime::from_unix_seconds(1_709_214_300)),
+            "2024-02-29 13:45Z"
+        );
+        // A stamp before the epoch must not wrap into the future.
+        assert_eq!(
+            wall_time(WallTime::from_unix_seconds(-1)),
+            "1969-12-31 23:59Z"
+        );
+    }
+
+    #[test]
+    fn durations_read_at_every_scale() {
+        assert_eq!(duration(Duration::from_millis(820)), "820ms");
+        assert_eq!(duration(Duration::from_secs(42)), "42s");
+        assert_eq!(duration(Duration::from_secs(252)), "4m 12s");
+        assert_eq!(duration(Duration::from_mins(64)), "1h 04m");
+        assert_eq!(duration(Duration::from_hours(2)), "2h 00m");
+        assert_eq!(duration(Duration::from_secs(94_000)), "26h 06m");
+    }
+
+    #[test]
+    fn byte_counts_read_at_every_scale() {
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(2_048), "2 kB");
+        assert_eq!(bytes(3_145_728), "3.0 MB");
     }
 }

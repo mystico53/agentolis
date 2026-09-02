@@ -3260,3 +3260,166 @@ matches the first one*, which a naive comparison calls a pass.
 against the cost of accepting a determinism bug by reflex. The trailing-newline
 case is treated as a match, so a hand-edited snapshot does not report a layout
 change.
+
+---
+
+## ADR-0085 — Hue encodes what kind of code it is, and PRD §8's industrial zone is one of the kinds
+
+**Context.** The renderer keys district hue on the top-level directory
+(`plan.rs`, "hue families keyed on the top-level directory"). That tells
+districts apart and says nothing else: green and purple are identities, not
+meanings. Looking at a rendered city of his own repository the operator said the
+colours "carry no meaning", and asked for "the kind of what the neighborhoods
+are". PRD §10.3's contrast budget is unchanged and unchallenged — the whole base
+map stays inside channel 48 — so hue is the only free channel there is, and
+spending it on identity is spending the one thing that was available.
+
+`FileClass` (PRD §8) cannot answer this. It is a *landmark* classification —
+monument, industrial, civic square — and it is deliberately sparse: almost every
+file is `Ordinary`, so almost every district would be one colour.
+
+**Decision.** A second, orthogonal axis: `polis_repo::kinds::CodeKind`, nine
+variants — `source`, `test`, `docs`, `config`, `build`, `assets`, `data`,
+`vendored`, `unknown` — decided from the path by six ordered passes, with one
+content heuristic (a `@generated` / `DO NOT EDIT` banner in the first 512 bytes).
+A neighborhood's kind is the dominant kind of its files, and the full `KindMix`
+travels with it, because "60 % test, 40 % source" is a real shape that one label
+throws away.
+
+Three things about this are load-bearing:
+
+* **`Vendored` *is* PRD §8's industrial zone**, decided by the existing
+  `tree::IndustrialRules`, not by a second list. Generalising the rule rather
+  than duplicating it is what keeps `FileClass::Industrial` and
+  `CodeKind::Vendored` from ever disagreeing, and it is checked first for the
+  reason `classify_with` checks it first: `node_modules` holds ten thousand files
+  called `index.js`.
+* **The pass order is the design.** A code extension is checked *before* the
+  directory hints, so `docs/conf.py` stays source; a directory hint is checked
+  before the remaining extensions, so `data/cities.json` is data and
+  `src/settings.json` is config; CI directories are checked before both, so
+  `.github/workflows/ci.yml` is build and not config.
+* **`Unknown` is reported, not folded into `Source`.** "1 819 files match no
+  rule" is a fact about the rules, and it is how Neovim's 2 044 `.vim` files were
+  found and fixed. A silent default would have hidden it.
+
+**Configurable, because a shipped list is wrong somewhere.**
+`.polis/neighborhoods.json` adds to or removes from every table, including the
+industrial one. Two known false positives are left in on purpose, with the config
+file as the answer: Django ships a `django/test/` package that is production
+source and is classified `test`, and a `.po` catalogue is `data` although a
+translator would call it source.
+
+**Consequences.** Kind is derived, never stored: `kind_of` is a pure function of
+the path, so `FileMeta` gains no field, a serialized `RepoTree` gains no bytes,
+and there is nothing to migrate when a rule changes. Measured over seven real
+repositories (`docs/neighborhoods-sample.md`), unclassified files are 0–2 % of
+each except Neovim before the `.vim` fix.
+
+---
+
+## ADR-0086 — District depth is adaptive, and vendored trees are held out of the sizing budget
+
+**Context.** A district is a directory (PRD §3), and `DistrictTree` takes that
+literally — every directory holding a file. The label-and-colour layer picked the
+top level instead, so a repository whose code lives under `src/` got one enormous
+district and a scatter of tiny ones. Neither end is usable: 13 121 districts is
+not a legend, and 70 is not a map of `qurio-toolset` either, because 61 458 of
+its files are one `node_modules`.
+
+**Decision.** Choose the depth per branch. Descend into a directory while it
+holds more than `max_share` (8 %) of the repository; stop when a child would hold
+fewer than a floor derived from the repository's own size
+(`max(6, 0.4 % of the files)`). Neither bound is a district *count*: a count
+would shred a small repository and fuse a large one, and the observed range is
+3 → 68 across the seven repositories tested.
+
+Four rules make it work on real trees rather than on generated ones:
+
+1. **Vendored trees are one neighborhood each and are excluded from the budget.**
+   The share and the floor are computed over *civic* files — the total with every
+   industrial subtree removed. Without this, `qurio-toolset`'s 88 880 vendored
+   files set the ceiling at 7 236 and the operator's own 1 575 collapse into a
+   single district, which is exactly backwards. It is also PRD §8 restated: the
+   mass is drawn as one mass.
+2. **One promotable child is enough to split.** The shape this exists for is
+   `src/` beside a lone `README.md`; a rule that required two children would find
+   one child and a one-file residual and hand back the blob it was asked to break.
+3. **Single-child chains collapse.** `a/b/c` with nothing else in `a` or `b` is
+   one place with three names.
+4. **Contrast is the second reason to descend.** A directory under the ceiling is
+   still split when a child large enough to label would be a *different kind* —
+   compared against the district **without** that child, not against the district
+   as it stands. Comparing against the whole is the trap: a child big enough to
+   decide its parent's kind always agrees with it. Measured on Django, this is
+   the difference between ten `contrib` apps reading as `data` — 2 456 `.po`
+   files outvoting the Python — and reading as the source packages they are, with
+   their `locale` trees beside them.
+
+A name is the shortest suffix no other neighborhood shares, with a floor of two
+components where there are two: `components/custom`, not `custom`. The extra
+component costs eight characters and is the difference between a label and a
+guess. Past 30 characters it falls back to one, so a 40-character storage-bucket
+name does not become the label.
+
+**PRD §9 is untouched.** "The tree determines placement" is about placement;
+this changes *granularity*. Every neighborhood is still a directory, still
+addressed by its path. `RepoIndex::districts` is unchanged and still returns
+every directory, because that is the granularity `polis-layout` places plots at.
+
+**Consequences.** Additive: no existing type changed shape, `polis-layout`
+consumes nothing new, and the golden snapshots were verified green rather than
+regenerated — they were not stale, because the layout did not move. The partition
+is a pure function of `(paths, sizes, options)` with every threshold fixed before
+the walk, so input permutation cannot move a neighborhood; asserted in unit tests
+and checked on all seven repositories across two processes and across debug and
+release.
+
+---
+
+## ADR-0087 — A neighborhood description is a quotation from the repository, or it is nothing
+
+**Context.** The operator asked for "the title and the description of what the
+neighborhood is doing", and chose **derived-from-repo over an LLM**. PRD §2
+independently forbids the alternative: "single operator, local machine, local
+data. No server, no auth, no telemetry leaving the box."
+
+**Decision.** Four sources, first one that survives sanitising: a README in the
+directory, a package manifest's `description`, a module doc comment on the
+directory's anchor file (Rust `//!`, a Python module docstring, a leading JS/TS
+block comment — read with the same tree-sitter grammars `imports` loads, through
+the same `ts_language`, not with regexes), and finally a synthesised **inventory**
+of what is actually there.
+
+The inventory is fenced off by `DescriptionSource::is_prose` and is deliberately
+a *statement of fact* — "most imported: `BookContext.tsx`", "67 files named
+`cover`" — never a guess at intent, and it is emitted only when it carries
+something neither the name nor the colour already shows. When there is nothing
+true to say, the answer is `None`: **a wrong description is worse than none**, and
+"utils" described as "Utility functions" is the failure mode this rule exists to
+refuse. 13–38 neighborhoods per repository get nothing, and that is the design
+working.
+
+**Sanitising is load-bearing, not hygiene**, because a description is drawn onto
+an image the operator may share. Markup and every C0/C1 control are stripped, and
+so are the Unicode bidi overrides and zero-width characters — text that renders as
+something other than its bytes is a spoofing channel on a shared picture. A
+candidate is **rejected whole** — and the next source tried — if it reads as code
+or a bare file path, or if it carries anything credential-shaped: a published key
+prefix, an assignment to a name like `api_key`, a URL with a password in it, or a
+20-character high-entropy token. Rejection rather than redaction, because a
+redacted secret still says *there is a secret in this file*. The plain word
+"secret" in a sentence is allowed through; only an assignment to it is not.
+
+**Consequences.** Cached like `imports::ParseCache` — a 128-bit content digest
+plus the byte length, written out rather than taken from `DefaultHasher`, so two
+machines cannot disagree about a hit. Only the first 16 KiB of a handful of files
+per neighborhood is read, and never inside an industrial tree: somebody else's
+library does not get to describe a district of this city.
+
+The honest number is the **prose** fraction, not the described fraction. It is
+79 % on this repository, where every crate has a `//!` and a `Cargo.toml`
+description, and 15–33 % on the operator's own repositories and on Django and
+Neovim. That is a fact about how repositories are written, not a gap in the
+extractor, and `docs/neighborhoods-sample.md` reports it per repository rather
+than averaging it away.

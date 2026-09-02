@@ -543,15 +543,45 @@ fn read_recording(path: &Path) -> anyhow::Result<Option<Replay>> {
     }))
 }
 
-/// Reads one session offline and prints the reconstructed event stream.
+/// Animates one recorded session over its city, or prints it (PRD §15 M2).
+///
+/// > **M2 — Single-session replay.** Read one JSONL file offline and **animate
+/// > it over the city.**
+///
+/// So the window is what this command does, and the text stream is what
+/// `--print` (or any of the flags that only make sense for a stream) selects.
+/// With no transcript at all the window opens on the session picker.
 ///
 /// Ordered by `(file, byte_offset)` and never by the records' own timestamps:
 /// 20% of transcript files contain a backwards step and one observed jump was
 /// 60 seconds (ADR-0014).
 pub fn replay(cli: &Cli, args: &ReplayArgs) -> anyhow::Result<()> {
+    if !args.is_text() {
+        let config = crate::config::Config {
+            repo_root: cli.repo_root().context("resolving the repository root")?,
+            ..crate::config::Config::default()
+        };
+        let mode = match &args.transcript {
+            // No transcript: the picker chooses the recording *and* the
+            // repository, so the repo root is not decided here.
+            None => crate::Mode::Pick,
+            Some(transcript) => crate::Mode::Replay {
+                transcript: transcript.clone(),
+                repo: config.repo_root.clone(),
+                speed: args.speed,
+            },
+        };
+        return crate::launch(config, mode);
+    }
+
     let repo_root = cli.repo_root().context("resolving the repository root")?;
     let mapper = PathMapper::new(&repo_root).unwrap_or_default();
-    let path = &args.transcript;
+    let Some(path) = args.transcript.as_ref() else {
+        anyhow::bail!(
+            "--print, --json, --out and --limit need a transcript to read.\n\
+             Run `polis replay` with no arguments to pick one from this machine's own sessions."
+        );
+    };
 
     // A path that is not there is a typo, not an empty session. The tailer
     // below is deliberately forgiving — a transcript can vanish under a live
@@ -620,8 +650,8 @@ pub fn replay(cli: &Cli, args: &ReplayArgs) -> anyhow::Result<()> {
     if (args.speed - 1.0).abs() > f32::EPSILON {
         writeln!(
             out,
-            "# --speed {} is recorded and ignored: there is no renderer yet, so the offline read \
-             runs as fast as it parses (PRD §15 M2)",
+            "# --speed {} applies to the window, not to this stream: the offline read runs as \
+             fast as it parses. Drop --print for the animated view (PRD §15 M2)",
             args.speed
         )?;
     }
