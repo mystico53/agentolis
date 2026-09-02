@@ -8,3 +8,17 @@
 *.jsonl -text
 *.png binary
 *.wgsl text eol=lf
+
+# Binary assets must never be line-ending converted. `* text eol=lf` above
+# applies to everything, and a GIF that goes through LF normalisation is
+# silently corrupted in the blob while the working copy still looks fine.
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.mp4 binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.db binary
