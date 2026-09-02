@@ -1,0 +1,27 @@
+=== small (real repo) ===
+roads      nodes=236 segments=262 components=1 crossings=0 cycles(E-V+C)=27
+junctions  degree_hist[2:197 3:29 4:8 5:1 6:1] dangling(deg1)=0 deg>=4 share of junctions=25.6%
+blocks     n=27 area min/med/max=215/750/1617 aspect min/med/p95/max=1.09/1.53/2.46/2.76 slivers=0 median_verts=18
+buildings  lots=115 buildings=86 files=86 without_building=0 outside_lot=0 intersecting_road=0
+districts  n=16 sharing_a_border=16 adjacency_components=1 border_pairs=29
+streets    routed=6 chord-like=0
+timing     full_generation=0.8ms incremental_add(vacant lot)=1.0us incremental_add(subtree resubdivide)=0.04ms
+
+=== large (5000 synthetic) ===
+roads      nodes=7124 segments=7832 components=1 crossings=0 cycles(E-V+C)=709
+junctions  degree_hist[2:6300 3:502 4:168 5:77 6:51 7:16 8:8 9:2] dangling(deg1)=0 deg>=4 share of junctions=39.1%
+blocks     n=709 area min/med/max=166/1543/7413 aspect min/med/p95/max=1.00/1.88/3.99/8.11 slivers=4 median_verts=21
+buildings  lots=5902 buildings=5007 files=5007 without_building=0 outside_lot=8 intersecting_road=39
+districts  n=97 sharing_a_border=97 adjacency_components=1 border_pairs=193
+streets    routed=70 chord-like=0
+timing     full_generation=32.8ms incremental_add(vacant lot)=0.8us incremental_add(subtree resubdivide)=0.51ms
+
+=== determinism digests (FNV-1a 64 of the canonical layout dump) ===
+layout small : 0c7ebd6010edf501
+layout large : 84e3132d1cd2ec17
+reversed input order small : 6d86745455dd6898  (matches: true)
+reversed input order large : 90e4df571490e9fd  (matches: true)
+png small.png            : 00a35fa913735084
+png large.png            : 597b9b134e5ff990
+png junctions.png        : da97b6d0999d90b3
+png junctions-large.png  : f6846b0f44106fb4

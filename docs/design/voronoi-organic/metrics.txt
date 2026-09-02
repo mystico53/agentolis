@@ -1,0 +1,32 @@
+=== agentolis (real repo) ===
+files 86  districts 26  blocks 52  buildings 86
+ROAD GRAPH  nodes(junctions) 82  segments(chains) 136  polyline-segments 6610
+ROAD GRAPH  connected components 1   cycles (E-V+C) 55   crossings-without-a-node 1
+ROAD GRAPH  degree histogram  2:1  3:57  4:22  5:1  6:1   dangling(deg1) 0
+ROAD GRAPH  4-way-or-more junctions 24 (29.3% of nodes)
+ROAD GRAPH  classes  arterial 80  perimeter 25  secondary 31
+BLOCKS  count 52  no-face 0 (of which zero-pixel 0)  area min/med/max 1824.2 / 10244.8 / 21220.3
+BLOCKS  unbuilt(open ground) 4  no-buildable-core 0
+BLOCKS  aspect min/med/max 1.02 / 1.66 / 3.00   slivers(ar>6 or area<12) 0
+BUILDINGS  count 86  files-with-no-building 0  outside-their-lot 0  intersecting-a-road 0
+DISTRICTS  count 26  sharing-a-border 26  adjacency-components 1  empty-cells 0
+DISTRICTS  cell pixels min/med/max 6475 / 63218 / 224975  (settlement K=561319, grown 0x)
+TIMING  full generation 1038 ms   incremental single-file add 64 us
+INCREMENTAL  block 14 in district polis-app/src/·; district resize needed: true; 4 of 410 dump lines changed
+=== synthetic 5k ===
+files 5122  districts 494  blocks 1319  buildings 5000
+ROAD GRAPH  nodes(junctions) 1967  segments(chains) 3294  polyline-segments 33132
+ROAD GRAPH  connected components 4   cycles (E-V+C) 1331   crossings-without-a-node 1
+ROAD GRAPH  degree histogram  2:4  3:1431  4:406  5:99  6:21  7:6   dangling(deg1) 0
+ROAD GRAPH  4-way-or-more junctions 532 (27.0% of nodes)
+ROAD GRAPH  classes  arterial 2020  perimeter 137  secondary 1137
+BLOCKS  count 1319  no-face 0 (of which zero-pixel 0)  area min/med/max 19.5 / 357.9 / 3055.3
+BLOCKS  unbuilt(open ground) 460  no-buildable-core 388
+BLOCKS  aspect min/med/max 1.00 / 2.33 / 14.03   slivers(ar>6 or area<12) 14
+BUILDINGS  count 5000  files-with-no-building 122  outside-their-lot 0  intersecting-a-road 14
+DISTRICTS  count 494  sharing-a-border 494  adjacency-components 1  empty-cells 0
+DISTRICTS  cell pixels min/med/max 850 / 3141 / 27929  (settlement K=561319, grown 0x)
+TIMING  full generation 1416 ms   incremental single-file add 89 us
+NOTE  104 subtrees fell below the legible-quarter size
+NOTE  26 quarters needed a rescued block; 114 files could not be housed
+INCREMENTAL  block 489 in district src/atom/patch_actor/·; district resize needed: false; 10 of 15130 dump lines changed
