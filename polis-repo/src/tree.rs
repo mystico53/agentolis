@@ -300,6 +300,13 @@ pub struct WalkOptions {
     pub max_files: Option<usize>,
     /// Which trees are industrial. `None` uses [`default_industrial_rules`].
     pub industrial_rules: Option<IndustrialRules>,
+    /// Paths the walk must not enter because Polis writes them.
+    ///
+    /// `None` uses [`default_walk_exclusions`]. Set it to
+    /// [`WalkExclusions::empty`] for a deliberately faithful walk, and to
+    /// [`WalkExclusions::shipped`] plus [`WalkExclusions::exclude_output`] for
+    /// anything that is about to write a file into the checkout.
+    pub exclusions: Option<WalkExclusions>,
 }
 
 impl WalkOptions {
@@ -308,6 +315,13 @@ impl WalkOptions {
         self.industrial_rules
             .as_ref()
             .unwrap_or_else(|| default_industrial_rules())
+    }
+
+    /// The exclusions in force, shipped defaults included.
+    pub fn excluded(&self) -> &WalkExclusions {
+        self.exclusions
+            .as_ref()
+            .unwrap_or_else(|| default_walk_exclusions())
     }
 }
 
@@ -318,6 +332,216 @@ impl WalkOptions {
 /// that descends into it spends its entire budget there and renders a city made
 /// of hashes.
 const NEVER_WALKED: &[&str] = &[".git"];
+
+// ---------------------------------------------------------------------------
+// The repo-walk trap
+// ---------------------------------------------------------------------------
+
+/// Paths the walk does not enter, because **Polis itself writes them**.
+///
+/// # The trap this closes
+///
+/// The city-layout design bake-off rendered its candidate cities into
+/// `docs/design/`. `docs/design/` is inside the repository. So every run added a
+/// few files to the repository the *next* run laid out, and the town grew by
+/// itself between two runs that were supposed to be identical. Nothing errored,
+/// no test failed, and the only symptom was a layout that drifted — the single
+/// hardest class of bug to diagnose in a system whose entire product promise
+/// (PRD §7.4) is that the map does not move.
+///
+/// It is a feedback loop, not a classification problem, and it is closed by
+/// refusing to ingest the tool's own output.
+///
+/// # Why this is not [`IndustrialRules`]
+///
+/// The two lists look alike and mean opposite things. PRD §8 requires
+/// `node_modules` to be **drawn**, as one dull mass — it is part of the
+/// repository and the operator should see how much of it there is. An excluded
+/// path is not drawn at all, because it is not part of the repository in any
+/// sense the operator cares about: it exists because Polis ran.
+///
+/// So `dist/` is industrial and `docs/design/` is excluded, and merging the two
+/// lists would either start drawing the tool's own PNGs as buildings or stop
+/// drawing the dependency tree PRD §8 asks for.
+///
+/// # Configurable, and why that is not optional
+///
+/// A hardcoded list is wrong in both directions here. Every project puts its
+/// generated artefacts somewhere different, and the shipped list will always be
+/// missing one — while a repository whose `docs/design/` is hand-written prose
+/// would have a real district silently vanish with no way to say otherwise.
+///
+/// Two rules, either of which is enough:
+///
+/// * **`dir_names`** — a directory of this name at any depth.
+/// * **`prefixes`** — a root-anchored path. A directory *or a single file*:
+///   `LogicalPath::starts_with` matches an exact path as well as a subtree,
+///   which is what lets [`WalkExclusions::exclude_output`] name one PNG rather
+///   than the whole of `docs/`.
+///
+/// Matching is ASCII case-insensitive, like [`LogicalPath`]'s own equality
+/// (ADR-0028).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkExclusions {
+    /// Directory names, lowercased, matched at any depth.
+    dir_names: BTreeSet<String>,
+    /// Root-anchored paths: a subtree, or one file.
+    prefixes: BTreeSet<LogicalPath>,
+}
+
+/// Root-anchored paths excluded by default.
+///
+/// One entry, and it is the one the bake-off was actually caught by. The general
+/// closure is [`WalkExclusions::exclude_output`], which every writer of a file
+/// into the repository is expected to call: a shipped list can only ever name
+/// yesterday's artefact directory.
+const DEFAULT_EXCLUDED_PREFIXES: &[&str] = &["docs/design"];
+
+/// Directory names excluded by default, at any depth.
+///
+/// Polis's own state and cache directories. Deliberately short: `target/`,
+/// `dist/` and `node_modules/` are **not** here, because PRD §8 draws them (see
+/// the type documentation).
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &[".polis", ".polis-cache"];
+
+/// The shipped exclusions, built once.
+///
+/// A `OnceLock` for the same reason [`default_industrial_rules`] is one: the
+/// walk tests every directory it meets against these.
+pub fn default_walk_exclusions() -> &'static WalkExclusions {
+    static RULES: OnceLock<WalkExclusions> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let mut rules = WalkExclusions::empty();
+        for name in DEFAULT_EXCLUDED_DIRS {
+            rules.push_dir(name);
+        }
+        for path in DEFAULT_EXCLUDED_PREFIXES {
+            rules.push_path(path);
+        }
+        rules
+    })
+}
+
+impl WalkExclusions {
+    /// Nothing is excluded.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            dir_names: BTreeSet::new(),
+            prefixes: BTreeSet::new(),
+        }
+    }
+
+    /// The shipped defaults.
+    #[must_use]
+    pub fn shipped() -> Self {
+        default_walk_exclusions().clone()
+    }
+
+    /// Excludes a directory name, matched at any depth.
+    pub fn push_dir(&mut self, name: &str) {
+        let name = name.trim().trim_matches('/');
+        if !name.is_empty() {
+            self.dir_names.insert(name.to_ascii_lowercase());
+        }
+    }
+
+    /// Excludes a root-anchored path: a subtree, or one file.
+    ///
+    /// An unparseable path, or the repository root itself, is ignored — a walk
+    /// that refused to enter the repository would be a worse bug than the one
+    /// this prevents.
+    pub fn push_path(&mut self, path: &str) {
+        if let Ok(path) = LogicalPath::new(path) {
+            if !path.is_root() {
+                self.prefixes.insert(path);
+            }
+        }
+    }
+
+    /// Stops excluding a directory name — the way to say "our `docs/design` is
+    /// hand-written".
+    pub fn remove_dir(&mut self, name: &str) -> bool {
+        self.dir_names.remove(&name.trim().to_ascii_lowercase())
+    }
+
+    /// Excludes a file Polis is about to write, if it lands inside `repo_root`.
+    ///
+    /// **This is the general form of the fix**, and every path Polis writes
+    /// should go through it. A shipped list of artefact directories can only
+    /// name the ones that existed when it was written; "do not ingest what you
+    /// are about to emit" holds for the next one too.
+    ///
+    /// A path outside the repository is not excluded, because it cannot be
+    /// walked. Returns whether anything was added, so a caller can log it.
+    pub fn exclude_output(&mut self, output: &Path, repo_root: &Path) -> bool {
+        let resolved = output.canonicalize().or_else(|_| {
+            // The file usually does not exist yet, so canonicalise its parent
+            // and re-attach the name.
+            let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
+            let parent = parent.unwrap_or(Path::new("."));
+            parent
+                .canonicalize()
+                .map(|p| output.file_name().map_or_else(|| p.clone(), |n| p.join(n)))
+        });
+        let (Ok(out), Ok(root)) = (resolved, repo_root.canonicalize()) else {
+            return false;
+        };
+        let Ok(rel) = out.strip_prefix(&root) else {
+            return false;
+        };
+        let text: String = rel
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        let before = self.prefixes.len();
+        self.push_path(&text);
+        self.prefixes.len() > before
+    }
+
+    /// True for a **directory** the walk must not enter.
+    #[must_use]
+    pub fn excludes_dir(&self, dir: &LogicalPath) -> bool {
+        if self.matches_prefix(dir) {
+            return true;
+        }
+        dir.components()
+            .any(|c| self.dir_names.contains(&c.to_ascii_lowercase()))
+    }
+
+    /// True for a **file** the walk must not emit.
+    ///
+    /// The file's own name is never tested against `dir_names`: a file called
+    /// `.polis` at the root is a config file and gets a building.
+    #[must_use]
+    pub fn excludes_file(&self, file: &LogicalPath) -> bool {
+        if self.matches_prefix(file) {
+            return true;
+        }
+        let mut components: Vec<&str> = file.components().collect();
+        components.pop();
+        components
+            .into_iter()
+            .any(|c| self.dir_names.contains(&c.to_ascii_lowercase()))
+    }
+
+    fn matches_prefix(&self, path: &LogicalPath) -> bool {
+        self.prefixes.iter().any(|p| path.starts_with(p))
+    }
+
+    /// How many rules are configured, of both kinds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.dir_names.len() + self.prefixes.len()
+    }
+
+    /// True when nothing is excluded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// Walks a checkout and returns one [`FileMeta`] per file, **sorted by logical
 /// path**.
@@ -344,6 +568,7 @@ pub fn walk(root: &Path) -> std::io::Result<Vec<FileMeta>> {
 /// metadata cannot be read because it vanished mid-walk.
 pub fn walk_with(root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<FileMeta>> {
     let rules = opts.industrial();
+    let excluded = opts.excluded();
     let mut out: Vec<FileMeta> = Vec::new();
     // (physical directory, its logical path). A stack, not recursion: a deep
     // node_modules will happily blow a recursive walk's stack.
@@ -390,8 +615,16 @@ pub fn walk_with(root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<FileMet
                 if opts.skip_massed && rules.is_industrial_dir(&child) {
                     continue;
                 }
+                // The repo-walk trap: a directory Polis writes into is not a
+                // district. See [`WalkExclusions`].
+                if excluded.excludes_dir(&child) {
+                    continue;
+                }
                 dirs.push((entry.path(), child));
             } else {
+                if excluded.excludes_file(&child) {
+                    continue;
+                }
                 let size = entry.metadata().map_or(0, |m| m.len());
                 files.push((child, size));
             }
@@ -1839,6 +2072,169 @@ mod tests {
         write(root, ".git/objects/ab/cdef", b"not a source file");
         write(root, ".git/HEAD", b"ref: refs/heads/main");
         dir
+    }
+
+    // -----------------------------------------------------------------------
+    // The repo-walk trap
+    // -----------------------------------------------------------------------
+
+    /// **The regression test for the repo-walk trap.**
+    ///
+    /// Walk, drop a render into an excluded directory the way a Polis run does,
+    /// walk again: the two results must be byte-identical. Written as a
+    /// *sequence* rather than as two independent walks on purpose — the bug was
+    /// a feedback loop between consecutive runs, and only a test that runs them
+    /// in order can catch it.
+    ///
+    /// Four writes, because the trap has four shapes: a new file in the excluded
+    /// subtree, a new *subdirectory* of it, a file in Polis's own state
+    /// directory, and an overwrite of a file that was already there.
+    #[test]
+    fn a_file_written_into_an_excluded_directory_cannot_move_the_city() {
+        let dir = fixture();
+        let root = dir.path();
+        write(root, "docs/design/DESIGN.md", b"# the winning architecture");
+        write(root, "docs/guide.md", b"# a real document");
+
+        let before = walk(root).expect("walk");
+        assert!(
+            before.iter().any(|f| f.path.as_str() == "docs/guide.md"),
+            "the exclusion must not take the whole of docs/ with it"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|f| f.path.as_str().starts_with("docs/design")),
+            "docs/design is excluded by default"
+        );
+
+        // Exactly what a run does between two other runs.
+        write(
+            root,
+            "docs/design/city-m1.png",
+            b"\x89PNG\r\n\x1a\n0123456789",
+        );
+        write(
+            root,
+            "docs/design/renders/large.png",
+            b"\x89PNG\r\n\x1a\nmore",
+        );
+        write(root, ".polis/state.json", b"{}");
+        write(
+            root,
+            "docs/design/DESIGN.md",
+            b"# rewritten, and much longer",
+        );
+
+        let after = walk(root).expect("walk");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the walk grew by {} files that Polis itself wrote",
+            after.len().saturating_sub(before.len())
+        );
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert_eq!(a.path, b.path, "the walk reordered");
+            assert_eq!(a.size_bytes, b.size_bytes, "{} changed size", a.path);
+            assert_eq!(a.class, b.class, "{} changed class", a.path);
+        }
+    }
+
+    /// The same corpus with the exclusions turned off: proof the test above is
+    /// testing the exclusion and not something else.
+    ///
+    /// Without this the first test would still pass if `walk` had simply stopped
+    /// seeing new files, which is a much worse bug.
+    #[test]
+    fn without_the_exclusion_the_same_writes_do_move_the_city() {
+        let dir = fixture();
+        let root = dir.path();
+        write(root, "docs/design/DESIGN.md", b"# the winning architecture");
+        let faithful = WalkOptions {
+            exclusions: Some(WalkExclusions::empty()),
+            ..WalkOptions::default()
+        };
+        let before = walk_with(root, &faithful).expect("walk");
+        write(
+            root,
+            "docs/design/city-m1.png",
+            b"\x89PNG\r\n\x1a\n0123456789",
+        );
+        let after = walk_with(root, &faithful).expect("walk");
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "the faithful walk must see the render Polis just wrote"
+        );
+    }
+
+    /// `--out docs/city.png` must cost one building, not the `docs/` district.
+    #[test]
+    fn excluding_an_output_file_keeps_its_directory() {
+        let dir = fixture();
+        let root = dir.path();
+        write(root, "docs/guide.md", b"# a real document");
+        write(root, "docs/city.png", b"\x89PNG\r\n\x1a\n");
+
+        let mut rules = WalkExclusions::shipped();
+        assert!(
+            rules.exclude_output(&root.join("docs").join("city.png"), root),
+            "an output inside the repository is excluded"
+        );
+        assert!(
+            !rules.exclude_output(Path::new("elsewhere.png"), root),
+            "an output outside the repository cannot be walked, so it is not excluded"
+        );
+
+        let files = walk_with(
+            root,
+            &WalkOptions {
+                exclusions: Some(rules),
+                ..WalkOptions::default()
+            },
+        )
+        .expect("walk");
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"docs/guide.md"), "{paths:?}");
+        assert!(!paths.contains(&"docs/city.png"), "{paths:?}");
+    }
+
+    /// The exclusions are rules, not a hardcoded list: both directions.
+    #[test]
+    fn the_exclusions_are_configurable_in_both_directions() {
+        let mut rules = WalkExclusions::shipped();
+        assert!(rules.excludes_dir(&lp("docs/design")));
+        assert!(rules.excludes_file(&lp("docs/design/deep/city.png")));
+        assert!(
+            rules.excludes_dir(&lp("web/.polis")),
+            "matched at any depth"
+        );
+        assert!(!rules.excludes_file(&lp("docs/guide.md")));
+        // A file *called* .polis at the root is configuration, not state.
+        assert!(!rules.excludes_file(&lp(".polis")));
+
+        // "our docs/design is hand-written prose."
+        let mut opened = WalkExclusions::empty();
+        opened.push_dir(".polis");
+        assert!(!opened.excludes_file(&lp("docs/design/DESIGN.md")));
+
+        // "our generated docs live in build/api."
+        rules.push_path("build/api");
+        assert!(rules.excludes_file(&lp("build/api/index.html")));
+        assert!(!rules.excludes_file(&lp("build/main.rs")));
+
+        assert!(rules.remove_dir(".polis"));
+        assert!(!rules.excludes_dir(&lp("web/.polis")));
+        assert!(!rules.is_empty());
+        assert!(WalkExclusions::empty().is_empty());
+    }
+
+    /// Matching folds ASCII case, like [`LogicalPath`] itself (ADR-0028).
+    #[test]
+    fn exclusion_matching_folds_ascii_case() {
+        let rules = WalkExclusions::shipped();
+        assert!(rules.excludes_file(&lp("DOCS/DESIGN/city.png")));
+        assert!(rules.excludes_dir(&lp("web/.POLIS")));
     }
 
     #[test]

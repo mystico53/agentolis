@@ -217,7 +217,7 @@ const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// which a single shared stream would.
 ///
 /// The algorithm is `SplitMix64`, written out (ADR-0029): a counter advanced by
-/// [`GOLDEN_GAMMA`] and passed through [`mix64`]. It is small enough to audit in
+/// `GOLDEN_GAMMA` and passed through [`mix64`]. It is small enough to audit in
 /// one screen, has no state beyond a `u64`, and passes `BigCrush` — which is far
 /// more than a city needs from a generator whose only job is to look arbitrary.
 ///

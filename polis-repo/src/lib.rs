@@ -41,6 +41,7 @@
 pub mod corpus;
 pub mod git;
 pub mod imports;
+pub mod synthetic;
 pub mod tree;
 
 use std::collections::BTreeMap;

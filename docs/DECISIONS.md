@@ -1387,6 +1387,383 @@ noisy `cargo test` on Windows.
 
 ---
 
+## ADR-0052 — Roads are the boundary network of the settled ground
+
+**Context.** PRD §7.2 step 2 specifies space colonisation with intersection
+snapping, and warns that "without snapping you get a tree, and trees read as
+artificial". The first M1 attempt implemented it literally and got exactly the
+warned-about failure, for a reason the PRD does not anticipate: snapping can only
+bridge two things that are *already* close. Attractors were scattered per
+district on a golden-angle spiral, so each district's cloud was spatially
+isolated, snapping never fired across a gap, and the graph came out as one small
+tree per island — no cycles, therefore no faces, therefore no blocks, therefore
+degenerate lots and degenerate buildings. `docs/city-m1.png` at that revision is
+shards in a void.
+
+Three architectures were then prototyped and rendered, scored by an independent
+judge on the images and reviewed by the lead (`docs/design/JUDGEMENT.md`).
+`accretion` won: simulate the town growing file by file in git commit order, and
+take the road network to be the *dual* of the settled ground.
+
+**Decision.** The road network is the boundary network of the settled ground. A
+road is the line where one parcel's territory stops and the next one's begins —
+the Voronoi diagram of a set of accreted plots, welded, collapsed and pruned. The
+pipeline is:
+
+| Stage | Module |
+|---|---|
+| terrain (PRD §7.2 step 1) | `terrain` |
+| district territory (constraint only) | `territory` |
+| accretion in commit order (PRD §7.1) | `accrete` |
+| cells → welded planar graph | `voronoi`, `roads` |
+| blocks = the faces (PRD §7.2 step 3) | `blocks` |
+| lots (PRD §7.2 step 4) | `lots` |
+| buildings (PRD §7.2 step 5) | `buildings` |
+
+Space colonisation is deleted: `roads::grow`, `RoadGrowth`, `Attractor`,
+`scatter_attractors`, `GrowthParams`, `step_towards`, `consume_reached`,
+`direction`, `blocks::DistrictSites`, `city::CITY_GROWTH` and
+`city::classify_roads` are gone. `RoadGraph`, `Block`, `Lot`, `Building`,
+`District`, `StreetLine` and `CityLayout` — the cross-crate contract — are
+unchanged, so `polis-render` and `polis-world` were not touched.
+
+PRD §7.2's snap survives as two operations that *do* bridge something: the
+**weld**, which fuses corners two adjacent cells computed independently, and the
+**collapse**, which contracts every boundary shorter than a threshold and turns
+two three-way corners into one four-, five- or six-way junction. At 5 000 files
+57 % of junctions are four-way or better; a raw Voronoi diagram is almost all
+three-way.
+
+**Consequences.** Planarity, connectivity and closed faces are properties of the
+construction rather than of a tuning constant, and there is no parameter setting
+at which the graph degenerates into a tree. Measured at 5 000 synthetic files:
+one connected component, zero dangling ends, zero crossings without a node, and
+1 071 blocks equal to `E − V + C` exactly. The identity is asserted on a fixed
+corpus by `eulers_formula_holds_on_a_fixed_corpus`, because a face walk that
+drops a face is invisible everywhere else.
+
+PRD §7.2 step 2 is therefore **not implemented as written**, and this ADR is the
+record of that. What the PRD is *for* — irregular four- and five-way junctions,
+closed blocks, irregularity as the residue of history — is delivered; the
+mechanism named in it is not the one that delivers it.
+
+---
+
+## ADR-0053 — The layout is `f64` inside and `f32` at the stage boundaries
+
+**Context.** `polis_layout::Point` is `f32`: it is the cross-crate contract and
+what the renderer uploads. The interior of the new pipeline cannot be.
+
+A cell is built by clipping a convex frame with the perpendicular bisector
+against each neighbour. Two adjacent cells compute the *same* corner from the
+same two bisector equations, but in a different clip order, so the two results
+differ by rounding. They become one road junction only if they agree to within
+the weld tolerance. The failure mode to design against is **near-cocircular
+sites**: four plots almost on a common circle, which accretion produces
+constantly because it settles plots at a fixed minimum separation. There the
+bisectors meet at a shallow angle and the rounding disagreement is amplified by
+orders of magnitude. In `f32` it exceeds the weld tolerance, the corner fails to
+weld, and the graph silently loses the cycle the whole design exists to produce —
+silently, because a city with one block too few still serializes cleanly and
+still looks like a city.
+
+**Decision.** Everything from the accretion search through the half-plane
+clipping, the weld, the collapse, the face walk, the lot subdivision and the
+footprint fit is `f64`, in `polis_layout::geom` (`Pt = [f64; 2]`). Conversion to
+`f32` happens **only** at stage boundaries, through `geom::to_point` /
+`geom::to_polygon`, which run `determinism::quantize_f64` first so a value that
+reaches the output has already been snapped to the same 0.001 grid the snapshot
+prints at. The weld tolerance is 0.004 — coarse enough to absorb the `f64`
+disagreement, fine enough that two genuinely different corners stay apart.
+
+**Consequences.** One extra type to convert at four boundaries, and about 30 %
+more memory in the working set, neither of which is measurable next to the search
+itself. In exchange, the weld is not a source of silent structural loss, and the
+quantisation is a single documented step rather than a property of whichever
+arithmetic happened to run. Nothing in the crate may take a coordinate from `f32`
+into a geometric predicate; if a future stage needs one, it converts through
+`geom::from_point` and back.
+
+---
+
+## ADR-0054 — A footprint is the inset lot, not an oriented rectangle
+
+**Context.** PRD §7.2 step 5: "**Buildings** are lots inset by a setback, with a
+small random rotation (±4°)." The `accretion` prototype deviated from this,
+using an oriented rectangle aligned to the parcel's long axis, on the grounds
+that a triangular parcel gives a triangular building and a triangle does not read
+as a building.
+
+Measured, that trade is far worse than it looks. The largest rectangle that fits
+inside a five-sided Voronoi-derived parcel is under half its area even with a
+multi-anchor search, so the rectangle threw away roughly a third of every
+footprint in the city. The design bake-off's judge identified building density as
+the **cross-cutting** finding across all three entries: footprints were 8.9 % of
+block area against 30–60 % for a dense historic core, "the ground is ~90 % empty,
+and THIS more than any topology property is why all three renders read as
+diagrams rather than cities".
+
+**Decision.** The footprint is the parcel's buildable region, scaled about its
+centroid to the target area and rotated ±4°. The buildable region is the parcel
+eroded **per edge** (`geom::erode_per_edge`): the full road half-width plus a
+kerb on an edge that lies on the block boundary — which *is* a road centre line —
+and a garden-fence setback on an interior lot line. Eroding uniformly by the
+larger of the two is what made small parcels unbuildable.
+
+**Consequences.** Coverage went from 8.9 % to 31–33 % at 5 000 files and 33 % on
+this repository, which is a different category of image. Parcels here come from a
+Voronoi cell cut into strips, so they are quadrilaterals and pentagons far more
+often than triangles; where a triangle does occur the building is a triangle, and
+that is accepted. Every footprint is verified corner-by-corner to be inside its
+own lot and clear of the road corridor before it is returned, and shrunk until
+both hold — so "no building stands in a road" is enforced, not asserted:
+measured zero of 4 565 at 5 000 files, against 79 in the prototype.
+
+---
+
+## ADR-0055 — Footprint area ramps between two fractions of the lot
+
+**Context.** PRD §7.3: "**Footprint area** ∝ `sqrt(file_size_bytes)`, clamped to
+`[min_lot, block_area * 0.6]`." Taken as a single absolute constant, that cannot
+satisfy a city whose rim parcels are twenty times its core parcels: a constant
+tuned for the core overflows nothing and leaves the rim empty, and one tuned for
+the rim makes every core building a fleck. The prototype's clamp bound almost
+everywhere, so file size stopped being legible at all.
+
+**Decision.** Both halves of PRD §7.3 are kept, as the two bounds they are.
+`buildings::fill_fraction` ramps the footprint from `MIN_FILL` to `MAX_FILL` of
+the parcel's buildable region as `sqrt(size_bytes)` goes from 512 B to 64 KiB;
+the result is then capped above by `FOOTPRINT_SCALE · sqrt(size_bytes)` — the
+literal proportionality, which stops a small file on a large outlying plot
+getting a warehouse — and by `BLOCK_AREA_FRACTION` of its block, which is PRD
+§7.3's own clamp, tightened from 0.6 to 0.40 because a one-file block otherwise
+reads as a block with a hole in it.
+
+**Consequences.** A bigger file is always a bigger building, which is the
+ordering PRD §7.3 is really asking for, and the density holds at both ends of the
+age gradient. The area is no longer *literally* proportional to the square root
+of the size across the whole range, and that is the deviation this ADR records.
+
+---
+
+## ADR-0056 — District territory is a constraint; the city limit is the frame
+
+> **Amended by ADR-0058.** The cut orientation below had a defect that made
+> the partition hand a group the area computed for the other side of the
+> cut, and "there is no contact rule" is now "contact is with a sibling".
+> The consequences recorded here are the numbers *before* that fix.
+
+**Context.** Accretion decides district membership emergently — a district is
+whatever fell out of where its plots happened to land. Measured at 5 000 files
+that gave 102 of 276 districts more than one disconnected piece, so in the dense
+core the colour changed every two or three blocks. That violates PRD §9 ("the
+tree determines placement") and PRD §8 (the district skeleton must stay readable
+at every zoom).
+
+The bake-off's `treemap-arterials` entry had the cure and lost on everything
+else. Its recursive tree partition is grafted here **only as a territory
+constraint**; its roads are not, and the chord-splitting that produced its
+crazed-glaze arterials and its snap-clustered seven-way stars is not present.
+
+**Decision.** `territory` runs a balanced recursive subdivision of a convex city
+limit — children ordered by `(oldest file, path)`, split at the index best
+balancing quantised subtree weight, face cut at the offset giving each side area
+proportional to its weight, cut normal the face's longest axis leaned 30 % toward
+the terrain gradient, older group taking the side nearer the civic square. A plot
+may then only settle inside its own district's polygon. Roads still come entirely
+from the Voronoi of the accreted plots.
+
+Two further decisions follow from measurement and are recorded here because both
+reverse the prototype:
+
+* **There is no contact rule.** The prototype required a new plot to be within
+  `1.75 × sep` of an existing one, which is what gave it one connected component.
+  With a territory partition that rule is redundant *and* harmful: a district
+  whose polygon the growth front had not yet reached failed the contact test
+  inside its own ground and settled in an ancestor's instead — 83 % of plots at
+  5 000 files, which left districts as fragmented as they were with no partition
+  at all.
+* **There are no phantom sites.** The prototype bounded its outer cells with
+  phantom plots laid wherever the ground was empty, and discarded their cells.
+  Empty ground *inside* the settlement grows phantoms too, so a gap between two
+  quarters became a hole in the map and, when wide enough, split the road graph —
+  eleven components at 5 000 files. Every cell is instead clipped to the city
+  limit, so the union of the cells **is** the city limit, `components = 1` is
+  structural, and the drawn edge of town is a drawn boundary rather than a ragged
+  fringe.
+
+A district's ground is sized by `accrete::Params::district_demand`, which counts
+`ceil(files / capacity)` whole plots, a slack factor, and a **border band**: a
+plot may come no closer than one separation to a plot over the border, so a
+district loses about half a separation around its whole perimeter, and that band
+is most of a small district's polygon.
+
+**Consequences.** Fragmented districts fell from 102/276 to 41/307 at 5 000
+files and to 0/33 on this repository. A plot that still cannot fit inside its own
+polygon relaxes, in a fixed order, onto its polygon's fringe, then into an
+ancestor's, then anywhere inside the city limit; every rung is counted in
+`CityReport` rather than hidden, and the counts are printed by `polis snapshot`.
+PRD §7.7's no-rearrangement property is upgraded from measured to structural for
+everything inside a district's polygon, since that polygon is fixed by its
+parent — but **not** across a repository that has grown, because the partition is
+computed from the whole file list and quantised weights make a moved cut rare
+rather than impossible.
+
+---
+
+## ADR-0057 — `polis snapshot` renders on the CPU, in the repository
+
+**Context.** PRD §15 M1 ends in "generate a city from git history and render it
+to a window (**or PNG**)". `polis snapshot` was declared in the CLI and returned
+an error, so the M1 gate had to write its own rendering harness — which means the
+thing being tested and the thing being shipped were two different pieces of code.
+
+**Decision.** `polis snapshot` is implemented (`polis-app/src/snapshot.rs`) and
+draws through `polis_render::plan`, a static plan renderer over
+`polis_render::raster`, a deterministic software rasteriser and PNG writer. It
+takes the checkout or a synthetic repository (`--synthetic N`), and writes the
+plan, optionally the junction diagram (`--junctions`) and the serialized layout
+(`--layout`).
+
+The CPU path is deliberate rather than a stopgap. A PNG has to be producible with
+no adapter, no surface and no window; and rasterisation rules differ between GPU
+vendors, so two machines would disagree about the bytes of the image while
+agreeing perfectly about the layout underneath. The PNG is written with stored
+(uncompressed) deflate blocks: a valid zlib stream every decoder accepts, no
+dependency, and output that is a pure function of the pixels where a compressor's
+heuristics would not be.
+
+The presentation scheme is taken from the bake-off's `voronoi-organic` entry,
+which lost on structure and won on presentation: hue families keyed on the
+top-level directory, in-map district labels, a drawn city limit, and a metrics
+footer. **No timing is ever drawn into the image** — the bake-off found a real
+leak there, a wall-clock generation time in the legend that made the PNG
+non-reproducible while the layout under it was perfect. Timings go to stdout.
+
+**Consequences.** There is one product path from a repository to a picture, and
+the M1 gate asserts that path is reproducible (`the_rendered_plan_is_reproducible`).
+Measured: `docs/city-m1.png` and `docs/city-m1-large.png` are byte-identical
+across separate processes and across the debug and release profiles. The
+interactive wgpu renderer is untouched; this is a second, offline output, not a
+replacement.
+
+---
+
+## ADR-0058 — Two rules make a district one piece, and the second is the load-bearing one
+
+**Context.** ADR-0056 grafted `treemap-arterials`' recursive partition onto the
+accretion layout as a territory constraint, and it did not work: fragmented
+districts only fell from 102 of 276 to 41 of 307 at 5 000 files, six of the
+thirteen top-level packages were still in more than one piece, and **636 of
+1 198 plots settled outside their own district's polygon**. The recorded
+explanation was that a small district's polygon is mostly exclusion band.
+
+That explanation was wrong, and the measurement that found it out is worth
+recording. Ranked by *ground given over ground needed*, the worst districts were
+not the small ones: `web/adapters/server/retry/policy/hasher`, 769 files, was
+given a polygon of **0.03 square units against the 494 its plots needed**, and
+every one of its 129 plots relaxed into an ancestor's territory. 146 of 279
+districts had less ground than their own plots occupied.
+
+The cause was one inverted assignment in `territory::place`. A cut has two jobs:
+give each side area in proportion to its group's quantised weight, and put the
+older group on the side nearer the civic square (PRD §7.1). The code solved the
+offset for the first, then chose which *half* to hand to which group by the
+second — so whenever the younger group's centroid was nearer the origin, each
+group received the area computed for the other. On a balanced cut that is
+invisible. On an unbalanced one it is catastrophic, and the deeper the tree the
+more often it compounds.
+
+**Decision.** Three changes, in the order they matter.
+
+1. **The cut's normal is oriented before the offset is solved for**, so that the
+   half with the area the first group asked for *is* the half nearer the civic
+   square. One constraint is met by choosing the sign of a normal and the other
+   by the offset, and neither has to be traded for the other. `districts`'
+   `a_district_that_asks_for_more_ground_gets_more_ground` states the property as
+   a monotonicity over every pair of districts, so it holds at every depth.
+
+2. **Rule A: after a district's first plot, every plot's nearest plot in the
+   whole city must be one of its own district's.** Rule T (a plot settles only
+   inside its own polygon) is not enough on its own — a convex polygon says
+   nothing about cells, and a neighbour's cell can reach through it. The
+   nearest-neighbour graph is a subgraph of the Delaunay graph, so rule A makes
+   each new cell share an edge with a sibling's, and a district's cells are one
+   edge-connected region by induction over the growth order. This reverses
+   ADR-0056's "there is no contact rule": the prototype's rule required contact
+   with *any* plot, which is what fought the partition; contact with a *sibling*
+   is always available and serves it.
+
+   The ladder drops rule T before rule A — a plot may sit up to `0.55 × sep` over
+   its own border if that is what lets it keep contact with its own ground —
+   because a plot half a separation over the line is still in its own quarter,
+   while a plot out of contact is a second piece of the district.
+
+3. **A maximum spanning forest of each district's cell-adjacency graph is never
+   contracted** (`districts::links_to_keep`, `roads::Graph::collapse_short`).
+   Contracting a boundary is what the collapse pass is *for* — it is where the
+   four- and five-way junctions come from — but it leaves the two cells either
+   side touching at a node, and when that boundary was the only thing joining a
+   two-parcel district, the district comes out in two pieces. Measured: one
+   district in 238 at 3 000 files. Taking the **longest** candidate at each step
+   means the protected boundaries are the ones a short-edge pass would never have
+   touched, so the cost is 0.5 points of four-and-five-plus junction share.
+
+**What was tried and rejected.** A fourth change would have made "adjacent
+directories are adjacent on the ground" structural at *every* level of the tree
+rather than only at the leaves: require a district's **founding** plot to have a
+plot of its nearest already-settled ancestor quarter as its nearest neighbour, so
+that a new quarter buds onto the quarter it belongs to. The induction is sound —
+it makes every subtree connected, not just every district — and the measurement
+says no. At 1 000 files it took fragmented districts from 0 to 1, fragmented
+packages from 0 to 1, and rule-A bends from 0 to 18, because a founding plot is
+the one with the least room to manoeuvre and forcing its neighbour pushes it
+somewhere worse. The weaker property is kept and *measured* instead:
+`CityReport::fragmented_subtrees` is 0, 1, 4 and 2 of 32, 144, 238 and 312
+subtrees at 200, 1 000, 3 000 and 5 000 files, and the gate bounds it at one in
+twenty rather than pretending it is zero.
+
+**Consequences.** Measured at 5 000 files against the same corpus, the same
+seed and the same `lots`/`buildings` code on both sides, so the numbers are this
+change and nothing else.
+
+| metric | before | after |
+|---|---|---|
+| fragmented districts | 41 of 307 | **0 of 312** |
+| fragmented top-level packages | 6 of 13 | **0** |
+| plots settling outside their own polygon | 712 of 1 198 | **0** |
+| districts with no ground of their own on the map | 5 | **0** |
+| faces the partition could not divide | 23 | **0** |
+| road nodes / segments | 1 262 / 2 332 | 1 299 / 2 354 |
+| components / crossings / dangling | 1 / 0 / 0 | 1 / 0 / 0 |
+| blocks (= independent cycles) | 1 071 | 1 056 |
+| four-and-five-plus share of junctions | 57.1 % | 52.5 % |
+| longest natural stroke | 76.4 % of diameter | 76.1 % |
+| block p95:p05 | 20.2x | 18.0x |
+| median block compactness | 0.718 | 0.707 |
+| age gradient (rim block area / core) | 2.98x | 4.00x |
+| building coverage of block area | 31.4 % | 34.0 % |
+| full generation | 2 276 ms | **275 ms** |
+
+Zero fragmented districts and zero fragmented packages also at 200, 1 000 and
+3 000 files and on both pinned fixtures, where the baseline was 2 of 31, 11 of
+144 and 41 of 307.
+
+The junction share is the price, and it is stated rather than buried: 4.6 points,
+of which about half is the protected spanning forest and half the adjacency rule.
+It stays above the 45 % floor the gate holds and close to the bake-off's 53.3 %
+baseline. The generation time falls by a factor of eight because the relaxation
+ladder is no longer walked 712 times.
+
+`CityReport` gains `settled_nonadjacent` (rule A bent), `presplit_districts` (a
+district the Voronoi diagram itself never joined, which no later repair could
+fix) and `fragmented_subtrees`; the first two are 0 at every scale measured and
+the M1 gate asserts it rather than printing it. Contiguity is not a tuning target
+any more: any fragmented district at all now means one of the three mechanisms
+above failed.
+
+---
+
 ## Open items carried forward
 
 Not decided here, and each needs an owner:
@@ -1420,3 +1797,368 @@ Not decided here, and each needs an owner:
 10. **Nothing non-Windows was executed.** Every Linux and macOS statement in
     `hook-ipc.md` is unverified, including the end-to-end spawn budget. The safety
     matrix must be re-run per platform.
+
+## ADR-0059 — Through-streets come from a **fan of quarters**, not from seeding the plots
+
+**Status** accepted · **Supersedes nothing; completes ADR-0052's road model.**
+
+The design bake-off's second defect was that the longest natural road stroke was
+28 % of the city diameter with exactly one stroke past 25 % — the "soap-foam
+honeycomb" tell. Its remedy, Graft 2, was to promote the district territory
+boundaries to *desire lines* and pull the plots near one onto a lattice aligned
+to it: a run of collinearly-seeded sites gives a run of collinear Voronoi
+boundaries, so the straightness would be emergent from the seeding rather than
+drawn.
+
+**That was built first, and measured.** It does not reach at this plot density,
+and the reason is arithmetic rather than tuning. A boundary segment on the line
+needs a *facing pair* — two plots mirrored across it — and the two sides of a cut
+are different districts settled at different times, so a run needs the second
+district to choose exactly the rungs the first one used, over and over. The share
+of lattice slots that can be filled at all is `pitch² × plot density`, about a
+quarter at 5 000 files. Measured, with the slots reserved from before the first
+file was placed and a bonus for completing a pair: **235 plots exactly on a
+lattice, 44 facing pairs, longest run of consecutive filled rungs = 2**, against
+the eighteen cells a 46 %-of-diameter avenue spans. Sweeping the lattice pitch
+from 1.0 to 4.0 × `sep` moves the longest run between 1 and 5 and never further.
+
+So the avenue is made **structural**, in the one way that does not draw a road:
+the diagram is computed *per quarter*. `territory` fans the city limit into
+`WEDGES` wedges round the civic square; a plot's cell starts from its own
+quarter's polygon and is clipped only against plots of the same quarter. Each
+quarter is tiled exactly by its own cells, the quarters tile the limit, and the
+shared edge between two quarters is the chord itself — one exactly straight road,
+for its whole length, with no coordination between the two sides.
+
+Why this is not treemap's chord-splitting, which the bake-off rejected:
+
+* treemap made **every** cut at every depth a road; here it is the fan's rays,
+  the civic square's sides and one ring road per wedge — at most 27 lines against
+  some three hundred cuts, and every other road in the city is still the bisector
+  of two accreted plots;
+* treemap's arterials were **city-spanning**; a ray runs from the civic square to
+  the limit and stops, which is 46 % of the diameter, and the acceptance band's
+  upper bound exists precisely to forbid the other thing.
+
+The fan, rather than a binary chord split, is what makes the second bullet
+possible: *any* binary split of a convex region starts with a full chord of it,
+so the first quarter boundary of a chord partition necessarily runs clean across
+the city.
+
+The lattice seeding is kept. It no longer makes the avenues straight; it makes
+the frontage along them regular and the cross streets meet them squarely.
+
+Measured at 5 000 files, before → after: longest street stroke 41.8 % → 45.8 % of
+the city diameter, strokes past a quarter of it 13 → 23, and — the number that
+actually separates an avenue from a wiggle that happens to end far away — the
+median sinuosity (arc length over end-to-end reach) of the ten longest strokes
+1.07 → 1.00.
+
+## ADR-0060 — The stroke measurement excludes the city limit, and uses the diameter
+
+**Status** accepted
+
+Two bugs in the number the bake-off set a range for, both of which flattered it.
+
+1. **The city limit was counted as a street.** Every cell is clipped to the
+   limit, so the limit is in the road graph as a chain of collinear edges broken
+   only at the limit polygon's own corners — and a nineteen-sided polygon turns
+   18.9° at a corner, inside the 40° continuation limit. The stroke rule walked
+   three quarters of the way round the outline and reported it as the city's
+   longest through-street: **74 % of the diameter on every seed tried**, before
+   and after any change to the plan. It is the outline every time. A chain that
+   uses a perimeter edge is no longer counted; `polis snapshot` prints both
+   numbers so the exclusion is visible rather than assumed.
+2. **The denominator was the bounding box's diagonal.** For a roughly round city
+   that is `2R√2` against a true diameter of `2R`, so every stroke read a factor
+   of √2 short — the difference between a 32 % avenue and a 46 % one.
+
+Also: the continuation limit itself was `cos 56.6°`, not the conventional 40°.
+On one graph, the same morning: 76.1 % at 56.6°, 75.6 % at 40°, 46.4 % at 30°,
+and 12, 5 and 4 strokes past a quarter of the city. A measurement that flatters
+the thing it measures is worse than no measurement, so it is pinned at the
+convention.
+
+## ADR-0061 — The weld is a tolerance, not a bucket
+
+**Status** accepted · **Fixes a latent planarity break in ADR-0052's weld.**
+
+Cell corners were welded by rounding onto a `0.004` lattice and grouping equal
+keys. That is a *bucketing*, not a tolerance: two corners a thousandth apart weld
+when they land in the same bucket and do not when the bucket boundary happens to
+fall between them. An unwelded pair leaves two nodes a thousandth apart with four
+edges between them, two of which cross without a node — the exact planarity break
+PRD §7.2 forbids, produced by a weld that was *asked* to fuse them and silently
+did not.
+
+It stayed latent while the plots were irregular and appeared the day the desire
+lines started seeding plots on a lattice, because a lattice is precisely what
+puts corners near a bucket boundary over and over. The lattice now finds
+*candidates* and a second pass unions neighbouring buckets whose corners really
+are within the tolerance, in sorted key order so the grouping is a property of
+the geometry rather than of the order the cells arrived in (PRD §7.4).
+
+## ADR-0062 — Streets are drawn on the roads, and are a layer that is off by default
+
+**Status** accepted
+
+PRD §9's streets are cross-district import relations. They were drawn as
+centroid-to-centroid chords slashing across open ground, which the bake-off
+called the single most anti-city element in the frame. They are now routed by
+Dijkstra over the road graph with arterials discounted, so a street prefers a
+main road exactly as traffic does and no street is a chord; width is the number
+of distinct import edges the relation carries, as PRD §9 asks; and the layer is
+**off at the widest zoom** (`polis snapshot --streets` turns it on), because the
+whole import graph drawn over the whole city at once is noise rather than
+information. §9's free diagnostics — a district with streets to everywhere is a
+hub or a god-module, one with none is isolated — are counted into
+`city::street_diagnostics` and printed with the metric set.
+
+## ADR-0063 — The block size hierarchy stops at 20×, and the reason is the directory tree
+
+**Status** accepted
+
+The bake-off's fifth defect asks for a `p95 : p05` block area ratio of `>= 30×`
+against a prototype's 6.8×. It is 19.6× at 5 000 files, 24.5× at 3 000 and 29.0×
+on this repository. Three ways of moving the last of it were built and measured:
+
+* a hotter prune (`PRUNE_RIM` 0.42 → 0.68) gives 21.2×: an independent coin per
+  boundary cannot make a heavy tail whatever its bias;
+* a block size cap that ramps outward, merging faces while their combined area is
+  under a local target — the shape of rule that *does* make a heavy tail — gives
+  20.4× at its best setting, and was removed;
+* coarser parcels reach the target and cost the map: `sep_rim` 2.75 → 3.90 gives
+  28.1× at 27.5 % building coverage, `sep_core` 0.55 → 0.36 gives 30.4× at 28.8 %
+  and fourteen slivers, both against 19.6× at 36.0 %. Coverage is the judge's
+  cross-cutting finding and the most important number on the map.
+
+The binding constraint is none of these. A district border is never pruned, so a
+block can never grow past its own district's ground, and at 5 000 files there are
+312 districts over 1 077 blocks — three and a half blocks each. The hierarchy is
+capped by the directory tree's own granularity. The honest ways past it are a
+coarser rim at the cost of coverage, or letting blocks merge across a district
+border at the cost of the contiguity the whole territory graft exists to
+guarantee. Neither is worth 10×.
+## ADR-0064 — PRD §7.1's age ramp reads **commit time**, not growth-sequence position
+
+**Status** accepted · **Supersedes the ramp inside ADR-0052's accretion.**
+Implemented in `polis_layout::age`.
+
+Every grain decision in the city — plot separation, plot capacity, the prune
+probability, and through them block size and building coverage — is driven by one
+number, `t ∈ [0, 1]`, the *age of the ground*. Until now that number was a file's
+**index in the growth sequence divided by the file count**. That is a rank, not a
+time, and it silently asserts that a repository adds files at a constant rate.
+PRD §7.1 says something quite different:
+
+> Files added in the repo's **first year** form the old town — dense, tangled,
+> irregular. Files added last month sit on the periphery.
+
+Two very common repositories break the rank ramp in opposite directions, and both
+were measured rather than imagined:
+
+* **Django** — 7 083 surviving files over 21.1 years, of which **235 (3.4 %)**
+  were added in the first year. On the rank ramp those files owned 3.4 % of the
+  grain range: no old town at all, in a repository that plainly has one.
+* **Neovim** — founded in 2014 by importing Vim's tree wholesale, 380 files in
+  the first commit and 1 412 (36.3 %) inside the first year. The rank ramp spread
+  those 380 *identically aged* files smoothly across a third of the range and
+  drew a gradient that does not exist.
+
+The ramp is now a piecewise-linear function of the commit timestamps
+`polis_repo::git` already carries in `FileMeta::added_at`. The repository's first
+year owns the first `OLD_TOWN_BAND` (0.40) of the range whatever share of the
+files it holds; everything after spreads over the rest by real elapsed time. The
+formula is continuous in the history span, so there is no cliff at the one-year
+mark.
+
+**What each degenerate history degrades to**, which is the part that had to be
+decided rather than discovered:
+
+| History | Kind | Result |
+|---|---|---|
+| ≥ 1 year | `Calibrated` | PRD §7.1 literally. Measured age gradient (rim block area ÷ core): Neovim **5.96×**, Django **1.65×**. |
+| 0 < span < 1 year | `Relative` | The whole repository is inside its own first year. The absolute ramp would compress every file into the first few percent, so the observed range is stretched to at least `MIN_SPREAD` (0.35) and the reading becomes relative: "oldest in *this* repository", not "older than a year". A month-old repository is a dense town with a small fringe, not a metropolis. |
+| one commit, or a squash import with nothing since | `Uniform` | There is no age information, so **none is drawn**: one grain everywhere, `NO_HISTORY` (0.5). Measured age gradient **0.96×**. The tempting fallback — rank position — would invent a gradient out of `git log`'s within-commit path order, and the operator would read alphabetical order as history. |
+| a decade with a wholesale import at the root | `Calibrated` | The imported files really are all the same age, so they all sit at `t = 0` and the old town is correspondingly large and fine. That is the truth about Neovim and it is what makes an imported tree look imported. |
+
+Three determinism properties, all required by PRD §7.4: no clock is read (`first`
+and `last` come from git); the table applies a running maximum over the growth
+sequence, so a commit date that goes backwards across a merge cannot make "lowest
+growth index" stop meaning "oldest ground"; and every value is quantised to
+`1/4096` before it leaves the module, so the `powf` in `sep_at` sees a small
+stable set of inputs and a one-second difference in a commit date cannot move a
+building.
+
+The ramp is **frozen at generation**. An incrementally added file reads at the
+newest calibrated value; recalibrating would move `last`, which moves every
+file's `t`, which moves every plot — exactly the ground-moving PRD §7.7 forbids.
+
+*Consequence for the gate.* The block size hierarchy and the age gradient are now
+properties of the *repository* rather than of the generator. Measured with one
+build: Neovim (36.3 % first-year) 23.8× and 5.96×; the synthetic fixture (8.2 %)
+10.0× and 2.07×; Django (3.4 %) 5.2× and 1.65×. The previous 20.2× and 2.98×
+were numbers the rank ramp manufactured for every repository alike. The M1 gate's
+bounds were lowered to sit below all three, and
+`the_age_ramp_follows_real_commit_time` — four histories over one unchanged file
+list, which must produce four different cities — is where the ramp's *response*
+is asserted instead.
+
+## ADR-0065 — Polis does not ingest its own output: the repo-walk exclusion
+
+**Status** accepted · Implemented in `polis_repo::tree::WalkExclusions`.
+
+The city-layout design bake-off rendered its candidate cities into
+`docs/design/`. `docs/design/` is inside the repository. So each run laid out a
+repository that the previous run had made larger: the town grew a few files by
+itself between two runs that were supposed to be identical. Nothing errored, no
+test failed, and the only symptom was a layout that drifted — the single hardest
+class of bug to diagnose in a system whose entire product promise (PRD §7.4) is
+that the map does not move. It was live in this repository when it was found.
+
+It is a feedback loop, not a classification problem, and it is closed by refusing
+to walk what Polis writes.
+
+**Why this is not the industrial list.** The two look alike and mean opposite
+things. PRD §8 requires `node_modules` to be *drawn*, as one dull mass — it is
+part of the repository and the operator should see how much of it there is. An
+excluded path is not drawn at all, because it is not part of the repository in
+any sense the operator cares about: it exists because Polis ran. Merging the
+lists would either start drawing the tool's own PNGs as buildings or stop drawing
+the dependency tree PRD §8 asks for.
+
+**Configurable, and that is not optional.** A hardcoded list is wrong in both
+directions. Every project puts its generated artefacts somewhere different and
+the shipped list will always be missing one; and a repository whose `docs/design`
+is hand-written prose would have a real district silently vanish with no way to
+say otherwise. So there are two rules — a directory name at any depth, and a
+root-anchored path — plus `remove_dir` for the opposite case.
+
+The shipped default is deliberately two entries (`docs/design`, `.polis`),
+because the general closure is not a list at all: it is
+`WalkExclusions::exclude_output`, which every writer of a file into the checkout
+calls with the path it is about to write. `polis snapshot` excludes `--out`,
+`--junctions` and `--layout` before it walks. **By name, not by directory**:
+`--out docs/city.png` must cost one building, not the `docs/` district.
+
+The regression test is a *sequence* — walk, write a render into an excluded
+directory, walk again, assert byte-identical — because a feedback loop between
+consecutive runs is invisible to two independent runs. It is paired with the
+inverse (`WalkExclusions::empty()` must see the new file), so it cannot pass by
+the walk having stopped seeing anything, and with an end-to-end leg in the M1
+gate that compares the whole city's digest on a real checkout with real history.
+
+## ADR-0066 — A quarter may only be subdivided by the cut that owns the whole of it
+
+**Status** accepted · **Fixes a silent 55 %-of-the-city failure in ADR-0059.**
+
+ADR-0059 computes the Voronoi diagram *per quarter*: a plot's cell starts from
+its own quarter's polygon and is clipped only against plots of the same quarter,
+which is what makes the shared edge between two quarters an exactly straight road
+for its whole length. The construction rests on one invariant the code did not
+enforce: **the leaf quarters must tile the city limit.**
+
+Promoting a cut to a quarter boundary marks the parent quarter non-leaf and
+pushes its two halves as new leaves. That is correct when the cut owns the whole
+quarter — which it does for every wedge the fan produces. It is wrong when the
+root fan does *not* commit, because the recursion then reaches depth 1 twice with
+the same quarter, and if the first cut is promoted and the second is not, the
+first retires a frame the second half of the city is still using.
+
+Django takes exactly that path (its root fan does not commit) and the result was
+invisible in every number the report printed: **two** leaf quarters covering less
+than half the map, 1 453 of 2 413 plots clipped against a polygon they are not
+inside and coming out with an **empty cell**, 1 483 plots landing inside no face
+and attached by `BlockIndex::locate`'s nearest-centroid fallback to whichever
+block happened to be closest — one sliver received 517 files — and **2 006 of
+7 014 files sharing a parcel** four stages downstream. Every count in the report
+was accurate and none of them said so.
+
+Three changes, in the order they matter:
+
+1. **The rule.** A `Quarter` now carries whether the face it describes *is* the
+   quarter or only part of it, and only a face that owns the whole quarter may
+   subdivide it.
+2. **The net.** `leaf_quarters` checks that the leaves' areas add up to the city
+   limit's and falls back to the whole limit as one frame when they do not. It
+   is an area test, which catches a gap but not an overlap; that is the right
+   trade, because the quarters are exact half-plane clips of one convex ring, so
+   a gap is what a bookkeeping slip produces and an overlap is not.
+3. **The instruments.** `CityReport` gained `empty_cells` and `plots_off_face`,
+   both zero by construction and both asserted at zero in the M1 gate. The bug
+   was not that the fallback existed — a fallback is right — but that it was
+   *unbounded and uncounted*.
+
+Measured on Django, before → after: empty cells 1 453 → **0**, plots off their
+face 1 483 → **0**, files sharing a parcel 2 006 → **0**, buildings 4 988 →
+**7 011 of 7 014**, blocks 897 → 2 346.
+
+This is the finding that justifies the judge's instruction to run a real
+repository *before* the gate rather than after. Three synthetic corpora, four
+scales each, and both pinned fixtures all take the fanned path and none of them
+reaches the branch.
+
+## ADR-0067 — The absolute footprint cap is measured against the repository's own median file
+
+**Status** accepted · **Amends ADR-0055.**
+
+`FOOTPRINT_SCALE · √bytes` is an area in **world units**, and the world's scale
+comes from the plot spacing, which comes from the file *count*. So the cap
+silently encoded an assumption about the average file, and it binds or does not
+bind according to how a repository's typical file compares with the corpus it was
+calibrated on.
+
+Measured on two real repositories through one build:
+
+| repository | files | median file | median lot fill | coverage |
+|---|---|---|---|---|
+| Neovim | 3 890 | 7.7 kB | 58.6 % | 29.1 % |
+| Django | 7 014 | 1.9 kB | 26.0 % | 15.8 % |
+
+Django is not a sparser repository than Neovim. It is a repository of small
+Python files, and the cap turned that into a city of specks on a wire mesh —
+the judge's cross-cutting finding ("not enough building") returning on the first
+corpus nobody had generated. It is calibration rather than architecture, exactly
+as the judge said.
+
+The byte term is now measured against the repository's own median file size:
+`FOOTPRINT_SCALE · √bytes · √(6 kB / median)`, clamped to 2.5× either way so the
+cap still exists for a repository of stubs. A file twice the median gets √2 times
+the cap in every repository; the *ordering* PRD §7.3 asks for is untouched,
+because the normalisation is one factor shared by every building in the city. The
+median is taken over the files that will actually carry a building — PRD §8's
+massed trees are excluded, so a `node_modules` full of minified bundles cannot
+set the scale of the source city — and it is the lower of two middle elements,
+never their average, so it is an integer that cannot differ in the last bit
+between targets (PRD §7.4).
+
+Measured after: Django coverage 15.8 % → **21.1 %** and median lot fill 26.0 % →
+**31.6 %**; Neovim 29.1 % → **30.4 %**; the 5 000-file fixture 31.4 % → **32.2 %**.
+Django is still the lowest and still short of the 30 % a dense historic core
+runs; the remaining lever is `buildings::grain_share`, which deliberately thins
+the fill on coarse plots to carry the age gradient, and Django's ground is almost
+all coarse.
+
+## ADR-0068 — Seating buildings is parallel; nothing else in the pipeline is
+
+**Status** accepted
+
+`City::accrete` re-runs the whole assembly after one growth step, so PRD §13.1's
+50 ms incremental budget is spent on `city::assemble`. Timed at 5 000 files:
+weld 0.003 ms, links 2.5, collapse 2.8, faces 2.9, prune 1.4, betweenness 1.1,
+blocks 2.6, **lots 12.4**, **buildings 30.4**, districts 1.4, measure 1.3 — a
+58 ms assembly of which the building stage is more than half, and the measured
+p95 for a single add was 66 ms, over budget.
+
+Seating a building is the only stage that is a pure function of one parcel: the
+footprint comes from the parcel ring, the block ring around it and a seed hashed
+from the file's own path, and it reads nothing another parcel writes. Everything
+upstream is a graph the next step mutates. So that one stage is a `rayon`
+`par_iter().map(…).collect::<Vec<_>>()`, which is the exact shape rule 4 of
+`polis-layout`'s module documentation permits: results are collected **in index
+order** and only then folded sequentially; no thread writes to a shared map and
+nothing is pushed as it finishes.
+
+Buildings 30.4 ms → **5.9 ms**, single-add p95 66.3 ms → **38.9 ms**, and the
+city's digest is byte-identical before and after — `41f20fff6e1c4516` either way,
+which is the only evidence that matters for PRD §7.4.

@@ -89,13 +89,27 @@ jobs:
   # `two_fresh_processes_agree` and `hash_map_iteration_order_cannot_move_the_city`.
   # Shuffling still earns its place: it catches a test that only passes because an
   # earlier test warmed a cache or a `OnceLock`.
+  # The matrix here is not decoration, and it is not the same matrix as `check`'s.
+  # The bug this job exists to catch was **release-only**, and a release-only bug
+  # is also plausibly platform-only: `f64`-to-`f32` rounding, `atan2`, and the
+  # order a filesystem hands back a directory are all places where Linux and
+  # Windows can differ while each stays perfectly self-consistent. PRD §15's gate
+  # is "byte-identical across two machines", so the profile that actually ships
+  # has to be exercised on both of them rather than only on the cheaper runner —
+  # otherwise the two-OS leg covers debug and the release leg covers one OS, and
+  # release-on-Windows is covered by neither.
   nondeterminism:
-    name: nondeterminism hunt
-    runs-on: ubuntu-latest
+    name: nondeterminism hunt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \

@@ -26,7 +26,7 @@
 //! Height is in **city-space units**, the same units as [`crate::Point`]: the
 //! base relief is [`RELIEF_FRACTION`] of the city's extent. That makes
 //! [`TerrainField::slope`] a plain dimensionless rise-over-run, so
-//! [`crate::roads::GrowthParams::slope_threshold`] is a number a human can
+//! A slope threshold expressed as a fraction of the relief is a number a human can
 //! reason about (`0.3` is a noticeable hill) and does not need retuning when the
 //! city's extent changes.
 //!
@@ -302,7 +302,7 @@ impl TerrainField {
 
     /// Slope magnitude at a point — `gradient(at).length()`, but without
     /// building the vector when only the comparison against
-    /// [`crate::roads::GrowthParams::slope_threshold`] is wanted.
+    /// a slope threshold expressed as a fraction of the relief is wanted.
     ///
     /// Dimensionless (rise over run). Computed in `f64` and rounded once, so it
     /// can differ from `gradient(at).length()` — which rounds twice — by an
@@ -540,6 +540,12 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
+            // Pinned, not inherited. Single-threaded is the harness mode whose
+            // output interleaving broke the parser below, so the child is always
+            // run in it — a parse that only works when the developer happens to
+            // launch the suite multi-threaded is a determinism test that stops
+            // running the moment CI sets `RUST_TEST_THREADS: 1`.
+            .env("RUST_TEST_THREADS", "1")
             .output()
             .expect("re-invoke the test binary");
         assert!(
@@ -548,11 +554,25 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let line = stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("POLIS_TERRAIN_DIGEST="))
+        // The marker is searched for **anywhere in the stream**, never at the
+        // start of a line, and that is not defensive style — a line-anchored
+        // parser here is a live bug.
+        //
+        // The child inherits this process's environment, `RUST_TEST_THREADS`
+        // included. In single-threaded mode libtest writes `test <name> ... `
+        // with **no trailing newline** before running the test, so the child's
+        // first `--nocapture` line arrives as
+        // `test terrain::tests::print_fixture_digest ... POLIS_TERRAIN_DIGEST=…`
+        // and a `strip_prefix` sees no digest at all. The test then panics on
+        // its own output format instead of comparing two processes — so the one
+        // assertion that can catch `RandomState` reaching the layout stops
+        // running, in exactly the CI job that sets `RUST_TEST_THREADS: 1` to run
+        // it. Parse position must not be part of what this test asserts.
+        let digest = stdout
+            .split_once("POLIS_TERRAIN_DIGEST=")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
             .unwrap_or_else(|| panic!("child printed no digest:\n{stdout}"));
-        u64::from_str_radix(line.trim(), 16).expect("hex digest")
+        u64::from_str_radix(digest, 16).expect("hex digest")
     }
 
     /// The child half of [`two_fresh_processes_are_identical`]. Ignored, so it

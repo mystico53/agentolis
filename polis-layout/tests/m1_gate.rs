@@ -20,6 +20,8 @@
 //! | d | [`two_fresh_processes_agree`] | anything seeded per process — `RandomState`, ASLR-ordered pointers, an environment variable read three layers down |
 //! | e | [`hash_map_iteration_order_cannot_move_the_city`], [`no_hash_map_reaches_the_layout`] | PRD §16's nondeterminism hunt |
 //! | f | [`ci_runs_the_golden_test_on_ubuntu_and_windows`] | the two-OS leg silently not being wired up |
+//! | g | [`a_render_written_between_two_runs_cannot_move_the_city`] | the repo-walk trap: Polis ingesting its own renders and growing the town a little every run |
+//! | h | [`the_age_ramp_follows_real_commit_time`] | PRD §7.1's age ramp quietly reading list position instead of the clock, so every history draws the same city |
 //!
 //! # On PRD §16's "run layout twice with `HashMap` iteration randomization
 //! # enabled"
@@ -80,7 +82,7 @@ use polis_repo::{FileMeta, RepoTree};
 const HAMLET_HEAD: &str = "eb563a19c1c728c8ef8f613101360db728073603";
 
 /// See [`HAMLET_HEAD`].
-const TOWN_HEAD: &str = "3b99d29aae0c36d175feaa95cc078b6623de6a30";
+const TOWN_HEAD: &str = "e5fc00b4191c366d9fa67e2dd79d94acbd8ce0f3";
 
 /// The workspace root — the directory holding `Cargo.toml` and `tests/`.
 fn workspace_root() -> PathBuf {
@@ -370,6 +372,44 @@ fn golden_town_in_use() {
     golden!("town-in-use", city.snapshot().expect("serializes"));
 }
 
+/// (b) The golden files must actually **contain** a street.
+///
+/// This is the assertion that would have caught the release-only `build_streets`
+/// bug at review time rather than at the gate. That bug was a `Vec` returned in
+/// caller order instead of canonical order, and it survived 57 determinism tests
+/// because every fixture's import graph was empty: all three goldens pinned
+/// `streets: []`, and a field that is always empty cannot regress *visibly* in a
+/// snapshot diff.
+///
+/// A coverage claim decays the moment someone edits a fixture, so it is asserted
+/// against the pinned snapshot itself rather than stated in a comment. If this
+/// fails, `tests/make-fixtures.sh` stopped producing a cross-district import and
+/// PRD §9's streets are once again uncovered by every golden file.
+#[test]
+fn the_goldens_pin_a_non_empty_street_array() {
+    let snap = workspace_root()
+        .join("tests")
+        .join("golden")
+        .join("town-in-use.snap");
+    let text =
+        std::fs::read_to_string(&snap).unwrap_or_else(|e| panic!("read {}: {e}", snap.display()));
+    assert!(
+        !text.contains("\"streets\": []"),
+        "{} pins an empty `streets` array, so no golden file covers PRD §9's          streets and the field can be reordered without any snapshot noticing",
+        snap.display()
+    );
+    // And more than one, or their *order* is still uncovered.
+    let streets = text
+        .split("\"streets\":")
+        .nth(1)
+        .expect("the snapshot has a streets field");
+    assert!(
+        streets.matches("\"from\":").count() > 1,
+        "{} pins fewer than two streets, so their canonical order is not          covered by any golden file",
+        snap.display()
+    );
+}
+
 /// A city has to actually be a city before its golden file is worth anything.
 /// A pipeline that produced no roads would snapshot cleanly forever.
 #[test]
@@ -394,6 +434,222 @@ fn the_golden_cities_are_cities() {
 // ---------------------------------------------------------------------------
 // (c) Two runs in one process
 // ---------------------------------------------------------------------------
+
+/// PRD §7.1's age gradient for a city: median block area on the newest ground
+/// over the oldest.
+///
+/// `CityReport` carries it as an integer so the struct stays `Eq` and a golden
+/// file cannot drift by one bit of an `f64` (see its documentation); this is the
+/// same number as a ratio.
+fn age_gradient(city: &City) -> f64 {
+    f64::from(city.report.age_gradient_x100) / 100.0
+}
+
+/// (g) **The repo-walk trap**, end to end.
+///
+/// `polis-repo`'s own tests prove the walk ignores an excluded path. This proves
+/// the *city* does — the property the operator actually has — and it proves it
+/// on a real checkout with real git history rather than on a synthesised file
+/// list.
+///
+/// The bug it guards against is not hypothetical. The city-layout design
+/// bake-off rendered its candidates into `docs/design/`, which is inside this
+/// repository, so each run laid out a repository that the previous run had made
+/// larger. The city drifted, nothing errored, and PRD §7.4's whole promise was
+/// quietly false.
+///
+/// Written as generate → write → generate in one test, in that order, because a
+/// feedback loop between consecutive runs is invisible to two independent ones.
+#[test]
+// The guard type is declared where it is used and nowhere else, which is the
+// point of it.
+#[allow(clippy::items_after_statements)]
+fn a_render_written_between_two_runs_cannot_move_the_city() {
+    let root = fixtures().join("town");
+    let probe = root.join("docs").join("design").join("city-probe.png");
+    // A guard, so a failed assertion cannot leave the fixture dirty for the
+    // rest of the binary: the fixture is shared and built once.
+    struct Probe(PathBuf);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir(self.0.parent().expect("parent"));
+        }
+    }
+
+    let before = city::generate_city(&repo_tree(&root, false));
+    std::fs::create_dir_all(probe.parent().expect("parent")).expect("mkdir docs/design");
+    let _guard = Probe(probe.clone());
+    std::fs::write(
+        &probe,
+        [0x89u8, b'P', b'N', b'G', 13, 10, 26, 10, 7, 7, 7, 7],
+    )
+    .expect("write the probe render");
+    let after = city::generate_city(&repo_tree(&root, false));
+
+    assert_eq!(
+        before.digest(),
+        after.digest(),
+        "a render written into docs/design/ between two runs moved the city; \
+         `polis_repo::tree::WalkExclusions` is what stops that"
+    );
+    assert_eq!(before.report.files, after.report.files);
+    assert!(
+        !after
+            .layout
+            .buildings
+            .keys()
+            .any(|p| p.as_str().starts_with("docs/design")),
+        "an excluded path got a building"
+    );
+    // And the exclusion is a *rule*, not a blanket ban on `docs/`: the town
+    // fixture's own documents are still districts.
+    assert!(
+        after
+            .layout
+            .buildings
+            .keys()
+            .any(|p| p.as_str() == "docs/guide.md"),
+        "the exclusion took the whole docs/ district with it"
+    );
+}
+
+/// (h) **PRD §7.1's age ramp reads clocks, not ranks**, at 5 000 files.
+///
+/// The four histories the ramp has to degrade honestly through, each built by
+/// rewriting `added_at` on one synthetic corpus so that *nothing else about the
+/// repository changes* — same paths, same sizes, same growth order. Anything
+/// that moves is the ramp.
+///
+/// This is the test that would have failed before the ramp was calibrated on
+/// commit time: with the ramp on growth-sequence position, all four histories
+/// produce the identical city, because none of them changes a file's position.
+#[test]
+// The casts are file indices and day counts, all far below 2^53; `housed` and
+// `shared` are two different questions about the same file and the names are the
+// clearest ones there are.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::similar_names
+)]
+fn the_age_ramp_follows_real_commit_time() {
+    use polis_layout::age::AgeRampKind;
+
+    const DAY_MS: i64 = 86_400_000;
+    const BASE_MS: i64 = 1_500_000_000_000;
+
+    /// One corpus, with every commit time rewritten by `at`.
+    fn with_history(at: &dyn Fn(usize, usize) -> i64) -> City {
+        let mut tree = polis_repo::synthetic::repository(5_000, GATE_SEED);
+        let n = tree.files.len();
+        let mut ordered: Vec<polis_events::LogicalPath> = tree.files.keys().cloned().collect();
+        ordered.sort_by_key(|p| tree.files[p].growth_index);
+        for (i, path) in ordered.iter().enumerate() {
+            let meta = tree.files.get_mut(path).expect("present");
+            meta.added_at = polis_events::WallTime::from_unix_millis(at(i, n));
+            meta.last_touched = meta.added_at;
+        }
+        city::generate_city(&tree)
+    }
+
+    // (1) One commit. There is no age information, so none is drawn.
+    let squashed = with_history(&|_, _| BASE_MS);
+    assert_eq!(squashed.report.age_ramp, AgeRampKind::Uniform);
+    assert_eq!(squashed.report.history_days, 0);
+    assert!(
+        (age_gradient(&squashed) - 1.0).abs() < 0.35,
+        "a squash-imported repository was given an age gradient of {:.2}x it does not have",
+        age_gradient(&squashed)
+    );
+
+    // (2) Three weeks old. Real ordering, no absolute calibration possible.
+    let young = with_history(&|i, n| BASE_MS + (i as i64) * 21 * DAY_MS / (n as i64).max(1));
+    assert_eq!(young.report.age_ramp, AgeRampKind::Relative);
+    assert_eq!(young.report.history_days, 20);
+    assert_eq!(
+        young.report.old_town_files, young.report.files,
+        "every file of a three-week-old repository is inside its first year"
+    );
+
+    // (3) A decade, with a wholesale import at the root: a third of the files
+    //     land in the founding commit, the rest over the next twelve years.
+    //     This is Neovim's shape, and it is the one that should have the
+    //     largest, finest old town.
+    let imported = with_history(&|i, n| {
+        let founding = n / 3;
+        if i < founding {
+            BASE_MS
+        } else {
+            let k = (i - founding) as i64;
+            let rest = (n - founding).max(1) as i64;
+            BASE_MS + 400 * DAY_MS + k * 12 * 365 * DAY_MS / rest
+        }
+    });
+    assert_eq!(imported.report.age_ramp, AgeRampKind::Calibrated);
+    assert!(
+        imported.report.old_town_files >= imported.report.files / 3,
+        "{} of {} files were added in year one and only {} were counted",
+        imported.report.files / 3,
+        imported.report.files,
+        imported.report.old_town_files
+    );
+
+    // (4) Twenty years, and only a handful of files survive from year one —
+    //     Django's shape, and the case PRD §7.1 was silently failing. Those few
+    //     files are *still* the old town.
+    let rewritten = with_history(&|i, n| {
+        let early = n / 40;
+        if i < early {
+            BASE_MS + (i as i64) * DAY_MS
+        } else {
+            let k = (i - early) as i64;
+            let rest = (n - early).max(1) as i64;
+            BASE_MS + 800 * DAY_MS + k * 19 * 365 * DAY_MS / rest
+        }
+    });
+    assert_eq!(rewritten.report.age_ramp, AgeRampKind::Calibrated);
+    assert!(
+        rewritten.report.old_town_files <= rewritten.report.files / 20,
+        "{} first-year files is not the 2.5% this history has",
+        rewritten.report.old_town_files
+    );
+
+    // The point of the whole exercise: four different histories over one
+    // unchanged file list must be four different cities.
+    let digests = [
+        squashed.digest(),
+        young.digest(),
+        imported.digest(),
+        rewritten.digest(),
+    ];
+    for i in 0..digests.len() {
+        for j in i + 1..digests.len() {
+            assert_ne!(
+                digests[i], digests[j],
+                "histories {i} and {j} produced the same city; the ramp is not \
+                 reading commit time"
+            );
+        }
+    }
+
+    // And the one that has a real founding cohort has the coarsest rim relative
+    // to its core — PRD §7.1's age structure, measured.
+    println!(
+        "POLIS_AGE_RAMP squashed={:.2}x young={:.2}x imported={:.2}x rewritten={:.2}x",
+        age_gradient(&squashed),
+        age_gradient(&young),
+        age_gradient(&imported),
+        age_gradient(&rewritten),
+    );
+    assert!(
+        age_gradient(&imported) > age_gradient(&squashed),
+        "the imported repository ({:.2}x) has no more age structure than the \
+         squashed one ({:.2}x)",
+        age_gradient(&imported),
+        age_gradient(&squashed)
+    );
+}
 
 /// (c) Catches a mutable static, a memoised value, a buffer that accumulates
 /// across calls — everything a golden file compared once cannot see.
@@ -455,6 +711,8 @@ fn child_digests() -> Vec<(String, u64)> {
             "--ignored",
             "--nocapture",
         ])
+        // Pinned, not inherited: see `child_markers`.
+        .env("RUST_TEST_THREADS", "1")
         .output()
         .expect("re-invoke the test binary");
     assert!(
@@ -464,19 +722,35 @@ fn child_digests() -> Vec<(String, u64)> {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Vec<(String, u64)> = stdout
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("POLIS_CITY_DIGEST "))
-        .filter_map(|rest| {
-            let (name, digest) = rest.split_once('=')?;
-            Some((
-                name.to_owned(),
-                u64::from_str_radix(digest.trim(), 16).ok()?,
-            ))
+    let parsed: Vec<(String, u64)> = child_markers(&stdout, "POLIS_CITY_DIGEST ")
+        .into_iter()
+        .filter_map(|token| {
+            let (name, digest) = token.split_once('=')?;
+            Some((name.to_owned(), u64::from_str_radix(digest, 16).ok()?))
         })
         .collect();
     assert_eq!(parsed.len(), 2, "child printed no digests:\n{stdout}");
     parsed
+}
+
+/// Every whitespace-delimited token that follows `marker` in a child's stdout.
+///
+/// **Position-independent on purpose, and this is not defensive style — a
+/// line-anchored parser here is a live bug.** The child inherits this process's
+/// environment, `RUST_TEST_THREADS` included, and in single-threaded mode
+/// libtest writes `test <name> ... ` with *no trailing newline* before running
+/// the test. The child's first `--nocapture` line therefore arrives as
+/// `test print_fixture_digests ... POLIS_CITY_DIGEST hamlet=…`, and a parser
+/// anchored to the start of the line finds nothing. The test then panics on its
+/// own output format instead of comparing two processes, so the assertion that
+/// catches `RandomState` reaching the layout silently stops running — in
+/// precisely the CI job that sets `RUST_TEST_THREADS: 1` in order to run it.
+fn child_markers<'a>(stdout: &'a str, marker: &str) -> Vec<&'a str> {
+    stdout
+        .split(marker)
+        .skip(1)
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect()
 }
 
 /// The child half of [`two_fresh_processes_agree`]. Ignored, so it only ever
@@ -553,13 +827,13 @@ fn hash_map_iteration_order_cannot_move_the_city() {
 /// CI's nondeterminism job runs this file in release for exactly this reason.
 ///
 /// This runs against **the workspace itself, not a fixture**, and that is not a
-/// convenience. Both fixtures produce `streets == []`: their import graphs have
-/// no cross-district edge, so all three golden files pin an empty `streets`
-/// array. That is precisely why this bug survived — a golden file that never
-/// contained a street cannot notice the streets being reordered. Until a fixture
-/// grows a cross-district import, the real repository is the only input on this
-/// machine that exercises the field at all, so the assertion below refuses to
-/// pass vacuously.
+/// convenience: the workspace has an order of magnitude more import edges than
+/// the fixture, so it is the harder permutation. The fixture used to have *no*
+/// cross-district edge at all, which is precisely why this bug survived — a
+/// golden file that never contained a street cannot notice the streets being
+/// reordered. `town` now carries three (see `tests/make-fixtures.sh` commit 9)
+/// and [`the_goldens_pin_a_non_empty_street_array`] refuses to let that go back
+/// to zero. The assertion below still refuses to pass vacuously.
 #[test]
 fn caller_supplied_input_order_cannot_move_the_city() {
     let root = workspace_root();
@@ -829,6 +1103,29 @@ fn ci_runs_the_golden_test_on_ubuntu_and_windows() {
         "another job starts between the OS matrix and `cargo test --workspace`, \
          so the golden test is not the one running on two operating systems"
     );
+
+    // And everything above covers **debug only**. The bug that took M1 red the
+    // first time was release-only, so the release leg has to run on both
+    // operating systems as well — otherwise the two-OS matrix covers debug, the
+    // release job covers one OS, and release-on-Windows is covered by neither.
+    let job = text
+        .find("\n  nondeterminism:")
+        .expect("no nondeterminism job in the workflow");
+    let rest = &text[job..];
+    let end = rest[1..].find("\n  docs:").map_or(rest.len(), |i| i + 1);
+    let job_text = &rest[..end];
+    assert!(
+        job_text.contains("cargo test --release"),
+        "the nondeterminism job does not run the suite in release. A \
+         `debug_assert` is not an invariant, and the profile that ships is the \
+         one that has to be byte-identical."
+    );
+    assert!(
+        job_text.contains("os: [ubuntu-latest, windows-latest]"),
+        "the release determinism suite runs on one operating system only. PRD \
+         §15's gate is byte-identical across two MACHINES, and a release-only \
+         bug would have been platform-only just as easily."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -953,4 +1250,643 @@ fn dump_the_real_city() {
     std::fs::write(&out, city.snapshot().expect("serializes")).expect("write the snapshot");
     println!("wrote {}", out.display());
     println!("report {:?}", city.report);
+}
+
+// ---------------------------------------------------------------------------
+// (g) The accretion architecture's own invariants
+//
+// Added with the port of the winning design from the bake-off
+// (`docs/design/accretion/DESIGN.md`). The road network is now the boundary
+// network of the settled ground rather than a space-colonisation tree, and these
+// are the properties that construction is supposed to guarantee. Each one is a
+// property the previous pipeline silently failed.
+// ---------------------------------------------------------------------------
+
+/// The free tripwire: `faces == E − V + C` on a fixed corpus.
+///
+/// > The face walk is the one piece where a subtle bug is invisible until the
+/// > block count is wrong, so it wants a golden test asserting
+/// > `faces == E − V + C` on a fixed corpus — that identity held at both scales
+/// > here and is a cheap invariant. (`docs/design/accretion/DESIGN.md` §9)
+///
+/// It is an *identity*, not a threshold: every bounded face of a connected
+/// planar graph is one independent cycle. A face walk that dropped a face, or
+/// counted the unbounded one, or walked one twice, breaks it immediately — and
+/// nothing downstream would notice, because a city with one block too few still
+/// serializes cleanly.
+#[test]
+fn eulers_formula_holds_on_a_fixed_corpus() {
+    let mut checked = 0;
+    for name in ["hamlet", "town"] {
+        let report = fixture_city(name).report;
+        assert_eq!(
+            report.blocks,
+            (report.road_segments + report.components).saturating_sub(report.road_nodes),
+            "{name}: {} faces against E-V+C = {}",
+            report.blocks,
+            report.road_segments + report.components - report.road_nodes
+        );
+        assert!(report.blocks > 0, "{name} has no blocks at all");
+        checked += 1;
+    }
+    for files in [200_usize, 1_000, 3_000] {
+        let city = city::generate_city(&polis_repo::synthetic::repository(files, GATE_SEED));
+        let report = city.report;
+        assert_eq!(
+            report.blocks,
+            (report.road_segments + report.components).saturating_sub(report.road_nodes),
+            "synthetic {files}: {report:?}"
+        );
+        assert_eq!(report.cycles, report.blocks);
+        checked += 1;
+    }
+    assert_eq!(checked, 5, "the corpus shrank");
+}
+
+/// The seed every synthetic corpus in this file uses. Fixed, so the corpus is a
+/// corpus rather than a sample.
+const GATE_SEED: u64 = 0xACCE_7107_0000_0001;
+
+/// The structural properties the design is supposed to guarantee, at the scale
+/// PRD §13.1 budgets for.
+///
+/// The numbers on the right of each assertion are the design bake-off's measured
+/// baseline at 5 000 files, so a regression reads as a regression rather than as
+/// an unexplained failure.
+#[test]
+fn the_layout_holds_at_five_thousand_files() {
+    let tree = polis_repo::synthetic::repository(5_000, GATE_SEED);
+    let started = std::time::Instant::now();
+    let city = city::generate_city(&tree);
+    let elapsed = started.elapsed();
+    let structure = city::measure(&city);
+    let r = city.report;
+    println!("POLIS_SCALE report={r:?}");
+    println!("POLIS_SCALE structure={structure:?}");
+    println!("POLIS_SCALE generated in {elapsed:?}");
+
+    // Connectivity and planarity: the whole reason this architecture replaced
+    // space colonisation.
+    assert_eq!(r.components, 1, "the city is in {} pieces", r.components);
+    assert_eq!(r.dangling, 0, "a road ends in mid-air");
+    assert_eq!(r.crossings, 0, "roads cross without a junction");
+    assert_eq!(r.blocks, r.cycles);
+    assert!(r.blocks > 700, "only {} blocks: {r:?}", r.blocks);
+
+    // The organic signature: four- and five-way junctions, which is what the eye
+    // reads as "grown" (PRD §7.2). The bake-off baseline was 53.3 %; measured
+    // with the commit-time ramp it is 46.7 % here, 55.2 % on Neovim and 48.1 %
+    // on Django. The share moves with the grain distribution — a repository
+    // whose ground is mostly one age tiles more regularly — so the bound is set
+    // below all three rather than at the fixture's own number. Two fifths is
+    // still far above what a snapped tree or a chord partition produces, and the
+    // properties that say "not a tree" (cycles, no dangling) are asserted
+    // separately and absolutely.
+    assert!(
+        r.complex_junctions * 5 >= r.junctions * 2,
+        "only {} of {} junctions are four-way or better",
+        r.complex_junctions,
+        r.junctions
+    );
+
+    // Buildings (baseline: 1.6 % in the road corridor, 0.3 % outside their lot,
+    // 8.9 % coverage).
+    assert_eq!(structure.buildings_on_road, 0);
+    assert_eq!(structure.buildings_outside_lot, 0);
+    assert!(
+        structure.coverage > 0.25,
+        "only {:.1}% of the ground is built on",
+        structure.coverage * 100.0
+    );
+
+    // Block geometry (bake-off baseline: 0 slivers, p95:p05 6.8x, median
+    // compactness 0.722, age gradient 1.96x).
+    assert!(structure.compactness > 0.65, "{}", structure.compactness);
+
+    // # Both of these are now properties of the repository, not of the generator
+    //
+    // The age ramp reads real commit time (PRD §7.1, `polis_layout::age`), so a
+    // repository with a large founding cohort has a large fine-grained core and
+    // a steep gradient, and one that rewrote itself has neither. Measured on
+    // three corpora with the same code:
+    //
+    //   | corpus            | first-year files | p95:p05 | age gradient |
+    //   |-------------------|------------------|---------|--------------|
+    //   | Neovim, 3 890     | 36.3 %           | 23.8x   | 5.96x        |
+    //   | this fixture      |  8.2 %           | 10.0x   | 2.07x        |
+    //   | Django, 7 014     |  3.4 %           |  5.2x   | 1.65x        |
+    //
+    // The previous 20.2x and 2.98x came from ramping on *growth-sequence
+    // position*, which spreads every repository's ages evenly over the ramp
+    // whatever its history — a number the generator manufactured rather than
+    // measured. These bounds are set below the fixture and above Django on
+    // purpose: the gate's job is to catch a generator that stopped producing a
+    // gradient at all, not to require every repository to have an old town.
+    // `the_age_ramp_follows_real_commit_time` is where the ramp's *response* to
+    // history is asserted, and it is the stronger test.
+    assert!(
+        structure.block_hierarchy > 8.0,
+        "block size hierarchy is only {:.1}x",
+        structure.block_hierarchy
+    );
+    assert!(
+        structure.age_gradient > 1.9,
+        "age gradient is only {:.2}x",
+        structure.age_gradient
+    );
+
+    // Through-streets: the design bake-off's second named defect, and its
+    // acceptance range. **Both bounds matter.** Under 35 % of the city diameter
+    // the plan is the soap foam the bake-off rejected; over 70 % it is
+    // `treemap-arterials`' city-spanning boulevard chord, which it also
+    // rejected. And one long stroke on its own proves nothing, so the count of
+    // strokes past a quarter of the diameter is asserted with it: a city has a
+    // *hierarchy* of through-streets, a foam with one boulevard in it does not.
+    //
+    // Measured on this corpus: longest 46 %, 16 through-streets, against 42 %
+    // and 13 before the avenues — and, more to the point, a median sinuosity
+    // (arc length over end-to-end reach) of 1.00 for the ten longest against
+    // 1.07 before. The strokes are now geometrically straight rather than
+    // chains of wiggles that happen to end up far apart.
+    assert!(
+        structure.longest_stroke > 0.35 && structure.longest_stroke < 0.70,
+        "longest stroke is {:.1}% of the diameter; the acceptance band is 35-70%",
+        structure.longest_stroke * 100.0
+    );
+    assert!(
+        structure.through_streets >= 8,
+        "only {} strokes reach a quarter of the city diameter",
+        structure.through_streets
+    );
+
+    // Districts. The bake-off baseline was 102 of 276 in more than one piece,
+    // and the first port of the territory graft still had 41 of 307. Both were
+    // tuning misses; the number this gate holds is **zero**, because
+    // `polis_layout::districts`' two rules make a district's blocks one
+    // edge-connected region by construction (see that module for the argument).
+    // Any fragment at all means the construction failed, not that a weight
+    // needs adjusting.
+    assert_eq!(
+        r.fragmented_districts, 0,
+        "{} of {} districts are in more than one piece",
+        r.fragmented_districts, r.districts
+    );
+    assert_eq!(
+        r.fragmented_packages, 0,
+        "{} top-level packages are in more than one piece",
+        r.fragmented_packages
+    );
+    assert!(
+        r.fragmented_subtrees * 20 <= r.districts,
+        "{} of {} directory subtrees are in more than one piece",
+        r.fragmented_subtrees,
+        r.districts
+    );
+    // The two rules, measured rather than assumed: every plot inside its own
+    // district's polygon, and every plot after a district's first in contact
+    // with that district's own ground.
+    // The relaxation ladder, hardest rung first. The last three are absolute:
+    // a plot in an ancestor's ground, anywhere in the city, or out of contact
+    // with the settlement is a failure of the construction. The first two are
+    // **rates**, because the ramp now reads real commit time and two adjacent
+    // districts can be a decade apart in grain — measured at 2 and 1 of 955
+    // plots here, 0 and 1 of 837 on Neovim, 2 and 0 of 2 413 on Django.
+    assert!(
+        r.settled_nonadjacent * 100 <= r.plots,
+        "{} of {} plots founded out of contact with their own district",
+        r.settled_nonadjacent,
+        r.plots
+    );
+    assert!(
+        r.settled_on_fringe * 100 <= r.plots,
+        "{} of {} plots settled on the fringe of their own polygon",
+        r.settled_on_fringe,
+        r.plots
+    );
+    assert_eq!(r.relaxed_to_ancestor, 0);
+    assert_eq!(r.relaxed_to_anywhere, 0);
+    assert_eq!(r.detached_placements, 0);
+    assert_eq!(r.shared_faces, 0, "the partition ran out of room");
+    assert_eq!(r.faceless_districts, 0);
+
+    // Every plot has a cell and every cell has a face. Both are zero by
+    // construction and both were **not** on a real repository: Django's leaf
+    // quarters stopped tiling the city limit, 1 453 of 2 413 plots came out with
+    // an empty cell, and 2 006 files ended up sharing a parcel four stages
+    // later. `polis_layout::territory::Quarter` records the bug and
+    // `covers_the_rim` is the net under it; these two are how the gate says so.
+    assert_eq!(
+        r.empty_cells, 0,
+        "{} plots have no Voronoi cell at all",
+        r.empty_cells
+    );
+    assert_eq!(
+        r.plots_off_face, 0,
+        "{} plots landed inside no face and were attached to a stranger's block",
+        r.plots_off_face
+    );
+    assert_eq!(r.overflow, 0, "{} files had to share a parcel", r.overflow);
+
+    // PRD §13.1: cold start to first frame under 3 s for a 5 000-file repo, and
+    // generation is only part of that.
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "generation took {elapsed:?}"
+    );
+}
+
+/// PRD §9's district rule, at four scales and on both fixture repositories.
+///
+/// > A **District** is a directory […] the tree determines placement, because
+/// > directory paths are the addressing system already in use in every tool
+/// > call, error message, and conversation.
+///
+/// A district in two pieces is not addressed by its path, and PRD §8's skeleton
+/// is unreadable where it happens. The single-scale gate above could be met by a
+/// corpus that happens to suit the partition; this one says the property is not
+/// a coincidence. Zero at 200, 1 000, 3 000 and 5 000 files, and zero on the two
+/// pinned fixtures.
+#[test]
+fn every_district_is_one_place_on_the_map_at_every_scale() {
+    let mut checked = 0;
+    for name in ["hamlet", "town"] {
+        let r = fixture_city(name).report;
+        assert_eq!(
+            r.fragmented_districts, 0,
+            "{name}: {} of {} districts are in more than one piece",
+            r.fragmented_districts, r.districts
+        );
+        assert_eq!(r.fragmented_packages, 0, "{name}");
+        checked += 1;
+    }
+    for files in [200_usize, 1_000, 3_000, 5_000] {
+        let city = city::generate_city(&polis_repo::synthetic::repository(files, GATE_SEED));
+        let r = city.report;
+        println!(
+            "POLIS_DISTRICTS files={files} districts={} fragmented={} packages={} \
+             subtrees={} presplit={} nonadjacent={} fringe={} ancestor={}",
+            r.districts,
+            r.fragmented_districts,
+            r.fragmented_packages,
+            r.fragmented_subtrees,
+            r.presplit_districts,
+            r.settled_nonadjacent,
+            r.settled_on_fringe,
+            r.relaxed_to_ancestor
+        );
+        assert_eq!(
+            r.fragmented_districts, 0,
+            "{files} files: {} of {} districts are in more than one piece",
+            r.fragmented_districts, r.districts
+        );
+        // A package is a *subtree*, and subtree contiguity is not structural for
+        // the reason spelled out below: a cousin's Voronoi cell can reach across
+        // the chord two sibling faces share. At every scale that matters it is
+        // nevertheless zero — 0 at 1 000, 3 000 and 5 000 files, 0 on Neovim's
+        // 3 890 and 0 on Django's 7 014 — but a two-hundred-file corpus has
+        // thirteen packages and thirty-two districts, so a single cell reaching
+        // one block too far is 8 % of the map. Measured: 1 at 200 and 250 files,
+        // 0 at 150, 300 and 400.
+        let allowed = usize::from(files < 1_000);
+        assert!(
+            r.fragmented_packages <= allowed,
+            "{files} files: {} top-level packages are in more than one piece",
+            r.fragmented_packages
+        );
+        // "Adjacent directories are adjacent on the ground" at *every* level of
+        // the tree, not only at the leaves and the root's children.
+        //
+        // This one is a bound rather than a zero, and the difference is honest
+        // rather than convenient. A district being one piece is structural —
+        // rules T and A give it. A whole subtree being one piece is not: two
+        // sibling districts are given faces that share a chord, but nothing
+        // forces a plot on one side of that chord to be a Voronoi neighbour of a
+        // plot on the other, so a cousin's cell can reach across it. Measured
+        // here: 0, 1, 4 and 2 subtrees of 32, 144, 238 and 312.
+        //
+        // Requiring a district's *founding* plot to touch its parent's ground
+        // was tried and is worse on measurement, not better: at 1 000 files it
+        // took fragmented districts from 0 to 1, packages from 0 to 1 and
+        // rule-A bends from 0 to 18, because the founding plot is exactly the
+        // one with the least room to manoeuvre. Recorded in ADR-0058.
+        assert!(
+            r.fragmented_subtrees * 20 <= r.districts,
+            "{files} files: {} of {} directory subtrees are in more than one piece",
+            r.fragmented_subtrees,
+            r.districts
+        );
+        // Rule A, which is what makes a district structural rather than lucky.
+        // A **rate**, since the ramp began reading real commit time: two
+        // adjacent districts can be a decade apart and settle at grains that
+        // differ by four, and the search that keeps a new plot in contact with
+        // its own district's ground occasionally cannot. Measured 0, 1, 1 and 2
+        // plots at 200, 1 000, 3 000 and 5 000 files, 0 of 837 on Neovim and 2
+        // of 2 413 on Django — and `fragmented_districts` stays 0 in every one
+        // of those, which is the property the rule exists to deliver.
+        assert!(
+            r.settled_nonadjacent * 100 <= r.plots,
+            "{files} files: {} of {} plots founded out of contact with their own district",
+            r.settled_nonadjacent,
+            r.plots
+        );
+        // Rule T is bent, rarely and by a bounded amount: a plot may sit up to
+        // `FRINGE × sep` over its own border when that is what lets it keep rule
+        // A. One plot in 200 files, none at 1 000 and above. It never leaves its
+        // own district's polygon for an ancestor's, and never lands loose in the
+        // city.
+        assert_eq!(
+            r.relaxed_to_ancestor + r.relaxed_to_anywhere + r.detached_placements,
+            0,
+            "{files} files: a plot settled outside its own district"
+        );
+        assert!(
+            r.settled_on_fringe * 50 <= r.plots,
+            "{files} files: {} of {} plots settled over their own border",
+            r.settled_on_fringe,
+            r.plots
+        );
+        // The road network is unharmed by constraining where plots may land.
+        assert_eq!(r.components, 1, "{files} files: the city is in pieces");
+        assert_eq!(r.crossings, 0, "{files} files");
+        assert_eq!(r.dangling, 0, "{files} files");
+        assert!(
+            r.complex_junctions * 100 >= r.junctions * 45,
+            "{files} files: only {} of {} junctions are four-way or better",
+            r.complex_junctions,
+            r.junctions
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 6, "the corpus shrank");
+}
+
+/// PRD §13.1: an incremental layout step under 50 ms, off-thread.
+///
+/// Growth is native here — adding a file calls the same `add_file` the batch
+/// generator calls — so this measures the real path rather than a shortcut.
+#[test]
+// `housed` and `shared` are two different questions about the same file, and
+// there is no clearer pair of names for them.
+#[allow(clippy::similar_names)]
+fn a_single_file_add_is_inside_the_incremental_budget() {
+    let mut tree = polis_repo::synthetic::repository(5_000, GATE_SEED);
+    let mut city = city::generate_city(&tree);
+    let inputs = LayoutInputs::default();
+    let mut timings = Vec::new();
+    let mut moved_nodes = Vec::new();
+    let mut shares = 0usize;
+    for i in 0..12u32 {
+        let path = lp(&format!("core/latecomer{i}.rs"));
+        let mut meta = polis_repo::FileMeta::untracked(path.clone(), 3_000 + u64::from(i) * 17);
+        meta.growth_index = u32::try_from(tree.files.len()).expect("fits");
+        tree.files.insert(path.clone(), meta);
+        let started = std::time::Instant::now();
+        let moved = city.accrete(&tree, &inputs, std::slice::from_ref(&path));
+        timings.push(started.elapsed());
+        moved_nodes.push(moved);
+        // The file is **accounted for**: its own lot with a building on it, or
+        // an `Overflow` record naming the lot it shares, which the renderer is
+        // required to draw. Never neither — a file that vanishes from the map is
+        // the one outcome `lots::LotReport` exists to make impossible.
+        //
+        // Twelve files into one already-surveyed district is the hardest case
+        // the incremental path has: they land on the same frontage one at a
+        // time, each halving a parcel that the last one already halved. Eleven
+        // of the twelve get a lot of their own; the twelfth shares. Asserting
+        // "every add gets its own lot" would be asserting that a block can be
+        // subdivided without limit.
+        let housed = city.building(&path).is_some();
+        let shared = city.overflow.iter().any(|o| o.path == path);
+        assert!(
+            housed || shared,
+            "add {i} is on the map nowhere at all: {:?}",
+            city.report
+        );
+        if !housed {
+            shares += 1;
+        }
+        assert_eq!(city.report.components, 1, "add {i} split the city");
+    }
+    assert!(
+        shares <= 1,
+        "{shares} of 12 incrementally added files had to share a lot"
+    );
+    timings.sort_unstable();
+    moved_nodes.sort_unstable();
+    let median = timings[timings.len() / 2];
+    let p95 = timings[(timings.len() * 95 / 100).min(timings.len() - 1)];
+    println!(
+        "POLIS_INCREMENTAL median={median:?} p95={p95:?} moved_nodes_median={} of {}",
+        moved_nodes[moved_nodes.len() / 2],
+        city.report.road_nodes
+    );
+    // PRD §13.1's budget is a property of the profile the product ships, and
+    // this test runs in whichever profile the developer chose. Measured on this
+    // machine at 5 000 files: release median 34 ms, p95 36 ms; the test profile
+    // is about twice that because the harness itself is unoptimised. The budget
+    // is asserted where it means something and reported everywhere.
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(200)
+    } else {
+        std::time::Duration::from_millis(50)
+    };
+    assert!(
+        p95 < budget,
+        "a single-file add took {p95:?}, over the {budget:?} budget for this profile"
+    );
+}
+
+/// Adding a file does not move the city out from under the operator.
+///
+/// > **Never move the ground while the operator is looking at it.** (PRD §7.7)
+///
+/// The honest claim, and it is weaker than "a grown city equals a generated
+/// one": the territory partition is computed from the whole file list, so a
+/// repository that has grown by six files has a slightly different partition
+/// from one that always had them, and the quantised weights make that *rare*
+/// rather than impossible. What is asserted here is what PRD §7.7 actually asks
+/// for — that the overwhelming majority of the map is untouched by one add —
+/// together with every structural invariant still holding afterwards.
+#[test]
+fn adding_a_file_leaves_the_rest_of_the_city_where_it_was() {
+    let full = polis_repo::synthetic::repository(600, GATE_SEED);
+    let newest: LogicalPath = {
+        let mut by_age: Vec<(&LogicalPath, u32)> = full
+            .files
+            .iter()
+            .map(|(p, m)| (p, m.growth_index))
+            .collect();
+        by_age.sort_by_key(|(p, g)| (*g, (*p).clone()));
+        by_age.last().expect("a file").0.clone()
+    };
+    let mut partial = full.clone();
+    partial.files.remove(&newest);
+
+    let mut city = city::generate_city(&partial);
+    let before: BTreeMap<LogicalPath, Vec<(f32, f32)>> = city
+        .layout
+        .buildings
+        .iter()
+        .map(|(p, b)| {
+            (
+                p.clone(),
+                b.footprint.vertices.iter().map(|v| (v.x, v.y)).collect(),
+            )
+        })
+        .collect();
+
+    city.accrete(
+        &full,
+        &LayoutInputs::default(),
+        std::slice::from_ref(&newest),
+    );
+
+    assert!(
+        city.building(&newest).is_some(),
+        "the new file got no building"
+    );
+    let mut same = 0usize;
+    for (path, footprint) in &before {
+        if city.building(path).is_some_and(|b| {
+            b.footprint
+                .vertices
+                .iter()
+                .map(|v| (v.x, v.y))
+                .eq(footprint.iter().copied())
+        }) {
+            same += 1;
+        }
+    }
+    println!(
+        "POLIS_STABILITY {same} of {} buildings unmoved by one add",
+        before.len()
+    );
+    assert!(
+        same * 10 >= before.len() * 9,
+        "one added file moved {} of {} buildings",
+        before.len() - same,
+        before.len()
+    );
+
+    // And every invariant still holds afterwards.
+    let r = city.report;
+    assert_eq!(r.components, 1);
+    assert_eq!(r.dangling, 0);
+    assert_eq!(r.crossings, 0);
+    assert_eq!(
+        r.blocks,
+        (r.road_segments + r.components).saturating_sub(r.road_nodes)
+    );
+    let structure = city::measure(&city);
+    assert_eq!(structure.buildings_on_road, 0);
+    assert_eq!(structure.buildings_outside_lot, 0);
+}
+
+/// Two fresh processes agree about a 3 000-file synthetic city.
+///
+/// The fixture version of this test above covers 90 files. Scale is where a
+/// nondeterminism actually hides: a tie broken by iteration order needs two
+/// candidates that tie, and small inputs rarely produce one.
+#[test]
+fn two_fresh_processes_agree_at_scale() {
+    let mine = synthetic_digest();
+    for i in 0..2 {
+        assert_eq!(
+            child_synthetic_digest(),
+            mine,
+            "child process {i} produced a different city at 3 000 files"
+        );
+    }
+}
+
+/// The digest [`two_fresh_processes_agree_at_scale`] compares.
+fn synthetic_digest() -> u64 {
+    city::generate_city(&polis_repo::synthetic::repository(3_000, GATE_SEED)).digest()
+}
+
+/// Re-invokes this binary and reads the digest back.
+fn child_synthetic_digest() -> u64 {
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = Command::new(exe)
+        .args([
+            "--exact",
+            "print_synthetic_digest",
+            "--ignored",
+            "--nocapture",
+        ])
+        // Pinned, not inherited: see `child_markers`.
+        .env("RUST_TEST_THREADS", "1")
+        .output()
+        .expect("re-invoke the test binary");
+    assert!(output.status.success(), "child process failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    child_markers(&stdout, "POLIS_SYNTHETIC_DIGEST ")
+        .first()
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| panic!("child printed no digest:\n{stdout}"))
+}
+
+/// The child half of [`two_fresh_processes_agree_at_scale`].
+#[test]
+#[ignore = "child process of two_fresh_processes_agree_at_scale"]
+fn print_synthetic_digest() {
+    println!("POLIS_SYNTHETIC_DIGEST {:016x}", synthetic_digest());
+}
+
+/// The input file order cannot move the city, at scale and in every profile.
+///
+/// `RepoTree::files` is a `BTreeMap`, so the pipeline is handed its files in
+/// path order however they were collected; this pushes them through a `HashMap`
+/// first, which is the strongest adversary Rust offers, and does it on a corpus
+/// big enough for ties to exist.
+#[test]
+fn file_order_cannot_move_the_city_at_scale() {
+    let tree = polis_repo::synthetic::repository(1_500, GATE_SEED);
+    let reference = city::generate_city(&tree).digest();
+    let shuffled: HashMap<LogicalPath, FileMeta> = tree
+        .files
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut rebuilt = RepoTree {
+        files: BTreeMap::new(),
+        ..tree.clone()
+    };
+    for (path, meta) in shuffled {
+        rebuilt.files.insert(path, meta);
+    }
+    assert_eq!(
+        city::generate_city(&rebuilt).digest(),
+        reference,
+        "the city moved when its files arrived in `RandomState` order"
+    );
+}
+
+/// The rendered PNG is a pure function of the layout.
+///
+/// PRD §15 M1 ends in "render it to a window (or PNG)". A determinism gate that
+/// stops at the layout leaves the last step — the one an operator actually looks
+/// at — unproven, and the design bake-off found a real leak there: a wall-clock
+/// number printed in the legend.
+#[test]
+fn the_rendered_plan_is_reproducible() {
+    let tree = polis_repo::synthetic::repository(400, GATE_SEED);
+    let city = city::generate_city(&tree);
+    let structure = city::measure(&city);
+    let first =
+        polis_render::plan::render_plan(&city, &structure, "GATE", 300, 1, true).encode_png();
+    let second =
+        polis_render::plan::render_plan(&city, &structure, "GATE", 300, 1, true).encode_png();
+    assert_eq!(first, second, "the PNG moved between two renders");
+    let junctions =
+        polis_render::plan::render_junctions(&city, &structure, "GATE", 300, 1).encode_png();
+    assert_eq!(
+        junctions,
+        polis_render::plan::render_junctions(&city, &structure, "GATE", 300, 1).encode_png()
+    );
+    assert!(
+        first.len() > 1_000,
+        "the plan encoded to {} bytes",
+        first.len()
+    );
 }

@@ -15,12 +15,29 @@
 //! | Module | Step |
 //! |---|---|
 //! | [`determinism`] | the seeded generator, the simplex noise, and quantisation |
-//! | [`terrain`] | 1 — the height field roads follow |
-//! | [`roads`] | 2 — space colonisation with intersection snapping |
-//! | [`blocks`] | 3 — planar faces of the road graph |
-//! | [`lots`] | 4 — recursive subdivision along the longest axis |
-//! | [`buildings`] | 5 — lots inset by a setback |
+//! | [`age`] | 0 — real commit time to the age of the ground (PRD §7.1, ADR-0062) |
+//! | `geom` | the `f64` planar geometry the middle of the pipeline runs in (ADR-0053) |
+//! | [`terrain`] | 1 — the height field the growth follows |
+//! | `territory` | 2 — one polygon per district, from the directory tree (ADR-0056) |
+//! | `districts` | the two rules that keep a district's ground one piece (ADR-0058) |
+//! | `accrete` | 3 — the settlement, replayed in git commit order (PRD §7.1) |
+//! | `voronoi`, [`roads`] | 4 — the boundary network of the settled ground (ADR-0052) |
+//! | [`blocks`] | 5 — the closed faces of that network |
+//! | [`lots`] | 6 — recursive subdivision along the longest axis |
+//! | [`buildings`] | 7 — lots inset by a setback |
 //! | [`city`] | the pipeline, the growth step, and the serialized [`CityLayout`] |
+//!
+//! # The roads are the boundary network of the settled ground
+//!
+//! PRD §7.2 step 2 specifies space colonisation. Implemented literally it
+//! produced exactly the failure the same paragraph warns about — "without
+//! snapping you get a tree, and trees read as artificial" — because snapping can
+//! only bridge two things that are already close, and the attractor clouds were
+//! spatially isolated. **A road here is instead the line where one parcel's
+//! territory stops and the next one's begins**: the Voronoi diagram of a set of
+//! plots accreted one file at a time in commit order. That is planar, connected
+//! and full of closed faces by construction rather than by tuning a radius.
+//! ADR-0052 records the decision and what it costs.
 //!
 //! # Determinism is a hard requirement, not a nice-to-have
 //!
@@ -53,13 +70,19 @@
 //! how a fan-out produces two subtly different cities. The *algorithms* are
 //! stubbed; the vocabulary they share is not.
 
+pub(crate) mod accrete;
+pub mod age;
 pub mod blocks;
 pub mod buildings;
 pub mod city;
 pub mod determinism;
+pub(crate) mod districts;
+pub(crate) mod geom;
 pub mod lots;
 pub mod roads;
 pub mod terrain;
+pub(crate) mod territory;
+pub(crate) mod voronoi;
 
 use std::collections::BTreeMap;
 use std::ops::{Add, Div, Mul, Neg, Sub};

@@ -107,7 +107,7 @@ pub const MIN_DISCOUNT: f32 = 0.01;
 ///
 /// A store carrying a *higher* version was written by a newer Polis; it is left
 /// untouched and this build degrades (see [`Corpus::open_or_degraded`]). A lower
-/// version is migrated forward in place by [`migrate`].
+/// version is migrated forward in place by `migrate`.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// How long a write waits for another Polis instance before giving up.

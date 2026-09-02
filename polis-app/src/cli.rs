@@ -54,11 +54,7 @@ pub enum Command {
     /// Generate the city and write it to a PNG without opening a window.
     ///
     /// PRD §15 M1's gate: byte-identical layout across two runs and two machines.
-    Snapshot {
-        /// Where to write the image.
-        #[arg(long, default_value = "polis.png")]
-        out: PathBuf,
-    },
+    Snapshot(SnapshotArgs),
 
     /// Report environment, channel health and the injected agent env block.
     ///
@@ -123,6 +119,53 @@ pub struct TailArgs {
     /// while both looked healthy (ADR-0026).
     #[arg(long)]
     pub allow_second: bool,
+}
+
+/// `polis snapshot` — PRD §15 M1.
+#[derive(Debug, clap::Args)]
+pub struct SnapshotArgs {
+    /// Where to write the city plan.
+    #[arg(long, default_value = "polis.png")]
+    pub out: PathBuf,
+
+    /// Also write the road graph alone, junctions coloured by degree.
+    ///
+    /// The "is it a tree?" render: a network with cycles and no dangling ends
+    /// is immediately, unarguably not a tree (PRD §7.2).
+    #[arg(long, value_name = "PATH")]
+    pub junctions: Option<PathBuf>,
+
+    /// Also write the serialized layout, for a golden-file diff (PRD §16).
+    #[arg(long, value_name = "PATH")]
+    pub layout: Option<PathBuf>,
+
+    /// Draw a synthetic repository of this many files instead of the checkout.
+    ///
+    /// PRD §13.1 budgets cold start at 5 000 files and no fixture is that big;
+    /// this is how the layout is exercised at the scale it has to hold at.
+    #[arg(long, value_name = "FILES")]
+    pub synthetic: Option<usize>,
+
+    /// Seed for `--synthetic`. Fixed by default, so the fixture is a fixture.
+    #[arg(long, default_value_t = 0xACCE_7107_0000_0001)]
+    pub seed: u64,
+
+    /// Draw PRD §9's import layer over the plan.
+    ///
+    /// Off by default: a street is a cross-district import relation, and the
+    /// whole import graph drawn over the whole city at once is noise. The layer
+    /// is for asking a question about one quarter, not for the city view.
+    #[arg(long)]
+    pub streets: bool,
+
+    /// Output edge length in pixels.
+    #[arg(long, default_value_t = 1600)]
+    pub pixels: usize,
+
+    /// Supersampling factor: the image is drawn this many times larger and box
+    /// filtered down. Two is the useful setting.
+    #[arg(long, default_value_t = 2)]
+    pub supersample: usize,
 }
 
 /// `polis install-hooks` — PRD §4.2.

@@ -28,6 +28,11 @@ thiserror = { workspace = true }
 # Golden-file layout snapshots — PRD §16's most important test.
 insta = { workspace = true }
 serde_json = { workspace = true }
+# The M1 gate renders the city it measures: PRD §15 M1 ends in "render it to a
+# window (or PNG)", and a determinism gate that stops at the layout leaves the
+# step an operator actually looks at unproven. A dev-dependency only — nothing
+# in `polis-layout` itself knows the renderer exists.
+polis-render = { workspace = true }
 
 [lints]
 workspace = true

@@ -14,7 +14,7 @@
 //!
 //! # The three-stage pipeline
 //!
-//! 1. [`Extractor`] turns one file's source into a list of *module specifiers* —
+//! 1. `Extractor` turns one file's source into a list of *module specifiers* —
 //!    the strings the code actually wrote (`"./auth"`, `"crate::imports"`,
 //!    `"react"`). This stage is pure syntax and knows nothing about the repo.
 //! 2. [`ImportIndex`] resolves each specifier to an [`ImportTarget`]. It is
@@ -49,7 +49,7 @@
 //!
 //! **A `Parser` is not `Sync` and holds an allocation.** Build one per thread and
 //! reuse it across files; constructing one per file is most of the cost of a
-//! cold index. [`ImportGraph::build`] therefore keeps one [`Extractor`] cache per
+//! cold index. [`ImportGraph::build`] therefore keeps one `Extractor` cache per
 //! worker thread and shares nothing but the immutable [`ImportIndex`].
 //!
 //! # Determinism
@@ -1720,7 +1720,7 @@ enum Slot {
     Ready(Box<Extractor>),
 }
 
-/// A per-thread cache of one [`Extractor`] per language, built on first use.
+/// A per-thread cache of one `Extractor` per language, built on first use.
 struct ExtractorCache {
     slots: [Slot; 5],
 }

@@ -20,5 +20,10 @@ lyon = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# The plan renderer's tests need a repository to draw; PRD §16's fixtures are
+# git checkouts, and a synthetic tree is the one that runs without `bash`.
+polis-repo = { workspace = true }
+
 [lints]
 workspace = true

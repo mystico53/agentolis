@@ -2402,6 +2402,7 @@ dependencies = [
  "insta",
  "lyon",
  "polis-events",
+ "polis-render",
  "polis-repo",
  "rayon",
  "serde",
@@ -2419,6 +2420,7 @@ dependencies = [
  "lyon",
  "polis-events",
  "polis-layout",
+ "polis-repo",
  "polis-world",
  "thiserror 2.0.20",
 ]

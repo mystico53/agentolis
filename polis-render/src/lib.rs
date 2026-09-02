@@ -40,6 +40,8 @@ pub mod camera;
 pub mod city;
 pub mod density;
 pub mod marks;
+pub mod plan;
+pub mod raster;
 
 use eframe::{egui, egui_wgpu, wgpu};
 use polis_world::snapshot::WorldSnapshot;

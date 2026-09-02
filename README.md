@@ -13,9 +13,14 @@ when the glance turns into a question.
 
 The city is a growth process, not a layout algorithm: `git log` supplies the
 growth order, so files added in the repo's first year form a dense old town and
-last month's work sits on a more planned periphery. Roads grow by space
-colonization and snap to nearby intersections, which is what makes the junctions
-read as *grown* rather than generated. Buildings are files; their height is
+last month's work sits on a more planned periphery — from the commit
+*timestamps*, so a repository whose first year produced a twentieth of its files
+still gets an old town and one imported in a single squash gets no invented
+gradient at all (ADR-0064). A road is the line where one accreted parcel's
+territory stops and the next one's begins, which makes planarity, connectivity
+and closed blocks properties of the construction rather than of a tuning constant
+(ADR-0052), and the four- and five-way junctions that read as *grown* fall out of
+it. Buildings are files; their height is
 uncommitted diff lines, so the city rises as agents work and settles when you
 merge. An agent's scope is a **density field**, not a boundary — a main agent
 that delegates has no meaningful point location, and a centroid of its workers
@@ -24,7 +29,7 @@ hash of the logical path, so the same repo produces the same city on every launc
 and every machine; spatial memory is the entire point.
 
 The spec is [`docs/PRD.md`](docs/PRD.md). Where the built system deliberately
-diverges from it — 43 recorded decisions, every one grounded in a measurement —
+diverges from it — 68 recorded decisions, every one grounded in a measurement —
 see [`docs/DECISIONS.md`](docs/DECISIONS.md). The evidence behind those decisions
 is in [`docs/verified/`](docs/verified/).
 
@@ -113,12 +118,50 @@ Ordered. Each ends in something demonstrable. Do not skip ahead — PRD §15.
 | | Milestone | Delivers | Status |
 |---|---|---|---|
 | **M0** | Event spine | `polis-events` + `polis-ingest`; `polis tail` prints a normalized event stream. Prove the hook's budget under synthetic load. | **Contracts done.** `polis-events` and `polis-hook` are implemented and tested; the four channels in `polis-ingest` are signatures. |
-| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | Not started. Determinism rules and the seeded generator are specified in `polis_layout::determinism`. |
+| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Implemented, one machine.** `polis snapshot` draws any checkout. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Measured on two real repositories — see below. |
 | **M2** | Single-session replay | One JSONL file animated over the city, offline. The fastest iteration loop the project has; most of the visual notation gets decided here. | Not started. Fixtures are in `tests/fixtures/transcripts/`. |
 | **M3** | Live, single session | M0 wired into M2. One agent, real time. | Not started. |
 | **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | Not started. Depends on the beta traces channel (ADR-0006). |
 | **M5** | Attention layer | The three states, contention detection, drill-down, linked filesystem view. **The first milestone that delivers the product thesis.** | Not started. |
 | **M6** | Landmarks and polish | Monuments, overgrowth, industrial zoning, scaffolding, trails, follow-thread camera, drift detection. | Not started. |
+
+### M1, measured
+
+Generation is a growth simulation: the Voronoi diagram of parcels accreted one
+file at a time in `git log` order, inside a territory partition that gives every
+directory its own polygon (ADR-0052, ADR-0056). PRD §7.1's age gradient is driven
+by **real commit timestamps**, not by position in the file list (ADR-0064), so a
+repository's age structure is a property of its history rather than of the
+generator.
+
+Two real open-source repositories, cloned with full history, and the shipped
+5 000-file fixture — one build, no per-corpus tuning:
+
+| | Neovim | Django | fixture |
+|---|---|---|---|
+| files / history | 3 890 · 12.6 y | 7 014 · 21.1 y | 4 965 · 8.0 y |
+| added in year one | 36.3 % | 3.4 % | 8.2 % |
+| road graph | V 915 · E 1 667 · 1 component · 0 crossings · 0 dangling | V 2 881 · E 5 226 · 1 · 0 · 0 | V 1 104 · E 1 909 · 1 · 0 · 0 |
+| blocks (= independent cycles) | 753 | 2 346 | 806 |
+| block area p95:p05 | 23.8× | 5.2× | 10.0× |
+| age gradient (rim ÷ core) | **5.96×** | 1.65× | 2.07× |
+| buildings | 3 890 / 3 890 | 7 011 / 7 014 | 4 565 / 4 565 |
+| ground built on | 30.4 % (core 40.8 %) | 21.1 % | 32.2 % |
+| in the road, or off their lot | 0, 0 | 0, 0 | 0, 0 |
+| districts in more than one piece | 0 of 178 | 1 of 2 076 | 0 of 312 |
+| full generation | **266 ms** | 400 ms | 284 ms |
+
+against PRD §13.1's 3 s cold-start budget, and a single incremental add at 5 000
+files is 37 ms median / 39 ms p95 against its 50 ms budget.
+
+`docs/city-real-5k.png` is Neovim, `docs/city-real-django.png` is Django, and
+`docs/city-real-5k-junctions.png` is the road graph alone with junctions coloured
+by degree — the "is it a tree?" render, which it is not.
+
+```sh
+polis --repo ../neovim snapshot --out city.png --junctions junctions.png
+polis snapshot --synthetic 5000 --out fixture.png   # the shipped fixture
+```
 
 ---
 

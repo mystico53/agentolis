@@ -64,7 +64,12 @@
 #                 anchors to rank;
 #               * files of visibly different sizes, because PRD §7.3's footprint
 #                 is proportional to sqrt(bytes) and a fixture of equal-sized
-#                 files would not notice if that stopped working.
+#                 files would not notice if that stopped working;
+#               * REAL CROSS-DISTRICT IMPORTS (commit 9), so PRD §9's `streets`
+#                 array is non-empty in a pinned snapshot. Before those existed
+#                 all three golden files pinned `streets: []`, which is why a
+#                 release-only reordering of that field passed 57 determinism
+#                 tests. See `write_importing`.
 #
 # ---------------------------------------------------------------------------
 # Known limitation
@@ -88,7 +93,7 @@ OUT="$1"
 # Bumped whenever the content or the history below changes. `m1_gate.rs` reads
 # it back out of the stamp file and rebuilds when it does not match, so a stale
 # fixture in a warm CI cache cannot silently pass yesterday's golden file.
-FIXTURE_VERSION=1
+FIXTURE_VERSION=2
 
 STAMP="$OUT/.polis-fixture-version"
 if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$FIXTURE_VERSION" ]; then
@@ -134,6 +139,36 @@ write() {
     mkdir -p "$REPO/$(dirname "$rel")"
     {
         printf '// %s\n' "$rel"
+        i=0
+        while [ "$i" -lt "$lines" ]; do
+            printf 'line %04d of %s\n' "$i" "$rel"
+            i=$((i + 1))
+        done
+    } > "$REPO/$rel"
+}
+
+# write_importing <relative-path> <line-count> <import-line>...
+#
+# `write`, but the file opens with real import statements, so
+# `polis_repo::imports` extracts a genuine cross-district edge from it.
+#
+# This exists because of a specific bug. `city::build_streets` asserted its
+# input was in canonical order with a `debug_assert` and returned it *unsorted*,
+# so `CityLayout::streets` serialized in caller order in release and in layout
+# order in debug. Every `cargo test` passed. The reason no golden file noticed
+# is that the fixtures had no cross-district import at all, so all three pinned
+# `streets: []` — a field that is always empty cannot regress visibly. PRD §16
+# calls the golden test the most important in the suite; it only covers what the
+# fixtures actually produce.
+write_importing() {
+    local rel="$1" lines="$2" i line
+    shift 2
+    mkdir -p "$REPO/$(dirname "$rel")"
+    {
+        printf '// %s\n' "$rel"
+        for line in "$@"; do
+            printf '%s\n' "$line"
+        done
         i=0
         while [ "$i" -lt "$lines" ]; do
             printf 'line %04d of %s\n' "$i" "$rel"
@@ -230,5 +265,18 @@ write src/ui/components/table.tsx 210
 write examples/basic.rs 55
 git -C "$REPO" add -A
 commit "2021-10-01T12:00:00+00:00" "the ui district"
+
+# Commit 9 — REAL CROSS-DISTRICT IMPORTS, so PRD §9's streets are non-empty in a
+# pinned snapshot. `src/net` imports from `src/auth` and `src/utils`; `src/ui`
+# imports twice from `src/ui/components`, so one street also carries an
+# `edge_count` above one and the width PRD §9 draws is covered too.
+write_importing src/net/gateway.rs 40 \
+    'use crate::auth::tokens;' \
+    'use crate::utils::helpers;'
+write_importing src/ui/store.ts 35 \
+    'import { Button } from "./components/button";' \
+    'import { Table } from "./components/table";'
+git -C "$REPO" add -A
+commit "2021-11-18T09:25:00+00:00" "wire the gateway and the ui store"
 
 printf '%s' "$FIXTURE_VERSION" > "$STAMP"

@@ -24,6 +24,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod format;
+pub mod snapshot;
 pub mod ui;
 
 #[cfg(test)]

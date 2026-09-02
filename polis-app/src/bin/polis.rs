@@ -28,11 +28,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::InstallHooks(args)) => commands::install_hooks(&cli, args),
         Some(Command::Env(args)) => commands::env(args),
         Some(Command::Replay(args)) => commands::replay(&cli, args),
-        Some(Command::Snapshot { out }) => Err(anyhow::anyhow!(
-            "`polis snapshot` needs the layout and the renderer (PRD §15 M1); \
-             nothing would be written to {}",
-            out.display()
-        )),
+        Some(Command::Snapshot(args)) => polis_app::snapshot::snapshot(&cli, args),
         Some(Command::Doctor) => commands::doctor(&cli),
     }
 }
