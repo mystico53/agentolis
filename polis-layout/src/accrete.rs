@@ -105,11 +105,13 @@
     clippy::too_many_lines
 )]
 
+use std::cmp::Reverse;
+
 use polis_events::{LogicalPath, WallTime};
 
 use crate::age::AgeRamp;
 use crate::determinism::{combine_seeds, det_sin_cos, quantize_f64, SeededRng, TAU};
-use crate::geom::{add, dist, mul, qp, sub, Pt};
+use crate::geom::{add, dist, len, mul, qp, sub, Pt};
 use crate::terrain::TerrainField;
 use crate::territory::Territory;
 
@@ -205,6 +207,230 @@ const TOWN_FRONTIER: usize = 24;
 /// Must exceed [`Params::touch_max`], or the connectivity rule would be decided
 /// on a neighbour set that does not contain the neighbour that satisfies it.
 const NEIGHBOUR_WINDOW: f64 = 1.9;
+
+// ---------------------------------------------------------------------------
+// The founding quarters — why a town has several old cores and not one
+// ---------------------------------------------------------------------------
+//
+// A settlement grown from **one** seed under [`Params::touch_max`] is a disc
+// that expands outward in commit order. `sep` and `cap` ramp with age, so grain
+// is a monotone function of *when*, and *when* is a monotone function of *how
+// far out*: the two compose into a polar density field. It was measured on the
+// junction set of three corpora — Pearson correlation between distance from the
+// densest point and nearest-neighbour spacing +0.574 / +0.582 / +0.609, with
+// median spacing doubling from the clot to the rim. That is the pie chart's
+// axle, left standing after its crust was removed.
+//
+// The cure is not to flatten the ramp: PRD §7.1 *requires* the age structure,
+// and a dense old core is the spec. The cure is to stop there being one centre
+// for it to be graded about. Real towns are several villages that grew into each
+// other along the roads between them, and the roads went where the ground let
+// them.
+//
+// So the founding is explicit. The biggest packages are given a **site each**,
+// chosen off the terrain rather than off a radius, and joined to what is already
+// settled by a **causeway** — a chain of plots each inside the connectivity
+// reach of the one before, routed along the contour. Every quarter then grows in
+// place at its own package's grain. The old town is wherever the oldest package
+// is, the civic square is with it, and the map's geometric centre is somewhere
+// else entirely — which is what "the historic centre" means in a real town.
+//
+// Nothing here partitions the plane. It places a dozen points and a few dozen
+// plots; every boundary on the finished map is still a Voronoi bisector and
+// every district is still a connected part of the plot adjacency graph
+// ([`crate::regions`]).
+//
+// # What it is worth, measured
+//
+// Correlation between nearest-neighbour junction spacing and distance from the
+// densest point, and the ratio of median spacing in the outermost radial octile
+// to the innermost — the two numbers the review reported — on the 5 000-file
+// synthetic corpus, Django (7 014 files) and Neovim (3 890):
+//
+// | growth | synthetic | Django | Neovim |
+// |---|---|---|---|
+// | one seed at the origin | +0.582 / 2.05× | +0.609 / 1.68× | +0.574 / 2.05× |
+// | quarters, no grain field | +0.459 / 1.39× | +0.402 / 1.32× | +0.072 / 1.27× |
+// | **both, as shipped** | **+0.338 / 1.41×** | **+0.339 / 1.28×** | **+0.153 / 0.97×** |
+//
+// The quarters do most of it and the grain field ([`Settlement::sep_of`]) does
+// the rest — on two corpora of three; on Neovim it costs 0.08, which is inside
+// the run-to-run spread of this statistic and is reported rather than tuned
+// away. Over the same three corpora the civic square moved from 5-14 % of the
+// radius off the centre of the built ground to 40-44 %, and PRD §7.1's age
+// gradient — median block area, newest third of the ground over oldest — stayed
+// at 2.23× / 2.51× / 2.84× against 2.76× / 2.35× / 3.42×. The gradient is the
+// spec; only its ordering by radius was the artefact.
+
+/// Largest number of quarters a repository is founded with.
+///
+/// Every top-level package that is worth one gets one, and the cap is a bound on
+/// the causeway network rather than a design choice: each quarter past the first
+/// costs a road out to it, settled before there are files for it.
+///
+/// It is high on purpose. **A handful of quarters does not break the axle** —
+/// measured at five on the synthetic corpus, the correlation moved from +0.582
+/// to +0.570, because the eight packages that did *not* get a site all still
+/// seeded off the civic square and rebuilt the clot around it. The number that
+/// matters is not how many quarters there are but how many packages are left
+/// growing out of one point.
+const MAX_QUARTERS: usize = 14;
+
+/// Smallest share of the repository a package must carry to found a quarter.
+///
+/// Below this the "quarter" is a hamlet whose causeway is longer than the ground
+/// it reaches, which is the one shape that leaves a corridor of empty blocks
+/// standing at the end of the growth.
+const QUARTER_SHARE: f64 = 0.012;
+
+/// Smallest absolute size, in files, for the same reason.
+const QUARTER_FILES: u32 = 12;
+
+/// Largest share of the repository one quarter may carry before it is split
+/// into its own subdirectories.
+///
+/// The top level is not the right unit on a real repository: `django/` is 95 %
+/// of Django and `src/` plus `runtime/` are all of Neovim, so a founding that
+/// stops at the root's children founds nothing there. Anything over this share
+/// is replaced by its own children, which is what makes `django/db`,
+/// `django/contrib` and `django/forms` quarters of a town rather than three
+/// rings of one.
+const QUARTER_CEILING: f64 = 0.26;
+
+/// How much bigger the town is than a jammed packing of its plots.
+///
+/// [`Settlement::expected_area`] adds up one plot's ground per plot, which is
+/// what the town would occupy with no voids in it. A real settlement has parks,
+/// bad ground and inlets — solidity measures 0.75-0.79 — so the radius the sites
+/// are spread over is larger than the area sum says. Measured, the unslacked
+/// estimate against the finished city's own radius: 35.1 against 55.7 on the
+/// synthetic corpus, 59.9 against 83.3 on Django, 30.1 against 45.7 on Neovim —
+/// ratios of 1.59, 1.39 and 1.52, and this is set at the bottom of that range.
+/// Under-reaching costs a merged pair of quarters; over-reaching costs a
+/// causeway that never fills in and stays standing as an empty corridor.
+const TOWN_SLACK: f64 = 1.40;
+
+/// Pitch of the candidate lattice the sites are chosen from, in units of the
+/// town's expected radius.
+///
+/// A lattice and not a ring: a ring of candidates round the origin is a radial
+/// construction and would put the quarters on a rosette, which is the artefact
+/// with one more step in it. The lattice is jittered per site from the layout
+/// seed, so the candidate set is a Poisson-ish scatter and the terrain decides
+/// which of it wins.
+const SITE_STEP: f64 = 0.19;
+
+/// How far a lattice site jitters, as a fraction of the pitch.
+const SITE_JITTER: f64 = 0.55;
+
+/// How far the candidate lattice reaches from its own centre, in radii.
+///
+/// With [`SITE_OFFSET`] this bounds how far a quarter can be founded from the
+/// civic square: `SITE_OFFSET + SITE_REACH` radii, so 1.12 here. **Keep the sum
+/// close to one.** Well above it the quarters are founded outside the ground the
+/// town will ever cover, the causeways between them never fill in, and the plan
+/// comes apart into the shards the first M1 attempt was failed for — measured at
+/// the sum 1.77: solidity 0.48, longest stroke 25 % of a diameter that had
+/// itself grown by three quarters, and no through-street at all. Well below it
+/// the quarters crush together and the axle comes back: at the sum 0.98 the
+/// correlation on the synthetic corpus was +0.365 against +0.338 here.
+const SITE_REACH: f64 = 0.72;
+
+/// Where the candidate region sits, in radii along the growth bearing from the
+/// civic square.
+///
+/// **This is what takes ROOT off the geometric centre.** The civic square is the
+/// origin (`polis_layout::WORLD_ORIGIN`) and the oldest package grows round it;
+/// every other quarter is sited in a region offset down the bearing the terrain
+/// favours, so the built ground's centre of mass ends up half a radius away from
+/// the old town. Measured, the root district moved from 5-14 % of the radius off
+/// centre to 40-44 % — 41.5 % on the synthetic corpus, 39.8 % on Django, 44.1 %
+/// on Neovim, against 12.2 %, 13.7 % and 5.2 % before.
+const SITE_OFFSET: f64 = 0.40;
+
+/// How far apart two quarters' centres must be, as a share of the sum of their
+/// expected radii.
+///
+/// Under about 0.7 the cores merge into one clot and the axle comes back; over
+/// about 1.1 the quarters never meet and the causeways stay standing as empty
+/// corridors.
+const QUARTER_GAP: f64 = 0.75;
+
+/// Weight on a site being clear of the quarters already placed.
+///
+/// The term **saturates** at [`SITE_ELBOW`] quarter radii. A term that keeps
+/// rewarding distance is a term that puts every site on the boundary of the
+/// candidate region, which is a ring, which is the rosette again.
+const SITE_SPREAD: f64 = 1.10;
+
+/// Where the spread reward stops, in quarter radii.
+const SITE_ELBOW: f64 = 3.0;
+
+/// Weight on a quarter sitting near the other quarters of its own package.
+///
+/// See [`Settlement::found`]: a package split into several quarters has to come
+/// back together as one connected region in [`crate::regions`], and it does that
+/// far more easily when its quarters are neighbours. It is also the truth —
+/// `django/db` and `django/forms` are two ends of one part of town.
+const SITE_KIN: f64 = 4.50;
+
+/// Weight on staying inside the town rather than out on its edge.
+///
+/// The counterweight to [`SITE_SPREAD`]: quarters that met are a town, quarters
+/// that did not are an archipelago.
+const SITE_PULL: f64 = 1.40;
+
+/// Length of one causeway step, as a share of the connectivity reach.
+///
+/// Inside the reach with margin, so the invariant every plot after the first is
+/// within [`Params::touch_max`] separations of an earlier one holds by
+/// construction and not by rounding. Also inside `voronoi::PHANTOM_NEAR`'s
+/// `1.02 · sep_rim` doubled, so no phantom can grow between two consecutive
+/// causeway plots and open a hole in the map.
+const CAUSEWAY_STRIDE: f64 = 0.88;
+
+/// Angular offsets a causeway step is allowed to take, so the road bends round
+/// the ground instead of ruling a line across it.
+const CAUSEWAY_BEND: [f64; 5] = [-0.42, -0.21, 0.0, 0.21, 0.42];
+
+/// Bearings sampled when asking which way the ground invites the town to grow.
+const BEARING_SAMPLES: u32 = 24;
+
+/// Coordinate scale the grain field is read at.
+///
+/// A wavelength of several quarters, so a whole neighbourhood agrees on its
+/// grain and the change from one to the next is a district boundary rather than
+/// a texture. Read much finer and neighbouring districts disagree, which is
+/// noise; much coarser and the field is a single gradient across the town, which
+/// is the artefact with a different centre.
+const GRAIN_SCALE: f64 = 0.045;
+
+/// How far the grain field may move a district's separation, either way.
+///
+/// The age ramp spans five to one ([`Params::sep_core`] to
+/// [`Params::sep_rim`]); this is under half of one step of that, which is enough
+/// to break the ordering by radius without touching the ordering by age.
+///
+/// Measured against the same growth with the field switched off — the middle row
+/// of the table at the top of this module — it takes the correlation a further
+/// 0.121 down on the synthetic corpus and 0.063 on Django, and puts 0.081 back
+/// on Neovim. It is second order to the quarters and it is kept because two
+/// corpora of three improve; the third is inside the spread. Above about 0.55 it
+/// starts costing the thing it must not cost: at 0.55 the synthetic corpus's age
+/// gradient fell to 1.79× and one Neovim package came apart.
+const GRAIN_SWING: f64 = 0.45;
+
+/// A founding quarter: where it is, how big it will get, and which package it
+/// belongs to.
+#[derive(Debug, Clone, Copy)]
+struct Quarter {
+    /// The site chosen for it.
+    site: Pt,
+    /// Radius of the ground its files will eventually cover.
+    radius: f64,
+    /// The top-level package, so quarters of one package stay together.
+    package: u32,
+}
 
 /// One file as the growth simulation sees it.
 #[derive(Debug, Clone)]
@@ -636,6 +862,14 @@ pub(crate) struct Settlement {
     open_rim: Vec<bool>,
     step: u32,
     scratch: Vec<u32>,
+    /// How many files the growth is about to be handed.
+    ///
+    /// The founding needs the town's *eventual* size before it has settled
+    /// anything — the quarters have to be spread over the ground the town will
+    /// occupy, not over the ground it occupies at step zero. It is an estimate
+    /// and it is allowed to be: it sets a spacing, and the growth fills whatever
+    /// it leaves.
+    total_files: u32,
 }
 
 impl Settlement {
@@ -648,8 +882,8 @@ impl Settlement {
         total_files: u32,
     ) -> Self {
         let ground = vec![DistrictGround::default(); territory.nodes.len()];
-        let _ = total_files;
         Self {
+            total_files,
             plots: Vec::new(),
             ground,
             files: Vec::new(),
@@ -688,9 +922,63 @@ impl Settlement {
         self.ramp.at(self.territory.nodes[did as usize].own_oldest)
     }
 
-    /// Plot separation in a district.
+    /// Plot separation in a district: its age, and the ground it stands on.
+    ///
+    /// # The second half is the other half of the axle
+    ///
+    /// Age alone makes grain a function of *when*, and a settlement grown under
+    /// [`Params::touch_max`] makes *when* a function of *how far out* — the two
+    /// compose into the polar density field this module's founding comment
+    /// describes. Founding several quarters breaks most of that composition;
+    /// what is left of it is that every quarter's newest ground is on the
+    /// outside of the town, because the outside is where the room is.
+    ///
+    /// So the grain also follows the **ground**. A low-frequency field — read at
+    /// [`GRAIN_SCALE`], a wavelength of a few quarters, and seeded apart from
+    /// the relief so it is not the same signal that shapes the coast — moves a
+    /// district's separation by up to [`GRAIN_SWING`] either way. Real density
+    /// follows soil and water, not radius, and this is that in one line:
+    /// somewhere on the rim is close-grained because the ground there is good,
+    /// and somewhere in the middle is loose because it is not.
+    ///
+    /// It is read at the district's **own ground**, so it is one value per
+    /// district at a time rather than a per-candidate field: the packing rule is
+    /// a comparison between a candidate and its neighbours, and a separation
+    /// that varied inside one district's search would make that comparison
+    /// asymmetric.
+    ///
+    /// Clamped into the ramp's own range — `[sep_core, sep_rim]` — so the
+    /// packing floor and the connectivity reach are exactly the two numbers they
+    /// were before, and every invariant stated against them still holds.
     pub(crate) fn sep_of(&self, did: u32) -> f64 {
-        self.params.sep_at(self.district_age(did))
+        let base = self.params.sep_at(self.district_age(did));
+        let here = self.district_seat(did);
+        (base * self.grain_at(here)).clamp(self.params.sep_core, self.params.sep_rim)
+    }
+
+    /// Where a district's grain is read: its own ground, or its nearest
+    /// ancestor's, or the civic square.
+    fn district_seat(&self, did: u32) -> Pt {
+        let mut up = Some(did);
+        while let Some(d) = up {
+            let g = &self.ground[d as usize];
+            if !g.plots.is_empty() {
+                return g.centroid();
+            }
+            up = self.territory.nodes[d as usize].parent;
+        }
+        [0.0, 0.0]
+    }
+
+    /// The grain of the ground at a point, in `[1 - GRAIN_SWING, 1 + …]`.
+    fn grain_at(&self, p: Pt) -> f64 {
+        let n = crate::determinism::fbm2_f64(
+            self.params.terrain_seed ^ 0x6772_6169_6E5F_0001,
+            p[0] * GRAIN_SCALE,
+            p[1] * GRAIN_SCALE,
+            2,
+        );
+        1.0 + GRAIN_SWING * n.clamp(-1.0, 1.0)
     }
 
     /// The local street frame: `(along the contour, up the fall line)`.
@@ -753,19 +1041,569 @@ impl Settlement {
     /// buildings and reads as a square. Making it a *plot* rather than hunting
     /// for an empty block afterwards is what makes it reliably central and
     /// reliably there.
+    /// A plot with capacity zero. It is settled before any file, so it is the
+    /// oldest ground in the city; nothing can move into it, so its cell has no
+    /// buildings and reads as a square. Making it a *plot* rather than hunting
+    /// for an empty block afterwards is what makes it reliably there.
+    ///
+    /// It is at the **origin**, and the origin is no longer the middle of the
+    /// map. [`Settlement::found`] sites every other quarter down one bearing
+    /// from here, so the civic square ends up where the oldest package is and
+    /// the built ground's centre of mass ends up half a radius away — the
+    /// historic centre rather than the geometric one, which is what PRD §8 asks
+    /// for and what a town that grew in one direction actually looks like.
     fn reserve_civic(&mut self) {
         if !self.plots.is_empty() || self.territory.nodes.is_empty() {
             return;
         }
         let root = self.territory.root();
-        // The origin, because the origin is where the first file would have
-        // settled anyway: the growth starts from nothing and hugs itself, so the
-        // oldest ground is the ground around the first plot. There is no city
-        // limit to take a centroid of any more, and there does not need to be.
         self.settle_plot(root, [0.0, 0.0], 0);
         // Counted like any other placement, so the ladder's tallies add up to
         // the plot count exactly and a plot can never go unaccounted for.
         self.relaxed.clean += 1;
+    }
+
+    /// Ground one district's files will eventually need, in world units².
+    fn expected_area(&self, files: u32, age: f64) -> f64 {
+        if files == 0 {
+            return 0.0;
+        }
+        let cap = f64::from(self.params.cap_at(age)).max(1.0);
+        let plots = (f64::from(files) / cap).ceil().max(1.0);
+        plots * self.params.plot_area_at(age)
+    }
+
+    /// Radius of the ground that much area covers, with the slack a real
+    /// settlement leaves in it ([`TOWN_SLACK`]).
+    fn expected_radius(&self, files: u32, age: f64) -> f64 {
+        (self.expected_area(files, age) / std::f64::consts::PI).sqrt() * TOWN_SLACK
+    }
+
+    /// The town's expected radius.
+    ///
+    /// Summed **per district at its own grain**, not taken at the mean age: the
+    /// separation ramps five to one across the ramp and its square ramps
+    /// twenty-five to one, so a single-age estimate of a repository whose files
+    /// are mostly recent is out by a factor of three. Measured against the
+    /// finished cities, this lands within 15 % on all three corpora, which is
+    /// all it has to do — it sets a spacing, and the growth fills whatever it
+    /// leaves.
+    fn town_reach(&self) -> f64 {
+        let mut area = 0.0;
+        for d in 0..self.territory.nodes.len() {
+            let node = &self.territory.nodes[d];
+            if node.own_files == 0 {
+                continue;
+            }
+            let id = u32::try_from(d).expect("district count fits in u32");
+            area += self.expected_area(node.own_files, self.district_age(id));
+        }
+        if area <= 0.0 {
+            area = self.expected_area(self.total_files, 0.5);
+        }
+        (area / std::f64::consts::PI).sqrt() * TOWN_SLACK
+    }
+
+    /// The packages that get a quarter of their own, oldest first.
+    ///
+    /// A **top-level** package, because that is the unit PRD §9 colours and the
+    /// unit `regions` keeps in one piece; and the founding district is the
+    /// directory the package's oldest file is actually in, so the founding plot
+    /// carries the package's real age rather than `u32::MAX` for a directory
+    /// that holds only subdirectories.
+    fn founding_packages(&self) -> Vec<(u32, u32)> {
+        let root = self.territory.root();
+        let Some(node) = self.territory.nodes.get(root as usize) else {
+            return Vec::new();
+        };
+        let total = f64::from(self.total_files.max(1));
+        let floor = QUARTER_FILES.max((total * QUARTER_SHARE).round() as u32);
+        let ceiling = (total * QUARTER_CEILING).round() as u32;
+
+        // Start at the top level, then **split whatever is too big to be one
+        // quarter**. Top-level packages are the right unit for a repository like
+        // the synthetic corpus, where a dozen of them share the tree; they are
+        // the wrong unit for a real one, where `django/` is 95 % of the files
+        // and `src/` plus `runtime/` are all of Neovim. Measured with no descent
+        // at all: two sites on Django and two on Neovim, and the correlation
+        // stayed at +0.56 and +0.60 — the founding did nothing, because nothing
+        // was founded.
+        //
+        // A node that is split keeps its place in the list when it has files of
+        // its own, so those files still have ground to seed from.
+        let mut frontier: Vec<u32> = node
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| self.territory.nodes[c as usize].subtree_files > 0)
+            .collect();
+        // A node that is split but kept — because it has files of its own —
+        // stays in the list and must never be split twice, or the loop grows
+        // nothing and never ends.
+        let mut expanded: Vec<u32> = Vec::new();
+        loop {
+            if frontier.len() >= MAX_QUARTERS {
+                break;
+            }
+            // The heaviest node over the ceiling that has somewhere to go.
+            // Integer keys and tree indices only (PRD §7.4).
+            let pick = frontier
+                .iter()
+                .enumerate()
+                .filter(|&(_, &d)| {
+                    let n = &self.territory.nodes[d as usize];
+                    !expanded.contains(&d)
+                        && n.subtree_files > ceiling
+                        && n.children
+                            .iter()
+                            .filter(|&&c| self.territory.nodes[c as usize].subtree_files > 0)
+                            .count()
+                            >= 2
+                })
+                .max_by_key(|&(i, &d)| {
+                    (
+                        self.territory.nodes[d as usize].subtree_files,
+                        Reverse(d),
+                        Reverse(i),
+                    )
+                })
+                .map(|(i, _)| i);
+            let Some(i) = pick else {
+                break;
+            };
+            let d = frontier[i];
+            let kids: Vec<u32> = self.territory.nodes[d as usize]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.territory.nodes[c as usize].subtree_files > 0)
+                .collect();
+            expanded.push(d);
+            if self.territory.nodes[d as usize].own_files > 0 {
+                frontier.extend(kids);
+            } else {
+                frontier.remove(i);
+                frontier.extend(kids);
+            }
+            frontier.sort_unstable();
+            frontier.dedup();
+        }
+
+        let mut big: Vec<(u32, u32, u32)> = frontier
+            .into_iter()
+            .filter_map(|c| {
+                let kid = &self.territory.nodes[c as usize];
+                (kid.subtree_files >= floor).then_some((kid.subtree_files, kid.oldest, c))
+            })
+            .collect();
+        // Biggest first, ties by age then by index — every key is an integer or
+        // a tree position, so no float comparison decides which package founds a
+        // quarter (PRD §7.4).
+        big.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        big.truncate(MAX_QUARTERS);
+        // …then oldest first, so the oldest quarter is the one that keeps the
+        // civic square and the rest are sited around it.
+        big.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+        let mut seats: Vec<u32> = Vec::new();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for (_, _, c) in big {
+            // A node that was split and a child of it can name the same oldest
+            // leaf; one site each would put two quarters on one piece of ground.
+            let seat = if self.territory.nodes[c as usize].own_files > 0 {
+                c
+            } else {
+                self.founding_district(c)
+            };
+            if seats.contains(&seat) {
+                continue;
+            }
+            seats.push(seat);
+            out.push((c, seat));
+        }
+        out
+    }
+
+    /// The directory inside `pkg` that holds its oldest file.
+    ///
+    /// Used for the **age** of the quarter's founding ground, not for its
+    /// ownership: the plot itself belongs to `pkg`, because a nucleus planted on
+    /// a leaf is ground only that leaf's own files can seed from — its four
+    /// sibling directories walk up to a parent with no ground, fall through to
+    /// the root, and found themselves back at the civic square. Measured on a
+    /// fixture with two old subsystems, that put four fifths of each quarter
+    /// back at the origin and left the correlation exactly where it started.
+    ///
+    /// Depth-first over `children`, which the territory orders by
+    /// `(oldest, path)`, so this is a deterministic walk and never a search.
+    fn founding_district(&self, pkg: u32) -> u32 {
+        let mut best = pkg;
+        let mut best_key = (self.territory.nodes[pkg as usize].own_oldest, pkg);
+        let mut stack = vec![pkg];
+        while let Some(d) = stack.pop() {
+            let node = &self.territory.nodes[d as usize];
+            if node.own_files > 0 && (node.own_oldest, d) < best_key {
+                best_key = (node.own_oldest, d);
+                best = d;
+            }
+            stack.extend(node.children.iter().copied());
+        }
+        best
+    }
+
+    /// How good a piece of ground is to found on: PRD §7.2's terrain, read with
+    /// the same two weights the growth scores every other candidate with.
+    fn ground_score(&self, c: Pt) -> f64 {
+        let (h, gx, gy) = self.terrain.sample(c[0], c[1]);
+        let relief = f64::from(self.terrain.relief()).max(1e-9);
+        let slope = (gx * gx + gy * gy).sqrt();
+        self.params.w_noise * (h / relief) - self.params.w_slope * slope
+    }
+
+    /// Which way the ground invites the town to grow, as a unit vector.
+    ///
+    /// One bearing, sampled once, from the terrain alone. It is the only radial
+    /// quantity in the founding and it is a *direction*, not a gradient: the
+    /// quarters are then chosen off a lattice laid down that way, so nothing on
+    /// the map is graded by distance from anywhere.
+    fn growth_bearing(&self, reach: f64) -> Pt {
+        let mut best: Option<(f64, Pt)> = None;
+        for k in 0..BEARING_SAMPLES {
+            let ang = TAU * f64::from(k) / f64::from(BEARING_SAMPLES);
+            let (sn, cs) = det_sin_cos(ang);
+            let u = [cs, sn];
+            // Averaged over the run out to the reach, so one lucky hilltop does
+            // not decide where a town of five thousand files goes.
+            let mut score = 0.0;
+            for step in 1..=4 {
+                let r = reach * f64::from(step) / 4.0;
+                score += self.ground_score([u[0] * r, u[1] * r]);
+            }
+            let key = quantize_f64(score);
+            if best.is_none_or(|(b, bu)| key > b || (key == b && (u[0], u[1]) < (bu[0], bu[1]))) {
+                best = Some((key, u));
+            }
+        }
+        best.map_or([1.0, 0.0], |(_, u)| u)
+    }
+
+    /// Found the town: the civic square, then one quarter per big package, each
+    /// sited off the terrain and joined to the settlement by a causeway.
+    ///
+    /// Called once, before the first file. A repository with fewer than two
+    /// qualifying packages is founded exactly as it was before — one seed at the
+    /// origin — because a town with one quarter is a town with one quarter, and
+    /// inventing a second one for a 90-file repository would be a lie about its
+    /// history.
+    fn found(&mut self) {
+        self.reserve_civic();
+        let packages = self.founding_packages();
+        if packages.len() < 2 {
+            return;
+        }
+        let reach = self.town_reach();
+        if !(reach.is_finite() && reach > self.params.sep_rim * 2.0) {
+            return;
+        }
+        let bearing = self.growth_bearing(reach);
+        let centre = qp([
+            bearing[0] * reach * SITE_OFFSET,
+            bearing[1] * reach * SITE_OFFSET,
+        ]);
+
+        // A quarter's **kin**: the top-level package it belongs to. Quarters of
+        // one package are drawn toward each other, so `django/db`,
+        // `django/forms` and `django/contrib` are neighbouring quarters of one
+        // district rather than three quarters scattered among strangers. It is
+        // truer — a package really is one part of town — and it is also what
+        // keeps `regions` able to make the package one connected region, which
+        // is asserted absolutely and was seen to fail once when the sites were
+        // scattered without it.
+        let kin = crate::districts::package_of(&self.territory);
+        let kin_of = |d: u32| kin.get(&d).copied().unwrap_or(0);
+
+        // The oldest quarter keeps the civic square's ground: it is the old
+        // town, and its own nucleus goes beside the square rather than out on
+        // the lattice.
+        let (first, first_seat) = packages[0];
+        let first_age = self.district_age(first_seat);
+        let first_born = self.territory.nodes[first_seat as usize].own_oldest;
+        self.plant_quarter([0.0, 0.0], first, self.params.cap_at(first_age), first_born);
+        let mut placed: Vec<Quarter> = vec![Quarter {
+            site: [0.0, 0.0],
+            radius: self.expected_radius(
+                self.territory.nodes[first as usize].subtree_files,
+                first_age,
+            ),
+            package: kin_of(first),
+        }];
+
+        for &(pkg, seat) in &packages[1..] {
+            let age = self.district_age(seat);
+            let born = self.territory.nodes[seat as usize].own_oldest;
+            let radius =
+                self.expected_radius(self.territory.nodes[pkg as usize].subtree_files, age);
+            let package = kin_of(pkg);
+            let Some(site) = self.quarter_site(centre, reach, radius, package, &placed) else {
+                continue;
+            };
+            // Claimed whether or not it is reached, so the next package looks
+            // somewhere else rather than at the same piece of ground again.
+            placed.push(Quarter {
+                site,
+                radius,
+                package,
+            });
+            self.lay_causeway(site, pkg, self.params.cap_at(age), born);
+        }
+    }
+
+    /// The best unclaimed piece of ground for a quarter of this size.
+    ///
+    /// The candidate set is a jittered lattice over the region the town will
+    /// occupy — not a ring, and not a sweep outward from anything. A site is
+    /// rejected outright when it would sit inside a quarter already placed, and
+    /// scored on the ground under it plus how far it is from its neighbours.
+    fn quarter_site(
+        &self,
+        centre: Pt,
+        reach: f64,
+        radius: f64,
+        package: u32,
+        placed: &[Quarter],
+    ) -> Option<Pt> {
+        let step = (reach * SITE_STEP).max(self.params.sep_rim);
+        let n = (SITE_REACH / SITE_STEP).ceil() as i32;
+        let span = reach * SITE_REACH;
+        let mut best: Option<(f64, Pt)> = None;
+        for iy in -n..=n {
+            for ix in -n..=n {
+                let mut rng = SeededRng::for_seed(
+                    combine_seeds(
+                        self.params.terrain_seed ^ 0x5175_4152_5445_5200,
+                        ((i64::from(ix) << 32) ^ i64::from(iy)) as u64,
+                    ),
+                    "quarter.site",
+                );
+                let jx = (rng.next_f64() - 0.5) * 2.0 * SITE_JITTER;
+                let jy = (rng.next_f64() - 0.5) * 2.0 * SITE_JITTER;
+                let c = qp([
+                    centre[0] + (f64::from(ix) + jx) * step,
+                    centre[1] + (f64::from(iy) + jy) * step,
+                ]);
+                if dist(c, centre) > span {
+                    continue;
+                }
+                let mut nearest = f64::INFINITY;
+                let mut nearest_kin = f64::INFINITY;
+                let mut clash = false;
+                for q in placed {
+                    let d = dist(c, q.site);
+                    if d < QUARTER_GAP * (q.radius + radius) {
+                        clash = true;
+                        break;
+                    }
+                    nearest = nearest.min(d);
+                    if q.package == package {
+                        nearest_kin = nearest_kin.min(d);
+                    }
+                }
+                if clash {
+                    continue;
+                }
+                let spread = if nearest.is_finite() {
+                    (nearest / (radius * SITE_ELBOW).max(1e-9)).min(1.0)
+                } else {
+                    1.0
+                };
+                let kin = if nearest_kin.is_finite() {
+                    1.0 - (nearest_kin / span.max(1e-9)).min(1.0)
+                } else {
+                    0.0
+                };
+                let pull = (dist(c, centre) / span.max(1e-9)).min(1.0);
+                let score = quantize_f64(
+                    self.ground_score(c) + SITE_SPREAD * spread + SITE_KIN * kin - SITE_PULL * pull,
+                );
+                let better = best.is_none_or(|(b, bp)| {
+                    score > b || (score == b && (c[0], c[1]) < (bp[0], bp[1]))
+                });
+                if better {
+                    best = Some((score, c));
+                }
+            }
+        }
+        best.map(|(_, c)| c)
+    }
+
+    /// Is this position legal ground for a plot of separation `sep`?
+    ///
+    /// The packing rule only. The connectivity rule is the causeway's business
+    /// and is satisfied by how the chain is built, not by a test after the fact.
+    fn legal_here(&self, c: Pt, sep: f64) -> bool {
+        let mut ok = true;
+        let plots = &self.plots;
+        self.grid.scan_while(c, sep, |pi| {
+            if dist(c, plots[pi as usize].pos) < sep - 1e-6 {
+                ok = false;
+                return false;
+            }
+            true
+        });
+        ok
+    }
+
+    /// Distance from `at` to the nearest settled plot, and where it is.
+    fn nearest_plot(&self, at: Pt) -> Option<(f64, Pt)> {
+        if self.plots.is_empty() {
+            return None;
+        }
+        let mut r = self.params.sep_rim * 2.0;
+        for _ in 0..14 {
+            let mut best: Option<(f64, Pt)> = None;
+            let plots = &self.plots;
+            self.grid.scan(at, r, |pi| {
+                let q = plots[pi as usize].pos;
+                let d = quantize_f64(dist(at, q));
+                if best.is_none_or(|(bd, bp)| d < bd || (d == bd && (q[0], q[1]) < (bp[0], bp[1])))
+                {
+                    best = Some((d, q));
+                }
+            });
+            if best.is_some() {
+                return best;
+            }
+            r *= 2.0;
+        }
+        None
+    }
+
+    /// Settle the road out to a new quarter, and the quarter's first plot at the
+    /// end of it. `true` when the quarter was founded.
+    ///
+    /// One plot at a time, each inside the connectivity reach of the one before
+    /// it, so the induction that makes `components = 1` — every plot after the
+    /// first is within [`Params::touch_max`] separations of an earlier one —
+    /// covers the causeway exactly as it covers the growth. The step bends onto
+    /// the best of [`CAUSEWAY_BEND`]'s offsets, so the road follows the ground
+    /// rather than ruling a line across it.
+    ///
+    /// The founding plot belongs to the **package**, not to the directory its
+    /// age was read from, so every directory under the package seeds from it.
+    ///
+    /// The **last plot of the causeway is the founding plot**, and it has to be:
+    /// an old package's separation is a fifth of the rim's, so its reach is a
+    /// fifth too, and a quarter left one causeway stride short of its own site
+    /// could never bud the rest of the way. A walk that cannot close founds
+    /// nothing and says so.
+    fn lay_causeway(&mut self, target: Pt, did: u32, cap: u32, born: u32) -> bool {
+        let reach = self.params.sep_rim * self.params.touch_max;
+        let stride = reach * CAUSEWAY_STRIDE;
+        let sep = self.params.sep_rim;
+        let road = self.territory.root();
+        let road_cap = self.params.cap_at(1.0);
+        let Some((start, _)) = self.nearest_plot(target) else {
+            return false;
+        };
+        let mut budget = 4 + (start / stride).ceil().max(0.0) as usize * 2;
+        loop {
+            let Some((d, from)) = self.nearest_plot(target) else {
+                return false;
+            };
+            if d <= reach {
+                // The site is in reach of the town. The quarter's own plot goes
+                // on it, or — when the growth has already taken that ground — on
+                // the nearest legal position beside it.
+                return self.plant_quarter(target, did, cap, born);
+            }
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            let to = sub(target, from);
+            let l = len(to);
+            if l < 1e-9 {
+                return false;
+            }
+            let dir = mul(to, 1.0 / l);
+            // **The last step lands the quarter itself.** Between `reach` and
+            // `reach + sep` there is a dead zone: too far for the site to be
+            // connected, too near for another causeway plot to fit in front of
+            // it. Walking into it is how a causeway got stuck 0.02 units outside
+            // the reach on Django and abandoned a quarter of 2 581 files. So the
+            // step that would land inside it is simply the founding plot.
+            let closing = d - stride <= reach;
+            let mut best: Option<(f64, Pt)> = None;
+            for bend in CAUSEWAY_BEND {
+                let (sn, cs) = det_sin_cos(bend);
+                let u = [dir[0] * cs - dir[1] * sn, dir[0] * sn + dir[1] * cs];
+                let c = qp([
+                    from[0] + u[0] * stride.min(d),
+                    from[1] + u[1] * stride.min(d),
+                ]);
+                // Never step away from the site, and never onto ground that is
+                // already taken.
+                if dist(c, target) >= d || !self.legal_here(c, sep) {
+                    continue;
+                }
+                let score = quantize_f64(self.ground_score(c));
+                let better = best.is_none_or(|(b, bp)| {
+                    score > b || (score == b && (c[0], c[1]) < (bp[0], bp[1]))
+                });
+                if better {
+                    best = Some((score, c));
+                }
+            }
+            let Some((_, c)) = best else {
+                return false;
+            };
+            if closing {
+                self.settle_born(did, c, cap, born);
+                self.relaxed.clean += 1;
+                return true;
+            }
+            self.settle_born(road, c, road_cap, born);
+            self.relaxed.clean += 1;
+        }
+    }
+
+    /// Put the quarter's founding plot on its site, or as near it as the packing
+    /// distance allows.
+    ///
+    /// The caller has already brought the settlement inside the connectivity
+    /// reach of `site`, so every position tested here satisfies that rule too:
+    /// they are all within one separation of the site.
+    fn plant_quarter(&mut self, site: Pt, did: u32, cap: u32, born: u32) -> bool {
+        let sep = self.params.sep_rim;
+        if self.legal_here(site, sep) {
+            self.settle_born(did, site, cap, born);
+            self.relaxed.clean += 1;
+            return true;
+        }
+        let mut best: Option<(f64, Pt)> = None;
+        for k in 0..BAND_ANGLES {
+            let ang = TAU * f64::from(k) / f64::from(BAND_ANGLES);
+            let (sn, cs) = det_sin_cos(ang);
+            let c = qp([site[0] + cs * sep * 1.05, site[1] + sn * sep * 1.05]);
+            if !self.legal_here(c, sep) {
+                continue;
+            }
+            let score = quantize_f64(self.ground_score(c));
+            let better = best
+                .is_none_or(|(b, bp)| score > b || (score == b && (c[0], c[1]) < (bp[0], bp[1])));
+            if better {
+                best = Some((score, c));
+            }
+        }
+        let Some((_, c)) = best else {
+            return false;
+        };
+        self.settle_born(did, c, cap, born);
+        self.relaxed.clean += 1;
+        true
     }
 
     /// One growth step: place one file.
@@ -1269,18 +2107,33 @@ impl Settlement {
     }
 
     /// Record a new plot.
+    ///
+    /// The plot's age is its district's, so the road mesh and the block sizes
+    /// around it follow the same ramp its spacing did. Stored raw, `u32::MAX`
+    /// included: the ramp, not a clamp, decides what an index it never saw reads
+    /// as.
     fn settle_plot(&mut self, did: u32, pos: Pt, cap: u32) -> u32 {
+        let birth = self.territory.nodes[did as usize].own_oldest;
+        self.settle_born(did, pos, cap, birth)
+    }
+
+    /// [`Settlement::settle_plot`], with the age of the ground given rather than
+    /// taken from the district.
+    ///
+    /// The one caller is the causeway. Its plots are the **root's** ground —
+    /// they are the road out of town, not part of any quarter, and leaving them
+    /// with the quarter would drag that quarter's whole search back along them
+    /// to the old town — but their age is the age of the quarter they reach.
+    /// Left to the root's own age they would read as the oldest ground in the
+    /// city and the prune ramp would lay a fine mesh down an empty road.
+    fn settle_born(&mut self, did: u32, pos: Pt, cap: u32, birth: u32) -> u32 {
         let id = u32::try_from(self.plots.len()).expect("plot count fits in u32");
         self.plots.push(Plot {
             pos,
             district: did,
             files: Vec::new(),
             cap,
-            // The plot's age is its district's, so the road mesh and the block
-            // sizes around it follow the same ramp its spacing did. Stored raw,
-            // `u32::MAX` included: the ramp, not a clamp, decides what an index
-            // it never saw reads as.
-            birth: self.territory.nodes[did as usize].own_oldest,
+            birth,
         });
         self.grid.insert(pos, id);
         // Optimistic: the refresh below tests it properly.
@@ -1483,6 +2336,12 @@ pub(crate) fn grow(
     files.sort_by(|a, b| (a.growth_index, a.path.as_str()).cmp(&(b.growth_index, b.path.as_str())));
     let total = u32::try_from(files.len()).unwrap_or(u32::MAX);
     let mut s = Settlement::new(territory, params, terrain, ramp, total);
+    // The founding runs once, before the first file: the quarters have to be
+    // sited over the ground the town will *end up* occupying, which is not
+    // knowable one file at a time. Everything after it is the same single growth
+    // step the incremental path calls, so a city grown a file at a time and one
+    // generated from scratch are still the same city (PRD §7.7).
+    s.found();
     for f in files {
         s.add_file(f);
     }
@@ -1647,6 +2506,316 @@ mod tests {
         assert!(p.sep_at(0.0) < p.sep_at(1.0));
         assert!(p.cap_at(0.0) <= p.cap_at(1.0));
         assert!(p.plot_area_at(1.0) > p.plot_area_at(0.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // The founding (PRD §7.1): several quarters, sited off the terrain
+    // -----------------------------------------------------------------------
+
+    /// A repository with **two** old subsystems and two later ones, each of
+    /// which keeps growing after it is founded.
+    ///
+    /// Two old ones, because that is the case the founding exists for: PRD §7.1
+    /// asks for an old town, and a repository that grew from two roots has two
+    /// of them. And every package keeps receiving files — in new subdirectories,
+    /// which is what a real one does — so each quarter carries its own age
+    /// gradient instead of one flat age. A fixture where a package is uniformly
+    /// old or uniformly new has a genuine single density centre and cannot tell
+    /// the two growths apart.
+    fn quartered_paths() -> Vec<String> {
+        const BORN: [(&str, usize); 4] =
+            [("alpha", 0), ("omega", 1), ("middle", 340), ("recent", 560)];
+        let mut out = vec!["README.md".to_owned()];
+        let mut count = [0usize; 4];
+        for step in 0..880 {
+            let k = step % 4;
+            let (name, born) = BORN[k];
+            if step < born {
+                continue;
+            }
+            // A new subdirectory every dozen files, so the package's own
+            // districts are founded across its whole life.
+            out.push(format!("{name}/mod{:02}/f{}.rs", count[k] / 12, count[k]));
+            count[k] += 1;
+        }
+        out
+    }
+
+    fn quartered_records() -> Vec<FileRec> {
+        let owned = quartered_paths();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        corpus(&refs)
+    }
+
+    fn quartered() -> Settlement {
+        settle_records(quartered_records())
+    }
+
+    /// The same corpus grown the way it was grown before the founding existed:
+    /// one seed at the origin, everything budding outward from it.
+    ///
+    /// This is the control. It is not a copy of the pipeline — it is the
+    /// pipeline with [`Settlement::found`] left out, which is exactly the change
+    /// under test.
+    fn unfounded() -> Settlement {
+        let mut files = quartered_records();
+        files.sort_by(|a, b| {
+            (a.growth_index, a.path.as_str()).cmp(&(b.growth_index, b.path.as_str()))
+        });
+        let total = u32::try_from(files.len()).expect("small");
+        let params = Params::for_file_count(files.len());
+        let terrain = crate::terrain::TerrainField::generate(0x51, 100.0);
+        let ramp = ramp_of(&files);
+        let t = territory::build(&crate::districts::demands(&files), &|p| {
+            p.as_str().starts_with("vendor")
+        });
+        let mut s = Settlement::new(t, params, terrain, ramp, total);
+        for f in files {
+            s.add_file(f);
+        }
+        s
+    }
+
+    /// The correlation between distance from the densest point and
+    /// nearest-neighbour spacing — the statistic the fresh-eyes review measured
+    /// on the renders, computed here on the ground itself.
+    fn drain(s: &Settlement) -> f64 {
+        let pts: Vec<Pt> = s.plots.iter().map(|p| p.pos).collect();
+        let spacing: Vec<f64> = pts
+            .iter()
+            .map(|p| {
+                pts.iter()
+                    .filter(|q| *q != p)
+                    .map(|q| dist(*p, *q))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..pts.len()).collect();
+        order.sort_by(|&a, &b| spacing[a].total_cmp(&spacing[b]));
+        let tight = &order[..(pts.len() / 10).max(3)];
+        let acc = mul(
+            tight.iter().fold([0.0, 0.0], |a, &i| add(a, pts[i])),
+            1.0 / tight.len() as f64,
+        );
+        let radius: Vec<f64> = pts.iter().map(|p| dist(*p, acc)).collect();
+        pearson(&radius, &spacing)
+    }
+
+    /// **The axle.** Spacing must be less of a function of distance-from-a-point
+    /// than it was before the founding.
+    ///
+    /// Asserted against the control rather than against a constant, because the
+    /// number a corpus can reach depends on the corpus — the fresh-eyes review
+    /// measured +0.553 to +0.584 on three real cities and this fixture is 133
+    /// files. What is asserted is that the mechanism does its job, and the
+    /// control is this same pipeline with the mechanism taken out.
+    #[test]
+    fn the_founding_flattens_the_radial_density_field() {
+        let before = drain(&unfounded());
+        let after = drain(&quartered());
+        assert!(
+            after + 0.12 < before,
+            "the founding moved the drain from {before:+.3} only to {after:+.3}"
+        );
+    }
+
+    /// Two old subsystems, two old quarters — and they are somewhere else from
+    /// each other.
+    ///
+    /// The density gradient is allowed, and required, to exist; what is not
+    /// allowed is for it to have one centre.
+    #[test]
+    fn two_old_subsystems_get_two_old_quarters() {
+        let s = quartered();
+        let alpha = s.territory.get(&lp("alpha")).expect("alpha");
+        let omega = s.territory.get(&lp("omega")).expect("omega");
+        // The **core** of a package's quarter: the centroid of its oldest and
+        // tightest ground, not of everything it owns. A package spreads as it
+        // grows; what has to be in two places is the dense old part of it.
+        let core = |pkg: u32| -> Pt {
+            let mut mine: Vec<(u32, Pt)> = Vec::new();
+            for plot in &s.plots {
+                let mut up = Some(plot.district);
+                while let Some(d) = up {
+                    if d == pkg {
+                        mine.push((plot.birth, plot.pos));
+                        break;
+                    }
+                    up = s.territory.nodes[d as usize].parent;
+                }
+            }
+            assert!(!mine.is_empty(), "a founding package settled no ground");
+            mine.sort_by(|x, y| {
+                x.0.cmp(&y.0)
+                    .then_with(|| x.1[0].total_cmp(&y.1[0]))
+                    .then_with(|| x.1[1].total_cmp(&y.1[1]))
+            });
+            mine.truncate((mine.len() / 4).max(1));
+            let n = mine.len() as f64;
+            mul(
+                mine.iter().fold([0.0, 0.0], |acc, (_, p)| add(acc, *p)),
+                1.0 / n,
+            )
+        };
+        let a = core(alpha);
+        let o = core(omega);
+        let radius = s
+            .plots
+            .iter()
+            .map(|p| dist(p.pos, s.town_centre()))
+            .fold(0.0, f64::max);
+        let apart = dist(a, o);
+        assert!(
+            apart > 0.30 * radius,
+            "the two old quarters are {apart:.1} apart in a town of radius {radius:.1}"
+        );
+    }
+
+    /// PRD §7.1's age structure has to survive the fix that killed the axle.
+    ///
+    /// The oldest ground must still be measurably finer-grained than the newest
+    /// — this is the number the naive fix (flatten the ramp) trades away, and it
+    /// is the spec.
+    #[test]
+    fn the_age_gradient_survives_the_founding() {
+        let s = quartered();
+        let mut by_age: Vec<(f64, f64)> = s
+            .plots
+            .iter()
+            .map(|p| (s.ramp.at(p.birth), s.params.sep_at(s.ramp.at(p.birth))))
+            .collect();
+        by_age.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let q = by_age.len() / 4;
+        assert!(q >= 2, "too few plots to quartile");
+        let median = |v: &[(f64, f64)]| {
+            let mut m: Vec<f64> = v.iter().map(|x| x.1).collect();
+            m.sort_by(f64::total_cmp);
+            m[m.len() / 2]
+        };
+        let oldest = median(&by_age[..q]);
+        let newest = median(&by_age[by_age.len() - q..]);
+        assert!(
+            newest > oldest * 1.25,
+            "the newest ground is only {newest:.3} to the oldest ground's {oldest:.3}"
+        );
+    }
+
+    /// The civic square is at the origin, and the origin is **not** the middle
+    /// of the map (PRD §8: the *historic* centre).
+    #[test]
+    fn the_civic_square_is_not_the_centre_of_the_map() {
+        let s = quartered();
+        assert_eq!(s.plots[0].cap, 0, "the first plot is not the civic square");
+        assert_eq!(s.plots[0].pos, [0.0, 0.0]);
+        let centre = s.town_centre();
+        let radius = s
+            .plots
+            .iter()
+            .map(|p| dist(p.pos, centre))
+            .fold(0.0, f64::max);
+        let off = dist([0.0, 0.0], centre);
+        assert!(
+            off > 0.10 * radius,
+            "the civic square sits {:.1}% of the radius from the centre of the map",
+            off / radius * 100.0
+        );
+    }
+
+    /// The founding settles plots directly, outside the candidate loop, so the
+    /// two hard rules have to be re-asserted against it: nothing overlaps, and
+    /// nothing is founded across a gap.
+    #[test]
+    fn the_founding_keeps_both_hard_rules() {
+        let s = quartered();
+        let reach = s.params.sep_rim * s.params.touch_max;
+        for (i, p) in s.plots.iter().enumerate() {
+            for q in &s.plots[i + 1..] {
+                assert!(
+                    dist(p.pos, q.pos) >= s.params.sep_core - 1e-3,
+                    "two plots are {} apart",
+                    dist(p.pos, q.pos)
+                );
+            }
+            if i == 0 {
+                continue;
+            }
+            let nearest = s.plots[..i]
+                .iter()
+                .map(|q| dist(p.pos, q.pos))
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest <= reach + 1e-6,
+                "plot {i} was founded {nearest} from the nearest ground, past {reach}"
+            );
+        }
+    }
+
+    /// The founding is a pure function of the repository, like everything else
+    /// in this crate (PRD §7.4).
+    #[test]
+    fn the_founding_is_deterministic() {
+        let a = quartered();
+        let b = quartered();
+        assert_eq!(a.plots.len(), b.plots.len());
+        for (x, y) in a.plots.iter().zip(b.plots.iter()) {
+            assert_eq!(x.pos, y.pos);
+            assert_eq!(x.district, y.district);
+            assert_eq!(x.birth, y.birth);
+        }
+        // And the input order cannot reach it: `grow` sorts, and the founding
+        // reads the territory, which is sorted too.
+        let mut shuffled = quartered_records();
+        shuffled.reverse();
+        shuffled.rotate_left(7);
+        let c = settle_records(shuffled);
+        assert_eq!(a.plots.len(), c.plots.len());
+        for (x, y) in a.plots.iter().zip(c.plots.iter()) {
+            assert_eq!(x.pos, y.pos);
+        }
+    }
+
+    /// The grain field moves a district's separation without taking it outside
+    /// the ramp: `[sep_core, sep_rim]` are the two numbers every other invariant
+    /// in this module is stated against.
+    #[test]
+    fn the_grain_field_stays_inside_the_ramp() {
+        let s = quartered();
+        for d in 0..s.territory.nodes.len() {
+            let id = u32::try_from(d).expect("fits");
+            let sep = s.sep_of(id);
+            assert!(
+                sep <= s.params.sep_rim + 1e-9 && sep >= s.params.sep_core - 1e-9,
+                "district {d} has separation {sep}"
+            );
+        }
+        // And it is a real field, not a constant: two places disagree.
+        let a = s.grain_at([0.0, 0.0]);
+        let b = s.grain_at([40.0, -25.0]);
+        assert!((a - b).abs() > 0.01, "the grain field is flat: {a} vs {b}");
+    }
+
+    /// A repository with one big package is founded exactly as it was before —
+    /// one seed at the origin. Inventing a second quarter for it would be a lie
+    /// about its history.
+    #[test]
+    fn one_package_is_still_one_town() {
+        let paths: Vec<String> = (0..30).map(|i| format!("only/f{i}.rs")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let s = settle(&refs);
+        assert_eq!(s.founding_packages().len(), 1);
+    }
+
+    fn pearson(x: &[f64], y: &[f64]) -> f64 {
+        let n = x.len() as f64;
+        let mx = x.iter().sum::<f64>() / n;
+        let my = y.iter().sum::<f64>() / n;
+        let sxy: f64 = x.iter().zip(y).map(|(a, b)| (a - mx) * (b - my)).sum();
+        let sxx: f64 = x.iter().map(|a| (a - mx) * (a - mx)).sum();
+        let syy: f64 = y.iter().map(|b| (b - my) * (b - my)).sum();
+        if sxx <= 0.0 || syy <= 0.0 {
+            return 0.0;
+        }
+        sxy / (sxx * syy).sqrt()
     }
 
     /// The street frame is a pair of perpendicular unit axes, and a candidate

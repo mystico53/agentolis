@@ -11,6 +11,17 @@
 //! 5 474 buildings on parcels that had not moved. The step was recomputing
 //! essentially the whole city to record a change to a thousandth of it.
 //!
+//! # The boundary matters as much as the cache
+//!
+//! [`CutCache`] first remembered `crate::lots::subdivide_weighted`'s bare rings.
+//! That is **0.4 ms** of a growth step. The 7.1 ms that turns those rings into
+//! parcels — probing each for an interior point clear of the carriageway,
+//! splitting the roomiest again until the block has one per file, and the
+//! frontage sort — was outside it, and so was paid on every step whether
+//! anything had moved or not. The stored value is a [`BlockCut`] now: the same
+//! key with one extra word in it, and six milliseconds a step that were being
+//! spent re-deriving parcels nobody had touched.
+//!
 //! # These are caches of pure functions, not an approximation
 //!
 //! Both stages memoised here are pure functions of their arguments and read
@@ -29,15 +40,37 @@
 //! # Why a cache and not a smaller recomputation
 //!
 //! Because *which* blocks change is not known until they have been rebuilt. The
-//! road graph is welded from the whole cell set, its faces are re-walked, and
-//! block indices shift when the face count changes — so an add cannot be
-//! localised upstream without a stable block identity, which the pipeline does
-//! not currently have (a block's cut seed is mixed from its **index**, so the
-//! blocks after an inserted face legitimately re-cut). Comparing the rebuilt
-//! arguments against the previous step's is the cheap, exact way to discover
-//! what genuinely moved. Measured hit rates at 5 000 files, twelve adds: **99 %**
-//! on a step that leaves the block count alone, **55 %** on a step that changes
-//! it.
+//! road graph is welded from the whole cell set and its faces are re-walked, so
+//! an add cannot be localised upstream. Comparing the rebuilt arguments against
+//! the previous step's is the cheap, exact way to discover what genuinely moved.
+//!
+//! # A cache cannot help with work that genuinely has to be redone
+//!
+//! This module's header used to end there, and the two hit rates it quoted —
+//! 99 % on a step that leaves the block count alone, 55 % on a step that changes
+//! it — hid the fact that most of that 45 % was **not** a real change. Two seeds
+//! in the pipeline were derived from an array index, so inserting anything
+//! re-rolled the dice for everything after it:
+//!
+//! * `crate::lots::block_cut_seed` was `first file's path hash ^ block index * 31`;
+//! * `crate::roads::edge_identity` (the prune coin) was seeded from an edge's two
+//!   **node** indices, which the weld renumbers.
+//!
+//! Both are geometric or path-derived now, and both are documented where they
+//! live. Measured at 5 000 files, one added file: **242 of ~900 blocks changed
+//! shape before, 49 after**, and the buildings that had to be re-seated on a
+//! typical step fell from a quarter of the city to 3-13 of 4 577.
+//!
+//! What is left is real. On the six adds in twelve that settle a *new plot*,
+//! `crate::regions::partition` reassigns plots between districts and
+//! `regions::seat_files` then moves files between plots, so ~200 blocks of ~900
+//! get a different file list and legitimately have to be cut and seated again.
+//! No cache can help with that: the arguments changed. Making the partition
+//! incremental is the next fix, and it is upstream of this module.
+//!
+//! Measured hit rates now, at 5 000 files over twelve adds: **99.9 %** on a step
+//! that seats a file into an existing plot, 45-95 % on one that settles a new
+//! plot, 77 % (cuts) and 90 % (buildings) averaged.
 //!
 //! # Bounded
 //!
@@ -136,25 +169,59 @@ impl Counts {
 }
 
 // ---------------------------------------------------------------------------
-// Block subdivisions
+// Block parcellings
 // ---------------------------------------------------------------------------
 
-/// `crate::lots::subdivide_weighted`'s results, keyed on the whole of its input.
+/// One block cut into parcels, sorted, with each buildable parcel's proof that
+/// it clears the road.
+///
+/// # Why the cached value is this and not the raw subdivision
+///
+/// It used to be `crate::lots::subdivide_weighted`'s bare rings, and that put
+/// the cache boundary in the wrong place. Measured at 5 000 files, one growth
+/// step: the subdivision itself is **0.4 ms** and everything between it and the
+/// occupant assignment — probing every ring for an interior point clear of the
+/// carriageway, splitting the roomiest again until the block has a parcel per
+/// file, and the frontage sort — is **7.1 ms**, on *every* step, cache hit or
+/// miss, because none of it was remembered. That is a fifth of PRD §13.1's
+/// whole incremental budget spent re-deriving parcels that had not moved.
+///
+/// Every one of those stages is a pure function of the same arguments the
+/// subdivision already keys on, plus the number of files the block has to seat,
+/// so moving the boundary down to here costs one extra word in the key. What is
+/// deliberately left *outside* is the occupant assignment and the surplus
+/// splitting: those read the files' identities, and a file arriving is exactly
+/// the change a growth step is recording.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BlockCut {
+    /// Parcels that can carry a building, in frontage order, each with the
+    /// interior point that proved it clear of the road corridor and that
+    /// point's clearance.
+    pub(crate) viable: Vec<(Vec<Pt>, Pt, f64)>,
+    /// The rest, in a canonical order. Vacant ground (PRD §7.5).
+    pub(crate) spare: Vec<Vec<Pt>>,
+}
+
+/// `crate::lots::parcel_geometry`'s results, keyed on the whole of its input.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CutCache {
     entries: BTreeMap<u64, Vec<CachedCut>>,
     counts: Counts,
 }
 
-/// One remembered subdivision, with the whole of its input beside it.
+/// One remembered parcelling, with the whole of its input beside it.
 #[derive(Debug, Clone)]
 struct CachedCut {
     ring: Vec<Pt>,
     items: Vec<f64>,
     seed: u64,
+    /// How many files the block had to seat: the densify loop's budget and its
+    /// stopping condition, so two blocks that agree on everything else and not
+    /// on this are two different parcellings.
+    files: usize,
     /// `min_w`, `road_half`, `min_clear`, as bits.
     lengths: [u64; 3],
-    rings: Vec<Vec<Pt>>,
+    cut: BlockCut,
 }
 
 impl CutCache {
@@ -170,16 +237,17 @@ impl CutCache {
         }
     }
 
-    /// The subdivision for these exact arguments, computing it only when it is
+    /// The parcelling for these exact arguments, computing it only when it is
     /// not already known.
     pub(crate) fn cut(
         &mut self,
         ring: &[Pt],
         items: &[f64],
         seed: u64,
+        files: usize,
         lengths: [f64; 3],
-        compute: impl FnOnce() -> Vec<Vec<Pt>>,
-    ) -> Vec<Vec<Pt>> {
+        compute: impl FnOnce() -> BlockCut,
+    ) -> BlockCut {
         let bits = [
             lengths[0].to_bits(),
             lengths[1].to_bits(),
@@ -187,6 +255,7 @@ impl CutCache {
         ];
         let mut d = Digest::new();
         d.word(seed).ring(ring);
+        d.word(files as u64);
         d.word(items.len() as u64);
         for w in items {
             d.float(*w);
@@ -199,25 +268,27 @@ impl CutCache {
         if let Some(bucket) = self.entries.get(&key) {
             for entry in bucket {
                 if entry.seed == seed
+                    && entry.files == files
                     && entry.lengths == bits
                     && same_ring(&entry.ring, ring)
                     && same_floats(&entry.items, items)
                 {
                     self.counts.hits += 1;
-                    return entry.rings.clone();
+                    return entry.cut.clone();
                 }
             }
         }
         self.counts.misses += 1;
-        let rings = compute();
+        let cut = compute();
         self.entries.entry(key).or_default().push(CachedCut {
             ring: ring.to_vec(),
             items: items.to_vec(),
             seed,
+            files,
             lengths: bits,
-            rings: rings.clone(),
+            cut: cut.clone(),
         });
-        rings
+        cut
     }
 }
 
@@ -444,19 +515,30 @@ mod tests {
         vec![[0.0, 0.0], [scale, 0.0], [scale, scale], [0.0, scale]]
     }
 
-    /// One argument list for [`CutCache::cut`]: ring, weights, seed, lengths.
-    type Variant = (Vec<Pt>, Vec<f64>, u64, [f64; 3]);
+    /// A parcelling of one ring, as the cache stores one.
+    fn parcelling(scale: f64) -> BlockCut {
+        BlockCut {
+            viable: vec![(ring(scale), [scale * 0.5, scale * 0.5], scale)],
+            spare: Vec::new(),
+        }
+    }
+
+    /// One argument list for [`CutCache::cut`]: ring, weights, seed, file count,
+    /// lengths.
+    type Variant = (Vec<Pt>, Vec<f64>, u64, usize, [f64; 3]);
 
     /// A hit returns the stored value and does not run the computation again.
     #[test]
     fn an_identical_cut_is_not_recomputed() {
         let mut cache = CutCache::default();
         let items = vec![1.0, 2.0];
-        let first = cache.cut(&ring(1.0), &items, 7, [0.1, 0.2, 0.3], || vec![ring(0.5)]);
-        let second = cache.cut(&ring(1.0), &items, 7, [0.1, 0.2, 0.3], || {
+        let first = cache.cut(&ring(1.0), &items, 7, 2, [0.1, 0.2, 0.3], || {
+            parcelling(0.5)
+        });
+        let second = cache.cut(&ring(1.0), &items, 7, 2, [0.1, 0.2, 0.3], || {
             panic!("the cut was recomputed for identical arguments")
         });
-        assert!(same_ring(&first[0], &second[0]));
+        assert!(same_ring(&first.viable[0].0, &second.viable[0].0));
         assert_eq!(cache.counts(), Counts { hits: 1, misses: 1 });
         assert!((cache.counts().hit_rate() - 0.5).abs() < f64::EPSILON);
     }
@@ -466,23 +548,42 @@ mod tests {
     /// of stale geometry the moment someone adds an input to the subdivision.
     #[test]
     fn every_argument_is_part_of_the_key() {
-        let base = (ring(1.0), vec![1.0, 2.0], 7u64, [0.1, 0.2, 0.3]);
+        let base = (ring(1.0), vec![1.0, 2.0], 7u64, 2usize, [0.1, 0.2, 0.3]);
         let variants: Vec<Variant> = vec![
-            (ring(1.5), base.1.clone(), base.2, base.3),
-            (base.0.clone(), vec![1.0, 2.5], base.2, base.3),
-            (base.0.clone(), vec![1.0, 2.0, 3.0], base.2, base.3),
-            (base.0.clone(), base.1.clone(), 8, base.3),
-            (base.0.clone(), base.1.clone(), base.2, [0.9, 0.2, 0.3]),
-            (base.0.clone(), base.1.clone(), base.2, [0.1, 0.9, 0.3]),
-            (base.0.clone(), base.1.clone(), base.2, [0.1, 0.2, 0.9]),
+            (ring(1.5), base.1.clone(), base.2, base.3, base.4),
+            (base.0.clone(), vec![1.0, 2.5], base.2, base.3, base.4),
+            (base.0.clone(), vec![1.0, 2.0, 3.0], base.2, base.3, base.4),
+            (base.0.clone(), base.1.clone(), 8, base.3, base.4),
+            (base.0.clone(), base.1.clone(), base.2, 3, base.4),
+            (
+                base.0.clone(),
+                base.1.clone(),
+                base.2,
+                base.3,
+                [0.9, 0.2, 0.3],
+            ),
+            (
+                base.0.clone(),
+                base.1.clone(),
+                base.2,
+                base.3,
+                [0.1, 0.9, 0.3],
+            ),
+            (
+                base.0.clone(),
+                base.1.clone(),
+                base.2,
+                base.3,
+                [0.1, 0.2, 0.9],
+            ),
         ];
         for (i, v) in variants.iter().enumerate() {
             let mut cache = CutCache::default();
-            cache.cut(&base.0, &base.1, base.2, base.3, || vec![ring(0.5)]);
+            cache.cut(&base.0, &base.1, base.2, base.3, base.4, || parcelling(0.5));
             let mut ran = false;
-            cache.cut(&v.0, &v.1, v.2, v.3, || {
+            cache.cut(&v.0, &v.1, v.2, v.3, v.4, || {
                 ran = true;
-                vec![ring(0.25)]
+                parcelling(0.25)
             });
             assert!(ran, "variant {i} was served from the cache");
         }
@@ -494,11 +595,11 @@ mod tests {
         let mut cache = CutCache::default();
         let a = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
         let b = vec![[-0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
-        cache.cut(&a, &[1.0], 1, [0.0, 0.0, 0.0], || vec![a.clone()]);
+        cache.cut(&a, &[1.0], 1, 1, [0.0, 0.0, 0.0], || parcelling(1.0));
         let mut ran = false;
-        cache.cut(&b, &[1.0], 1, [0.0, 0.0, 0.0], || {
+        cache.cut(&b, &[1.0], 1, 1, [0.0, 0.0, 0.0], || {
             ran = true;
-            vec![b.clone()]
+            parcelling(2.0)
         });
         assert!(ran, "-0.0 was served the cut for 0.0");
     }
@@ -511,7 +612,10 @@ mod tests {
             cache.trim(10);
             #[allow(clippy::cast_precision_loss)] // a loop counter
             let r = ring(1.0 + i as f64);
-            cache.cut(&r, &[1.0], i, [0.0, 0.0, 0.0], || vec![r.clone()]);
+            cache.cut(&r, &[1.0], i, 1, [0.0, 0.0, 0.0], || BlockCut {
+                viable: vec![(r.clone(), [0.0, 0.0], 1.0)],
+                spare: Vec::new(),
+            });
         }
         assert!(
             cache.entries.len() <= 10 * SLACK + SLACK + 1,

@@ -108,11 +108,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::accrete::Settlement;
 use crate::blocks::BlockPlan;
-use crate::determinism::{narrow, seed_for_path, SeededRng};
+use crate::determinism::{combine_seeds, narrow, quantize_f64, seed_for_path, SeededRng};
 use crate::geom::{
     area, centroid, dist, dist_to_boundary, extent_along, interior_point_avoiding, longest_axis,
     perp, split_ring, Pt,
 };
+use crate::memo::BlockCut;
 use crate::{Lot, LotId};
 
 /// Largest a parcel on the oldest ground may be, in units of the city-wide grain.
@@ -1139,10 +1140,7 @@ pub(crate) fn parcel_city(
         // to be proportional to anything.
         floor_plot_shares(&mut items, a, min_w * min_w * MIN_PLOT_AREA_STRIPS);
         cap_plot_shares(&mut items);
-        let seed = files
-            .first()
-            .map_or(bi as u64, |f| s.files[*f as usize].path.layout_seed())
-            ^ (bi as u64).wrapping_mul(31);
+        let seed = block_cut_seed(block, &files, s);
         // A parcel is buildable when a point inside it clears the road corridor.
         // Passing it into the subdivision is what turns "reject the sliver" into
         // "never cut the sliver off in the first place".
@@ -1150,14 +1148,15 @@ pub(crate) fn parcel_city(
             interior_point_avoiding(r, Some(&block.ring), road_half)
                 .is_some_and(|(_, clear)| clear >= min_clear)
         };
-        // The cut is a pure function of exactly these arguments, so a block the
-        // growth step did not touch keeps the subdivision it already had —
+        // The parcelling is a pure function of exactly these arguments, so a
+        // block the growth step did not touch keeps the parcels it already had —
         // recomputed only when something it reads has actually changed. See
         // [`crate::memo::CutCache`].
-        let mut rings = cuts.cut(
+        let cut = cuts.cut(
             &block.ring,
             &items,
             seed,
+            files.len(),
             [min_w, road_half, min_clear],
             || {
                 let mut rings: Vec<Vec<Pt>> = Vec::new();
@@ -1171,17 +1170,16 @@ pub(crate) fn parcel_city(
                     &buildable,
                     &mut rings,
                 );
-                rings
+                rings.retain(|r| area(r) > 1e-9);
+                if rings.is_empty() {
+                    rings.push(block.ring.clone());
+                }
+                parcel_geometry(block, rings, files.len(), road_half, min_clear, min_w, seed)
             },
         );
-        rings.retain(|r| area(r) > 1e-9);
-        if rings.is_empty() {
-            rings.push(block.ring.clone());
-        }
 
         seat_block(
-            &mut out, block, block_id, rings, &files, &weights, s, road_half, min_clear, min_w,
-            seed,
+            &mut out, block, block_id, cut, &files, &weights, s, road_half, min_clear, min_w, seed,
         );
     }
 
@@ -1380,21 +1378,71 @@ fn rehouse_overflow_next_door(out: &mut Parcelling, blocks: &[BlockPlan], s: &Se
 /// city with no vacant ground at all.
 const REHOUSE_RINGS: usize = 4;
 
-/// Seat one block's files on its parcels.
-#[allow(clippy::too_many_arguments)]
-fn seat_block(
-    out: &mut Parcelling,
+/// The seed of one block's subdivision — a property of the **block**, never of
+/// its position in the face list.
+///
+/// # Why the block index cannot be in here
+///
+/// It used to be: `first file's layout seed ^ block index * 31`. The index is
+/// the block's position in the face walk, so **inserting one face re-seeds every
+/// block after it** and the whole tail of the city is cut again from scratch.
+/// That is not a cache miss, it is the ground moving: measured at 5 000 files,
+/// one added file re-cut a third of the blocks and re-seated a quarter of the
+/// buildings on parcels that had not changed shape — which PRD §7.7 forbids
+/// outright, and which `crate::memo`'s header named as the next thing to fix.
+///
+/// Every branch here is a property the block carries with it:
+///
+/// 1. its oldest file's path — PRD §7.4's rule verbatim, and the overwhelming
+///    majority of blocks;
+/// 2. failing that, the lowest plot id inside it: plot ids are handed out in
+///    settlement order and never reused, so they survive a growth step;
+/// 3. failing that — an open block with no plot at all — its own quantised
+///    ring, at the same 0.001 grid every coordinate that reaches a golden file
+///    goes through.
+fn block_cut_seed(block: &BlockPlan, files: &[u32], s: &Settlement) -> u64 {
+    if let Some(&fi) = files.first() {
+        return s.files[fi as usize].path.layout_seed();
+    }
+    if let Some(&pi) = block.plots.iter().min() {
+        return combine_seeds(OPEN_BLOCK_SEED, u64::from(pi));
+    }
+    let mut d = FNV_OFFSET;
+    for p in &block.ring {
+        for c in [p[0], p[1]] {
+            d ^= quantize_f64(c).to_bits();
+            d = d.wrapping_mul(FNV_PRIME);
+        }
+    }
+    d
+}
+
+/// Salt for [`block_cut_seed`]'s plot-id branch, so a plot id and a file's path
+/// hash cannot collide by arithmetic accident.
+const OPEN_BLOCK_SEED: u64 = 0x5107_0000_0000_0001;
+
+/// FNV-1a's offset basis and prime, for [`block_cut_seed`]'s last resort.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// See [`FNV_OFFSET`].
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Cut one block into the parcels a block of this shape with this many files
+/// gets, in the order they will be handed out.
+///
+/// **No file identity reaches this**, only how many there are: that is what lets
+/// [`crate::memo::CutCache`] remember the answer across a growth step, and it is
+/// why the occupant assignment is [`seat_block`]'s job and not this function's.
+/// See [`crate::memo::BlockCut`] for the measurement that moved the boundary
+/// here.
+fn parcel_geometry(
     block: &BlockPlan,
-    block_id: u32,
     rings: Vec<Vec<Pt>>,
-    files: &[u32],
-    weights: &[f64],
-    s: &Settlement,
+    file_count: usize,
     road_half: f64,
     min_clear: f64,
     min_w: f64,
     seed: u64,
-) {
+) -> BlockCut {
     // A parcel is viable when a point inside it clears the road corridor.
     let probe = |ring: &[Pt]| interior_point_avoiding(ring, Some(&block.ring), road_half);
     let buildable = |r: &[Pt]| probe(r).is_some_and(|(_, clear)| clear >= min_clear);
@@ -1431,19 +1479,19 @@ fn seat_block(
     //
     // The bound below is a real one rather than a hope. Each round either splits
     // a parcel, which strictly increases `viable` and so can happen at most
-    // `files.len()` times before the loop condition ends it, or strikes one off
+    // `file_count` times before the loop condition ends it, or strikes one off
     // into `refused`, which is never retried and is bounded by the number of
     // parcels that have ever existed. Two rounds per file plus the old constant
     // covers both halves; `largest_untried` returning `None` is what actually
     // ends the loop in practice.
     let mut rounds = 0;
-    let budget = files.len() * 2 + MAX_DENSIFY_ROUNDS * 3;
+    let budget = file_count * 2 + MAX_DENSIFY_ROUNDS * 3;
     let mut refused: BTreeSet<(i64, i64)> = BTreeSet::new();
     let key = |ring: &[Pt]| -> (i64, i64) {
         let c = centroid(ring);
         ((c[1] * 1e6) as i64, (c[0] * 1e6) as i64)
     };
-    while viable.len() < files.len() && rounds < budget {
+    while viable.len() < file_count && rounds < budget {
         rounds += 1;
         let Some(idx) = largest_untried(&viable, &refused, &key) else {
             break;
@@ -1495,6 +1543,27 @@ fn seat_block(
         let c = centroid(r);
         ((c[1] * 1e5) as i64, (c[0] * 1e5) as i64)
     });
+    BlockCut { viable, spare }
+}
+
+/// Seat one block's files on the parcels [`parcel_geometry`] cut for it.
+#[allow(clippy::too_many_arguments)]
+fn seat_block(
+    out: &mut Parcelling,
+    block: &BlockPlan,
+    block_id: u32,
+    cut: BlockCut,
+    files: &[u32],
+    weights: &[f64],
+    s: &Settlement,
+    road_half: f64,
+    min_clear: f64,
+    min_w: f64,
+    seed: u64,
+) {
+    let BlockCut { viable, spare } = cut;
+    let probe = |ring: &[Pt]| interior_point_avoiding(ring, Some(&block.ring), road_half);
+    let buildable = |r: &[Pt]| probe(r).is_some_and(|(_, clear)| clear >= min_clear);
 
     let base = out.parcels.len();
     for (ring, _, _) in &viable {

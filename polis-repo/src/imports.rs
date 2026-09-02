@@ -146,14 +146,58 @@ impl ImportGraph {
     /// layout or a serialized artifact can see from depending on timing, and a
     /// duration inside a `Serialize` struct is exactly that.
     pub fn build_timed(tree: &RepoTree) -> (Self, Duration) {
+        Self::build_with(tree, None, None)
+    }
+
+    /// [`build`](Self::build) through the on-disk specifier cache
+    /// [`default_parse_cache_path`] names — the product path.
+    ///
+    /// # What this is for
+    ///
+    /// PRD §13.1 budgets cold start to first frame at under three seconds, and
+    /// `tree-sitter` over every source file is the second-largest term in it:
+    /// measured on this machine, 0.97 s of Django's launch, 1.28 s of
+    /// `CPython`'s and 1.05 s of Ansible's. None of that work changes between
+    /// two launches of a checkout nobody edited, and none of it is affected by
+    /// a commit landing — which is what separates it from the history walk,
+    /// whose cache PRD §7.1 already asks for.
+    ///
+    /// The result is identical to [`build`](Self::build)'s, file for file and
+    /// edge for edge: only the syntax stage is remembered, every hit is checked
+    /// against a 128-bit digest of the source that produced it, and every
+    /// specifier is resolved afresh against this run's index. See
+    /// [`ParseCache`].
+    ///
+    /// A repository with no state directory, an unreadable cache, or a cache
+    /// from an older version simply parses everything, exactly as before.
+    #[must_use]
+    pub fn build_cached(tree: &RepoTree) -> Self {
+        let path = default_parse_cache_path(&tree.root);
+        let cache = path.as_deref().map(ParseCache::read);
+        Self::build_with(tree, cache.as_ref(), path.as_deref()).0
+    }
+
+    /// The one body behind [`build_timed`](Self::build_timed) and
+    /// [`build_cached`](Self::build_cached).
+    fn build_with(
+        tree: &RepoTree,
+        remembered: Option<&ParseCache>,
+        write_to: Option<&Path>,
+    ) -> (Self, Duration) {
         let started = Instant::now();
 
         let index = ImportIndex::from_tree(tree);
         let mut stats = ImportStats::default();
         let candidates = select_candidates(tree, &mut stats);
 
-        let (parsed, parse_stats) = parse_all(&tree.root, &index, &candidates);
+        let (parsed, parse_stats, seen) = parse_all(&tree.root, &index, &candidates, remembered);
         stats.merge(&parse_stats);
+        if let Some(path) = write_to {
+            ParseCache {
+                by_path: seen.into_iter().map(|e| (e.path.clone(), e)).collect(),
+            }
+            .write(path);
+        }
 
         let mut graph = Self {
             by_file: parsed.into_iter().collect(),
@@ -823,6 +867,14 @@ fn is_industrial_path(path: &LogicalPath) -> bool {
 // Parsing
 // ---------------------------------------------------------------------------
 
+/// One parse pass: the edges by file, what the pass counted, and what each file
+/// produced, ready for [`ParseCache`] to remember.
+type Parsed = (
+    Vec<(LogicalPath, Vec<ImportEdge>)>,
+    ImportStats,
+    Vec<CachedFile>,
+);
+
 /// Parses every candidate, in parallel when there are enough of them.
 ///
 /// Determinism does not depend on the thread count: each file is parsed
@@ -833,17 +885,22 @@ fn parse_all(
     root: &Path,
     index: &ImportIndex,
     candidates: &[(LogicalPath, Language)],
-) -> (Vec<(LogicalPath, Vec<ImportEdge>)>, ImportStats) {
+    cache: Option<&ParseCache>,
+) -> Parsed {
     let threads = worker_count(candidates.len());
     if threads <= 1 {
         let mut out = Vec::new();
+        let mut fresh = Vec::new();
         let mut stats = ImportStats::default();
-        parse_chunk(root, index, candidates, &mut out, &mut stats);
-        return (out, stats);
+        parse_chunk(
+            root, index, candidates, cache, &mut out, &mut fresh, &mut stats,
+        );
+        return (out, stats, fresh);
     }
 
     let chunk_size = candidates.len().div_ceil(threads);
     let mut merged: Vec<(LogicalPath, Vec<ImportEdge>)> = Vec::new();
+    let mut fresh: Vec<CachedFile> = Vec::new();
     let mut stats = ImportStats::default();
 
     std::thread::scope(|scope| {
@@ -852,15 +909,17 @@ fn parse_all(
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut out = Vec::new();
+                    let mut seen = Vec::new();
                     let mut local = ImportStats::default();
-                    parse_chunk(root, index, chunk, &mut out, &mut local);
-                    (out, local)
+                    parse_chunk(root, index, chunk, cache, &mut out, &mut seen, &mut local);
+                    (out, local, seen)
                 })
             })
             .collect();
         for handle in handles {
-            if let Ok((out, local)) = handle.join() {
+            if let Ok((out, local, seen)) = handle.join() {
                 merged.extend(out);
+                fresh.extend(seen);
                 stats.merge(&local);
             } else {
                 // PRD §9: non-fatal. Those files simply have no streets.
@@ -870,7 +929,7 @@ fn parse_all(
         }
     });
 
-    (merged, stats)
+    (merged, stats, fresh)
 }
 
 /// How many workers to use for `files` candidates.
@@ -886,11 +945,14 @@ fn worker_count(files: usize) -> usize {
 }
 
 /// Reads and parses one contiguous slice of the candidate list.
+#[allow(clippy::too_many_arguments)] // one worker's whole job, in one place
 fn parse_chunk(
     root: &Path,
     index: &ImportIndex,
     chunk: &[(LogicalPath, Language)],
+    remembered: Option<&ParseCache>,
     out: &mut Vec<(LogicalPath, Vec<ImportEdge>)>,
+    seen: &mut Vec<CachedFile>,
     stats: &mut ImportStats,
 ) {
     let mut cache = ExtractorCache::default();
@@ -898,10 +960,34 @@ fn parse_chunk(
         let Some(source) = read_source(root, path, stats) else {
             continue;
         };
-        let Some(extractor) = cache.get(*language) else {
-            continue;
+        // The syntax stage, from the previous run when this file's bytes are
+        // unchanged. Resolution below runs either way: it is the stage a file
+        // arriving or leaving changes, and it is not what costs the second.
+        let hit = remembered.and_then(|c| c.get(path, *language, &source));
+        let (specifiers, errors) = if let Some(entry) = hit {
+            (entry.specifiers.clone(), entry.errors)
+        } else {
+            let Some(extractor) = cache.get(*language) else {
+                continue;
+            };
+            let before = stats.files_with_parse_errors;
+            let found = extractor.specifiers(path, &source, stats);
+            (found, stats.files_with_parse_errors > before)
         };
-        let edges = extractor.edges(path, &source, Some(index), stats);
+        if hit.is_some() && errors {
+            stats.files_with_parse_errors += 1;
+        }
+        let (lo, hi) = content_digest(source.as_bytes());
+        seen.push(CachedFile {
+            path: path.clone(),
+            lo,
+            hi,
+            len: source.len() as u64,
+            language: *language,
+            errors,
+            specifiers: specifiers.clone(),
+        });
+        let edges = resolve_specifiers(path, *language, specifiers, Some(index));
         stats.files_parsed += 1;
         if !edges.is_empty() {
             out.push((path.clone(), edges));
@@ -944,6 +1030,38 @@ fn read_source(root: &Path, path: &LogicalPath, stats: &mut ImportStats) -> Opti
         stats.skipped_binary += 1;
         None
     }
+}
+
+/// Turns one file's module specifiers into edges, resolving each against the
+/// index when there is one.
+///
+/// Split out of `Extractor::edges` so the cheap half can run on its own: a
+/// [`ParseCache`] hit skips the `tree-sitter` parse and still resolves here,
+/// against **this** run's index. The sort and dedup are inside, so a cached file
+/// and a freshly parsed one produce the same bytes in the same order (PRD §7.4).
+fn resolve_specifiers(
+    path: &LogicalPath,
+    language: Language,
+    specifiers: Vec<(String, u32)>,
+    index: Option<&ImportIndex>,
+) -> Vec<ImportEdge> {
+    let mut edges: Vec<ImportEdge> = specifiers
+        .into_iter()
+        .map(|(specifier, inline_depth)| {
+            let to = index.map_or(ImportTarget::Unresolved, |index| {
+                index.resolve_nested(path, &specifier, language, inline_depth)
+            });
+            ImportEdge {
+                from: path.clone(),
+                to,
+                specifier,
+                language,
+            }
+        })
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    edges
 }
 
 /// Extracts and (optionally) resolves one file's imports.
@@ -1640,23 +1758,7 @@ impl Extractor {
     ) -> Vec<ImportEdge> {
         let language = self.language;
         let specifiers = self.specifiers(path, source, stats);
-        let mut edges: Vec<ImportEdge> = specifiers
-            .into_iter()
-            .map(|(specifier, inline_depth)| {
-                let to = index.map_or(ImportTarget::Unresolved, |index| {
-                    index.resolve_nested(path, &specifier, language, inline_depth)
-                });
-                ImportEdge {
-                    from: path.clone(),
-                    to,
-                    specifier,
-                    language,
-                }
-            })
-            .collect();
-        edges.sort_unstable();
-        edges.dedup();
-        edges
+        resolve_specifiers(path, language, specifiers, index)
     }
 
     /// Every module specifier the file names, in source order, each paired with
@@ -2013,6 +2115,176 @@ fn string_literal(node: Node<'_>, bytes: &[u8]) -> Option<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The specifier cache (PRD §13.1: cold start under three seconds)
+// ---------------------------------------------------------------------------
+
+/// Bump on any change to what [`Extractor::specifiers`] returns, or to the
+/// grammars behind it. A version mismatch is a total miss, exactly like a
+/// corrupt file — never a partial read of something whose meaning has moved.
+const PARSE_CACHE_VERSION: u32 = 1;
+
+/// Where [`ImportGraph::build_cached`] keeps one repository's extracted
+/// specifiers.
+///
+/// `%LOCALAPPDATA%\polis\imports\<key>.json` on Windows,
+/// `$XDG_STATE_HOME/polis/imports/<key>.json` elsewhere — beside the history
+/// cache and the corpus store, and deliberately **outside the checkout**: a
+/// cache written into the repository would be walked, given a building, and
+/// change the city.
+///
+/// The key is the same folding of the normalised root that the history cache
+/// uses, so two worktrees of one repository get two caches and a checkout
+/// spelled `C:\Repo` and `c:/repo/` gets one.
+#[must_use]
+pub fn default_parse_cache_path(repo_root: &Path) -> Option<std::path::PathBuf> {
+    let key =
+        crate::git::fnv1a64(crate::git::normalize_root(&repo_root.to_string_lossy()).as_bytes());
+    Some(
+        crate::corpus::state_dir()?
+            .join("imports")
+            .join(format!("{key:016x}.json")),
+    )
+}
+
+/// One file's extraction, as it is stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedFile {
+    /// The layout key (PRD §7.6).
+    path: LogicalPath,
+    /// The two halves of the content digest. See [`content_digest`].
+    lo: u64,
+    hi: u64,
+    /// Source length in bytes; a third, free, independent check.
+    len: u64,
+    /// The grammar the specifiers came out of.
+    language: Language,
+    /// Whether `tree-sitter`'s error recovery had to salvage this file, so a
+    /// cache hit reports the same counters a parse would.
+    errors: bool,
+    /// What [`Extractor::specifiers`] returned: the module specifier and the
+    /// number of inline `mod` blocks it sits inside.
+    specifiers: Vec<(String, u32)>,
+}
+
+/// The on-disk file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParseCacheFile {
+    version: u32,
+    entries: Vec<CachedFile>,
+}
+
+/// What the previous run extracted, ready to be asked about a file.
+///
+/// # Why this is safe to trust, and exactly how far
+///
+/// A hit is verified against a **128-bit content digest plus the byte length**
+/// of the source that produced it, so a file whose bytes changed by one bit is a
+/// miss. It is not the bit-for-bit argument comparison `polis_layout::memo`
+/// uses, because the argument here is the whole file and storing every byte of
+/// the repository to avoid re-parsing it would cost more than the parse. What it
+/// buys instead is a collision probability below any rate at which the rest of
+/// this pipeline is correct, and — this is the part that matters for PRD §7.4 —
+/// a *deterministic* one: the same bytes give the same digest on every machine
+/// and every run, so two machines cannot disagree about a hit.
+///
+/// **Resolution is never cached.** Only the syntax stage is, which is a pure
+/// function of `(source, language)`; every specifier is re-resolved against the
+/// current [`ImportIndex`] on every run, because that is the stage a file
+/// arriving or leaving changes.
+#[derive(Debug, Default)]
+pub struct ParseCache {
+    by_path: BTreeMap<LogicalPath, CachedFile>,
+}
+
+impl ParseCache {
+    /// Reads a cache file, or an empty cache when there is none, it is
+    /// unreadable, or it was written by a different version.
+    ///
+    /// Never an error: a cold cache and a corrupt one are the same situation,
+    /// and neither is worth failing a launch over.
+    #[must_use]
+    pub fn read(path: &Path) -> Self {
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(file) = serde_json::from_slice::<ParseCacheFile>(&bytes) else {
+            return Self::default();
+        };
+        if file.version != PARSE_CACHE_VERSION {
+            return Self::default();
+        }
+        Self {
+            by_path: file
+                .entries
+                .into_iter()
+                .map(|e| (e.path.clone(), e))
+                .collect(),
+        }
+    }
+
+    /// The specifiers this file's exact bytes produced last time, if any.
+    fn get(&self, path: &LogicalPath, language: Language, source: &str) -> Option<&CachedFile> {
+        let entry = self.by_path.get(path)?;
+        if entry.language != language || entry.len != source.len() as u64 {
+            return None;
+        }
+        let (lo, hi) = content_digest(source.as_bytes());
+        (entry.lo == lo && entry.hi == hi).then_some(entry)
+    }
+
+    /// Writes the cache for the files that exist **now**, so a repository that
+    /// shrinks does not carry its deleted files forever.
+    ///
+    /// Failure is silent by design: an unwritable state directory costs the next
+    /// launch a re-parse and nothing else.
+    fn write(&self, path: &Path) {
+        let file = ParseCacheFile {
+            version: PARSE_CACHE_VERSION,
+            entries: self.by_path.values().cloned().collect(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&file) {
+            if let Err(error) = crate::git::write_atomic(path, &bytes) {
+                tracing::debug!(%error, "could not write the specifier cache");
+            }
+        }
+    }
+
+    /// How many files it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_path.len()
+    }
+
+    /// True when it holds nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_path.is_empty()
+    }
+}
+
+/// A 128-bit content digest: FNV-1a over the bytes forwards, and a second,
+/// independent FNV-1a over them with a different basis and prime.
+///
+/// Written out rather than reached for, for the same reason every other hash in
+/// this workspace is: a `DefaultHasher` is seeded per process and a cache key
+/// that changes between runs is not a cache key.
+fn content_digest(bytes: &[u8]) -> (u64, u64) {
+    const OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME_A: u64 = 0x0000_0100_0000_01b3;
+    const OFFSET_B: u64 = 0x9E37_79B9_7F4A_7C15;
+    const PRIME_B: u64 = 0x0000_0100_0000_1B3F;
+    let mut a = OFFSET_A;
+    let mut b = OFFSET_B;
+    for &byte in bytes {
+        a ^= u64::from(byte);
+        a = a.wrapping_mul(PRIME_A);
+        b = b.rotate_left(7) ^ u64::from(byte);
+        b = b.wrapping_mul(PRIME_B);
+    }
+    (a, b)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2075,6 +2347,18 @@ mod tests {
 
         fn build(&self) -> ImportGraph {
             ImportGraph::build(&self.tree)
+        }
+
+        /// Builds through a cache file inside the fixture's own temp directory,
+        /// so a test never touches the developer's state directory.
+        fn build_through(&self, cache_file: &Path) -> ImportGraph {
+            let remembered = ParseCache::read(cache_file);
+            ImportGraph::build_with(&self.tree, Some(&remembered), Some(cache_file)).0
+        }
+
+        /// Where this fixture keeps its cache file.
+        fn cache_file(&self) -> PathBuf {
+            self.dir.path().join("specifiers.json")
         }
     }
 
@@ -2914,14 +3198,16 @@ mod tests {
         let mut stats = ImportStats::default();
         let candidates = select_candidates(&f.tree, &mut stats);
 
-        let (parallel, _) = parse_all(&f.tree.root, &index, &candidates);
+        let (parallel, _, _) = parse_all(&f.tree.root, &index, &candidates, None);
         let mut sequential = Vec::new();
         let mut ignored = ImportStats::default();
         parse_chunk(
             &f.tree.root,
             &index,
             &candidates,
+            None,
             &mut sequential,
+            &mut Vec::new(),
             &mut ignored,
         );
 
@@ -2991,5 +3277,118 @@ mod tests {
             elapsed < Duration::from_secs(60),
             "5k files took {elapsed:?}; something is quadratic"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The specifier cache (PRD §13.1)
+    // -----------------------------------------------------------------------
+
+    /// The whole point: a warm cache must produce the identical graph. Not
+    /// "roughly the same edges" — the same edges, in the same order, with the
+    /// same resolutions, because the layout reads them (PRD §7.4).
+    #[test]
+    fn a_warm_specifier_cache_builds_the_identical_graph() {
+        let f = corpus();
+        let cache = f.cache_file();
+        let cold = f.build_through(&cache);
+        assert!(
+            !ParseCache::read(&cache).is_empty(),
+            "the cold build wrote nothing to remember"
+        );
+        let warm = f.build_through(&cache);
+        assert_eq!(cold.edges(), warm.edges(), "a warm build moved a street");
+        assert_eq!(
+            cold.edges(),
+            f.build().edges(),
+            "the cached path and the uncached path disagree"
+        );
+    }
+
+    /// A file whose bytes changed is re-parsed, whatever its length or its name.
+    #[test]
+    fn editing_a_file_invalidates_only_its_own_entry() {
+        let mut f = corpus();
+        let cache = f.cache_file();
+        f.build_through(&cache);
+        // Same length, different bytes: the length check alone would miss this,
+        // which is why the digest is the check and the length is the extra.
+        f.add(
+            "src/util/helpers.rs",
+            Some(Language::Rust),
+            b"use crate::app::run;
+pub fn sanitize() { run() }
+",
+        );
+        let after = f.build_through(&cache);
+        assert!(
+            after
+                .edges_from(&lp("src/util/helpers.rs"))
+                .iter()
+                .any(|e| e.specifier == "crate::app::run"),
+            "the edited file kept its old imports: {:?}",
+            after.edges_from(&lp("src/util/helpers.rs"))
+        );
+        assert_eq!(
+            after.edges(),
+            f.build().edges(),
+            "an edited file left the cached graph different from a fresh one"
+        );
+    }
+
+    /// A cache from another version, or a corrupt one, is a miss and never a
+    /// failure: a launch must not depend on a state file being intact.
+    #[test]
+    fn a_corrupt_or_stale_cache_is_simply_cold() {
+        let f = corpus();
+        let cache = f.cache_file();
+        std::fs::write(&cache, b"{ this is not json").expect("write");
+        assert!(ParseCache::read(&cache).is_empty());
+        let stale = serde_json::json!({ "version": PARSE_CACHE_VERSION + 1, "entries": [] });
+        std::fs::write(&cache, serde_json::to_vec(&stale).expect("json")).expect("write");
+        assert!(ParseCache::read(&cache).is_empty());
+        // And a build over it still works, and still writes a usable one.
+        let built = f.build_through(&cache);
+        assert_eq!(built.edges(), f.build().edges());
+        assert!(!ParseCache::read(&cache).is_empty());
+    }
+
+    /// The cache holds the files that exist now, not every file that ever did.
+    #[test]
+    fn a_deleted_file_leaves_the_cache() {
+        let mut f = corpus();
+        let cache = f.cache_file();
+        f.build_through(&cache);
+        let before = ParseCache::read(&cache).len();
+        f.tree.files.remove(&lp("src/main.rs"));
+        f.build_through(&cache);
+        let after = ParseCache::read(&cache);
+        assert_eq!(
+            after.len(),
+            before - 1,
+            "the cache kept a file that is gone"
+        );
+        assert!(!after.by_path.contains_key(&lp("src/main.rs")));
+    }
+
+    /// Two different byte strings must not share a digest for any reason a test
+    /// can construct — in particular not by transposition, which a plain
+    /// additive checksum would miss.
+    #[test]
+    fn the_content_digest_separates_transpositions() {
+        assert_ne!(content_digest(b"ab"), content_digest(b"ba"));
+        assert_ne!(
+            content_digest(
+                b"use a;
+use b;
+"
+            ),
+            content_digest(
+                b"use b;
+use a;
+"
+            )
+        );
+        assert_ne!(content_digest(b""), content_digest(&[0u8]));
+        assert_eq!(content_digest(b"stable"), content_digest(b"stable"));
     }
 }

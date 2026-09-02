@@ -1,8 +1,256 @@
 # Polis — Visual Review (fresh eyes, no implementer claims read)
 
-> **ROUND 5 is the current review. Round 4 is archived below the double rule.**
+> **ROUND 6 is the current review. Round 5 and earlier are archived below the rule.**
 
 ---
+
+# Round 6 — the axle was not removed. It was mass-produced.
+
+Reviewer: independent visual pass, given the PRD intent and the §10.3 dimness ruling and nothing
+else. Method, in order: 180 px squint sheet before anything else; full frame; 1:1 and 2:1 crops;
+then measurement — junction-dot extraction (recovered 116 / 999 / 801 nodes against legend counts
+of 116 / 1016 / 802, so the extraction is sound), nearest-neighbour spacing against radius, a
+grid search for the best-fitting single centre, boundary box-counting, a luminance census split
+into neutral / tinted / text, and a base-vs-overlay difference on the contrast validation.
+
+## Verdict up front: no.
+
+Closer than round 5, and the improvement is real, not a repaint. But it fails, and it fails on
+something new that the measurements make unambiguous.
+
+**Round 5 asked whether the axle survived the removal of the wedges. The answer is worse than
+"yes". The single axle has become many axles.** `city-m1-large-junctions.png` contains at least
+three junction accumulation points; the two largest, at (696,293) and (842,409), are textbook
+phyllotactic rosettes — visible spiral arms, spacing collapsing to a point, 19 and 15 nodes
+packed at 55–60 % of the map's median spacing. Crop them and you are looking at the sunflower
+from round 1 at half scale, twice. `city-real-5k-junctions.png` has the same thing at (1000,883)
+with 31 nodes. Distributing the gradient across districts lowers the global correlation number
+without removing the artefact — it multiplies it.
+
+And the global gradient is not gone either:
+
+| render | corr(radius, spacing) | median spacing, inner → outer quintile | outer/inner |
+|---|---|---|---|
+| `city-m1-junctions.png` | **+0.54** | 67.7 → 77.2 → 84.5 → 88.1 → 126.0 | **1.86×** |
+| `city-m1-large-junctions.png` | **+0.49** | 28.0 → 28.0 → 28.8 → 31.3 → 38.7 | 1.38× |
+| `city-real-5k-junctions.png` | +0.23 | 30.0 → 31.4 → 33.5 → 39.5 → 34.8 | 1.16× |
+
+The small repo is still a clean monotone function of distance from one point — five of five
+quintiles increasing, best-fitting axle at (673,846), ρ = +0.55. That is round 5's number
+unchanged. The two large renders improved, but their residual is concentrated almost entirely in
+the **outermost quintile** — a rind of oversized cells wrapped uniformly around the whole
+perimeter. That rind is visible without measuring it: in every junction render the edge of the
+map is a chain of large, similar, near-regular polygons at a scale that appears nowhere in the
+interior.
+
+## The two textures, and neither of them is grown
+
+Zoom into any district interior in the junction renders and you get exactly one of two things.
+
+**Graph paper.** `city-real-5k-junctions.png` at (330–900, 330–620) — the RUNTIME / SYNTAX
+district — is a rectangular lattice of degree-4 junctions. Rows dead straight for fifteen cells,
+constant spacing, constant block size. At (820–1180, 760–1010) the same lattice appears rotated
+about 30°. Districts get a lattice at their own rotation angle and are sewn together along
+irregular seams. Manhattan is a real city, so a grid is not per se wrong — but a *perfect* grid,
+with no broken rows, no varying block proportion and no diagonal, is graph paper.
+
+**Sunflower.** The rosettes named above.
+
+A grown city's block size varies with age, terrain and use, and its correlation with distance to
+any single point is near zero. Here every district is either a crystal or a spiral. Both are
+mathematical objects, and an eye finds them instantly even when it cannot name them.
+
+## The pinwheel — the artefact that appears at every zoom in every image
+
+This is new to this review, and I think it is the most damaging single thing in the pixels.
+
+Brighten any dense crop 3–4× (I used `city-real-django.png` at (700,700)–(1200,1050) and
+`city-m1-large.png` at (350,600)–(850,950)) and the fabric resolves into **asterisks**: five to
+eight wedge-shaped buildings radiating from a common point inside each block, streets radiating
+between them. Almost no building in any of these four maps is a rectangle. They are trapezoids,
+triangles, slivers and pie-slices — lot polygons shrunk inward. Blocks are being subdivided by a
+fan from an interior seed rather than by frontage onto a street.
+
+This is why five rounds of reviewers have reached for "crazed glaze", "shards", "cracked mud"
+and "mould". Those are all descriptions of the same thing: **a Voronoi cell decomposition
+rendered directly as architecture.** The dim palette hides it; it does not fix it. And where a
+district is sparse, the disguise fails completely — `city-real-5k.png` around AUTOCMD at
+(950,880)–(1400,1180) is a bare Lloyd-relaxed Voronoi diagram with white cell walls and four or
+five sliver buildings inside it. That is the generator, undressed, printed on the map.
+
+Nothing reads as a city from above without rectangles aligned to a street.
+
+## The coast is die-cut, not ragged
+
+The lobes are genuine and they are an improvement — fingers at the top of django, a bay at the
+south-west, the TESTDIR peninsula in neovim. But the roughness exists at exactly one scale.
+
+Boundary box-counting dimension: **0.98, 1.00, 1.00, 1.02** for m1 / m1-large / neovim / django.
+A smooth polygon measures 1.00 on this estimator; a real coastline measures 1.15–1.30. Visually:
+crop 450 px of django's east coast and it is six straight segments meeting at obtuse angles, with
+a uniform pale rim-light stroke and a soft gradient sea outside. No inlets, no estuaries, no
+offshore islets, no roughness below about 100 px. It is a sticker.
+
+Circularity is 0.23–0.34, so the shape is genuinely lobed at map scale. It is ragged in the large
+and perfectly smooth in the small — the signature of a hull drawn around district centroids, not
+of a city that grew into its terrain.
+
+## Height: the primary quantity is not on the map
+
+The legend of every render says it out loud:
+
+- `city-m1.png` — TALLEST `polis-render/src/plan.rs` **H = 50.8**
+- `city-m1-large.png` — **H = 6.0**
+- `city-real-5k.png` — **H = 6.0**
+- `city-real-django.png` — **H = 6.0**
+
+On the three maps that matter, the tallest building in the repository is 6 units, and every
+extrusion side-wall in a brightened crop measures the same depth. There is no skyline. There is
+no tallest building. **The only way to find it is to read an amber text label.**
+
+Whether that is because the working trees are clean is beside the point for a visual review: the
+image cannot distinguish "flat because nothing changed" from "height is not rendered", and
+neither can an operator. The map exists to show one quantity and it currently shows it in
+typography. On `city-m1.png`, where H = 50.8, height *does* read — thick dark side-walls, an amber
+monument with a lit face. So the renderer can do it. The encoding cannot survive a real repo.
+
+## The contrast budget: not wasted downward. Wasted on text.
+
+Being precise here, because round 5's "you cannot see it" is not what I measure.
+
+Within the map, buildings and ground **are** separated:
+
+| | neutral px (building / road) | tinted px (district ground) |
+|---|---|---|
+| `city-real-django.png` | L p50 = **30.9**, p90 = 40.9 | L p50 = **21.9**, p90 = 23.6 |
+| `city-real-5k.png` | L p50 = **32.1**, p90 = 43.9 | L p50 = **16.9**, p90 = 20.4 |
+
+About 11 levels of separation inside a 48-level allowance. That is workable, and the mid-zoom
+crops prove it: at 1:1, django and neovim are legible with no boost at all. **Within its dim
+palette the map is mostly crisp, not a smudge.** Round 5's diagnosis was wrong, or has been fixed.
+
+Two real problems remain, and both are about *allocation*, not brightness:
+
+1. **The city occupies half its own allowance.** The interquartile range of in-map luminance is
+   15.9–32.8 (m1) and 17.5–31.1 (django) — a span of **13–17 levels out of the 48 available**.
+   The ceiling at 48 is barely approached except by roof highlights. There is room to widen the
+   building/ground separation and put a real tonal ramp on roofs without touching the ceiling.
+
+2. **The labels sit at L = 142 in every single image, without exception.** That is three times
+   the base-map ceiling of 48, and it lands *inside the M4 agent band, 97–168*. On `city-m1.png`
+   there are 32,116 such pixels. The brightest thing on a map whose thesis is "the coastline is
+   always faint; the storm gets the ink" is the word POLIS-RENDER/SRC. The typography is
+   squatting in the band reserved for live agents — including on the image built to prove the
+   bands are respected.
+
+## `contrast-validation.png` — half of it works
+
+**The point and line marks work, cleanly.** The red route, the red and salmon squares, the cyan
+rings, the yellow diamond all separate from the base without effort. The band scheme is sound for
+marks, and the dim base does exactly its job underneath them. Good.
+
+**The cloud layer does not work.** Measured against the django base: the overlay lifts **36 % of
+the city** by more than 6 levels, and under those clouds the base median goes from L 22 to L 45.
+Absolute local detail survives (9×9 σ falls 8.7 → 6.7, 77 % retained), but the *ratio* collapses —
+±7 around 45 instead of ±9 around 22 is less than half the perceived contrast. That matches what
+the eye reports: the AUTH_TESTS / MODELS / TEXT quarter and the RELEASES / DOCS / REF lobe are
+fogged into pale grey mush. You lose the map exactly where the activity is, which is backwards.
+Clouds need to be a texture or a hatch the city shows through, not an area fill that raises the
+floor.
+
+## Squint test, 180 px
+
+| render | reads as |
+|---|---|
+| `city-m1.png` | A cracked ceramic tile, or a stained-glass fragment with the caption bigger than the picture. Object, not place. |
+| `city-m1-large.png` | Moss on slate. Lobed and textured, with one conspicuous smooth grey wedge (CODEC) that reads as a chip out of it. |
+| `city-real-5k.png` | A bruise. Two flat colour zones, navy over plum, with grain. Closest of the four to a place. |
+| `city-real-django.png` | Lichen on a rock, cut in half by a ruler-straight diagonal. Object. |
+| `contrast-validation.png` | A weather map with fog banks — and the only one where a *place* is implied, because the marks give it scale. |
+| `REF-accretion-large.png` | A hydrangea head. Bright and chart-like, but unmistakably one connected settlement. |
+
+None of the four base maps reads as a city at 180 px. Three read as a stain on a surface. What is
+missing at this scale is not brightness — it is **structure**: no arterials crossing the map, no
+dark voids (parks, water, yards), no density gradient. Coverage is 32–33 % *everywhere*, so the
+grain is uniform edge to edge, and uniform grain at thumbnail scale is a texture, not a city.
+
+Two of the four also carry a huge flat colour boundary no city has: django is split by a
+near-perfectly straight diagonal running the whole width of the map, tests-plum above,
+django-green below, with a bright khaki band along the seam. It reads as a fold in paper.
+
+## Mid-zoom — where an operator works
+
+This is the round's genuine success and it should be said plainly. At 1:1 on django and neovim
+there is a street network with real junctions, blocks of varying outline, legible building/ground
+separation and visible density change. Crop 500 px out of the dense part of django, show it with
+no context, and it passes for an aerial. That was not true two rounds ago.
+
+It falls apart on three things: the pinwheel blocks (above); the total absence of road hierarchy
+— V = 2411, E = 4747 in django and every one of those edges is the same width and the same tone,
+so there is no arterial, no boulevard, nothing to navigate by; and the district ground colour,
+which is saturated forest green at L 22 under 68 % of the city. Boost it and django looks like a
+village scattered across a golf course.
+
+`city-m1.png` at mid-zoom is a different and much worse story: no streets at all in a 500 px crop,
+six enormous slabs at random angles on a green field, and three label strings occupying perhaps a
+third of the frame. With 134 lots there is no fabric to look at, and the render flatters the
+layout by showing none of it.
+
+## Worst thing in each image
+
+| image | the single worst thing |
+|---|---|
+| `city-m1.png` | Text is the dominant graphic element. At mid-zoom the labels cover more area than the buildings, and there is not one street in the crop. |
+| `city-m1-large.png` | The `CODEC` polygon: an enormous 45°-hatched empty zone, middle-left. A graphic-design fill pattern, not terrain — and the largest single feature on the map. |
+| `city-real-5k.png` | The AUTOCMD quarter is an undressed Voronoi diagram — big convex cells, white walls, five sliver buildings. The generator is showing. |
+| `city-real-django.png` | The ruler-straight diagonal colour seam across the entire map, with a bright band along it. |
+| `city-m1-junctions.png` | The axle is untouched: five of five radius quintiles increasing, 1.86× inner to outer, ρ = +0.54. |
+| `city-m1-large-junctions.png` | Two phyllotactic rosettes at (696,293) and (842,409), spiral arms visible. Round 1's sunflower, twice, at half scale. |
+| `city-real-5k-junctions.png` | Fifteen cells of perfect rectangular lattice at (330–900, 330–620). Graph paper. |
+| `contrast-validation.png` | The clouds smother 36 % of the city — and the base map's own labels sit at L 142, inside the agent band the image exists to protect. |
+
+## Highest-value change to the IMAGE
+
+**Rebuild the inside of the block. Stop fan-subdividing lots from an interior seed; subdivide each
+block into rectangular lots fronting onto its bounding streets, with varied depth and frontage,
+and let footprint and height vary within the block.**
+
+One change, and it reaches every image at every zoom:
+
+- Wedges, triangles and slivers become rectangles with a shared grain direction. That single
+  property is what makes an aerial read as *built* rather than *cracked*, and it is the thing all
+  five previous rounds have been circling with "glaze", "shards" and "mould".
+- Blocks acquire an orientation, which breaks up the graph-paper districts without touching the
+  road graph — a perfect lattice with varied frontage on it reads as a grid *city*.
+- Varied footprint gives massing hierarchy, which is exactly what the 180 px thumbnail lacks.
+- It removes the naked-Voronoi failure mode in sparse districts, because a lot with frontage
+  still looks like a lot when there is only one building on it.
+
+Then, in order:
+
+2. **Make height survive a real repository.** H = 6.0 on three of four maps means the map's
+   primary quantity is invisible. Rescale so the top of the observed range always reaches a
+   visibly tall extrusion, add a cast shadow proportional to height, and put a tonal ramp on roofs
+   across the L 30–48 headroom that is currently unused. Right now the tallest building is found
+   by reading.
+3. **Give the road network a hierarchy** — a dozen continuous arterials that cross district
+   boundaries, wider and one tone brighter than the rest. It is the only thing that will make the
+   180 px thumbnail read as a place, and the abandoned `accretion` prototype in this repo already
+   had it (the cyan import routes) before it was dropped.
+4. **Get the labels out of the agent band.** L 142 for district text on a base map capped at 48 is
+   a straight violation of §10.3, and it is why every squint test so far has reported the caption
+   before the city. Drop them to the top of the base band, or draw them only on hover.
+5. **Break the coast below 100 px.** Box-dimension 1.00 is a polygon. A little noise on the hull at
+   two smaller scales costs nothing and buys the word "coastline".
+
+Do not answer this round with a palette change. The palette is, this time, close to right.
+
+
+---
+
+---
+
+# ARCHIVE — Round 5
 
 # Round 5 — the pie is gone; the map is now invisible
 

@@ -1022,7 +1022,7 @@ pub fn worktree_id_for(root: &str) -> WorktreeId {
 /// Forward slashes, no trailing separator, ASCII case folded — the same folding
 /// [`LogicalPath`] applies (ADR-0028), so a path is one worktree however the
 /// channel that delivered it spelled it.
-fn normalize_root(root: &str) -> String {
+pub(crate) fn normalize_root(root: &str) -> String {
     let mut s: String = strip_verbatim(root)
         .chars()
         .map(|c| {
@@ -1040,7 +1040,7 @@ fn normalize_root(root: &str) -> String {
 }
 
 /// FNV-1a, 64-bit. Written out; see [`worktree_id_for`].
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = OFFSET;
@@ -1478,7 +1478,7 @@ pub fn default_cache_path(repo_root: &Path) -> Option<PathBuf> {
 /// The pid keeps two Polis instances on one repository from writing the same
 /// temp file. It never reaches the file contents, so it is not a determinism
 /// hazard.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;

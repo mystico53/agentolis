@@ -139,6 +139,16 @@ pub struct SnapshotArgs {
     #[arg(long, value_name = "PATH")]
     pub layout: Option<PathBuf>,
 
+    /// Also write the PRD §10.3 band-validation render.
+    ///
+    /// The same base map with **simulated** M4 clouds and M5 agent and
+    /// attention marks drawn on top, each inside the band §10.3 reserves for
+    /// it. It answers one question and only that question: is a base map held
+    /// in the bottom fifth of the contrast range still legible as context under
+    /// the highlights it exists to make room for? Nothing in it is live data.
+    #[arg(long, value_name = "PATH")]
+    pub bands: Option<PathBuf>,
+
     /// Draw a synthetic repository of this many files instead of the checkout.
     ///
     /// PRD §13.1 budgets cold start at 5 000 files and no fixture is that big;

@@ -122,6 +122,20 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
         println!("wrote {}", path.display());
     }
 
+    if let Some(path) = &args.bands {
+        let bands = plan::render_band_validation(
+            &city,
+            &structure,
+            &format!("{title} - PRD 10.3 BAND VALIDATION (M4/M5 MARKS SIMULATED)"),
+            args.pixels,
+            args.supersample,
+        );
+        bands
+            .write_png(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+
     if let Some(path) = &args.layout {
         let json = city.snapshot().context("serializing the layout")?;
         std::fs::write(path, &json).with_context(|| format!("writing {}", path.display()))?;
@@ -159,6 +173,7 @@ fn index(root: &Path, args: &SnapshotArgs, phases: &mut Phases) -> anyhow::Resul
         Some(&args.out),
         args.junctions.as_ref(),
         args.layout.as_ref(),
+        args.bands.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -195,9 +210,26 @@ fn index(root: &Path, args: &SnapshotArgs, phases: &mut Phases) -> anyhow::Resul
 }
 
 /// Streets, monuments and heights, where the repository can supply them.
+///
+/// # The import graph is read through its cache
+///
+/// Same argument as the history above, and the same shape of answer: PRD §13.1
+/// budgets the whole cold start at under three seconds, and `tree-sitter` over
+/// every source file is the second-largest term in it — measured 0.97 s of
+/// Django's launch, 1.28 s of `CPython`'s, 1.05 s of Ansible's. None of it
+/// changes between two launches of a checkout nobody edited, so the product path
+/// uses [`polis_repo::imports::ImportGraph::build_cached`], whose every hit is
+/// checked against a digest of the source that produced it.
+///
+/// A synthetic repository has no checkout to read, so it uses the plain build:
+/// there is nothing on disk for a cache to key on.
 fn layout_inputs(tree: &RepoTree, real: bool, phases: &mut Phases) -> LayoutInputs {
     let started = Instant::now();
-    let imports = polis_repo::imports::ImportGraph::build(tree);
+    let imports = if real {
+        polis_repo::imports::ImportGraph::build_cached(tree)
+    } else {
+        polis_repo::imports::ImportGraph::build(tree)
+    };
     phases.imports_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let started = Instant::now();
     let diff_lines = if real {

@@ -1,5 +1,6 @@
 ---
 source: polis-layout/tests/m1_gate.rs
+assertion_line: 316
 expression: "city.snapshot().expect(\"serializes\")"
 ---
 {
@@ -7,7 +8,7 @@ expression: "city.snapshot().expect(\"serializes\")"
     "format": 3,
     "schema": 1,
     "quantum": 0.001,
-    "extent": 3.396,
+    "extent": 4.512,
     "roads": {
       "snap_tolerance": 0.004,
       "nodes": [
@@ -20,56 +21,44 @@ expression: "city.snapshot().expect(\"serializes\")"
           -0.513
         ],
         [
-          -0.508,
-          -2.116
-        ],
-        [
           -0.537,
           1.688
+        ],
+        [
+          -0.321,
+          -2.191
         ],
         [
           -0.118,
           2.09
         ],
         [
-          0.109,
-          -0.91
+          0.576,
+          -2.182
         ],
         [
-          0.37,
-          -0.124
+          0.912,
+          2.338
         ],
         [
-          0.688,
-          -2.594
+          1.217,
+          -1.819
         ],
         [
-          0.861,
-          0.125
+          1.828,
+          -1.582
         ],
         [
-          1.146,
-          2.333
+          2.786,
+          -1.267
         ],
         [
-          1.559,
-          -0.105
+          2.854,
+          2.642
         ],
         [
-          2.255,
-          2.133
-        ],
-        [
-          2.888,
-          -0.079
-        ],
-        [
-          2.987,
-          -1.616
-        ],
-        [
-          3.028,
-          0.636
+          4.088,
+          1.909
         ]
       ],
       "segments": [
@@ -80,18 +69,18 @@ expression: "city.snapshot().expect(\"serializes\")"
         },
         {
           "from": 0,
-          "to": 3,
-          "class": "street"
-        },
-        {
-          "from": 1,
           "to": 2,
           "class": "street"
         },
         {
+          "from": 1,
+          "to": 3,
+          "class": "street"
+        },
+        {
           "from": 2,
-          "to": 5,
-          "class": "arterial"
+          "to": 4,
+          "class": "street"
         },
         {
           "from": 2,
@@ -100,11 +89,11 @@ expression: "city.snapshot().expect(\"serializes\")"
         },
         {
           "from": 3,
-          "to": 4,
+          "to": 5,
           "class": "street"
         },
         {
-          "from": 3,
+          "from": 4,
           "to": 6,
           "class": "street"
         },
@@ -114,18 +103,8 @@ expression: "city.snapshot().expect(\"serializes\")"
           "class": "alley"
         },
         {
-          "from": 4,
-          "to": 9,
-          "class": "street"
-        },
-        {
           "from": 5,
-          "to": 6,
-          "class": "street"
-        },
-        {
-          "from": 5,
-          "to": 10,
+          "to": 7,
           "class": "arterial"
         },
         {
@@ -134,13 +113,23 @@ expression: "city.snapshot().expect(\"serializes\")"
           "class": "street"
         },
         {
-          "from": 7,
-          "to": 13,
+          "from": 6,
+          "to": 9,
+          "class": "alley"
+        },
+        {
+          "from": 6,
+          "to": 10,
           "class": "street"
         },
         {
+          "from": 7,
+          "to": 8,
+          "class": "arterial"
+        },
+        {
           "from": 8,
-          "to": 10,
+          "to": 9,
           "class": "street"
         },
         {
@@ -150,22 +139,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         },
         {
           "from": 10,
-          "to": 12,
-          "class": "arterial"
-        },
-        {
-          "from": 11,
-          "to": 14,
-          "class": "street"
-        },
-        {
-          "from": 12,
-          "to": 13,
-          "class": "street"
-        },
-        {
-          "from": 12,
-          "to": 14,
+          "to": 11,
           "class": "street"
         }
       ]
@@ -184,16 +158,16 @@ expression: "city.snapshot().expect(\"serializes\")"
             -0.513
           ],
           [
-            -0.508,
-            -2.116
+            -0.321,
+            -2.191
           ],
           [
-            0.109,
-            -0.91
+            0.576,
+            -2.182
           ],
           [
-            0.37,
-            -0.124
+            1.217,
+            -1.819
           ],
           [
             -0.537,
@@ -206,36 +180,6 @@ expression: "city.snapshot().expect(\"serializes\")"
         "district": "",
         "boundary": [
           [
-            0.109,
-            -0.91
-          ],
-          [
-            -0.508,
-            -2.116
-          ],
-          [
-            0.688,
-            -2.594
-          ],
-          [
-            2.987,
-            -1.616
-          ],
-          [
-            2.888,
-            -0.079
-          ],
-          [
-            1.559,
-            -0.105
-          ]
-        ]
-      },
-      {
-        "id": 2,
-        "district": "src",
-        "boundary": [
-          [
             -0.118,
             2.09
           ],
@@ -244,12 +188,30 @@ expression: "city.snapshot().expect(\"serializes\")"
             1.688
           ],
           [
-            0.37,
-            -0.124
+            1.217,
+            -1.819
           ],
           [
-            0.861,
-            0.125
+            1.828,
+            -1.582
+          ]
+        ]
+      },
+      {
+        "id": 2,
+        "district": "",
+        "boundary": [
+          [
+            0.912,
+            2.338
+          ],
+          [
+            -0.118,
+            2.09
+          ],
+          [
+            1.828,
+            -1.582
           ]
         ]
       },
@@ -258,54 +220,38 @@ expression: "city.snapshot().expect(\"serializes\")"
         "district": "src",
         "boundary": [
           [
-            -0.118,
-            2.09
+            0.912,
+            2.338
           ],
           [
-            0.861,
-            0.125
+            1.828,
+            -1.582
           ],
           [
-            1.559,
-            -0.105
-          ],
-          [
-            2.888,
-            -0.079
-          ],
-          [
-            3.028,
-            0.636
-          ],
-          [
-            2.255,
-            2.133
-          ],
-          [
-            1.146,
-            2.333
+            2.786,
+            -1.267
           ]
         ]
       },
       {
         "id": 4,
-        "district": "",
+        "district": "src",
         "boundary": [
           [
-            0.37,
-            -0.124
+            0.912,
+            2.338
           ],
           [
-            0.109,
-            -0.91
+            2.786,
+            -1.267
           ],
           [
-            1.559,
-            -0.105
+            4.088,
+            1.909
           ],
           [
-            0.861,
-            0.125
+            2.854,
+            2.642
           ]
         ]
       }
@@ -314,38 +260,7 @@ expression: "city.snapshot().expect(\"serializes\")"
       {
         "id": 0,
         "block": 1,
-        "occupant": "README.md",
-        "boundary": [
-          [
-            0.109,
-            -0.91
-          ],
-          [
-            -0.508,
-            -2.116
-          ],
-          [
-            0.688,
-            -2.594
-          ],
-          [
-            2.987,
-            -1.616
-          ],
-          [
-            2.888,
-            -0.079
-          ],
-          [
-            1.559,
-            -0.105
-          ]
-        ]
-      },
-      {
-        "id": 1,
-        "block": 2,
-        "occupant": "src/main.rs",
+        "occupant": ".gitattributes",
         "boundary": [
           [
             -0.118,
@@ -356,93 +271,96 @@ expression: "city.snapshot().expect(\"serializes\")"
             1.688
           ],
           [
-            0.37,
-            -0.124
+            1.217,
+            -1.819
           ],
           [
-            0.861,
-            0.125
+            1.828,
+            -1.582
+          ]
+        ]
+      },
+      {
+        "id": 1,
+        "block": 2,
+        "occupant": "README.md",
+        "boundary": [
+          [
+            0.912,
+            2.338
+          ],
+          [
+            -0.118,
+            2.09
+          ],
+          [
+            1.828,
+            -1.582
           ]
         ]
       },
       {
         "id": 2,
         "block": 3,
-        "occupant": "src/util.rs",
+        "occupant": "src/main.rs",
         "boundary": [
           [
-            -0.118,
-            2.09
+            0.912,
+            2.338
           ],
           [
-            0.676,
-            0.497
+            1.828,
+            -1.582
           ],
           [
-            2.237,
-            2.136
-          ],
-          [
-            1.146,
-            2.333
+            2.786,
+            -1.267
           ]
         ]
       },
       {
         "id": 3,
-        "block": 3,
-        "occupant": null,
+        "block": 4,
+        "occupant": "src/util.rs",
         "boundary": [
           [
-            0.676,
-            0.497
+            0.912,
+            2.338
           ],
           [
-            0.861,
-            0.125
+            1.428,
+            1.345
           ],
           [
-            1.559,
-            -0.105
+            4.062,
+            1.845
           ],
           [
-            2.888,
-            -0.079
+            4.088,
+            1.909
           ],
           [
-            3.028,
-            0.636
-          ],
-          [
-            2.255,
-            2.133
-          ],
-          [
-            2.237,
-            2.136
+            2.854,
+            2.642
           ]
         ]
       },
       {
         "id": 4,
         "block": 4,
-        "occupant": ".gitattributes",
+        "occupant": null,
         "boundary": [
           [
-            0.37,
-            -0.124
+            1.428,
+            1.345
           ],
           [
-            0.109,
-            -0.91
+            2.786,
+            -1.267
           ],
           [
-            1.559,
-            -0.105
-          ],
-          [
-            0.861,
-            0.125
+            4.062,
+            1.845
           ]
         ]
       }
@@ -450,105 +368,109 @@ expression: "city.snapshot().expect(\"serializes\")"
     "buildings": [
       {
         "path": ".gitattributes",
-        "lot": 4,
+        "lot": 0,
         "height": 1.163,
         "roof": "pitched",
         "rotation": 0.02,
         "footprint": [
           [
-            0.653,
-            -0.535
+            0.318,
+            0.12
           ],
           [
-            0.969,
-            -0.36
+            0.451,
+            -0.146
           ],
           [
-            0.77,
-            -0.018
+            0.871,
+            0.088
           ],
           [
-            0.458,
-            -0.2
+            0.732,
+            0.35
           ]
         ]
       },
       {
         "path": "README.md",
-        "lot": 0,
+        "lot": 1,
         "height": 2.277,
         "roof": "stepped",
         "rotation": -0.064,
         "footprint": [
           [
-            1.207,
-            -2.304
+            0.407,
+            1.235
           ],
           [
-            1.859,
-            -2.027
+            1.224,
+            -0.307
           ],
           [
-            1.468,
-            -0.914
+            1.442,
+            -0.208
           ],
           [
-            0.801,
-            -1.149
+            1.038,
+            1.519
           ]
         ]
       },
       {
         "path": "src/main.rs",
-        "lot": 1,
+        "lot": 2,
         "height": 6.0,
         "roof": "stepped",
         "rotation": -0.041,
         "footprint": [
           [
-            -0.273,
-            1.381
+            1.291,
+            0.997
           ],
           [
-            0.068,
-            0.62
+            1.697,
+            -0.741
           ],
           [
-            0.177,
-            0.404
+            2.295,
+            -0.46
           ],
           [
-            0.564,
-            0.578
-          ],
-          [
-            0.084,
-            1.541
+            1.489,
+            1.09
           ]
         ]
       },
       {
         "path": "src/util.rs",
-        "lot": 2,
+        "lot": 3,
         "height": 2.123,
         "roof": "stepped",
         "rotation": -0.056,
         "footprint": [
           [
-            -0.024,
-            2.043
+            1.857,
+            1.514
           ],
           [
-            0.718,
-            0.555
+            2.67,
+            1.595
           ],
           [
-            1.375,
-            1.244
+            3.255,
+            1.706
           ],
           [
-            0.95,
-            2.231
+            3.189,
+            2.369
+          ],
+          [
+            2.841,
+            2.576
+          ],
+          [
+            1.768,
+            2.408
           ]
         ]
       }
@@ -557,13 +479,13 @@ expression: "city.snapshot().expect(\"serializes\")"
       {
         "path": "",
         "centre": [
-          0.582,
-          -0.324
+          0.492,
+          0.247
         ],
         "blocks": [
           0,
           1,
-          4
+          2
         ],
         "boundary": [
           [
@@ -575,69 +497,57 @@ expression: "city.snapshot().expect(\"serializes\")"
             -0.513
           ],
           [
-            -0.508,
-            -2.116
+            -0.321,
+            -2.191
           ],
           [
-            0.688,
-            -2.594
+            0.576,
+            -2.182
           ],
           [
-            2.987,
-            -1.616
+            1.828,
+            -1.582
           ],
           [
-            2.888,
-            -0.079
+            0.912,
+            2.338
           ],
           [
-            -0.537,
-            1.688
+            -0.118,
+            2.09
           ]
         ]
       },
       {
         "path": "src",
         "centre": [
-          0.738,
-          0.37
+          1.751,
+          0.799
         ],
         "blocks": [
-          2,
-          3
+          3,
+          4
         ],
         "boundary": [
           [
-            -0.537,
-            1.688
+            0.912,
+            2.338
           ],
           [
-            0.37,
-            -0.124
+            1.828,
+            -1.582
           ],
           [
-            1.559,
-            -0.105
+            2.786,
+            -1.267
           ],
           [
-            2.888,
-            -0.079
+            4.088,
+            1.909
           ],
           [
-            3.028,
-            0.636
-          ],
-          [
-            2.255,
-            2.133
-          ],
-          [
-            1.146,
-            2.333
-          ],
-          [
-            -0.118,
-            2.09
+            2.854,
+            2.642
           ]
         ]
       }
@@ -650,7 +560,7 @@ expression: "city.snapshot().expect(\"serializes\")"
     "octaves": 3,
     "relief": 1.2,
     "districts": 2,
-    "digest": "0x54f795f8ef48eabf"
+    "digest": "0x7f1b639074e3118a"
   },
   "monuments": [
     {
@@ -679,19 +589,19 @@ expression: "city.snapshot().expect(\"serializes\")"
     "buildings": 4,
     "blocks": 5,
     "open_blocks": 0,
-    "slivers": 0,
+    "slivers": 1,
     "lots": 5,
     "empty_lots": 1,
     "massed": 0,
     "overflow": 0,
     "unbuilt": 0,
     "plots": 5,
-    "road_nodes": 15,
-    "road_segments": 19,
+    "road_nodes": 12,
+    "road_segments": 16,
     "components": 1,
     "cycles": 5,
-    "junctions": 8,
-    "complex_junctions": 0,
+    "junctions": 6,
+    "complex_junctions": 2,
     "dangling": 0,
     "crossings": 0,
     "districts": 2,

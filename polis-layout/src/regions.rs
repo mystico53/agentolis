@@ -68,10 +68,20 @@
 //! # Where the old town ends up
 //!
 //! Seed `a` is the **oldest plot** in `S`, and the older half of the item list
-//! takes `A`. The growth settles from the origin outward in commit order, so the
-//! oldest ground is the middle of the town — and the old quarters therefore end
-//! up in the middle without anything in this module knowing what "middle" means
-//! (PRD §7.1).
+//! takes `A`. So a district's oldest ground anchors its quarter and the newer
+//! subtrees are cut away from it — PRD §7.1's age structure, obtained on the
+//! graph without this module ever forming a coordinate.
+//!
+//! It used to say something stronger and no longer true, and the correction is
+//! the point of the rule below it: *"the growth settles from the origin outward
+//! in commit order, so the oldest ground is the middle of the town."* That was
+//! exactly the artefact — one origin, everything graded outward from it, junction
+//! spacing a monotone function of radius at correlation +0.55 to +0.61 on three
+//! corpora. [`crate::accrete`] now founds **several** quarters, sited off the
+//! terrain, so the oldest ground is wherever the oldest package is and there is
+//! no middle to be in. Nothing here changed, because nothing here ever knew what
+//! "middle" meant: the seed is the oldest plot of the *set it is given*, which is
+//! the right answer under either growth.
 //!
 //! # Where the terrain gets in
 //!
