@@ -325,12 +325,28 @@ impl WalkOptions {
     }
 }
 
-/// Directory names never walked, whatever the options say.
+/// Names never walked, whatever the options say — as a directory **or as a
+/// file**.
 ///
 /// `.git` is not a district. It is not in `git ls-files`, it holds no source,
 /// and on a busy repository it is tens of thousands of loose objects — a walk
 /// that descends into it spends its entire budget there and renders a city made
 /// of hashes.
+///
+/// # The file case is not hypothetical: it is PRD §7.6
+///
+/// In a `git worktree`, `.git` is not a directory at all — it is a 150-byte
+/// regular file holding `gitdir: …`. Skipping the name only in the directory
+/// branch therefore gave the worktree one extra building that the main checkout
+/// does not have, and one extra file moves *every* plot after it in the growth
+/// order. Measured on Neovim at 3 890 files: the checkout digested
+/// `0x81a7fc4673746894` and a detached worktree of the same commit digested
+/// `0x32253e6355279852`.
+///
+/// > `/repo-wt-3/src/auth.ts` and `/repo-wt-7/src/auth.ts` are the **same
+/// > logical file in two physical places** … never a separate city. (PRD §7.6)
+///
+/// So the name is skipped by name, whatever kind of entry it turns out to be.
 const NEVER_WALKED: &[&str] = &[".git"];
 
 // ---------------------------------------------------------------------------
@@ -601,6 +617,12 @@ pub fn walk_with(root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<FileMet
             let Ok(child) = logical.join(&name) else {
                 continue;
             };
+            // Before the directory/file split, because a worktree's `.git` is a
+            // *file* and skipping it only as a directory gives every worktree a
+            // different city (PRD §7.6). See [`NEVER_WALKED`].
+            if NEVER_WALKED.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
             // `file_type` does not follow symlinks; `metadata` does, which is
             // what makes a followed symlink resolve to its target's kind.
             let is_dir = if file_type.is_symlink() {
@@ -609,9 +631,6 @@ pub fn walk_with(root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<FileMet
                 file_type.is_dir()
             };
             if is_dir {
-                if NEVER_WALKED.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
-                    continue;
-                }
                 if opts.skip_massed && rules.is_industrial_dir(&child) {
                     continue;
                 }
@@ -2273,6 +2292,32 @@ mod tests {
 
         // The same walk, run again, is byte-identical (PRD §7.4).
         assert_eq!(files, walk(dir.path()).expect("walk again"));
+    }
+
+    /// PRD §7.6: a worktree is the same base map, not a different city.
+    ///
+    /// In a `git worktree` the repository pointer is a regular **file** called
+    /// `.git`, not a directory. The walk skipped the name only in its directory
+    /// branch, so a worktree came out with one building the main checkout does
+    /// not have — and one extra file shifts the growth order under every plot
+    /// after it, so the whole city moved. Measured on Neovim before the fix:
+    /// checkout digest `0x81a7fc4673746894`, worktree digest
+    /// `0x32253e6355279852`, for the same commit.
+    #[test]
+    fn a_worktrees_dot_git_pointer_file_is_not_a_building() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(root, "README.md", b"# repo");
+        write(root, "src/main.rs", b"fn main() {}");
+        // Exactly what `git worktree add` leaves at the root of a linked tree.
+        write(root, ".git", b"gitdir: /elsewhere/.git/worktrees/wt-3\n");
+        let files = walk(root).expect("walk");
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["README.md", "src/main.rs"],
+            "the worktree's `.git` pointer file was given a building"
+        );
     }
 
     #[test]

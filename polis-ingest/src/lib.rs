@@ -19,7 +19,7 @@
 //!
 //! A Polis that dies because a stale collector holds port 4317 is strictly worse
 //! than a Polis with no OTel. Each channel reports its own failure as
-//! [`ControlEvent::ChannelDegraded`](polis_events::ControlEvent::ChannelDegraded)
+//! [`ControlEvent::ChannelDegraded`]
 //! and the rest keep running (ADR-0011). The one exception is the hook
 //! listener's `AddrInUse`, which means a second Polis is already running and is
 //! fatal by design — see [`hook_listener`].
@@ -110,7 +110,7 @@ pub enum SourceHealth {
     Running,
     /// Running, but not delivering everything it should. Carries the operator-
     /// readable reason that goes into
-    /// [`ControlEvent::ChannelDegraded`](polis_events::ControlEvent::ChannelDegraded).
+    /// [`ControlEvent::ChannelDegraded`].
     ///
     /// The canonical cases: port 4317 held by a stale collector, and the beta
     /// traces channel producing no spans — in which case every tool call is
@@ -506,7 +506,7 @@ impl Ingest {
 
     /// Requests shutdown and waits for every channel thread to stop.
     ///
-    /// Announces [`ControlEvent::Shutdown`](polis_events::ControlEvent::Shutdown)
+    /// Announces [`ControlEvent::Shutdown`]
     /// first, so a consumer draining the bus learns why it is about to end, then
     /// drops Polis's own sink — which is what makes
     /// [`EventSource::recv`] return `None` once the channel threads have

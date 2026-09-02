@@ -1,0 +1,86 @@
+== C:/coding/agentolis/docs/design/render-review/before-large.png  (1600x1600, 2342400 map px)
+  L* percentiles: p0=3.7  p1=3.7  p5=3.7  p25=3.7  p50=39.8  p75=60.5  p90=78.1  p95=78.1  p99=90.9  p99.9=94.0  p100=96.4
+  chroma pctiles: p0=0.0  p1=0.8  p5=2.0  p25=2.0  p50=5.9  p75=19.6  p90=21.6  p95=22.0  p99=23.1  p99.9=23.5  p100=23.9
+    L* >= 20 : 68.427% of map area
+    L* >= 30 : 67.238% of map area
+    L* >= 40 : 49.821% of map area
+    L* >= 50 : 29.071% of map area
+    L* >= 60 : 25.129% of map area
+    L* >= 70 : 23.063% of map area
+    L* >= 80 :  3.293% of map area
+  top colours:
+    (12, 13, 17)        31.17%  L*=  3.7 chroma=  2.0
+    (197, 193, 182)     16.12%  L*= 78.1 chroma=  5.9
+    (79, 81, 87)         6.44%  L*= 34.5 chroma=  3.1
+    (131, 80, 99)        1.68%  L*= 40.4 chroma= 20.0
+    (131, 105, 80)       1.18%  L*= 46.3 chroma= 20.0
+    (79, 106, 130)       1.10%  L*= 43.6 chroma= 20.0
+  distinct colours in map area: 95240
+  thumb -> C:/coding/agentolis/docs/design/render-review/before-large-thumb180.png
+== C:/coding/agentolis/docs/design/render-review/after-large.png  (1600x1600, 2342400 map px)
+  L* percentiles: p0=0.5  p1=1.1  p5=1.6  p25=3.0  p50=6.3  p75=9.2  p90=12.8  p95=13.7  p99=17.6  p99.9=59.3  p100=59.3
+  chroma pctiles: p0=0.0  p1=0.4  p5=0.8  p25=1.2  p50=1.6  p75=3.1  p90=3.9  p95=4.3  p99=4.3  p99.9=5.5  p100=5.9
+    L* >= 20 :  0.470% of map area
+    L* >= 30 :  0.421% of map area
+    L* >= 40 :  0.314% of map area
+    L* >= 50 :  0.268% of map area
+    L* >= 60 :  0.000% of map area
+    L* >= 70 :  0.000% of map area
+    L* >= 80 :  0.000% of map area
+  top colours:
+    (34, 33, 31)         7.25%  L*= 12.8 chroma=  1.2
+    (19, 20, 22)         6.69%  L*=  6.3 chroma=  1.2
+    (26, 17, 23)         5.05%  L*=  6.2 chroma=  3.5
+    (6, 7, 10)           4.91%  L*=  1.9 chroma=  1.6
+    (5, 6, 9)            4.55%  L*=  1.6 chroma=  1.6
+    (7, 8, 11)           4.08%  L*=  2.2 chroma=  1.6
+  distinct colours in map area: 5506
+  thumb -> C:/coding/agentolis/docs/design/render-review/after-large-thumb180.png
+== C:/coding/agentolis/docs/design/render-review/before-repo.png  (1600x1600, 2342400 map px)
+  L* percentiles: p0=3.0  p1=3.7  p5=3.7  p25=3.7  p50=35.1  p75=78.0  p90=78.1  p95=85.0  p99=92.1  p99.9=96.1  p100=96.4
+  chroma pctiles: p0=0.0  p1=1.2  p5=2.0  p25=2.0  p50=5.9  p75=22.0  p90=23.1  p95=23.1  p99=67.1  p99.9=67.1  p100=67.1
+    L* >= 20 : 67.770% of map area
+    L* >= 30 : 60.242% of map area
+    L* >= 40 : 42.686% of map area
+    L* >= 50 : 29.095% of map area
+    L* >= 60 : 27.465% of map area
+    L* >= 70 : 26.242% of map area
+    L* >= 80 :  8.662% of map area
+  top colours:
+    (12, 13, 17)        31.10%  L*=  3.7 chroma=  2.0
+    (197, 193, 182)     15.31%  L*= 78.1 chroma=  5.9
+    (57, 86, 111)        3.80%  L*= 35.3 chroma= 21.2
+    (110, 51, 51)        3.10%  L*= 29.2 chroma= 23.1
+    (255, 206, 84)       2.92%  L*= 85.0 chroma= 67.1
+    (88, 58, 116)        2.84%  L*= 30.3 chroma= 22.7
+  distinct colours in map area: 28269
+  thumb -> C:/coding/agentolis/docs/design/render-review/before-repo-thumb180.png
+== C:/coding/agentolis/docs/design/render-review/after-repo.png  (1600x1600, 2342400 map px)
+  L* percentiles: p0=0.5  p1=1.4  p5=1.9  p25=3.9  p50=6.3  p75=10.2  p90=15.2  p95=18.0  p99=59.3  p99.9=59.5  p100=59.5
+  chroma pctiles: p0=0.0  p1=0.4  p5=0.8  p25=1.6  p50=2.4  p75=3.9  p90=4.3  p95=5.1  p99=9.4  p99.9=31.4  p100=31.4
+    L* >= 20 :  2.052% of map area
+    L* >= 30 :  1.907% of map area
+    L* >= 40 :  1.513% of map area
+    L* >= 50 :  1.373% of map area
+    L* >= 60 :  0.000% of map area
+    L* >= 70 :  0.000% of map area
+    L* >= 80 :  0.000% of map area
+  top colours:
+    (34, 33, 31)         7.11%  L*= 12.8 chroma=  1.2
+    (26, 17, 23)         5.46%  L*=  6.2 chroma=  3.5
+    (39, 38, 35)         3.12%  L*= 15.2 chroma=  1.6
+    (26, 17, 18)         3.01%  L*=  6.0 chroma=  3.5
+    (22, 27, 18)         2.99%  L*=  9.0 chroma=  3.5
+    (17, 23, 28)         2.89%  L*=  7.4 chroma=  4.3
+  distinct colours in map area: 6575
+  thumb -> C:/coding/agentolis/docs/design/render-review/after-repo-thumb180.png
+
+== built-mass tone census (pixels whose largest channel is 30..48, i.e. layer-2 built mass)
+  before-repo.png    tones= 456  tones>=0.02% of map=  2  band covers   0.2% of map
+  after-repo.png     tones=1839  tones>=0.02% of map= 62  band covers  21.3% of map
+  before-large.png   tones= 560  tones>=0.02% of map=  1  band covers   0.1% of map
+  after-large.png    tones=1618  tones>=0.02% of map= 52  band covers  17.3% of map
+
+== the flat-fill census the fresh-eyes review ran
+  before-repo.png    top five: [((12, 13, 17), 31.1), ((197, 193, 182), 15.31), ((57, 86, 111), 3.8), ((110, 51, 51), 3.1), ((255, 206, 84), 2.92)]
+  after-repo.png     top five: [((34, 33, 31), 7.11), ((26, 17, 23), 5.46), ((39, 38, 35), 3.12), ((26, 17, 18), 3.01), ((22, 27, 18), 2.99)]

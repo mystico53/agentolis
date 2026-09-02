@@ -360,6 +360,21 @@ pub struct CityReport {
     /// Files added inside the repository's **first year** — PRD §7.1's old town,
     /// counted rather than assumed.
     pub old_town_files: usize,
+    /// Files whose ground lands in the core band — PRD §7.1's old town as the
+    /// operator actually sees it.
+    ///
+    /// Equal to [`Self::old_town_files`] on a repository whose growth curve
+    /// suits the calendar ramp, larger on one that does not, and the difference
+    /// is what [`Self::age_equalisation_x100`] bought.
+    pub core_files: usize,
+    /// How far the age ramp had to be corrected away from pure commit time
+    /// toward the repository's own distribution, in hundredths.
+    ///
+    /// `0` is a repository PRD §7.1 describes literally. `100` is one whose
+    /// calendar says nothing usable about where its core is. See
+    /// `crate::age::AgeRamp::equalisation`; an integer here because the report
+    /// is compared byte-for-byte in a golden file.
+    pub age_equalisation_x100: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +397,17 @@ pub struct Growth {
     pub(crate) cells: Cells,
     /// The terrain field, pinned so a growth step reproduces it exactly.
     pub(crate) terrain: TerrainField,
+    /// Which quarter each plot's cell is computed in, one entry per plot.
+    ///
+    /// Carried rather than recomputed: a growth step adds a plot, and the five
+    /// thousand plots already on the ground have not moved and the quarters have
+    /// not changed, so re-running the point-location for all of them is work
+    /// whose answer is already known (PRD §7.4's "growth is genuinely
+    /// incremental"). [`City::accrete`] appends the new plot's quarter by the
+    /// same rule [`quarter_assignment`] applies, and
+    /// `the_carried_quarter_assignment_matches_a_fresh_one` holds the two to
+    /// each other.
+    pub(crate) quarter_of: Vec<u32>,
 }
 
 impl Growth {
@@ -418,6 +444,17 @@ pub struct City {
     pub report: CityReport,
     /// The accretion state, so one more file is one more growth step.
     pub growth: Growth,
+    /// Block subdivisions carried over from the previous growth step.
+    ///
+    /// A **timing** structure and nothing else: every hit is checked bit for bit
+    /// against the arguments that produced it, so the cache can skip work but
+    /// cannot change an output (PRD §7.4). It is deliberately outside
+    /// [`CitySnapshot`] and outside [`City::digest`] — two cities with the same
+    /// map are the same city whatever either one remembered on the way there.
+    pub(crate) cuts: crate::memo::CutCache,
+    /// Buildings carried over from the previous growth step. See
+    /// [`City::cuts`]; the same rules apply, and for the same reason.
+    pub(crate) seats: crate::memo::SeatCache,
 }
 
 impl Default for TerrainParams {
@@ -444,6 +481,33 @@ impl City {
     #[must_use]
     pub fn building(&self, path: &LogicalPath) -> Option<&Building> {
         self.layout.buildings.get(path)
+    }
+
+    /// Empties what the growth step remembers, so the next one recomputes
+    /// everything from scratch.
+    ///
+    /// The caches behind [`City::reuse`] are *timing* structures whose every hit
+    /// is verified bit for bit against the arguments that produced it, so
+    /// forgetting them must change nothing but the clock — which is what
+    /// `a_warm_cache_and_a_cold_one_build_the_same_city` asserts. Exposed
+    /// because a city that will not grow again can give the memory back.
+    pub fn forget(&mut self) {
+        self.cuts = crate::memo::CutCache::default();
+        self.seats = crate::memo::SeatCache::default();
+    }
+
+    /// What the last assembly reused: `(block cuts, seated buildings)`, each the
+    /// share in `[0, 1]` that did not have to be recomputed.
+    ///
+    /// `(0, 0)` for a city generated from scratch, which had nothing to reuse.
+    /// A growth step that reports low numbers is one that moved the ground, and
+    /// PRD §7.7 says it should not have.
+    #[must_use]
+    pub fn reuse(&self) -> (f64, f64) {
+        (
+            self.cuts.counts().hit_rate(),
+            self.seats.counts().hit_rate(),
+        )
     }
 
     /// True when a file is one of PRD §8's anchors.
@@ -515,6 +579,11 @@ impl City {
             })
             .collect();
         let sep = self.growth.settlement.params.sep_rim;
+        // The partition does not change while files are being added, so the
+        // quarters and their centroids are computed once for the whole batch
+        // rather than once per file.
+        let quarters = self.growth.settlement.territory.leaf_quarters();
+        let centres: Vec<Pt> = quarters.iter().map(|q| centroid(q)).collect();
         for path in crate::determinism::canonical_order(added.iter().cloned()) {
             let Some(meta) = tree.file(&path) else {
                 continue;
@@ -525,12 +594,18 @@ impl City {
             if self.growth.settlement.plots.len() > plots_before {
                 let at = self.growth.settlement.plots[plots_before].pos;
                 let positions = self.growth.settlement.positions();
-                let quarters = self.growth.settlement.territory.leaf_quarters();
-                let quarter_of = quarter_assignment(&positions, &quarters);
+                // Every plot that was already here is in the quarter it was in:
+                // it has not moved and neither have the quarters. Only the new
+                // plots need locating.
+                for p in &positions[self.growth.quarter_of.len()..] {
+                    let q = quarter_of_point(*p, &quarters, &centres);
+                    self.growth.quarter_of.push(q);
+                }
+                debug_assert_eq!(self.growth.quarter_of.len(), positions.len());
                 let which = voronoi::affected(&positions, &[at], sep);
                 voronoi::rebuild_subset(
                     &positions,
-                    &quarter_of,
+                    &self.growth.quarter_of,
                     sep,
                     &mut self.growth.cells,
                     &which,
@@ -542,6 +617,8 @@ impl City {
             tree,
             inputs,
             self.vacancies.clone(),
+            std::mem::take(&mut self.cuts),
+            std::mem::take(&mut self.seats),
         );
         *self = rebuilt;
         let after: BTreeSet<(i64, i64)> = self
@@ -647,8 +724,16 @@ pub fn generate_with_seed(tree: &RepoTree, inputs: &LayoutInputs, seed: u64) -> 
         settlement,
         cells,
         terrain,
+        quarter_of,
     };
-    assemble(growth, tree, inputs, VacancyLedger::new())
+    assemble(
+        growth,
+        tree,
+        inputs,
+        VacancyLedger::new(),
+        crate::memo::CutCache::default(),
+        crate::memo::SeatCache::default(),
+    )
 }
 
 /// Which quarter each plot's cell is computed in (PRD §7.2, [`crate::voronoi`]).
@@ -670,23 +755,33 @@ fn quarter_assignment(positions: &[Pt], quarters: &[Vec<Pt>]) -> Vec<u32> {
     let centres: Vec<Pt> = quarters.iter().map(|q| centroid(q)).collect();
     positions
         .iter()
-        .map(|p| {
-            for (i, q) in quarters.iter().enumerate() {
-                if geom::contains(q, *p) {
-                    return u32::try_from(i).expect("quarter count fits in u32");
-                }
-            }
-            let mut best = (f64::INFINITY, 0u32);
-            for (i, c) in centres.iter().enumerate() {
-                let d = crate::determinism::quantize_f64(dist(*p, *c));
-                let i = u32::try_from(i).expect("quarter count fits in u32");
-                if d < best.0 {
-                    best = (d, i);
-                }
-            }
-            best.1
-        })
+        .map(|p| quarter_of_point(*p, quarters, &centres))
         .collect()
+}
+
+/// [`quarter_assignment`] for one point, with the quarters' centroids supplied.
+///
+/// Split out so [`City::accrete`] can locate the one plot it just added without
+/// re-locating the five thousand that have not moved — and so that when it does,
+/// it applies the *same rule*, rather than a second copy of it that can drift.
+fn quarter_of_point(p: Pt, quarters: &[Vec<Pt>], centres: &[Pt]) -> u32 {
+    if quarters.len() <= 1 {
+        return 0;
+    }
+    for (i, q) in quarters.iter().enumerate() {
+        if geom::contains(q, p) {
+            return u32::try_from(i).expect("quarter count fits in u32");
+        }
+    }
+    let mut best = (f64::INFINITY, 0u32);
+    for (i, c) in centres.iter().enumerate() {
+        let d = crate::determinism::quantize_f64(dist(p, *c));
+        let i = u32::try_from(i).expect("quarter count fits in u32");
+        if d < best.0 {
+            best = (d, i);
+        }
+    }
+    best.1
 }
 
 /// Everything downstream of the settled ground.
@@ -699,6 +794,8 @@ fn assemble(
     tree: &RepoTree,
     inputs: &LayoutInputs,
     vacancies: VacancyLedger,
+    mut cuts: crate::memo::CutCache,
+    mut seats: crate::memo::SeatCache,
 ) -> City {
     let s = &growth.settlement;
     let params = s.params;
@@ -765,7 +862,7 @@ fn assemble(
 
     // --- 6. Lots (PRD §7.2 step 4) ----------------------------------------
     let road_half = growth.road_half();
-    let parcelling = lots::parcel_city(&block_plans, s, civic, road_half);
+    let parcelling = lots::parcel_city(&block_plans, s, civic, road_half, &mut cuts);
     // The repository's own median file size, which the absolute footprint cap is
     // measured against (`buildings::FOOTPRINT_REFERENCE_BYTES`). Computed from
     // the files that will actually carry a building, so a `node_modules` full of
@@ -786,56 +883,115 @@ fn assemble(
     // assembly, and assembly is what PRD §13.1's 50 ms incremental budget is
     // spent on — `City::accrete` re-runs exactly this after one growth step.
     //
+    // The same purity is why the stage is *skipped* wherever nothing moved: a
+    // growth step is asked for the buildings of five thousand parcels and only a
+    // handful of them are new. `crate::memo::SeatCache` holds the previous
+    // step's answers and every hit is checked bit for bit against the arguments
+    // that produced it, so the cache removes work without being able to change
+    // an output. Parallelism alone was not enough: it hides the cost on a
+    // twenty-four-core developer machine and returns in full on a four-core CI
+    // runner, which is exactly where the budget was flaking.
+    // One shared copy of each block's ring: a block has many parcels and each
+    // of their keys needs it, and copying it per parcel cost more than the
+    // seating it saves.
+    let block_rings: Vec<(std::sync::Arc<Vec<crate::geom::Pt>>, u64)> = block_plans
+        .iter()
+        .map(|b| {
+            (
+                std::sync::Arc::new(b.ring.clone()),
+                crate::memo::digest_ring(&b.ring),
+            )
+        })
+        .collect();
+    let seat_inputs: Vec<(Lot, Option<crate::memo::SeatKey>)> = parcelling
+        .parcels
+        .into_iter()
+        .enumerate()
+        .map(|(i, parcel)| {
+            let id = LotId(u32::try_from(i).expect("lot count fits in u32"));
+            let occupant = parcel.occupant.map(|f| s.files[f as usize].path.clone());
+            let boundary = to_polygon(&parcel.ring);
+            let lot = Lot {
+                id,
+                block: BlockId(parcel.block),
+                boundary,
+                occupant: occupant.clone(),
+            };
+            let key = occupant.and_then(|path| {
+                let meta = tree.file(&path)?;
+                let rec = &s.files[parcel.occupant.expect("occupied") as usize];
+                let spec = BuildingSpec::new(rec.size_bytes)
+                    .with_diff_lines(inputs.diff_lines_of(&path))
+                    .with_size_reference(median_bytes)
+                    .with_class(if rec.monument {
+                        FileClass::Monument
+                    } else {
+                        meta.class
+                    });
+                let (block, block_digest) = &block_rings[parcel.block as usize];
+                Some(crate::memo::SeatKey {
+                    parcel: parcel.ring,
+                    block: std::sync::Arc::clone(block),
+                    block_digest: *block_digest,
+                    path,
+                    spec,
+                    lot: id,
+                    road_half,
+                })
+            });
+            (lot, key)
+        })
+        .collect();
+
+    // What the previous growth step already seated, on a parcel that has not
+    // moved since. Read-only and single-threaded, so the cache itself is never
+    // shared across the `rayon` fan-out below (`crate::memo`).
+    let mut known: Vec<Option<Option<Building>>> = seat_inputs
+        .iter()
+        .map(|(_, key)| key.as_ref().and_then(|k| seats.get(k)))
+        .collect();
+    let todo: Vec<usize> = (0..seat_inputs.len())
+        .filter(|&i| seat_inputs[i].1.is_some() && known[i].is_none())
+        .collect();
     // Determinism (PRD §7.4, and rule 4 in this crate's module docs) survives
     // because the results are collected **in index order** into a `Vec` and only
     // then folded. No thread writes to a shared map, nothing is pushed as it
     // finishes, and the fold is a sequential loop over that `Vec`. The
     // `BTreeMap` is filled afterwards and is ordered by key regardless.
-    let seated: Vec<(Lot, Option<Building>, bool)> = parcelling
-        .parcels
+    let fresh: Vec<Option<Building>> = todo
         .par_iter()
-        .enumerate()
-        .map(|(i, parcel)| {
-            let id = LotId(u32::try_from(i).expect("lot count fits in u32"));
-            let occupant = parcel.occupant.map(|f| s.files[f as usize].path.clone());
-            let lot = Lot {
-                id,
-                block: BlockId(parcel.block),
-                boundary: to_polygon(&parcel.ring),
-                occupant: occupant.clone(),
-            };
-            let Some(path) = occupant else {
-                return (lot, None, false);
-            };
-            let Some(meta) = tree.file(&path) else {
-                return (lot, None, false);
-            };
-            let block_ring = &block_plans[parcel.block as usize].ring;
-            let rec = &s.files[parcel.occupant.expect("occupied") as usize];
-            let spec = BuildingSpec::new(rec.size_bytes)
-                .with_diff_lines(inputs.diff_lines_of(&path))
-                .with_size_reference(median_bytes)
-                .with_class(if rec.monument {
-                    FileClass::Monument
-                } else {
-                    meta.class
-                });
-            match buildings::place_in_parcel(&parcel.ring, block_ring, &path, spec, id, road_half) {
-                Some(building) => (lot, Some(building), false),
-                None => (lot, None, true),
-            }
+        .map(|&i| {
+            let k = seat_inputs[i].1.as_ref().expect("filtered to occupied");
+            buildings::place_in_parcel(&k.parcel, &k.block, &k.path, k.spec, k.lot, k.road_half)
         })
         .collect();
-    let mut lot_list: Vec<Lot> = Vec::with_capacity(seated.len());
+
+    let mut lot_list: Vec<Lot> = Vec::with_capacity(seat_inputs.len());
     let mut buildings_map: BTreeMap<LogicalPath, Building> = BTreeMap::new();
     let mut unbuilt = 0usize;
-    for (lot, building, missed) in seated {
-        if let (Some(path), Some(building)) = (lot.occupant.clone(), building) {
-            buildings_map.insert(path, building);
+    let mut computed = todo.iter().copied().zip(fresh).peekable();
+    let mut next_seats = crate::memo::SeatCache::with_capacity(known.len());
+    for (i, (lot, key)) in seat_inputs.into_iter().enumerate() {
+        // A parcel with no occupant, or one whose occupant the tree no longer
+        // holds, has no key and is not counted as a building that failed to
+        // stand — it is a parcel that was never asked for one.
+        let (building, hit) = if let Some(hit) = known[i].take() {
+            (hit, true)
+        } else if let Some((_, building)) = computed.next_if(|(j, _)| *j == i) {
+            (building, false)
+        } else {
+            (None, false)
+        };
+        if let Some(key) = key {
+            if let (Some(path), Some(building)) = (lot.occupant.as_ref(), building.as_ref()) {
+                buildings_map.insert(path.clone(), building.clone());
+            }
+            unbuilt += usize::from(building.is_none());
+            next_seats.put(key, building, hit);
         }
-        unbuilt += usize::from(missed);
         lot_list.push(lot);
     }
+    seats = next_seats;
     // --- Districts, streets, landmarks ------------------------------------
     let district_path = |d: u32| s.territory.nodes[d as usize].path.clone();
     // Top-level package of every district, for the coarse contiguity metric.
@@ -898,6 +1054,10 @@ fn assemble(
         age_ramp: s.ramp.kind(),
         history_days: s.ramp.span_days(),
         old_town_files: s.ramp.old_town(),
+        core_files: s.ramp.core_files(),
+        // `round`, then a saturating cast: the value is in `[0, 1]` by
+        // construction, so this is exact on every target (PRD §7.4).
+        age_equalisation_x100: (s.ramp.equalisation() * 100.0).round() as u32,
     };
 
     let layout = CityLayout {
@@ -921,6 +1081,8 @@ fn assemble(
         overflow: parcelling.overflow,
         report,
         growth,
+        cuts,
+        seats,
     }
 }
 
@@ -2526,6 +2688,79 @@ mod tests {
 
     fn town(files: usize) -> City {
         generate_city(&synthetic::repository(files, 0x0D15_EA5E_0000_0001))
+    }
+
+    /// The growth step's caches are a clock optimisation and nothing else.
+    ///
+    /// Two cities are grown by the same six files. One keeps everything the
+    /// previous step worked out; the other is made to forget it before every
+    /// step, so every block is re-cut and every building re-seated from nothing.
+    /// The two must be **byte-identical** — PRD §7.4 does not have an exception
+    /// for "it was faster the second way".
+    ///
+    /// This is the test that makes `crate::memo` safe to extend: a key that
+    /// stops covering one of the seating function's inputs fails here, on the
+    /// first run, rather than as a building that quietly kept a stale shape.
+    #[test]
+    fn a_warm_cache_and_a_cold_one_build_the_same_city() {
+        let mut tree = synthetic::repository(600, 0x0D15_EA5E_0000_0001);
+        let inputs = LayoutInputs::default();
+        let mut warm = generate_with(&tree, &inputs);
+        let mut cold = generate_with(&tree, &inputs);
+        assert_eq!(warm.digest(), cold.digest(), "the two starts differ");
+
+        for i in 0..6u32 {
+            let path = lp(&format!("core/newcomer{i}.rs"));
+            let mut meta = polis_repo::FileMeta::untracked(path.clone(), 2_500 + u64::from(i) * 91);
+            meta.growth_index = u32::try_from(tree.files.len()).expect("fits");
+            tree.files.insert(path.clone(), meta);
+
+            warm.accrete(&tree, &inputs, std::slice::from_ref(&path));
+            cold.forget();
+            cold.accrete(&tree, &inputs, std::slice::from_ref(&path));
+            assert_eq!(
+                warm.digest(),
+                cold.digest(),
+                "add {i}: the remembered city and the recomputed one diverged"
+            );
+        }
+        // And the caches were actually doing something, or the test proves
+        // nothing at all.
+        let (cuts, seats) = warm.reuse();
+        assert!(
+            cuts > 0.5 && seats > 0.5,
+            "the growth step reused {:.0}% of block cuts and {:.0}% of buildings;              the caches are not being used and this test is vacuous",
+            cuts * 100.0,
+            seats * 100.0
+        );
+        assert_eq!(cold.reuse().1, 0.0, "the cold city reused a building");
+    }
+
+    /// The carried quarter assignment is the one a fresh point-location gives.
+    ///
+    /// `City::accrete` appends the new plot's quarter instead of re-locating
+    /// every plot, on the argument that a plot that has not moved is in the
+    /// quarter it was in. That argument is only as good as the two rules staying
+    /// the same rule, so this asserts them equal after six growth steps.
+    #[test]
+    fn the_carried_quarter_assignment_matches_a_fresh_one() {
+        let mut tree = synthetic::repository(400, 0x0D15_EA5E_0000_0001);
+        let inputs = LayoutInputs::default();
+        let mut city = generate_with(&tree, &inputs);
+        for i in 0..6u32 {
+            let path = lp(&format!("core/quartered{i}.rs"));
+            let mut meta = polis_repo::FileMeta::untracked(path.clone(), 1_800 + u64::from(i));
+            meta.growth_index = u32::try_from(tree.files.len()).expect("fits");
+            tree.files.insert(path.clone(), meta);
+            city.accrete(&tree, &inputs, std::slice::from_ref(&path));
+        }
+        let positions = city.growth.settlement.positions();
+        let quarters = city.growth.settlement.territory.leaf_quarters();
+        assert_eq!(
+            city.growth.quarter_of,
+            quarter_assignment(&positions, &quarters),
+            "the carried assignment drifted from the rule it stands in for"
+        );
     }
 
     /// Euler's formula, on a real generated city.

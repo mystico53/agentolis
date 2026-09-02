@@ -594,25 +594,7 @@ impl GrowthSequence {
     /// comparison across two operating systems meaningful.
     pub fn save_cached(&self, cache: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
-        if let Some(parent) = cache.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        // The pid keeps two Polis instances on one repository from writing the
-        // same temp file. It never reaches the cache contents, so it is not a
-        // determinism hazard.
-        let mut tmp = cache.as_os_str().to_owned();
-        tmp.push(format!(".{}.tmp", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, &bytes)?;
-        match std::fs::rename(&tmp, cache) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        write_atomic(cache, &bytes)
     }
 
     /// The growth index of a path, if git has ever seen it.
@@ -682,11 +664,61 @@ fn walk_log(
     repo_root: &Path,
     rev: &str,
     extra: &[&str],
+    on_path: impl FnMut(WallTime, &[u8]),
+) -> anyhow::Result<GitRun> {
+    walk_log_with(repo_root, rev, "--name-only", extra, on_path)
+}
+
+/// [`walk_log`] over `--name-status`, so one pass carries both PRD §7.1's
+/// first-additions and PRD §8's last-touched times.
+///
+/// The line grammar gains one field: a file line is `<status>\t<path>`, where
+/// `<status>` is git's diff-filter letter — `A`, `M`, `D`, `T`. With
+/// `--no-renames` pinned (see the module docs) there is no `R<score>` form and
+/// therefore never a second tab, so the split is unambiguous.
+///
+/// **`status == b'A'` is exactly `--diff-filter=A`**: the filter selects on the
+/// same letter this prints. `the_fused_walk_agrees_with_the_two_pinned_commands`
+/// asserts that on real repositories rather than trusting it.
+fn walk_log_status(
+    repo_root: &Path,
+    rev: &str,
+    mut on_entry: impl FnMut(WallTime, u8, &[u8]),
+) -> anyhow::Result<GitRun> {
+    walk_log_with(repo_root, rev, "--name-status", &[], |time, line| {
+        if let Some((status, path)) = split_status(line) {
+            on_entry(time, status, path);
+        }
+    })
+}
+
+/// Splits a `--name-status` file line into its status letter and its path.
+///
+/// `None` for a line with no tab or an empty path — neither is a file, and a
+/// malformed line must be dropped rather than parsed as a path called `A`.
+fn split_status(line: &[u8]) -> Option<(u8, &[u8])> {
+    let tab = line.iter().position(|&b| b == b'\t')?;
+    let status = *line.first()?;
+    let path = line.get(tab + 1..)?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((status, path))
+}
+
+/// The shared walk. `name_flag` selects the diff output format; it is one flag
+/// and not part of `extra` because passing both `--name-only` and
+/// `--name-status` is a silent last-one-wins in git.
+fn walk_log_with(
+    repo_root: &Path,
+    rev: &str,
+    name_flag: &str,
+    extra: &[&str],
     mut on_path: impl FnMut(WallTime, &[u8]),
 ) -> anyhow::Result<GitRun> {
     let mut args: Vec<&str> = vec![
         "log",
-        "--name-only",
+        name_flag,
         "--no-renames",
         "--no-diff-merges",
         "--reverse",
@@ -1402,6 +1434,69 @@ fn count_untracked_lines(path: &Path) -> DiffCount {
 // Everything git knows, folded into the tree.
 // ---------------------------------------------------------------------------
 
+/// On-disk shape of the [`History`] cache.
+///
+/// A private type with an explicit `version`, so the format can change without
+/// a stale file from an older build parsing into something plausible and wrong.
+/// A version mismatch is a miss, exactly like a corrupt file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryCache {
+    version: u32,
+    growth: GrowthSequence,
+    last_touched: Vec<(LogicalPath, WallTime)>,
+}
+
+/// Bump on any change to [`HistoryCache`]'s meaning.
+const HISTORY_CACHE_VERSION: u32 = 1;
+
+/// Where [`History::read_cached_default`] keeps a repository's derived history.
+///
+/// `%LOCALAPPDATA%\polis\history\<key>.json` on Windows,
+/// `$XDG_STATE_HOME/polis/history/<key>.json` elsewhere — beside the corpus
+/// store, and deliberately **outside the checkout**: a cache written into the
+/// repository would be walked, given a building, and change the city, which is
+/// the feedback loop `crate::tree::WalkExclusions` exists to close (ADR-0065).
+///
+/// `key` is a written-out FNV-1a of the normalised root, the same folding
+/// [`worktree_id_for`] uses, so two worktrees of one repository get two caches
+/// and a checkout spelled `C:\Repo` and `c:/repo/` gets one.
+///
+/// `None` means no environment variable identified a state directory; the
+/// caller falls back to an uncached read rather than inventing a path.
+#[must_use]
+pub fn default_cache_path(repo_root: &Path) -> Option<PathBuf> {
+    let key = fnv1a64(normalize_root(&repo_root.to_string_lossy()).as_bytes());
+    Some(
+        crate::corpus::state_dir()?
+            .join("history")
+            .join(format!("{key:016x}.json")),
+    )
+}
+
+/// Writes `bytes` to `path` via a temp file and a rename.
+///
+/// The pid keeps two Polis instances on one repository from writing the same
+/// temp file. It never reaches the file contents, so it is not a determinism
+/// hazard.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// The two history facts every building needs: when it appeared and when it was
 /// last touched (PRD §7.1, §8).
 #[derive(Debug, Clone, Default)]
@@ -1413,84 +1508,205 @@ pub struct History {
 }
 
 impl History {
-    /// Reads both from git.
+    /// Reads both from git, in **one** `git log --name-status` pass.
     ///
-    /// Two `git log` passes, not one: the growth sequence is derived from PRD
-    /// §7.1's pinned `--diff-filter=A` command and nothing else, so that the
-    /// city's most load-bearing input has exactly one derivation. Deriving it as
-    /// a side effect of the unfiltered walk would be a little faster and would
-    /// make two code paths that must agree forever.
+    /// # Why this used to be two passes, and why one is now correct
+    ///
+    /// The growth sequence used to be derived from PRD §7.1's pinned
+    /// `--diff-filter=A` command and nothing else, so that the city's most
+    /// load-bearing input had exactly one derivation; `last_touched` came from a
+    /// second, unfiltered walk. The cost of that principle is a *whole extra
+    /// traversal of the entire history*, and it is not small: measured on this
+    /// machine, one full walk is 0.90 s on Django (34 898 commits) and 0.95 s on
+    /// Neovim (37 934), so the second pass alone was a third of PRD §13.1's
+    /// entire 3 s cold-start budget.
+    ///
+    /// `--diff-filter=A` selects entries whose status letter is `A`, and
+    /// `--name-status` *prints* that letter. The two derivations are the same
+    /// selection expressed twice, so folding them costs no fidelity — and the
+    /// "two code paths that must agree forever" objection is answered by
+    /// [`GrowthSequence::bootstrap`] remaining the PRD's pinned command and by
+    /// `the_fused_walk_agrees_with_the_two_pinned_commands` asserting, on every
+    /// fixture in this module, that the fused walk reproduces both of them
+    /// exactly.
     pub fn read(repo_root: &Path) -> anyhow::Result<Self> {
-        Ok(Self {
-            growth: GrowthSequence::bootstrap(repo_root)?,
-            last_touched: last_touched_map(repo_root)?,
-        })
+        let head = head_commit(repo_root)?;
+        let mut history = Self {
+            growth: GrowthSequence {
+                entries: Vec::new(),
+                head,
+            },
+            last_touched: BTreeMap::new(),
+        };
+        if history.growth.head.is_empty() {
+            return Ok(history);
+        }
+        let rev = history.growth.head.clone();
+        let mut seen = BTreeSet::new();
+        history.fold_range(repo_root, &rev, &mut seen)?;
+        Ok(history)
     }
 
-    /// [`Self::read`], reusing a cached growth sequence when its `HEAD` still
-    /// matches and refreshing it incrementally when it does not.
+    /// Folds one revision range into both halves.
     ///
-    /// The cache is written back on any change. A cache write failure is logged
-    /// and swallowed: a read-only cache directory must cost a slower launch, not
-    /// a failed one.
+    /// Forward order (`--reverse`) means a later commit simply overwrites an
+    /// earlier `last_touched`, and `seen` keeps a re-added path at its *first*
+    /// addition, so applying a range on top of an existing history is correct
+    /// without any comparison.
+    fn fold_range(
+        &mut self,
+        repo_root: &Path,
+        rev: &str,
+        seen: &mut BTreeSet<LogicalPath>,
+    ) -> anyhow::Result<()> {
+        let growth = &mut self.growth.entries;
+        let touched = &mut self.last_touched;
+        let run = walk_log_status(repo_root, rev, |time, status, raw| {
+            let Some(path) = decode_path_logged(raw) else {
+                return;
+            };
+            if status == b'A' && seen.insert(path.clone()) {
+                growth.push((path.clone(), time));
+            }
+            touched.insert(path, time);
+        })?;
+        run.check("log --name-status", repo_root)
+    }
+
+    /// [`Self::read`], reusing a cache keyed on `HEAD` and refreshing it
+    /// incrementally when `HEAD` has moved (PRD §7.1).
     ///
-    /// Only the growth sequence is cached. `last_touched` is recomputed every
-    /// launch, because it is the half that a single new commit invalidates
-    /// broadly and it is not what a growth index is keyed on — caching it would
-    /// add a second file that can disagree with the first for no saving that
-    /// [`Self::extend_to_head`] does not already give a running Polis.
+    /// > Cache the derived growth sequence keyed on `HEAD`; recompute
+    /// > incrementally on new commits. (PRD §7.1)
+    ///
+    /// **Both** halves are cached. The growth sequence alone used to be, on the
+    /// reasoning that `last_touched` is invalidated broadly by any new commit —
+    /// true, and beside the point: the launch that follows *no* new commit is
+    /// the common one, and it was paying a full history walk for a map that had
+    /// not changed. Caching one half of a pair that is always read together
+    /// halves a cost that should be zero.
+    ///
+    /// The cache is written back on any change. A write failure is logged and
+    /// swallowed: a read-only cache directory must cost a slower launch, not a
+    /// failed one.
     pub fn read_cached(repo_root: &Path, cache: &Path) -> anyhow::Result<Self> {
         let head = head_commit(repo_root)?;
-        let growth = if let Some(hit) = GrowthSequence::load_cached(cache, &head) {
-            hit
-        } else {
-            // A cache keyed on a *different* `HEAD` is still worth having: the
-            // whole point of §7.4's incremental growth is that yesterday's
-            // sequence plus today's commits beats recomputing yesterday.
-            let seq = match Self::read_stale(cache) {
-                Some(stale) => {
-                    let mut stale = stale;
-                    stale.extend_to_head(repo_root)?;
-                    stale
-                }
-                None => GrowthSequence::bootstrap(repo_root)?,
-            };
-            if let Err(e) = seq.save_cached(cache) {
-                tracing::warn!(cache = %cache.display(), error = %e, "growth cache not written");
+        if let Some(hit) = Self::load_cached(cache, &head) {
+            return Ok(hit);
+        }
+        // A cache keyed on a *different* `HEAD` is still worth having: the whole
+        // point of §7.4's incremental growth is that yesterday's history plus
+        // today's commits beats recomputing yesterday.
+        let history = match Self::load_stale(cache) {
+            Some(mut stale) => {
+                stale.extend_to_head(repo_root)?;
+                stale
             }
-            seq
+            None => Self::read(repo_root)?,
         };
-        Ok(Self {
-            last_touched: last_touched_map(repo_root)?,
-            growth,
+        if let Err(e) = history.save_cached(cache) {
+            tracing::warn!(cache = %cache.display(), error = %e, "history cache not written");
+        }
+        Ok(history)
+    }
+
+    /// [`Self::read_cached`] at [`default_cache_path`] — the product path.
+    ///
+    /// Falls back to an uncached [`Self::read`] when no environment variable
+    /// identifies a state directory, which is a slower launch and never a
+    /// failure.
+    pub fn read_cached_default(repo_root: &Path) -> anyhow::Result<Self> {
+        match default_cache_path(repo_root) {
+            Some(path) => Self::read_cached(repo_root, &path),
+            None => Self::read(repo_root),
+        }
+    }
+
+    /// Loads a cache whose `HEAD` still matches.
+    ///
+    /// Every failure — absent, unreadable, truncated, written by an older
+    /// format version, or keyed on a different `HEAD` — is a **miss**, not an
+    /// error. A cache that can fail a launch is worse than no cache.
+    #[must_use]
+    pub fn load_cached(cache: &Path, head: &str) -> Option<Self> {
+        let history = Self::load_stale(cache)?;
+        (history.growth.head == head).then_some(history)
+    }
+
+    /// Loads a cache whatever `HEAD` it was keyed on, for [`Self::read_cached`]
+    /// to extend. A corrupt or foreign file is `None`, never an error.
+    fn load_stale(cache: &Path) -> Option<Self> {
+        let bytes = std::fs::read(cache).ok()?;
+        let disk: HistoryCache = serde_json::from_slice(&bytes).ok()?;
+        if disk.version != HISTORY_CACHE_VERSION {
+            return None;
+        }
+        Some(Self {
+            growth: disk.growth,
+            last_touched: disk.last_touched.into_iter().collect(),
         })
     }
 
-    /// Loads a cached sequence whatever `HEAD` it was keyed on, for
-    /// [`Self::read_cached`] to extend. A corrupt file is `None`, never an
-    /// error.
-    fn read_stale(cache: &Path) -> Option<GrowthSequence> {
-        let bytes = std::fs::read(cache).ok()?;
-        serde_json::from_slice(&bytes).ok()
+    /// Writes the cache atomically (temp + rename).
+    ///
+    /// `last_touched` is stored as an **array of pairs** rather than a JSON
+    /// object: a `BTreeMap` keyed on [`LogicalPath`] would serialise as an
+    /// object whose keys are the paths, and a path containing a character JSON
+    /// has to escape is then a round-trip that depends on the encoder. The
+    /// array is the same bytes on every platform, which is what makes the cache
+    /// safe for a layout that must be byte-identical across machines (PRD §7.4).
+    pub fn save_cached(&self, cache: &Path) -> std::io::Result<()> {
+        let disk = HistoryCache {
+            version: HISTORY_CACHE_VERSION,
+            growth: self.growth.clone(),
+            last_touched: self
+                .last_touched
+                .iter()
+                .map(|(p, t)| (p.clone(), *t))
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&disk).map_err(std::io::Error::other)?;
+        write_atomic(cache, &bytes)
     }
 
     /// Brings both halves up to the current `HEAD` without a full recompute
     /// (PRD §7.4). Returns how many files entered the growth sequence.
+    ///
+    /// # When the promise cannot be kept
+    ///
+    /// A rebase, an amend, or a reset moves `HEAD` somewhere that is not a
+    /// descendant of the cached one, and the history the city was built from no
+    /// longer exists. Both halves are then **rebuilt** from scratch, and growth
+    /// indices may move. That is deliberate: grafting the surviving paths onto
+    /// the old order would make an incrementally-updated Polis and a
+    /// freshly-launched Polis disagree about the same repository, which is
+    /// exactly what PRD §7.4 forbids. A rewritten history is the one case where
+    /// the city legitimately changes.
     pub fn extend_to_head(&mut self, repo_root: &Path) -> anyhow::Result<usize> {
         let previous = self.growth.head.clone();
-        let appended = self.growth.extend_to_head(repo_root)?;
-        if self.growth.head == previous {
-            return Ok(appended);
+        let head = head_commit(repo_root)?;
+        if head == previous {
+            return Ok(0);
         }
-        if previous.is_empty()
-            || !is_ancestor(repo_root, &previous, &self.growth.head).unwrap_or(false)
-        {
-            self.last_touched = last_touched_map(repo_root)?;
-        } else {
-            let range = format!("{previous}..{}", self.growth.head);
-            last_touched_into(repo_root, &range, &mut self.last_touched)?;
+        if head.is_empty() {
+            // The repository was rewound to an unborn HEAD. Nothing is added.
+            self.growth.entries.clear();
+            self.last_touched.clear();
+            self.growth.head = head;
+            return Ok(0);
         }
-        Ok(appended)
+        if previous.is_empty() || !is_ancestor(repo_root, &previous, &head)? {
+            let before = self.growth.entries.len();
+            *self = Self::read(repo_root)?;
+            return Ok(self.growth.entries.len().saturating_sub(before));
+        }
+        let range = format!("{previous}..{head}");
+        let before = self.growth.entries.len();
+        let mut seen: BTreeSet<LogicalPath> =
+            self.growth.entries.iter().map(|(p, _)| p.clone()).collect();
+        self.fold_range(repo_root, &range, &mut seen)?;
+        self.growth.head = head;
+        Ok(self.growth.entries.len() - before)
     }
 
     /// Fills [`crate::FileMeta::growth_index`], `added_at` and `last_touched` on
@@ -2090,6 +2306,145 @@ mod tests {
         // Third read is a straight hit.
         let third = History::read_cached(f.root(), &cache).expect("third");
         assert_eq!(paths(&third.growth), paths(&second.growth));
+        assert_eq!(third.last_touched, second.last_touched);
+
+        // And the whole point: a cache that was *extended* must give the same
+        // history a launch with no cache at all would. Anything less and an
+        // incrementally-updated Polis and a freshly-launched one disagree about
+        // the same repository, which is what PRD §7.4 forbids.
+        let fresh = History::read(f.root()).expect("fresh");
+        assert_eq!(
+            third.growth.entries, fresh.growth.entries,
+            "the extended cache and a cold read disagree about the growth order"
+        );
+        assert_eq!(third.growth.head, fresh.growth.head);
+        assert_eq!(
+            third.last_touched, fresh.last_touched,
+            "the extended cache and a cold read disagree about last-touched"
+        );
+    }
+
+    /// The fused `--name-status` walk reproduces **both** pinned commands
+    /// exactly, on every shape of history this module has a fixture for.
+    ///
+    /// This is the test that lets [`History::read`] be one pass instead of two.
+    /// The saving is real — one full walk is ~0.9 s on a repository of Django's
+    /// age, a third of PRD §13.1's whole cold-start budget — but it is only
+    /// safe while `status == b'A'` and `--diff-filter=A` select the same
+    /// entries, and that is an assertion about git, not about this code.
+    #[test]
+    fn the_fused_walk_agrees_with_the_two_pinned_commands() {
+        let mut checked = 0;
+        for (name, f) in [
+            ("canonical", canonical()),
+            ("one commit", {
+                let f = Fixture::new();
+                f.write("only.rs", "x\n");
+                f.add_all_and_commit("c1", 1000);
+                f
+            }),
+            ("non-ascii and deletions", {
+                let f = Fixture::new();
+                f.write("src/héllo wörld.rs", "a\n");
+                f.write("src/gone.rs", "b\n");
+                f.add_all_and_commit("c1", 1000);
+                std::fs::remove_file(f.root().join("src/gone.rs")).expect("rm");
+                f.add_all_and_commit("c2", 2000);
+                // Re-added at a new time: the growth index must stay at the
+                // first addition while last-touched moves.
+                f.write("src/gone.rs", "c\n");
+                f.add_all_and_commit("c3", 3000);
+                f
+            }),
+            ("unborn", Fixture::new()),
+        ] {
+            let fused = History::read(f.root()).expect("fused read");
+            let pinned_growth = GrowthSequence::bootstrap(f.root()).expect("bootstrap");
+            let pinned_touched = last_touched_map(f.root()).expect("last_touched");
+            assert_eq!(
+                fused.growth.entries, pinned_growth.entries,
+                "{name}: the fused growth order left --diff-filter=A behind"
+            );
+            assert_eq!(fused.growth.head, pinned_growth.head, "{name}: head");
+            assert_eq!(
+                fused.last_touched, pinned_touched,
+                "{name}: the fused last-touched left the unfiltered walk behind"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the corpus shrank");
+    }
+
+    /// The cache carries **both** halves, and anything it cannot vouch for is a
+    /// miss rather than an error.
+    #[test]
+    fn the_history_cache_round_trips_and_anything_doubtful_is_a_miss() {
+        let f = canonical();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("nested/history.json");
+        let history = History::read(f.root()).expect("read");
+        history.save_cached(&cache).expect("save");
+
+        let hit = History::load_cached(&cache, &history.growth.head).expect("hit");
+        assert_eq!(hit.growth.entries, history.growth.entries);
+        assert_eq!(
+            hit.last_touched, history.last_touched,
+            "last_touched is cached too, or the second launch pays a full walk"
+        );
+
+        assert!(
+            History::load_cached(&cache, "0".repeat(40).as_str()).is_none(),
+            "a cache keyed on another HEAD is a miss"
+        );
+        assert!(
+            History::load_cached(
+                dir.path().join("absent.json").as_path(),
+                &history.growth.head
+            )
+            .is_none(),
+            "an absent cache is a miss, not an error"
+        );
+
+        // A file from a future format version parses as JSON and must still be
+        // refused, or a stale cache would deserialise into something plausible.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache).expect("read")).expect("json");
+        raw["version"] = serde_json::Value::from(HISTORY_CACHE_VERSION + 1);
+        std::fs::write(&cache, serde_json::to_vec(&raw).expect("json")).expect("write");
+        assert!(
+            History::load_cached(&cache, &history.growth.head).is_none(),
+            "a foreign format version is a miss"
+        );
+
+        std::fs::write(&cache, b"{ not json").expect("write");
+        assert!(History::load_cached(&cache, &history.growth.head).is_none());
+        // And a corrupt cache still yields a correct history, the slow way.
+        let recovered = History::read_cached(f.root(), &cache).expect("recover");
+        assert_eq!(recovered.growth.entries, history.growth.entries);
+        assert_eq!(recovered.last_touched, history.last_touched);
+    }
+
+    /// The default cache lives outside the checkout and folds the spelling of
+    /// the root, so `C:\Repo` and `c:/repo/` share one file (ADR-0065).
+    #[test]
+    fn the_default_cache_path_is_outside_the_checkout() {
+        let f = canonical();
+        let Some(path) = default_cache_path(f.root()) else {
+            // No state directory on this machine: the caller falls back to an
+            // uncached read, which is the documented degradation.
+            return;
+        };
+        assert!(
+            !path.starts_with(f.root()),
+            "the cache is inside the repository it describes: {}",
+            path.display()
+        );
+        let spelled = PathBuf::from(f.root().to_string_lossy().replace('\\', "/") + "/");
+        assert_eq!(
+            default_cache_path(&spelled),
+            Some(path),
+            "two spellings of one root took two caches"
+        );
     }
 
     // -----------------------------------------------------------------------

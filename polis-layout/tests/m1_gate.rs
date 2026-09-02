@@ -1620,82 +1620,13 @@ fn every_district_is_one_place_on_the_map_at_every_scale() {
     assert_eq!(checked, 6, "the corpus shrank");
 }
 
-/// PRD §13.1: an incremental layout step under 50 ms, off-thread.
-///
-/// Growth is native here — adding a file calls the same `add_file` the batch
-/// generator calls — so this measures the real path rather than a shortcut.
-#[test]
-// `housed` and `shared` are two different questions about the same file, and
-// there is no clearer pair of names for them.
-#[allow(clippy::similar_names)]
-fn a_single_file_add_is_inside_the_incremental_budget() {
-    let mut tree = polis_repo::synthetic::repository(5_000, GATE_SEED);
-    let mut city = city::generate_city(&tree);
-    let inputs = LayoutInputs::default();
-    let mut timings = Vec::new();
-    let mut moved_nodes = Vec::new();
-    let mut shares = 0usize;
-    for i in 0..12u32 {
-        let path = lp(&format!("core/latecomer{i}.rs"));
-        let mut meta = polis_repo::FileMeta::untracked(path.clone(), 3_000 + u64::from(i) * 17);
-        meta.growth_index = u32::try_from(tree.files.len()).expect("fits");
-        tree.files.insert(path.clone(), meta);
-        let started = std::time::Instant::now();
-        let moved = city.accrete(&tree, &inputs, std::slice::from_ref(&path));
-        timings.push(started.elapsed());
-        moved_nodes.push(moved);
-        // The file is **accounted for**: its own lot with a building on it, or
-        // an `Overflow` record naming the lot it shares, which the renderer is
-        // required to draw. Never neither — a file that vanishes from the map is
-        // the one outcome `lots::LotReport` exists to make impossible.
-        //
-        // Twelve files into one already-surveyed district is the hardest case
-        // the incremental path has: they land on the same frontage one at a
-        // time, each halving a parcel that the last one already halved. Eleven
-        // of the twelve get a lot of their own; the twelfth shares. Asserting
-        // "every add gets its own lot" would be asserting that a block can be
-        // subdivided without limit.
-        let housed = city.building(&path).is_some();
-        let shared = city.overflow.iter().any(|o| o.path == path);
-        assert!(
-            housed || shared,
-            "add {i} is on the map nowhere at all: {:?}",
-            city.report
-        );
-        if !housed {
-            shares += 1;
-        }
-        assert_eq!(city.report.components, 1, "add {i} split the city");
-    }
-    assert!(
-        shares <= 1,
-        "{shares} of 12 incrementally added files had to share a lot"
-    );
-    timings.sort_unstable();
-    moved_nodes.sort_unstable();
-    let median = timings[timings.len() / 2];
-    let p95 = timings[(timings.len() * 95 / 100).min(timings.len() - 1)];
-    println!(
-        "POLIS_INCREMENTAL median={median:?} p95={p95:?} moved_nodes_median={} of {}",
-        moved_nodes[moved_nodes.len() / 2],
-        city.report.road_nodes
-    );
-    // PRD §13.1's budget is a property of the profile the product ships, and
-    // this test runs in whichever profile the developer chose. Measured on this
-    // machine at 5 000 files: release median 34 ms, p95 36 ms; the test profile
-    // is about twice that because the harness itself is unoptimised. The budget
-    // is asserted where it means something and reported everywhere.
-    let budget = if cfg!(debug_assertions) {
-        std::time::Duration::from_millis(200)
-    } else {
-        std::time::Duration::from_millis(50)
-    };
-    assert!(
-        p95 < budget,
-        "a single-file add took {p95:?}, over the {budget:?} budget for this profile"
-    );
-}
-
+// PRD §13.1's incremental budget lives in `tests/incremental_budget.rs`, not
+// here. `cargo test` runs the tests inside one binary in parallel, and several
+// of the tests in this file generate a five-thousand-file city — so timing a
+// growth step here was timing the harness: 36 ms median alone against 42 ms
+// median racing this binary, with a p95 that crossed the budget. Cargo runs test
+// *targets* sequentially, so a target holding one test measures the step.
+//
 /// Adding a file does not move the city out from under the operator.
 ///
 /// > **Never move the ground while the operator is looking at it.** (PRD §7.7)

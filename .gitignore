@@ -15,3 +15,6 @@ corpus.db-journal
 .idea/
 .DS_Store
 Thumbs.db
+
+# Agent worktrees and session scratch
+.claude/

@@ -14,9 +14,10 @@ when the glance turns into a question.
 The city is a growth process, not a layout algorithm: `git log` supplies the
 growth order, so files added in the repo's first year form a dense old town and
 last month's work sits on a more planned periphery — from the commit
-*timestamps*, so a repository whose first year produced a twentieth of its files
-still gets an old town and one imported in a single squash gets no invented
-gradient at all (ADR-0064). A road is the line where one accreted parcel's
+*timestamps*, and corrected toward the repository's own distribution only as far
+as it must be, so Django (3.4 % of its files in year one) gets a legible core
+while Neovim (36.3 %) is left on the calendar untouched, and a tree imported in a
+single squash gets no invented gradient at all (ADR-0064, ADR-0073). A road is the line where one accreted parcel's
 territory stops and the next one's begins, which makes planarity, connectivity
 and closed blocks properties of the construction rather than of a tuning constant
 (ADR-0052), and the four- and five-way junctions that read as *grown* fall out of
@@ -29,7 +30,7 @@ hash of the logical path, so the same repo produces the same city on every launc
 and every machine; spatial memory is the entire point.
 
 The spec is [`docs/PRD.md`](docs/PRD.md). Where the built system deliberately
-diverges from it — 68 recorded decisions, every one grounded in a measurement —
+diverges from it — 72 recorded decisions, every one grounded in a measurement —
 see [`docs/DECISIONS.md`](docs/DECISIONS.md). The evidence behind those decisions
 is in [`docs/verified/`](docs/verified/).
 
@@ -83,7 +84,7 @@ rather than a toolchain one. See ADR-0001.
 
 ```sh
 cargo build --workspace           # everything
-cargo test  --workspace           # 69 tests
+cargo test  --workspace           # 628 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -118,7 +119,7 @@ Ordered. Each ends in something demonstrable. Do not skip ahead — PRD §15.
 | | Milestone | Delivers | Status |
 |---|---|---|---|
 | **M0** | Event spine | `polis-events` + `polis-ingest`; `polis tail` prints a normalized event stream. Prove the hook's budget under synthetic load. | **Contracts done.** `polis-events` and `polis-hook` are implemented and tested; the four channels in `polis-ingest` are signatures. |
-| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Implemented, one machine.** `polis snapshot` draws any checkout. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Measured on two real repositories — see below. |
+| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Structure and budgets met on one machine; the render is still being judged.** `polis snapshot` draws any checkout. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Both PRD §13.1 budgets now hold on both real repositories — see below. The open item is the picture: the district partition still fans straight radial boundaries from the civic square and the coastline is still near-convex, both of which the fresh-eyes review named. |
 | **M2** | Single-session replay | One JSONL file animated over the city, offline. The fastest iteration loop the project has; most of the visual notation gets decided here. | Not started. Fixtures are in `tests/fixtures/transcripts/`. |
 | **M3** | Live, single session | M0 wired into M2. One agent, real time. | Not started. |
 | **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | Not started. Depends on the beta traces channel (ADR-0006). |
@@ -141,19 +142,55 @@ Two real open-source repositories, cloned with full history, and the shipped
 |---|---|---|---|
 | files / history | 3 890 · 12.6 y | 7 014 · 21.1 y | 4 965 · 8.0 y |
 | added in year one | 36.3 % | 3.4 % | 8.2 % |
-| road graph | V 915 · E 1 667 · 1 component · 0 crossings · 0 dangling | V 2 881 · E 5 226 · 1 · 0 · 0 | V 1 104 · E 1 909 · 1 · 0 · 0 |
-| blocks (= independent cycles) | 753 | 2 346 | 806 |
-| block area p95:p05 | 23.8× | 5.2× | 10.0× |
-| age gradient (rim ÷ core) | **5.96×** | 1.65× | 2.07× |
+| age-ramp correction | **0 %** — the calendar is already right | 47 % | 45 % |
+| files in the core band | 36.3 % | **26.2 %** (was 3.4 %) | 25.3 % |
+| road graph | V 912 · E 1 666 · 1 component · 0 crossings · 0 dangling | V 2 865 · E 5 270 · 1 · 0 · 0 | V 1 161 · E 2 015 · 1 · 0 · 0 |
+| blocks (= independent cycles) | 755 | 2 406 | 855 |
+| 4- and 5-way junction share | 57.1 % | 50.3 % | 45.2 % |
+| block area p95:p05 | 22.8× | 7.1× | 13.6× |
+| age gradient (rim ÷ core) | **6.12×** | **2.33×** (was 1.65×) | 2.96× |
 | buildings | 3 890 / 3 890 | 7 011 / 7 014 | 4 565 / 4 565 |
-| ground built on | 30.4 % (core 40.8 %) | 21.1 % | 32.2 % |
+| ground built on | 29.2 % (core 48.1 %) | 21.4 % | 32.8 % |
+| distinct building heights | 1 998 | 2 429 | 2 036 |
 | in the road, or off their lot | 0, 0 | 0, 0 | 0, 0 |
-| districts in more than one piece | 0 of 178 | 1 of 2 076 | 0 of 312 |
-| full generation | **266 ms** | 400 ms | 284 ms |
+| districts in more than one piece | 0 of 178 | 0 of 2 076 | 0 of 312 |
+| full generation | 282 ms | 499 ms | 295 ms |
 
-against PRD §13.1's 3 s cold-start budget, and a single incremental add at 5 000
-files is 37 ms median / 39 ms p95 against its 50 ms budget.
+### The two PRD §13.1 budgets
 
+**Cold start to first frame, under 3 s.** Both halves of the derived history now
+come out of **one** `git log --name-status` pass instead of two, and the result
+is cached keyed on `HEAD` exactly as PRD §7.1 asks (ADR-0069, ADR-0070). Wall
+clock, `polis snapshot` end to end, one machine:
+
+| | Neovim | Django |
+|---|---|---|
+| before | 2.77 s | **3.13 s** |
+| first launch ever, nothing cached | 2.58 s | 4.43 s (a 35 k-commit, 21-year history) |
+| every launch after | **0.99 s** | **1.86 s** |
+
+**Incremental layout step, under 50 ms off-thread.** A single add at 5 000 files
+moves a median of four of 1 165 road nodes, and the step now reuses 87 % of the
+city's buildings and 71 % of its block cuts instead of recomputing them
+(ADR-0071). Release, twelve adds:
+
+| | median | p95 |
+|---|---|---|
+| before, 24 threads | 44.1 ms | 46.5 ms |
+| before, 1 thread | 61.2 ms | 71.9 ms |
+| **after, 24 threads** | **37.7 ms** | **43.3 ms** |
+| **after, 1 thread** | **36.0 ms** | 44.7 ms |
+| after, machine half-loaded | 39.0–45.5 ms | 47.7–61.8 ms |
+| after, machine fully saturated | 68–78 ms | 155–172 ms |
+
+The interesting row is not the fastest one: it is that 24 threads and 1 thread
+now give the same answer, because the work was **removed** rather than spread
+across cores that a CI runner does not have. No algorithm meets a wall-clock
+budget on a fully saturated machine, and the last row is reported rather than
+asserted.
+
+Renders are regenerated from the real corpora, never from the synthetic
+fixture: a fixture can be accidentally flattering and these two are not.
 `docs/city-real-5k.png` is Neovim, `docs/city-real-django.png` is Django, and
 `docs/city-real-5k-junctions.png` is the road graph alone with junctions coloured
 by degree — the "is it a tree?" render, which it is not.

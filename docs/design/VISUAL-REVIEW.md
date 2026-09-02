@@ -261,3 +261,163 @@ Two things must die alongside it or the fix will not survive the squint test:
 
 And while you are in the renderer: the convex 12-gon silhouette and the 30% black surround make the
 city read as an object rather than a place. Take the ragged coastline back from `accretion`.
+
+---
+---
+
+# ROUND 2 — second independent fresh-eyes pass (2026-09-02)
+
+Reviewer: a second independent pass, told nothing about what was claimed or changed. Same method:
+squint test at 180px FIRST, then full frame, then 1:1 mid-zoom crops, then a pixel census.
+Images reviewed: `docs/city-m1.png`, `city-m1-large.png`, `city-real-5k.png`, `city-real-django.png`,
+and the three junction renders, against the prototypes in `docs/design/*/`.
+
+## Verdict: still NO. And it is the SAME pie chart as Round 1.
+
+I wrote my findings before reading the Round 1 section above. They match it almost line for line.
+Then I measured why.
+
+**Structural edge-difference between `render-review/before-large.png` and `after-large.png`: 5.4% RMSE.
+Between `after-large.png` and today's `city-m1-large.png`: 2.3% RMSE.** The geometry has not moved.
+
+Round 1 gave four recommendations. Exactly one was implemented:
+
+| Round 1 said | Status |
+|---|---|
+| Drop the saturated categorical palette; make the ground dark and low-chroma | **DONE.** Genuinely done, and it worked — see "credit where due" |
+| Kill the radial wedge partition converging on ROOT | **NOT DONE.** Untouched |
+| Take the ragged coastline back from `accretion`; lose the convex 12-gon | **NOT DONE.** Untouched |
+| Give buildings a tonal range and a shadow so height is *seen* | **NOT DONE.** Measurably not done |
+
+The pie chart was **recoloured, not removed**. Turning the saturation down made the wedges harder to
+see in a screenshot and did nothing to the thing that makes them wedges. This is the third cycle in
+which a geometric failure has been answered with a tonal fix.
+
+## 1. Squint test (180px)
+
+| Render | What the thumbnail reads as |
+|---|---|
+| `city-m1.png` | A dark stained-glass coaster. Lumpy disc, grey slabs on tinted glass |
+| `city-m1-large.png` | **Pac-Man.** A dark coin with an empty pie slice cut out of the top-right, apex on the centre |
+| `city-real-5k.png` | A polished agate / geode slice. Coin outline, a wedge at 3 o'clock |
+| `city-real-django.png` | **A two-colour pie chart with a fan of thin slices on the right.** Textbook |
+| `city-m1-junctions.png` | A wire mesh disc — acceptable, this one reads as a graph and is meant to |
+| `city-m1-large-junctions.png` | A dartboard. Radial spokes and a ruled diameter across the middle |
+| `city-real-5k-junctions.png` | **A sunburst diagram.** Straight spokes to a singularity at dead centre |
+
+Every single one is an **object with a rim**, not a place. Not one has an edge that a coastline,
+a river, a ridge or a road ever made.
+
+## 2. The mathematical tell, named
+
+**Polar coordinates.** The layout is a sunburst/pie chart in disguise:
+
+- **A singularity at the centre.** In `city-real-5k-junctions.png` the junctions visibly collapse
+  into a knot at one point. In `city-real-django.png` the node labelled `ROOT` is the apex that every
+  district boundary radiates from.
+- **District boundaries are exact radii.** Perfectly straight lines, 700+ px long, from ROOT to the
+  rim. `city-m1-large-junctions.png` has a ruled horizontal **diameter** running edge to edge through
+  the centre. Real settlements do not contain a straight line that long, ever.
+- **The outer boundary is a convex ~12-gon** — a coin with chamfered edges. Real city footprints are
+  ragged, lobed and deeply non-convex. This is the single strongest "not a place" signal in the set.
+- **Empty wedges.** In `city-real-django.png`, `SCRIPTS`, `.TX`, `EXTRAS`, `RELEASES`, `POSTGRES` are
+  flat coloured triangles with **no buildings in them at all**, converging on the labelled centre.
+  Empty coloured triangles meeting at a labelled point is not "like" a pie chart. It is one.
+- **Sliver districts.** `CMAKE` in `city-real-5k.png` is a 900 px long, 40 px wide spike. A district
+  shaped like a spoke is not a neighbourhood.
+- **A radial density gradient** — a pale circular bald spot around the centre of `city-real-django.png`
+  where lots shrink toward the origin. It reads as a thumbprint, and it is another polar artefact.
+
+`city-m1.png` (115 roads) escapes the worst of this only because at 26 districts there is not enough
+of it to see the fan. It is the small-N alibi, not a counterexample.
+
+## 3. Building height is invisible. This is measurable.
+
+Height is the primary encoded quantity and it is not in the picture.
+
+Colour census over the map area of `city-m1-large.png`, every colour brighter than L≈38:
+
+```
+103234 px  #2C2C29      <- one roof grey, dominant by 6x
+ 17892 px  #2D2C29
+ 10867 px  #282724
+  7296 px  #2C2B29
+  ... 1183 distinct tones, ALL inside #272725 .. #2F2E2B
+```
+
+**Every roof in the city occupies about 8 levels out of 255 — 3% of the available dynamic range.**
+There is one roof grey. There is no roof ramp, no shadow, no massing. The extruded side wall is
+2–4 px on every building regardless of height.
+
+The proof: `city-real-5k.png` captions its own tallest building as `SRC/NVIM/MAIN.C H=6.0`. I cropped
+that location and viewed it at 2x. **I cannot pick it out from its neighbours.** The only thing
+marking the tallest structure in the repository is a gold *text label*. The map is carrying its
+primary quantity in typography.
+
+Worse: the brightest ink on the base map, `#8A8F98`, is the **label text**. Nothing built is
+brighter than the words. The city is a caption with a texture behind it.
+
+`city-m1.png` is the exception — at 115 buildings you can see extrusion, side walls and gold
+monuments, and it is the only render in the set where the encoding is legible. That legibility does
+not survive contact with a real repository, which is the only case that matters.
+
+## 4. Credit where due — the two things that are now right
+
+- **The base map is faint enough.** Mean luminance over the map area is 20–24/255, max 143. There is
+  a clean 110+ level of headroom for a bright "what is happening now" overlay. PRD §10.3 is
+  satisfied. Do not undo this.
+- **The road network is topologically sound.** `COMP=1`, `DANGLING=0`, `CROSSINGS WITHOUT A NODE=0`,
+  deg4+ share 45–57%. It is one settlement and the junctions are real junctions. The problem with the
+  roads is not their topology, it is their *geometry* — a polar grid, not a grown network.
+
+## 5. Mid-distance
+
+Mixed, and worth separating:
+
+- The **interior fabric of a large district** holds up. The NW corner of `city-real-django.png` at 1:1
+  genuinely resembles an aerial photograph of a dense low-rise town — irregular blocks, capillary
+  lanes, no visible tiling. This part is good work.
+- The **centre dissolves immediately**. The 700 px crop around ROOT in django is nothing but ruled
+  radial lines and empty triangles. The one place an operator will look first is the one place that
+  is unambiguously a chart.
+- Everywhere, the fabric is **uniform grain**. Same building size, same tone, edge to edge. It reads
+  as crushed gravel or cracked mud, because there is no massing hierarchy to read.
+
+## 6. Worst thing in each image
+
+| Image | Worst thing |
+|---|---|
+| `city-m1.png` | Buildings are the size of city blocks; 26 districts is a village, and it flatters the layout |
+| `city-m1-large.png` | The empty `CODEC`/`TESTS` pie slice with its apex on ROOT. Pac-Man |
+| `city-real-5k.png` | `CMAKE` and `SCRIPTS` as ruled spokes, plus a visible junction singularity at centre |
+| `city-real-django.png` | A fan of ten empty coloured triangles converging on a point labelled ROOT |
+| `city-m1-junctions.png` | Nothing serious — but the convex hull boundary is still a coin |
+| `city-m1-large-junctions.png` | A ruled diameter straight across the image through the centre |
+| `city-real-5k-junctions.png` | The centre singularity, laid bare. This image is the diagnosis |
+
+Minor but sloppy: the third caption line is **clipped by the right image edge** in every large render
+(`... TALLEST DJANGO/__MAIN__.PY H=` — value cut off; same in the 5k render).
+
+## 7. The highest-value change to the image
+
+**Delete the polar layout. Take the geometry from `docs/design/accretion/` — which is already in this
+repo and is already right — and render it with the current dark palette.**
+
+Put the two side by side at 180px. `accretion/large.png` has a ragged, lobed, deeply non-convex
+footprint with tendrils following roads out into the black; districts are irregular interlocking
+blobs; there is no centre and no radius anywhere in it. It reads as a place at a glance. Its only
+fault was that it was too bright and too saturated — and that is precisely the fault that has already
+been fixed in the current renderer.
+
+The two halves of the answer already exist in the repository, in different directories. Round 1 said
+this. Ship `accretion` geometry + current tone and the squint test is passed in one cycle.
+
+Then, and only then, the second change:
+
+**Make height visible.** Give roofs a tonal ramp across the full range up to ~#C8C8C0, add a dark
+offset shadow proportional to height, and widen the footprint distribution ~10x within a block so
+mass varies. Right now the tallest building in a 7000-file repository is indistinguishable from its
+neighbours and is identified only by a text label. That is the whole point of the map, and it is the
+one thing the map does not do.
+
+**Do not answer this review with another palette change.**

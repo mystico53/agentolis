@@ -31,8 +31,47 @@ use polis_repo::{synthetic, RepoTree};
 
 use crate::cli::{Cli, SnapshotArgs};
 
+/// Where the wall clock of a cold start goes (PRD §13.1: under 3 s at 5 000
+/// files).
+///
+/// Every stage between "the process started" and "there is a frame", timed
+/// separately, because the budget was blown by the one stage nobody was
+/// measuring: two full `git log` walks of the whole history, at over a second
+/// each on a repository of Django's age.
+// Every field is a duration and the unit is the point of the name: `walk` alone
+// would read as a count, and the report prints them side by side in one row.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy, Default)]
+struct Phases {
+    /// Walking the checkout: `read_dir`, classify, `stat`.
+    walk_ms: f64,
+    /// `polis_repo::git::History` — the growth order and last-touched times.
+    history_ms: f64,
+    /// tree-sitter over every source file (PRD §9).
+    imports_ms: f64,
+    /// `git diff --numstat` for PRD §7.3's building heights.
+    diff_ms: f64,
+    /// The layout itself (PRD §7.2).
+    generate_ms: f64,
+    /// Rasterising the plan and writing the PNG.
+    render_ms: f64,
+}
+
+impl Phases {
+    /// Everything from process start to a frame on screen.
+    fn total_ms(self) -> f64 {
+        self.walk_ms
+            + self.history_ms
+            + self.imports_ms
+            + self.diff_ms
+            + self.generate_ms
+            + self.render_ms
+    }
+}
+
 /// Runs `polis snapshot`.
 pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
+    let mut phases = Phases::default();
     let (tree, title) = if let Some(files) = args.synthetic {
         (
             synthetic::repository(files, args.seed),
@@ -40,7 +79,7 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
         )
     } else {
         let root = cli.repo_root().context("resolving the repository root")?;
-        let tree = index(&root, args)?;
+        let tree = index(&root, args, &mut phases)?;
         let name = root.file_name().map_or_else(
             || root.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -48,12 +87,13 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
         (tree, format!("POLIS / {} REPOSITORY", name.to_uppercase()))
     };
 
-    let inputs = layout_inputs(&tree, args.synthetic.is_none());
+    let inputs = layout_inputs(&tree, args.synthetic.is_none(), &mut phases);
     let started = Instant::now();
     let city = city::generate_with(&tree, &inputs);
-    let generate_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    phases.generate_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let structure = city::measure(&city);
 
+    let started = Instant::now();
     let plan_canvas = plan::render_plan(
         &city,
         &structure,
@@ -65,6 +105,7 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
     plan_canvas
         .write_png(&args.out)
         .with_context(|| format!("writing {}", args.out.display()))?;
+    phases.render_ms = started.elapsed().as_secs_f64() * 1_000.0;
     println!("wrote {}", args.out.display());
 
     if let Some(path) = &args.junctions {
@@ -87,7 +128,7 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
         println!("wrote {} ({} bytes)", path.display(), json.len());
     }
 
-    print!("{}", report(&city, &structure, generate_ms));
+    print!("{}", report(&city, &structure, phases));
     println!("DIGEST      {:016x}", city.digest());
     Ok(())
 }
@@ -104,7 +145,15 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
 /// So every path this command is about to write is excluded before the walk,
 /// by name rather than by directory: `--out docs/city.png` must not delete the
 /// `docs/` district from the map, only the one file.
-fn index(root: &Path, args: &SnapshotArgs) -> anyhow::Result<RepoTree> {
+///
+/// # The history is read through its cache
+///
+/// PRD §7.1 asks for the derived growth sequence to be "cached keyed on `HEAD`"
+/// and recomputed incrementally, and PRD §13.1 budgets the whole cold start at
+/// under 3 s. Reading it uncached costs a full `git log` walk of the entire
+/// history — 1.9 s of Django's 3.1 s — so the product path uses
+/// [`History::read_cached_default`], which is the cache PRD §7.1 specifies.
+fn index(root: &Path, args: &SnapshotArgs, phases: &mut Phases) -> anyhow::Result<RepoTree> {
     let mut exclusions = WalkExclusions::shipped();
     for output in [
         Some(&args.out),
@@ -123,7 +172,9 @@ fn index(root: &Path, args: &SnapshotArgs) -> anyhow::Result<RepoTree> {
         exclusions: Some(exclusions),
         ..WalkOptions::default()
     };
+    let started = Instant::now();
     let files = walk_with(root, &options).context("walking the checkout")?;
+    phases.walk_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let mut tree = RepoTree {
         root: root.to_path_buf(),
         files: BTreeMap::new(),
@@ -135,15 +186,20 @@ fn index(root: &Path, args: &SnapshotArgs) -> anyhow::Result<RepoTree> {
     for meta in files {
         tree.files.insert(meta.path.clone(), meta);
     }
-    History::read(root)
+    let started = Instant::now();
+    History::read_cached_default(root)
         .context("reading git history")?
         .apply(&mut tree);
+    phases.history_ms = started.elapsed().as_secs_f64() * 1_000.0;
     Ok(tree)
 }
 
 /// Streets, monuments and heights, where the repository can supply them.
-fn layout_inputs(tree: &RepoTree, real: bool) -> LayoutInputs {
+fn layout_inputs(tree: &RepoTree, real: bool, phases: &mut Phases) -> LayoutInputs {
+    let started = Instant::now();
     let imports = polis_repo::imports::ImportGraph::build(tree);
+    phases.imports_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let started = Instant::now();
     let diff_lines = if real {
         polis_repo::git::diff_line_counts(&tree.root)
             .unwrap_or_default()
@@ -152,6 +208,7 @@ fn layout_inputs(tree: &RepoTree, real: bool) -> LayoutInputs {
     } else {
         BTreeMap::new()
     };
+    phases.diff_ms = started.elapsed().as_secs_f64() * 1_000.0;
     LayoutInputs {
         streets: imports.cross_district_edges(),
         inbound: imports.inbound_counts(),
@@ -164,7 +221,7 @@ fn layout_inputs(tree: &RepoTree, real: bool) -> LayoutInputs {
 // the report in one function and its content in another, and the cast is a file
 // count becoming a percentage.
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-fn report(city: &City, s: &Structure, generate_ms: f64) -> String {
+fn report(city: &City, s: &Structure, phases: Phases) -> String {
     use std::fmt::Write as _;
     let r = &city.report;
     let mut out = String::new();
@@ -253,11 +310,40 @@ fn report(city: &City, s: &Structure, generate_ms: f64) -> String {
     );
     let _ = writeln!(
         out,
-        "HISTORY     age ramp={} history={} days first-year files={} ({:.1}%)",
+        "HISTORY     age ramp={} history={} days first-year files={} ({:.1}%) core files={} ({:.1}%) equalisation={}%",
         r.age_ramp.label(),
         r.history_days,
         r.old_town_files,
-        100.0 * r.old_town_files as f64 / r.files.max(1) as f64
+        100.0 * r.old_town_files as f64 / r.files.max(1) as f64,
+        r.core_files,
+        100.0 * r.core_files as f64 / r.files.max(1) as f64,
+        r.age_equalisation_x100
+    );
+    // PRD §7.3 makes height the primary encoded quantity — "the tallest thing on
+    // the map is the biggest unreviewed pile" — so the report says which
+    // building that is. It is the one line an operator can check the picture
+    // against, and it is what caught the earlier renders drawing every building
+    // at one tone: on a clean checkout the whole column is the base height, and
+    // that is a fact about the repository rather than about the renderer.
+    let mut heights: Vec<f32> = city.layout.buildings.values().map(|b| b.height).collect();
+    heights.sort_by(f32::total_cmp);
+    let tallest = city.layout.buildings.values().max_by(|a, b| {
+        a.height
+            .total_cmp(&b.height)
+            .then_with(|| b.path.cmp(&a.path))
+    });
+    let _ = writeln!(
+        out,
+        "HEIGHT      distinct={} min/median/max={:.2}/{:.2}/{:.2} tallest={} (PRD 7.3: uncommitted diff lines)",
+        {
+            let mut seen: Vec<f32> = heights.clone();
+            seen.dedup_by(|a, b| a.total_cmp(b).is_eq());
+            seen.len()
+        },
+        heights.first().copied().unwrap_or(0.0),
+        heights.get(heights.len() / 2).copied().unwrap_or(0.0),
+        heights.last().copied().unwrap_or(0.0),
+        tallest.map_or_else(|| "none".to_owned(), |b| b.path.as_str().to_owned())
     );
     let d = polis_layout::city::street_diagnostics(city);
     let _ = writeln!(
@@ -270,7 +356,18 @@ fn report(city: &City, s: &Structure, generate_ms: f64) -> String {
     );
     let _ = writeln!(
         out,
-        "TIMING      full generation = {generate_ms:.1} ms  (PRD 13.1 budget: 3000 ms)"
+        "TIMING      cold start to first frame = {:.0} ms  (PRD 13.1 budget: 3000 ms)",
+        phases.total_ms()
+    );
+    let _ = writeln!(
+        out,
+        "            walk={:.0} history={:.0} imports={:.0} diff={:.0} layout={:.0} render={:.0} ms",
+        phases.walk_ms,
+        phases.history_ms,
+        phases.imports_ms,
+        phases.diff_ms,
+        phases.generate_ms,
+        phases.render_ms
     );
     out
 }
@@ -282,10 +379,11 @@ mod tests {
     #[test]
     fn a_synthetic_repository_renders_and_reports() {
         let tree = synthetic::repository(200, 0x99);
-        let inputs = layout_inputs(&tree, false);
+        let mut phases = Phases::default();
+        let inputs = layout_inputs(&tree, false, &mut phases);
         let city = city::generate_with(&tree, &inputs);
         let structure = city::measure(&city);
-        let text = report(&city, &structure, 1.0);
+        let text = report(&city, &structure, phases);
         assert!(text.contains("ROADS"), "{text}");
         assert!(
             text.contains("COVERAGE") || text.contains("coverage"),

@@ -331,7 +331,7 @@ expression: "city.snapshot().expect(\"serializes\")"
       {
         "path": ".gitattributes",
         "lot": 2,
-        "height": 1.0,
+        "height": 1.163,
         "roof": "pitched",
         "rotation": 0.02,
         "footprint": [
@@ -356,13 +356,13 @@ expression: "city.snapshot().expect(\"serializes\")"
       {
         "path": "README.md",
         "lot": 0,
-        "height": 1.0,
+        "height": 2.277,
         "roof": "stepped",
         "rotation": -0.064,
         "footprint": [
           [
-            -0.851,
-            -0.005
+            -0.849,
+            -0.028
           ],
           [
             -0.806,
@@ -373,29 +373,29 @@ expression: "city.snapshot().expect(\"serializes\")"
             0.124
           ],
           [
-            -0.127,
-            0.45
+            -0.119,
+            0.431
           ]
         ]
       },
       {
         "path": "src/main.rs",
         "lot": 3,
-        "height": 2.5,
+        "height": 6.0,
         "roof": "stepped",
         "rotation": -0.041,
         "footprint": [
           [
-            0.297,
-            -0.021
+            0.317,
+            -0.04
           ],
           [
-            0.728,
-            -0.457
+            0.709,
+            -0.437
           ],
           [
-            0.816,
-            -0.378
+            0.827,
+            -0.33
           ],
           [
             0.847,
@@ -406,15 +406,15 @@ expression: "city.snapshot().expect(\"serializes\")"
             0.032
           ],
           [
-            0.358,
-            0.035
+            0.399,
+            0.034
           ]
         ]
       },
       {
         "path": "src/util.rs",
         "lot": 1,
-        "height": 1.0,
+        "height": 2.123,
         "roof": "stepped",
         "rotation": -0.056,
         "footprint": [
@@ -427,12 +427,12 @@ expression: "city.snapshot().expect(\"serializes\")"
             0.165
           ],
           [
-            0.52,
+            0.499,
             0.16
           ],
           [
-            0.281,
-            0.84
+            0.258,
+            0.843
           ]
         ]
       }
@@ -601,6 +601,8 @@ expression: "city.snapshot().expect(\"serializes\")"
     "monuments": 1,
     "age_ramp": "relative",
     "history_days": 38,
-    "old_town_files": 4
+    "old_town_files": 4,
+    "core_files": 3,
+    "age_equalisation_x100": 59
   }
 }

@@ -79,6 +79,7 @@ pub mod determinism;
 pub(crate) mod districts;
 pub(crate) mod geom;
 pub mod lots;
+pub(crate) mod memo;
 pub mod roads;
 pub mod terrain;
 pub(crate) mod territory;

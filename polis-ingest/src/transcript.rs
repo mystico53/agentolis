@@ -121,7 +121,11 @@ pub const MAX_RECORD_STRING: usize = 2048;
 const PROJECT_KEY_LIMIT: usize = 200;
 
 /// Bytes of a transcript read when probing it for its `cwd`.
-const CWD_PROBE_BYTES: u64 = 256 * 1024;
+///
+/// Public because [`index_projects`] and [`project_dir_cwd`] both promise it as
+/// a bound in their own documentation, and a bound a caller cannot name is a
+/// number in a sentence rather than a contract.
+pub const CWD_PROBE_BYTES: u64 = 256 * 1024;
 
 /// Deepest directory nesting [`session_files`] will walk under `subagents/`.
 ///

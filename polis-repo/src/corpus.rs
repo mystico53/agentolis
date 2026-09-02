@@ -990,14 +990,14 @@ fn move_aside(path: &Path) -> std::io::Result<()> {
 /// configurations, and not `%APPDATA%`, which roams: a machine-local statistical
 /// cache has no business on a domain profile share.
 #[cfg(windows)]
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("polis"))
 }
 
 /// `$XDG_STATE_HOME/polis`, falling back to `~/.local/state/polis` — the XDG
 /// default, which is unset far more often than the specification implies.
 #[cfg(not(windows))]
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;

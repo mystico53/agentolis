@@ -1040,11 +1040,57 @@ expression: "city.snapshot().expect(\"serializes\")"
       {
         "id": 0,
         "block": 0,
+        "occupant": "src/ui/components/table.tsx",
+        "boundary": [
+          [
+            -7.143,
+            3.039
+          ],
+          [
+            -7.196,
+            1.552
+          ],
+          [
+            -4.676,
+            1.76
+          ],
+          [
+            -5.305,
+            3.367
+          ]
+        ]
+      },
+      {
+        "id": 1,
+        "block": 0,
         "occupant": "src/ui/components/button.tsx",
         "boundary": [
           [
-            -4.208,
-            1.799
+            -7.114,
+            3.85
+          ],
+          [
+            -7.143,
+            3.039
+          ],
+          [
+            -5.305,
+            3.367
+          ],
+          [
+            -5.922,
+            4.943
+          ]
+        ]
+      },
+      {
+        "id": 2,
+        "block": 0,
+        "occupant": null,
+        "boundary": [
+          [
+            -4.676,
+            1.76
           ],
           [
             -3.901,
@@ -1055,89 +1101,35 @@ expression: "city.snapshot().expect(\"serializes\")"
             3.913
           ],
           [
-            -4.992,
-            5.797
+            -2.813,
+            4.319
           ],
           [
-            -5.567,
-            5.27
-          ]
-        ]
-      },
-      {
-        "id": 1,
-        "block": 0,
-        "occupant": "src/ui/components/table.tsx",
-        "boundary": [
-          [
-            -7.114,
-            3.85
-          ],
-          [
-            -7.196,
-            1.552
-          ],
-          [
-            -4.208,
-            1.799
-          ],
-          [
-            -5.567,
-            5.27
-          ]
-        ]
-      },
-      {
-        "id": 2,
-        "block": 1,
-        "occupant": "src/ui/app.tsx",
-        "boundary": [
-          [
-            -2.737,
-            -1.864
-          ],
-          [
-            -1.955,
-            -1.367
-          ],
-          [
-            -1.499,
-            0.462
-          ],
-          [
-            -3.331,
-            1.501
-          ],
-          [
-            -4.324,
-            -1.151
+            -5.26,
+            3.253
           ]
         ]
       },
       {
         "id": 3,
-        "block": 1,
-        "occupant": "src/ui/routes.ts",
+        "block": 0,
+        "occupant": null,
         "boundary": [
           [
-            -3.331,
-            1.501
+            -2.813,
+            4.319
           ],
           [
-            -3.901,
-            1.824
+            -4.992,
+            5.797
           ],
           [
-            -7.196,
-            1.552
+            -5.922,
+            4.943
           ],
           [
-            -7.169,
-            0.127
-          ],
-          [
-            -4.324,
-            -1.151
+            -5.26,
+            3.253
           ]
         ]
       },
@@ -1147,8 +1139,8 @@ expression: "city.snapshot().expect(\"serializes\")"
         "occupant": "src/ui/store.ts",
         "boundary": [
           [
-            -7.169,
-            0.127
+            -7.139,
+            -1.485
           ],
           [
             -7.095,
@@ -1159,17 +1151,71 @@ expression: "city.snapshot().expect(\"serializes\")"
             -5.298
           ],
           [
-            -4.148,
-            -2.761
-          ],
-          [
-            -2.737,
-            -1.864
+            -4.175,
+            -2.817
           ]
         ]
       },
       {
         "id": 5,
+        "block": 1,
+        "occupant": "src/ui/app.tsx",
+        "boundary": [
+          [
+            -5.45,
+            -2.244
+          ],
+          [
+            -4.175,
+            -2.817
+          ],
+          [
+            -4.148,
+            -2.761
+          ],
+          [
+            -1.955,
+            -1.367
+          ],
+          [
+            -1.499,
+            0.462
+          ],
+          [
+            -3.901,
+            1.824
+          ],
+          [
+            -4.001,
+            1.816
+          ]
+        ]
+      },
+      {
+        "id": 6,
+        "block": 1,
+        "occupant": "src/ui/routes.ts",
+        "boundary": [
+          [
+            -4.001,
+            1.816
+          ],
+          [
+            -7.196,
+            1.552
+          ],
+          [
+            -7.139,
+            -1.485
+          ],
+          [
+            -5.45,
+            -2.244
+          ]
+        ]
+      },
+      {
+        "id": 7,
         "block": 2,
         "occupant": "src/net/gateway.rs",
         "boundary": [
@@ -1200,7 +1246,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 6,
+        "id": 8,
         "block": 3,
         "occupant": "tests/net_test.rs",
         "boundary": [
@@ -1219,7 +1265,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 7,
+        "id": 9,
         "block": 4,
         "occupant": "src/utils/helpers.rs",
         "boundary": [
@@ -1242,7 +1288,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 8,
+        "id": 10,
         "block": 5,
         "occupant": "src/main.rs",
         "boundary": [
@@ -1269,7 +1315,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 9,
+        "id": 11,
         "block": 6,
         "occupant": "tests/auth_test.rs",
         "boundary": [
@@ -1292,7 +1338,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 10,
+        "id": 12,
         "block": 7,
         "occupant": "src/net/client.rs",
         "boundary": [
@@ -1315,7 +1361,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 11,
+        "id": 13,
         "block": 8,
         "occupant": "src/net/server.rs",
         "boundary": [
@@ -1334,7 +1380,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 12,
+        "id": 14,
         "block": 9,
         "occupant": "src/auth/session.rs",
         "boundary": [
@@ -1357,7 +1403,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 13,
+        "id": 15,
         "block": 10,
         "occupant": "src/lib.rs",
         "boundary": [
@@ -1376,7 +1422,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 14,
+        "id": 16,
         "block": 11,
         "occupant": "docs/guide.md",
         "boundary": [
@@ -1395,7 +1441,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 15,
+        "id": 17,
         "block": 12,
         "occupant": "src/café/módulo.rs",
         "boundary": [
@@ -1414,7 +1460,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 16,
+        "id": 18,
         "block": 13,
         "occupant": "src/café/naïve.rs",
         "boundary": [
@@ -1441,7 +1487,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 17,
+        "id": 19,
         "block": 14,
         "occupant": null,
         "boundary": [
@@ -1472,7 +1518,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 18,
+        "id": 20,
         "block": 15,
         "occupant": "docs/日本語.md",
         "boundary": [
@@ -1495,7 +1541,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 19,
+        "id": 21,
         "block": 16,
         "occupant": "src/auth/tokens.rs",
         "boundary": [
@@ -1514,7 +1560,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 20,
+        "id": 22,
         "block": 17,
         "occupant": "src/auth/providers/ldap.rs",
         "boundary": [
@@ -1533,7 +1579,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 21,
+        "id": 23,
         "block": 18,
         "occupant": null,
         "boundary": [
@@ -1560,7 +1606,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 22,
+        "id": 24,
         "block": 19,
         "occupant": "src/auth/providers/oauth/github.rs",
         "boundary": [
@@ -1583,7 +1629,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 23,
+        "id": 25,
         "block": 20,
         "occupant": "src/auth/providers/oauth/google.rs",
         "boundary": [
@@ -1610,7 +1656,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 24,
+        "id": 26,
         "block": 21,
         "occupant": "examples/basic.rs",
         "boundary": [
@@ -1637,7 +1683,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 25,
+        "id": 27,
         "block": 22,
         "occupant": "README.md",
         "boundary": [
@@ -1660,7 +1706,7 @@ expression: "city.snapshot().expect(\"serializes\")"
         ]
       },
       {
-        "id": 26,
+        "id": 28,
         "block": 24,
         "occupant": ".gitattributes",
         "boundary": [
@@ -1682,33 +1728,33 @@ expression: "city.snapshot().expect(\"serializes\")"
     "buildings": [
       {
         "path": ".gitattributes",
-        "lot": 26,
-        "height": 1.0,
+        "lot": 28,
+        "height": 1.163,
         "roof": "pitched",
         "rotation": 0.02,
         "footprint": [
           [
-            6.069,
-            -2.642
+            6.072,
+            -2.643
           ],
           [
-            6.419,
-            -2.747
+            6.416,
+            -2.746
           ],
           [
-            6.394,
+            6.392,
             -2.446
           ],
           [
-            6.054,
+            6.057,
             -2.467
           ]
         ]
       },
       {
         "path": "docs/guide.md",
-        "lot": 14,
-        "height": 1.0,
+        "lot": 16,
+        "height": 2.681,
         "roof": "flat",
         "rotation": 0.062,
         "footprint": [
@@ -1717,243 +1763,243 @@ expression: "city.snapshot().expect(\"serializes\")"
             6.296
           ],
           [
-            -0.574,
-            5.741
+            -0.558,
+            5.625
           ],
           [
-            -0.142,
-            5.583
+            -0.184,
+            5.488
           ],
           [
-            0.215,
-            6.397
+            0.257,
+            6.492
           ],
           [
-            -0.516,
-            6.665
+            -0.48,
+            6.762
           ]
         ]
       },
       {
         "path": "docs/日本語.md",
-        "lot": 18,
-        "height": 6.007,
+        "lot": 20,
+        "height": 27.676,
         "roof": "stepped",
         "rotation": 0.031,
         "footprint": [
           [
-            0.341,
-            6.369
+            0.339,
+            6.363
           ],
           [
-            0.035,
-            5.671
+            0.038,
+            5.677
           ],
           [
-            0.933,
-            5.31
+            0.935,
+            5.316
           ],
           [
-            1.217,
-            6.016
+            1.215,
+            6.011
           ]
         ]
       },
       {
         "path": "examples/basic.rs",
-        "lot": 24,
-        "height": 1.0,
+        "lot": 26,
+        "height": 1.869,
         "roof": "pitched",
         "rotation": -0.032,
         "footprint": [
           [
-            6.972,
-            1.846
+            6.97,
+            1.852
           ],
           [
-            6.76,
-            2.558
+            6.762,
+            2.552
           ],
           [
-            5.216,
-            2.153
+            5.218,
+            2.147
           ],
           [
-            5.405,
-            1.434
+            5.403,
+            1.44
           ]
         ]
       },
       {
         "path": "README.md",
-        "lot": 25,
-        "height": 1.0,
+        "lot": 27,
+        "height": 1.747,
         "roof": "stepped",
         "rotation": -0.064,
         "footprint": [
           [
-            5.97,
-            -1.555
+            5.977,
+            -1.554
           ],
           [
-            6.846,
-            -1.346
+            6.839,
+            -1.348
           ],
           [
-            6.643,
-            -0.495
+            6.636,
+            -0.497
           ],
           [
-            5.78,
-            -0.76
+            5.788,
+            -0.757
           ]
         ]
       },
       {
         "path": "src/auth/providers/ldap.rs",
-        "lot": 20,
-        "height": 1.0,
+        "lot": 22,
+        "height": 2.453,
         "roof": "stepped",
         "rotation": -0.027,
         "footprint": [
           [
-            2.167,
-            -2.182
+            2.048,
+            -2.279
           ],
           [
             2.763,
             -1.7
           ],
           [
-            2.839,
-            -1.36
+            2.881,
+            -1.168
           ],
           [
-            2.273,
-            -0.66
+            2.39,
+            -0.561
           ],
           [
-            1.482,
-            -1.336
+            1.366,
+            -1.435
           ]
         ]
       },
       {
         "path": "src/auth/providers/oauth/github.rs",
-        "lot": 22,
-        "height": 1.0,
+        "lot": 24,
+        "height": 2.417,
         "roof": "stepped",
         "rotation": 0.023,
         "footprint": [
           [
-            3.721,
-            -5.83
+            3.651,
+            -5.868
           ],
           [
-            5.073,
-            -5.098
+            5.143,
+            -5.06
           ],
           [
-            4.369,
-            -3.866
+            4.438,
+            -3.826
           ],
           [
             4.049,
             -4.048
           ],
           [
-            3.269,
-            -5.038
+            3.216,
+            -5.106
           ]
         ]
       },
       {
         "path": "src/auth/providers/oauth/google.rs",
-        "lot": 23,
-        "height": 4.165,
+        "lot": 25,
+        "height": 23.713,
         "roof": "pitched",
         "rotation": -0.061,
         "footprint": [
           [
-            3.796,
-            -4.164
+            3.806,
+            -4.152
           ],
           [
-            4.967,
-            -2.679
+            4.957,
+            -2.691
           ],
           [
-            4.075,
-            -1.884
+            4.065,
+            -1.895
           ],
           [
-            2.818,
-            -3.292
+            2.829,
+            -3.28
           ]
         ]
       },
       {
         "path": "src/auth/session.rs",
-        "lot": 12,
-        "height": 8.643,
+        "lot": 14,
+        "height": 36.443,
         "roof": "flat",
         "rotation": -0.069,
         "footprint": [
           [
-            0.303,
-            0.05
+            0.185,
+            0.038
           ],
           [
-            1.444,
-            0.16
+            1.562,
+            0.171
           ],
           [
-            1.414,
-            1.276
+            1.532,
+            1.279
           ],
           [
             0.947,
             1.263
           ],
           [
-            0.276,
-            1.025
+            0.159,
+            0.983
           ]
         ]
       },
       {
         "path": "src/auth/tokens.rs",
-        "lot": 19,
-        "height": 2.5,
+        "lot": 21,
+        "height": 6.0,
         "roof": "stepped",
         "rotation": -0.069,
         "footprint": [
           [
-            0.781,
-            -1.056
+            0.61,
+            -1.06
           ],
           [
             1.642,
             -1.033
           ],
           [
-            1.942,
-            -0.776
+            2.109,
+            -0.633
           ],
           [
-            1.919,
-            0.078
+            2.089,
+            0.094
           ],
           [
-            0.754,
-            -0.035
+            0.583,
+            -0.051
           ]
         ]
       },
       {
         "path": "src/café/módulo.rs",
-        "lot": 15,
-        "height": 1.15,
+        "lot": 17,
+        "height": 11.646,
         "roof": "stepped",
         "rotation": -0.045,
         "footprint": [
@@ -1962,20 +2008,20 @@ expression: "city.snapshot().expect(\"serializes\")"
             -3.11
           ],
           [
-            -0.72,
-            -3.371
+            -0.725,
+            -3.343
           ],
           [
-            -0.267,
-            -3.601
+            -0.257,
+            -3.58
           ],
           [
-            0.045,
-            -2.912
+            0.035,
+            -2.933
           ],
           [
-            -0.355,
-            -2.709
+            -0.378,
+            -2.723
           ],
           [
             -0.666,
@@ -1985,304 +2031,328 @@ expression: "city.snapshot().expect(\"serializes\")"
       },
       {
         "path": "src/café/naïve.rs",
-        "lot": 16,
-        "height": 1.0,
+        "lot": 18,
+        "height": 2.223,
         "roof": "stepped",
         "rotation": 0.054,
         "footprint": [
           [
-            0.497,
-            -5.153
+            0.503,
+            -5.157
           ],
           [
-            1.227,
-            -5.689
+            1.221,
+            -5.685
           ],
           [
-            1.917,
-            -4.636
+            1.91,
+            -4.632
           ],
           [
-            1.16,
-            -4.14
+            1.166,
+            -4.144
           ]
         ]
       },
       {
         "path": "src/lib.rs",
-        "lot": 13,
-        "height": 2.5,
+        "lot": 15,
+        "height": 6.0,
         "roof": "stepped",
         "rotation": 0.055,
         "footprint": [
           [
-            0.157,
-            1.998
+            0.193,
+            2.034
           ],
           [
-            -0.613,
-            1.242
+            -0.65,
+            1.206
           ],
           [
-            -0.468,
-            0.895
+            -0.513,
+            0.88
           ],
           [
-            0.478,
-            1.231
+            0.523,
+            1.247
           ]
         ]
       },
       {
         "path": "src/main.rs",
-        "lot": 8,
-        "height": 2.5,
+        "lot": 10,
+        "height": 6.0,
         "roof": "stepped",
         "rotation": -0.041,
         "footprint": [
           [
-            -3.208,
-            1.504
+            -3.197,
+            1.498
           ],
           [
-            -1.895,
-            0.76
+            -1.906,
+            0.766
           ],
           [
-            -1.358,
-            1.622
+            -1.369,
+            1.629
           ],
           [
-            -2.638,
-            2.419
+            -2.628,
+            2.413
           ]
         ]
       },
       {
         "path": "src/net/client.rs",
-        "lot": 10,
-        "height": 1.0,
+        "lot": 12,
+        "height": 2.38,
         "roof": "stepped",
         "rotation": 0.05,
         "footprint": [
           [
-            -1.449,
-            -1.456
+            -1.587,
+            -1.414
           ],
           [
-            -0.077,
-            -1.877
+            0.061,
+            -1.919
           ],
           [
-            0.05,
-            -1.374
+            0.147,
+            -1.577
           ],
           [
             -0.093,
             -1.076
           ],
           [
-            -1.277,
-            -0.776
+            -1.417,
+            -0.741
           ]
         ]
       },
       {
         "path": "src/net/gateway.rs",
-        "lot": 5,
-        "height": 1.0,
+        "lot": 7,
+        "height": 1.769,
         "roof": "flat",
         "rotation": 0.052,
         "footprint": [
           [
-            -3.036,
-            -5.223
+            -3.031,
+            -5.221
           ],
           [
-            -2.393,
-            -5.001
+            -2.398,
+            -5.003
           ],
           [
-            -2.984,
-            -3.54
+            -2.989,
+            -3.542
           ],
           [
-            -3.613,
-            -3.795
+            -3.608,
+            -3.793
           ]
         ]
       },
       {
         "path": "src/net/server.rs",
-        "lot": 11,
-        "height": 2.5,
+        "lot": 13,
+        "height": 16.822,
         "roof": "stepped",
         "rotation": 0.06,
         "footprint": [
           [
-            -1.302,
-            -2.206
+            -1.283,
+            -2.233
           ],
           [
             -1.16,
             -2.412
           ],
           [
-            -0.459,
-            -2.582
+            -0.483,
+            -2.576
           ],
           [
-            -0.303,
-            -1.941
+            -0.327,
+            -1.933
           ],
           [
-            -1.173,
-            -1.674
+            -1.149,
+            -1.681
           ]
         ]
       },
       {
         "path": "src/ui/app.tsx",
-        "lot": 2,
-        "height": 12.266,
+        "lot": 5,
+        "height": 52.408,
         "roof": "stepped",
         "rotation": -0.055,
         "footprint": [
           [
-            -1.843,
-            -0.654
+            -3.158,
+            -0.572
           ],
           [
-            -1.572,
-            0.431
+            -2.435,
+            0.92
           ],
           [
-            -3.31,
-            1.416
+            -3.915,
+            1.759
           ],
           [
-            -3.65,
-            0.507
+            -3.97,
+            1.755
+          ],
+          [
+            -3.97,
+            1.754
+          ],
+          [
+            -4.495,
+            0.286
           ]
         ]
       },
       {
         "path": "src/ui/components/button.tsx",
-        "lot": 0,
-        "height": 1.0,
+        "lot": 1,
+        "height": 2.194,
         "roof": "stepped",
         "rotation": -0.011,
         "footprint": [
           [
-            -3.18,
-            4.491
+            -7.051,
+            3.821
           ],
           [
-            -4.24,
-            5.21
+            -7.066,
+            3.413
           ],
           [
-            -4.883,
-            4.284
+            -6.821,
+            3.14
           ],
           [
-            -3.831,
-            3.554
+            -6.801,
+            3.143
+          ],
+          [
+            -5.663,
+            4.164
+          ],
+          [
+            -5.701,
+            4.26
+          ],
+          [
+            -6.095,
+            4.699
           ]
         ]
       },
       {
         "path": "src/ui/components/table.tsx",
-        "lot": 1,
-        "height": 1.0,
+        "lot": 0,
+        "height": 3.119,
         "roof": "flat",
         "rotation": 0.041,
         "footprint": [
           [
-            -7.098,
-            2.528
+            -7.095,
+            2.593
           ],
           [
             -7.13,
             1.621
           ],
           [
-            -4.284,
-            1.856
+            -4.752,
+            1.817
           ],
           [
-            -4.665,
-            2.83
+            -4.752,
+            1.818
+          ],
+          [
+            -5.15,
+            2.834
           ]
         ]
       },
       {
         "path": "src/ui/routes.ts",
-        "lot": 3,
-        "height": 2.5,
+        "lot": 6,
+        "height": 6.0,
         "roof": "stepped",
         "rotation": -0.011,
         "footprint": [
           [
-            -4.553,
-            1.706
+            -4.753,
+            1.69
           ],
           [
-            -6.065,
-            1.582
+            -6.513,
+            1.545
           ],
           [
-            -5.975,
-            0.319
+            -6.437,
+            0.48
           ],
           [
-            -4.462,
-            0.427
+            -4.676,
+            0.606
           ]
         ]
       },
       {
         "path": "src/ui/store.ts",
         "lot": 4,
-        "height": 1.0,
+        "height": 1.427,
         "roof": "flat",
         "rotation": 0.061,
         "footprint": [
           [
-            -7.071,
-            -1.748
+            -5.065,
+            -4.508
           ],
           [
-            -7.057,
-            -2.461
+            -4.575,
+            -3.497
           ],
           [
-            -5.686,
-            -2.351
+            -5.388,
+            -3.162
           ],
           [
-            -5.742,
-            -1.642
+            -5.815,
+            -4.2
           ]
         ]
       },
       {
         "path": "src/utils/helpers.rs",
-        "lot": 7,
-        "height": 1.0,
+        "lot": 9,
+        "height": 1.563,
         "roof": "pitched",
         "rotation": 0.0,
         "footprint": [
           [
-            -1.376,
+            -1.372,
             -6.942
           ],
           [
-            -0.847,
-            -6.888
+            -0.851,
+            -6.889
           ],
           [
-            -1.06,
+            -1.064,
             -4.796
           ],
           [
@@ -2290,62 +2360,62 @@ expression: "city.snapshot().expect(\"serializes\")"
             -4.846
           ],
           [
-            -1.588,
-            -4.858
+            -1.584,
+            -4.857
           ]
         ]
       },
       {
         "path": "tests/auth_test.rs",
-        "lot": 9,
-        "height": 1.0,
+        "lot": 11,
+        "height": 2.162,
         "roof": "pitched",
         "rotation": 0.041,
         "footprint": [
           [
-            -2.709,
-            6.375
+            -2.707,
+            6.363
           ],
           [
-            -2.384,
-            4.945
+            -2.387,
+            4.956
           ],
           [
-            -1.307,
-            5.237
+            -1.31,
+            5.248
           ],
           [
-            -1.69,
-            6.651
+            -1.687,
+            6.639
           ]
         ]
       },
       {
         "path": "tests/net_test.rs",
-        "lot": 6,
-        "height": 1.0,
+        "lot": 8,
+        "height": 1.823,
         "roof": "stepped",
         "rotation": 0.024,
         "footprint": [
           [
-            -3.867,
-            5.954
+            -3.894,
+            6.06
           ],
           [
             -3.61,
             4.936
           ],
           [
-            -3.504,
-            4.865
+            -3.383,
+            4.782
           ],
           [
-            -2.551,
-            5.106
+            -2.527,
+            4.999
           ],
           [
-            -2.805,
-            6.223
+            -2.83,
+            6.33
           ]
         ]
       }
@@ -3062,8 +3132,8 @@ expression: "city.snapshot().expect(\"serializes\")"
     "blocks": 25,
     "open_blocks": 0,
     "slivers": 0,
-    "lots": 27,
-    "empty_lots": 2,
+    "lots": 29,
+    "empty_lots": 4,
     "massed": 3,
     "overflow": 0,
     "unbuilt": 0,
@@ -3095,6 +3165,8 @@ expression: "city.snapshot().expect(\"serializes\")"
     "monuments": 6,
     "age_ramp": "calibrated",
     "history_days": 626,
-    "old_town_files": 20
+    "old_town_files": 20,
+    "core_files": 20,
+    "age_equalisation_x100": 0
   }
 }

@@ -26,14 +26,28 @@
 //! So [`PolisRenderer`] exposes an encode-into-the-caller's-encoder entry point
 //! and a draw-into-the-caller's-pass entry point, and is storable in a type-map.
 //!
-//! # Unresolved before any contrast tuning
+//! # PRD §10.3's contrast budget, and where it is decided
 //!
-//! eframe's surface format is **non-sRGB and backend-dependent** (`Rgba8Unorm`
-//! on Vulkan, `Bgra8Unorm` on DX12) while an offscreen `Rgba8UnormSrgb` target
-//! encodes differently, so identical shader output looks darker in the window
-//! than headless. Settle the colour-space convention before doing PRD §10.3's
-//! "bottom fifth of the contrast range" work, or the palette gets done twice
-//! (ADR-0021). Never hardcode the format; read `render_state.target_format`.
+//! The budget — layers 1–2 inside the bottom fifth of the contrast range, the
+//! rest reserved for layers 4–5 — is **defined and enforced in [`plan`]**, in
+//! 8-bit sRGB channel space, as [`plan::BASE_MAP_CEILING`] plus the reserved
+//! bands [`plan::CLOUD_BAND`], [`plan::AGENT_BAND`] and
+//! [`plan::ATTENTION_BAND`]. Read that module before adding any colour to this
+//! crate; the ceiling is a channel bound precisely so that it survives blending
+//! and downsampling, which is what makes it enforceable rather than aspirational.
+//!
+//! ADR-0021 asked for the colour-space convention to be settled before that
+//! tuning, and for the PNG path it now is: the CPU rasteriser writes sRGB bytes
+//! straight into the file, with no surface format in the way.
+//!
+//! **The wgpu path still has to reproduce it, and cannot do so by copying
+//! constants blindly.** eframe's surface format is non-sRGB and
+//! backend-dependent (`Rgba8Unorm` on Vulkan, `Bgra8Unorm` on DX12) while an
+//! offscreen `Rgba8UnormSrgb` target encodes differently, so identical shader
+//! output looks darker in the window than headless. The budget travels as a
+//! *luminance* bound (`L* ≤ 19.9` for layers 1–2); convert it into whatever
+//! `render_state.target_format` reports at runtime, and never hardcode the
+//! format.
 
 pub mod agents;
 pub mod camera;
