@@ -14,6 +14,7 @@
 //! | [`kinds`] | §8 — what kind of code a file is, which is what hue should mean |
 //! | [`neighborhoods`] | §3, §8 — districts at a size a person can read, named and labelled |
 //! | [`describe`] | §12 — what a neighborhood does, quoted from the repository |
+//! | [`llm`] | §12 — and what a model says when the repository says nothing |
 //! | [`manifest`] | §16 — a real repository, recorded so CI can lay it out without a clone |
 //!
 //! # The labelled layer, for a renderer
@@ -76,6 +77,7 @@ pub mod describe;
 pub mod git;
 pub mod imports;
 pub mod kinds;
+pub mod llm;
 pub mod manifest;
 pub mod neighborhoods;
 pub mod synthetic;

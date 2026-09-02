@@ -387,9 +387,7 @@ fn lzw(indices: &[u8], min_code_size: u8, out: &mut Vec<u8>) {
             }
         } else {
             bits.push(clear, code_size);
-            for d in &mut dict {
-                *d = 0;
-            }
+            dict.fill(0);
             next = eoi + 1;
             code_size = u32::from(min_code_size) + 1;
         }

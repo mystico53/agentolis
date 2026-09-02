@@ -57,6 +57,42 @@
 //! `render_state.target_format` reports at runtime, and never hardcode the
 //! format.
 
+//! # The live layer, and where to find it
+//!
+//! Layers 3–5 — clouds, agents and attention — are drawn by [`live`], which
+//! owns the whole of PRD §10's notation: the six operation glyphs, the three
+//! outcome colours, the trail notations, the tether, the revisit rosette, the
+//! scaffolding and the three attention states. It draws onto a [`raster::Canvas`]
+//! and knows nothing about wgpu, which is deliberate: the notation had to be
+//! decidable in M2 without a window (PRD §15), and a notation that only exists
+//! inside a GPU pipeline cannot be diffed, tested on pixels, or recorded.
+//!
+//! [`frame`] is the headless frame renderer — a world snapshot and a time in, an
+//! image out — and [`gif`] records a sequence of them. Together they are the M2
+//! iteration loop:
+//!
+//! ```no_run
+//! use polis_render::{frame::{FrameOptions, FrameRenderer}, gif};
+//! # fn demo(city: &polis_layout::city::City, reader: &polis_world::snapshot::SnapshotReader) {
+//! let mut renderer = FrameRenderer::new(city, FrameOptions::default());
+//! let dt = std::time::Duration::from_millis(42);
+//! let frames: Vec<_> = (0..96)
+//!     .map(|_| renderer.render_owned(&reader.load(), dt))
+//!     .collect();
+//! gif::write(std::path::Path::new("replay.gif"), &frames, 4).unwrap();
+//! # }
+//! ```
+//!
+//! The wgpu path below has to reproduce [`live`]'s notation, not reinvent it:
+//! the constants are there, the band rules are asserted there on real pixels,
+//! and every number in it was tuned against a rendered frame.
+//!
+//! **The one rule that is easy to get wrong on the GPU path**: fading is a
+//! **tone** ramp toward the band floor, never an alpha ramp. Alpha-blending a
+//! live mark over Polis's near-black base map composites it *into* the map's own
+//! band — measured, a trail at `α = 0.55` lands at channel 69, dimmer than a
+//! district label. See [`live`]'s module docs.
+
 pub mod agents;
 pub mod camera;
 pub mod city;

@@ -3423,3 +3423,288 @@ description, and 15–33 % on the operator's own repositories and on Django and
 Neovim. That is a fact about how repositories are written, not a gap in the
 extractor, and `docs/neighborhoods-sample.md` reports it per repository rather
 than averaging it away.
+
+---
+
+## ADR-0088 — A description is rejected when a *tool* wrote it, and a file speaks only for the directory it is in
+
+**Context.** ADR-0087's extractor was reviewed by running it over the operator's
+eight repositories rather than over fixtures, and four of its outputs were
+indefensible on sight:
+
+* `qurio-toolset/src/components/landing` was described, on the map, as
+  **"eslint-disable"**. A leading `/* eslint-disable */` is a block comment in
+  exactly the position a module doc comment occupies, and tree-sitter was right
+  to hand it over. It is simply not prose.
+* Four of eight repositories had their **root** district — PRD §8's civic
+  square, the most prominent label on the map — described by a project
+  generator: "This is a Next.js project bootstrapped with create-next-app" on
+  three, and "This template provides a minimal setup to get React working in
+  Vite" on the fourth. That text describes the generator, not the repository.
+* `qurio-toolset`'s root was then described as "a DEV-ONLY Vite plugin", because
+  the doc-comment extractor fell back to the district's monument wherever it sat
+  in the subtree — here `vite-plugins/manualReloadPlugin.js`. The same rule made
+  `components/MediaWindow` a YouTube renderer, from
+  `MediaWindow/renderers/YouTubeRenderer.jsx`.
+* `components/ChatWindow` was described as "most imported: `ChatWindow.jsx`" and
+  `src/types` as "most imported: `index.ts`". ADR-0087's `says_nothing_new`
+  guard missed both: it compares against the *display name*
+  (`components/ChatWindow`), which a leaf file name never equals, and it does not
+  strip the extension.
+
+**Decision.** Four rules, all of which make the output *smaller*.
+
+1. **`SanitiseReject::Boilerplate`.** Two closed tables — `PRAGMA_PREFIXES`
+   (`eslint-*`, `prettier-ignore`, `ts-nocheck`, `noqa`, `pylint:`, `coding:`, …)
+   prefix-matched after markup stripping, and `BOILERPLATE_PHRASES`, verbatim
+   generator output, matched anywhere. Rejected whole and the next source tried,
+   the same contract as a secret. A phrase earns a place in the second table only
+   by being a string a tool emits, never by sounding generic: the general "says
+   nothing new" test is `says_nothing_new`, and the general "there is nothing to
+   say" answer is `None`.
+2. **The cache version is bumped with any rule change.** The cache is keyed on
+   the bytes of the file, not on the rules that read them, so a warm cache would
+   go on serving the answer the new rule exists to refuse — and only on machines
+   that had run before, which is the worst possible way to find out.
+3. **An `extra` doc-comment candidate must sit in the directory itself.** A doc
+   comment describes the file it is written in. An `ANCHOR_NAMES` file is the
+   directory's declared front door and may speak for it; any other file speaks by
+   proximity, and proximity runs out at the first subdirectory. This does not
+   make the survivors true of a whole 223-file district — that is a judgement no
+   path rule can make — it removes the cases with no basis at all.
+4. **A monument that repeats the district's own leaf name, extension stripped,
+   is not a description**, and neither is a universal entry point (`index`,
+   `main`, `mod`, `lib`, `app`, `__init__`, …). The monument itself is untouched:
+   PRD §8 still draws and labels that building. It is a useless label for the
+   *district*.
+
+Also: `.astro`, `.playwright-mcp`, `playwright-report`, `test-results`,
+`.docusaurus`, `.vercel`, `.netlify` and `.wrangler` join
+`DEFAULT_INDUSTRIAL_DIRS`. All are tool output that nobody edits, and without
+them 152 such files sat in the civic budget of the operator's repositories —
+106 of them, in `biwt`, as one of that repository's largest `config` districts.
+
+**Consequences.** Prose descriptions across the operator's eight repositories
+fall from 44 to 38 and the *informative* count stays at 10, which is the point:
+every loss was wrong. The honest number is now 23 prose descriptions across 160
+districts outside this repository — 14 % — of which 10 tell the reader something
+the label did not. `docs/design/NEIGHBORHOODS-REVIEW.md` records the grading
+district by district, and concludes that the remaining gap is not reachable by
+more rules.
+
+**One thing deliberately not fixed.** `vc-tower/vcsheet-scraper` holds 13 058
+scraped `.json` and `.html` files that read as `config` and `source`, set the
+sizing budget, and collapse that repository's whole application into one
+100-file district. `.json → Config` was chosen deliberately in ADR-0085 and
+flipping it globally is not a review's change to make. The right fix is to
+generalise ADR-0086's hold-out from *directory names* to *behaviour* — a flat
+directory of thousands of files sharing one extension is a mass whatever it is
+called — and it is the top recommendation of the review.
+
+---
+
+## ADR-0089 — A model writes the descriptions the repository does not, and everything about it is fenced
+
+**Status** accepted · Implemented in `polis_repo::llm`.
+
+**Context.** ADR-0087 derived a neighborhood's description by quoting the
+repository, and ADR-0088 tightened it. `docs/design/NEIGHBORHOODS-REVIEW.md` then
+measured the result by running it over the operator's eight repositories:
+**23 prose descriptions across 160 districts — 14 % — of which 10 told the reader
+something the label did not.** Nine of the 23 were the folder name in different
+words (`services/settings` → "The settings entry contract"). `biwt` has 20
+districts and zero prose in the whole checkout.
+
+The gap is structural, not a missing rule: **most directories in a working
+repository contain no sentence saying what they are**, and no extractor can quote
+what nobody wrote. So the operator approved adding a model, after an explicit
+discussion of the trade-offs, and PRD §2's "no telemetry leaving the box" is bent
+here — deliberately, once, and with the payload fenced.
+
+**Decision.** `GLM-5.3-Flash` on Z.ai by default, behind a provider-agnostic
+interface, with seven properties that are each load-bearing.
+
+**1. The provider is a config line.** `ChatProvider` has two methods: build a
+request, parse a response. Everything above it — planning, batching, caching,
+staleness, redaction, retries, accounting — is written against that. `Glm`,
+`Ollama` (the same `OpenAI`-compatible shape, locally, with no key at all) and
+`Anthropic` (Messages API, `x-api-key`, `anthropic-version`) ship.
+`LlmConfig::with_provider` moves base URL, model, key-variable *name* and price
+together, because changing one without the others is the failure it exists to
+prevent.
+
+**2. There is no HTTP crate.** A blocking client with TLS is ~40 crates including
+a cryptography library with a C build and a compiled-in CA set that ages;
+`polis-repo` has nine direct dependencies and this work added **zero** —
+`Cargo.lock`'s `polis-repo` entry is untouched, so a security review of the
+feature is still one directory of one crate, and `polis-hook`'s zero-dependency
+guarantee (PRD §14, ADR-0036) cannot be eroded by accident. Instead there are two
+transports behind one trait: `http://` is HTTP/1.1 over `std::net::TcpStream`,
+written out here (chunked decoding included, because Ollama uses it); `https://`
+is `curl` as a subprocess, using the operating system's own trust store. This is
+the same call `polis-repo/Cargo.toml` already made for `git log`, for the same
+reasons. **It is a trait so it is reversible**: a `ureq`-backed
+`impl Transport` is a new type in the caller's crate and no change here.
+
+A consequence worth stating: the tests drive the *shipped* plain-HTTP client
+against a real `TcpListener` on `127.0.0.1`, so the end-to-end HTTP path is
+exercised by `cargo test` with no network and no mock.
+
+**3. The key is a type, not a discipline.** `Secret` has no `Serialize`, no
+`Display` and no constructor from a literal; it prints as `Secret(<redacted>)`,
+so a `{:?}` of any struct holding one is safe to log; it is reachable only
+through `Secret::expose`, which is one greppable name. `curl`'s command line is
+visible to every process on the machine, so a secret header is written to
+`curl --config -` **on stdin** and never into `argv` and never into a file; the
+request body, which carries no key, goes to a temporary file in the state
+directory that is deleted when the call returns. Any text arriving from outside
+this crate — a subprocess's stderr — is run through `secret::scrub` before it can
+reach an error string.
+
+**4. Editing a file does not change what a folder is.** The cache key is the
+district's **identity plus a fingerprint of its file names**, never file
+contents. Keyed on content, every commit invalidates most of the cache: a
+one-time cost becomes a per-commit cost and, worse, the words on the map churn —
+which is the same failure as a city that reshuffles (PRD §7.4). A description is
+regenerated only when meaning plausibly moved, which is three things:
+
+* **a district appeared** (`Freshness::Missing`);
+* **a district split or merged** — the entry stores its child district paths, so
+  a growing `src/services` splitting into `src/services/auth` and
+  `src/services/billing` is caught *structurally*, even though the parent's own
+  file names barely moved. This is the case the operator asked about and the one
+  a name fingerprint alone misses;
+* **the name fingerprint drifted** past the threshold.
+
+Relations are deliberately not on that list. Import edges are exact and update
+instantly; they answer "what talks to what". Descriptions answer "what is this
+folder", which moves slowly. Keeping them apart is what stops the fast-changing
+half from ever triggering a call.
+
+**The threshold is 440 ‰ of Jaccard distance, and the number is measured, not
+chosen.** `polis-repo/examples/llm_drift.rs` lists every district of every
+repository in `C:/coding` at `HEAD` and at the same repository 30, 90 and 365
+days — and 25, 100 and 400 commits — earlier, using `git ls-tree` so nothing is
+checked out. Drift is `1 - |A ∩ B| / |A ∪ B|`, symmetric in additions and
+removals, which is the property you want: a district that *loses* a third of its
+files has changed as much as one that gains a third. That symmetry is also why
+the constant is not the brief's "a third" read literally — replacing a third of
+*n* names gives 500 ‰, adding a third gives 250 ‰, so "a third changed" is a band
+from 250 to 500 and the measurement picks the point inside it:
+
+| window | surviving districts | ≥250 ‰ | ≥330 ‰ | **≥440 ‰** | ≥500 ‰ | ≥660 ‰ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 30 days | 117 | 11 % | 7 % | **3 %** | 3 % | 2 % |
+| 90 days | 113 | 19 % | 12 % | **9 %** | 5 % | 4 % |
+| 25 commits | 110 | 15 % | 11 % | **9 %** | 9 % | 7 % |
+| 100 commits | 83 | 43 % | 33 % | **25 %** | 23 % | 13 % |
+| 400 commits | 55 | 60 % | 56 % | **44 %** | 40 % | 29 % |
+
+At 440 ‰ the *median* district never fires in any calendar window — median drift
+is 0 ‰ on five of the eight repositories over 90 days — so the typical caption is
+stable across a quarter, which is exactly the spatial-memory property. It still
+fires on the districts that genuinely churned: `qurio-toolset`'s 90-day p90 is
+784 ‰. 330 ‰ costs a third more regenerations for districts whose names moved by
+a quarter, which is a refactor, not a change of purpose; 250 ‰ nearly doubles it.
+
+**5. Staleness is a state, never a silence.** A caption reading "Payment
+processing" over a folder that quietly became the notification service is *worse
+than no caption*: it is confidently wrong and the operator would trust it. So
+`Neighborhood::freshness` is `Fresh` / `Stale(Drift { permille, cause })` /
+`Missing`, the cause distinguishes names from split, merge and a changed
+model-or-prompt, and the drift is a `u16` per-mille rather than an `f32` because
+`Neighborhood` derives `Eq` and a serialized value must compare bit-identically
+on every machine. A stale description is **still shown**, marked — blanking it
+would trade a caption the operator can see is old for no caption at all, and the
+requirement was that staleness be visible, not hidden.
+
+**6. Nothing is called implicitly, and every failure degrades.**
+`RepoIndex::neighborhoods_described` and `llm::apply_cached_model_descriptions`
+read; only `LlmRunner::run` calls, and `LlmRunner::spawn` puts it on a background
+thread so a render never waits for a network. **`RunMode::DryRun` is the
+default**, produces the whole priced plan having called nothing, and a
+`Generate` against a **cold cache** refuses to spend unless confirmed: cold start
+is the expensive one and nobody should discover a bill. No key, no network, a
+dead port, a 401, a 429, a timeout, a body that is not JSON, a model that
+refuses — each is one line in `RunReport::errors` and a map identical to the one
+you get with the feature off. Retries are bounded and only for errors that could
+change: a 429 and a 5xx are the endpoint asking for patience, a 401 will be just
+as wrong in half a second.
+
+**7. Empty beats filler, enforced twice.** The prompt leads with the refusal
+rule, in capitals, illustrated with three of the review's *real* failures
+verbatim, and asks for `null`. And `prompt::restates_the_name` enforces it
+independently, because a rule that lives only in a prompt holds only until the
+next model: caption words are split on `camelCase` and punctuation, singularised,
+and stripped of stopwords and a closed list of category nouns; if nothing is left
+that the district's name does not already contain, the answer is refused. Graded
+against the review's own tables it catches **six of the nine** restatements and
+**none of the ten** informative captions — "Tool Registry" survives, because
+`registry` is neither in `services/tools` nor a category noun. It is deliberately
+high-precision: a false positive here silently deletes a good caption.
+
+The same function also decides *which* districts are asked about. A real README
+or manifest sentence always wins; the model is asked only where the extractor
+returned nothing, returned an inventory line, restated the name, or hung one
+file's doc comment on a district too large for it to speak for
+(`src/services`, 223 files, labelled from `WindowManager.js`).
+
+**Consequences.**
+
+*Nothing leaves without being vetted.* `llm::outbound::vet` applies
+`describe::looks_like_secret` — the **same** predicate as the inbound sanitiser,
+not a second copy — to every file name and doc snippet, strips every control
+character and bidi override with `describe::is_unsafe_char`, and drops whole
+fields rather than redacting inside them. Measured over the operator's eight
+repositories: **169 names refused, 0 doc snippets, 0 districts skipped.** One of
+those is a genuine catch — `AuthKey_73425WW27A.p8`, the Apple private key in
+`qurio-toolset/electron/signing/apple`, the district ADR-0087's review already
+flagged. The rest are long hyphenated document names with digits
+(`1968-End-of-an-Era.pdf`) and epoch-prefixed uploads
+(`1765241215200-A Cielo Abierto.png`) that read as high-entropy. That is the
+right side to err on, and it is why vetting happens *before* the sixty-name
+truncation rather than after: otherwise `stickingplacebooks`' upload directory
+would have spent its whole budget on names that were then dropped.
+
+*Source code bodies never leave.* Structurally, not by promise: `DistrictBrief`
+has no field that could hold one and its builder opens no file.
+
+*The layout cannot move.* A description is text hung on a district. The partition
+is a pure function of the file list and runs before any of this; there is a test
+that a full generation leaves every district's path, file count and kind
+byte-identical, and the `m1_gate` goldens are untouched.
+
+*`DescriptionSource::Model` is not prose.* `is_prose()` stays false for it and
+`NeighborhoodStats` counts `described_model` separately, so the review's 14 % —
+the honest measurement of how well a repository documents *itself* — cannot be
+inflated by having paid for sentences.
+
+*Cost, measured rather than estimated.* A cold start over the operator's eight
+repositories, priced from the exact bytes that would be sent: `qurio-toolset`
+$0.0018 (41 districts, 6 calls), `stickingplacebooks` $0.0013,
+`Squigglo` $0.0008, `biwt` $0.0006, `stickingplace` $0.0004, `vc-tower` $0.0003,
+`agentolis` $0.0001, `qurio-networked` $0.0001 — **$0.0054 for all eight, about
+$0.0007 each**, an order of magnitude below the $0.006 per repository the brief
+estimated, because a district's names and doc snippet are ~250 input tokens, not
+1 000. The price is configuration, not a constant, because the shipped default is
+a promotional rate that expires on 2026-09-09, and `RunReport` prints the price
+it used and says plainly when the provider reported no usage and the figure is
+therefore an estimate.
+
+*Structured output is requested and never relied on.* `models.dev` reports that
+`glm-5.3-flash` supports it; Z.ai's documentation does not describe the syntax,
+and this round had no key to settle it with. So `response_format` is sent when
+`request_json_object` is set — one config line to turn off — and `parse_reply` is
+tolerant either way: a bare object, a bare array, a fenced block, or JSON inside
+prose. **This is unverified**, and it is written down here rather than assumed.
+
+*What the live endpoint did confirm, with no valid key.* An unauthenticated
+`POST https://api.z.ai/api/paas/v4/chat/completions` returns HTTP 401 and
+`{"error":{"code":"1001","message":"Authentication parameter not received in
+Header, unable to authenticate"}}`; the same request through the shipped
+`CurlTransport` carrying a deliberately invalid key returns HTTP 401 and
+`"token expired or incorrect"`. The two messages differ, which is the proof that
+the `--config -` stdin mechanism actually delivers the header. The run classified
+it as non-retryable, made one attempt, logged one error line and left both
+districts on their derived descriptions. **A successful completion has not been
+observed**: no key was present in this environment.

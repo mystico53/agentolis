@@ -147,13 +147,14 @@ fn print_plain(
         sources(hoods)
     );
     println!(
-        "describe: {} files read, {} cache hits, rejected {} (short {}, code {}, secret {})",
+        "describe: {} files read, {} cache hits, rejected {} (short {}, code {}, secret {}, boilerplate {})",
         stats.describe.files_read,
         stats.describe.cache_hits,
         stats.describe.rejected(),
         stats.describe.rejected_short,
         stats.describe.rejected_code,
-        stats.describe.rejected_secret
+        stats.describe.rejected_secret,
+        stats.describe.rejected_boilerplate
     );
     println!();
     for hood in hoods.by_size().into_iter().take(top) {
@@ -196,7 +197,7 @@ fn print_markdown(
     println!();
     println!(
         "Described **{}/{}**, of which **{}** is prose a human wrote ({:.0}%). Sources: {:?}. \
-         Rejected {} candidates (short {}, code {}, credential-shaped {}).",
+         Rejected {} candidates (short {}, code {}, credential-shaped {}, boilerplate {}).",
         stats.described,
         stats.districts,
         stats.described_prose,
@@ -205,7 +206,8 @@ fn print_markdown(
         stats.describe.rejected(),
         stats.describe.rejected_short,
         stats.describe.rejected_code,
-        stats.describe.rejected_secret
+        stats.describe.rejected_secret,
+        stats.describe.rejected_boilerplate
     );
     println!();
     println!("| neighborhood | kind | files | description | source |");

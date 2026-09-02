@@ -66,12 +66,14 @@
 // `float_cmp` fires on the tween assertions, and an approximate comparison
 // there would be the bug: "the agent arrived" and "the tween did not start from
 // nowhere" are exact statements about an exact interpolation. The `cast_*`
-// family lands in pixel indices that are clamped on purpose, as in `plan`.
+// family lands in pixel indices that are clamped on purpose, as in `plan`, and
+// `a`, `b`, `w`, `h`, `r` are the names the geometry itself uses.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::float_cmp,
+    clippy::many_single_char_names,
     clippy::too_many_lines
 )]
 
@@ -111,10 +113,18 @@ const CLOUD_RATE: f64 = 2.5;
 /// How long an operation mark survives, in **world** seconds.
 ///
 /// A mark is a memory, not a state, so it has to expire or the map becomes a
-/// palimpsest. Ninety seconds keeps roughly the last two minutes of work
-/// legible, which is the window an operator glancing at a second monitor is
-/// actually asking about.
-pub const MARK_TTL: f64 = 90.0;
+/// palimpsest — but the expiry rule belongs to the **world**, not to the
+/// renderer. `polis_world` already keeps `Thread::ops` for
+/// [`polis_world::TRAIL_TTL`] and caps it at `OPS_CAP`, so a second, shorter
+/// TTL here is a policy nobody declared and nobody can see.
+///
+/// It was 90 s, and on a real session that threw away five sixths of the
+/// evidence: measured at the busiest moment of a 27-hour session, the world
+/// held 127 placeable operations and the renderer drew **one**. The shape
+/// channel was empty while the data was there. So the renderer now draws what
+/// the world kept, fades it across the world's own window, and limits density
+/// with a per-thread mark cap rather than with time.
+pub const MARK_TTL: f64 = polis_world::TRAIL_TTL.as_secs() as f64;
 
 /// The most marks drawn for one thread. `Thread::ops` is capped at 128 by the
 /// world; drawing all of them at district zoom is confetti.
@@ -138,7 +148,7 @@ const TETHERS_PER_THREAD: usize = 16;
 /// Same argument, plus a budget one: a session that has touched 130 files draws
 /// 130 five-stroke frames, which on the measurement that matters — PRD §13.1's
 /// 4 ms — was most of the layer.
-const MAX_SCAFFOLDS: usize = 40;
+const MAX_SCAFFOLDS: usize = 24;
 
 /// How recently a file must have been touched to carry scaffolding, in world
 /// seconds.
@@ -506,10 +516,15 @@ impl FrameRenderer {
                 let at = m.at();
                 if let Some(a) = anchor {
                     if rank < TETHERS_PER_THREAD {
+                        // Fan the bundle: rank 0 bows one way, the last bows the
+                        // other, and the count becomes readable.
+                        let n = TETHERS_PER_THREAD.min(thread.workers.len()).max(2) - 1;
+                        let spread = (rank as f64 / n as f64).mul_add(2.0, -1.0);
                         frame.tethers.push(live::Tether {
                             anchor: a,
                             worker: at,
                             running: worker.running,
+                            spread,
                         });
                     }
                 }
@@ -926,8 +941,8 @@ fn chase(current: f64, target: f64, dt: f64, rate: f64) -> f64 {
 mod tests {
     use super::*;
     use polis_events::{
-        Channel, Event, EventMeta, OtelEvent, Outcome, Payload, SessionId, ToolCall, ToolKind,
-        ToolUseId, WorkerId, WorktreeId,
+        Channel, Event, EventMeta, Glyph, OtelEvent, Outcome, Payload, SessionId, ToolCall,
+        ToolKind, ToolUseId, WorkerId, WorktreeId,
     };
     use polis_layout::city;
     use polis_repo::{synthetic, RepoTree};
@@ -1554,18 +1569,14 @@ mod tests {
                 let mut calls: Vec<u64> = Vec::new();
                 let mut seen = 0u64;
                 while scout.step(&mut probe) {
-                    // Count **path touches**, not tool calls: a tool call with
-                    // no path draws nothing, and the transcript is full of
-                    // them. This is the quantity the trail, the marks and the
-                    // revisit rosettes are all made of, so maximising it is the
-                    // same question as "where does this session have the most
-                    // to show".
-                    let now: u64 = probe
-                        .threads
-                        .values()
-                        .flat_map(|t| t.visits.values())
-                        .map(|v| u64::from(v.count))
-                        .sum();
+                    // The metric is **distinct paths reached**, and getting
+                    // here took three tries. Records are dominated by assistant
+                    // text; tool calls are dominated by calls with no path;
+                    // path *touches* are dominated by one file being hammered,
+                    // which the trail deduplicates into a single step by
+                    // design. What makes a map worth looking at is the session
+                    // spreading out, so that is what the window maximises.
+                    let now: u64 = probe.threads.values().map(|t| t.visits.len() as u64).sum();
                     if now > seen {
                         seen = now;
                         calls.push(scout.clock().position_ms());
@@ -1582,7 +1593,7 @@ mod tests {
                     }
                 }
                 eprintln!(
-                    "  {} path touches in the session; the busiest {} s window holds {}",
+                    "  {} distinct paths reached; the busiest {} s window reaches {}",
                     calls.len(),
                     window / 1000,
                     best.1
@@ -1702,13 +1713,6 @@ mod tests {
                     name.to_uppercase(),
                     if waiting > 0 { "WAITING" } else { "" }
                 ));
-                if i == 0 || i + 1 == frames {
-                    eprintln!(
-                        "  [{name}] frame {i}: schedule {} ms, session {} s",
-                        p.position_ms,
-                        p.session_elapsed().as_secs()
-                    );
-                }
                 if i * 2 == frames {
                     let f = renderer.build(&snap, 0.0);
                     eprintln!(
@@ -1742,14 +1746,6 @@ mod tests {
                         th.trail.len(),
                         th.visits.len(),
                         th.status
-                    );
-                    eprintln!(
-                        "  [{name}] tool_calls {}, op ages {:?}",
-                        th.tool_calls,
-                        th.ops
-                            .iter()
-                            .map(|o| secs_since(snap.at, o.at).round() as i64)
-                            .collect::<Vec<_>>()
                     );
                     let t = &th.territory;
                     eprintln!(
@@ -1788,6 +1784,287 @@ mod tests {
                 snap.attention.len()
             );
             gif::write(&out.join(format!("replay-{name}.gif")), &shots, 4).expect("gif");
+        }
+        eprintln!("wrote {}", out.display());
+    }
+    /// Draws the whole visual language once, on a real city, at district zoom.
+    ///
+    /// The real-session recording is the honest test of the renderer and a poor
+    /// test of the *notation*: a live session spends most of its time reading
+    /// files, so eight frames in ten show hollow circles in teal and nothing
+    /// else. This sheet puts every one of PRD §10.1's six shapes, §10.2's three
+    /// colours, both trail notations, the revisit rosette, the scaffolding, the
+    /// tether fan, an iso-contour cloud and all three §11.2 attention states on
+    /// one map, at the size they are actually drawn, so the questions "can these
+    /// six shapes be told apart" and "is the city still legible under them" have
+    /// a picture to be answered from.
+    ///
+    /// Everything is placed on **real buildings** of a generated city, at the
+    /// real glyph radius. Nothing is scaled up for the illustration.
+    ///
+    /// ```text
+    /// POLIS_OUT=<dir> cargo test -p polis-render --release -- --ignored --nocapture notation_sheet
+    /// ```
+    #[test]
+    #[ignore = "writes images"]
+    fn notation_sheet() {
+        let Ok(out) = std::env::var("POLIS_OUT") else {
+            eprintln!("skipped: set POLIS_OUT to a directory");
+            return;
+        };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).expect("output directory");
+
+        let city = city::generate_city(&synthetic::repository(900, 0x51));
+        let pixels = 900;
+        let renderer = FrameRenderer::new(
+            &city,
+            FrameOptions {
+                pixels,
+                supersample: 2,
+                caption: false,
+                ..FrameOptions::default()
+            },
+        );
+        let view = *renderer.view();
+        let unit = renderer.unit();
+        let r = live::glyph_radius(unit, pixels as f64);
+        eprintln!(
+            "city: {} buildings, unit {unit:.1} px, glyph radius {r:.1} px",
+            city.layout.buildings.len()
+        );
+
+        // A column of buildings to hang the sheet on, spread across the map.
+        let mut spots: Vec<Px> = city
+            .layout
+            .buildings
+            .values()
+            .map(|b| view.at(b.footprint.centroid()))
+            .collect();
+        spots.sort_by(|a, b| a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0])));
+        let pick = |fx: f64, fy: f64| -> Px {
+            // Nearest real building to a fractional position on the map.
+            let target = [fx * pixels as f64, fy * pixels as f64];
+            *spots
+                .iter()
+                .min_by(|a, b| {
+                    let d = |p: &Px| (p[0] - target[0]).powi(2) + (p[1] - target[1]).powi(2);
+                    d(a).total_cmp(&d(b))
+                })
+                .expect("a building")
+        };
+
+        let glyphs = [
+            (Glyph::HollowCircle, "READ"),
+            (Glyph::BarredCircle, "EDIT"),
+            (Glyph::FilledSquare, "WRITE"),
+            (Glyph::FilledTriangle, "RUN"),
+            (Glyph::ConcentricCircles, "VERIFY"),
+            (Glyph::Delegate, "DELEGATE"),
+        ];
+        let outcomes = [
+            (Outcome::Pending, "PENDING"),
+            (Outcome::Done, "DONE"),
+            (Outcome::Failed, "FAILED"),
+        ];
+
+        let mut frame = LiveFrame {
+            unit,
+            map_height: pixels as f64,
+            ..LiveFrame::default()
+        };
+
+        // 1. The shape × colour matrix, one mark per real building.
+        for (gi, (glyph, _)) in glyphs.iter().enumerate() {
+            for (oi, (outcome, _)) in outcomes.iter().enumerate() {
+                frame.marks.push(Mark {
+                    at: pick(0.10 + gi as f64 * 0.055, 0.12 + oi as f64 * 0.055),
+                    glyph: *glyph,
+                    outcome: *outcome,
+                    age: 0.0,
+                    pulse: 0.0,
+                });
+            }
+        }
+        // 2. The same six shapes aged, to show the fade stays inside the band.
+        for (gi, (glyph, _)) in glyphs.iter().enumerate() {
+            for step in 0..4 {
+                frame.marks.push(Mark {
+                    at: pick(0.10 + gi as f64 * 0.055, 0.32 + f64::from(step) * 0.045),
+                    glyph: *glyph,
+                    outcome: Outcome::Done,
+                    age: f64::from(step) / 3.0,
+                    pulse: 0.0,
+                });
+            }
+        }
+        // 3. An arrival, mid-pulse.
+        frame.marks.push(Mark {
+            at: pick(0.50, 0.14),
+            glyph: Glyph::FilledSquare,
+            outcome: Outcome::Done,
+            age: 0.0,
+            pulse: 0.55,
+        });
+
+        // 4. A trail that backtracks and thrashes (PRD §12).
+        let walk: Vec<Px> = [
+            (0.62, 0.30),
+            (0.72, 0.36),
+            (0.66, 0.44),
+            (0.78, 0.42),
+            (0.66, 0.44),
+            (0.84, 0.52),
+            (0.66, 0.44),
+            (0.74, 0.58),
+            (0.66, 0.44),
+            (0.60, 0.55),
+            (0.66, 0.44),
+            (0.70, 0.66),
+        ]
+        .iter()
+        .map(|(x, y)| pick(*x, *y))
+        .collect();
+        let n = walk.len();
+        frame.trails.push(Trail {
+            steps: walk
+                .iter()
+                .enumerate()
+                .map(|(i, at)| TrailStep {
+                    at: *at,
+                    age: (n - 1 - i) as f64 * 24.0,
+                    visits: if i % 2 == 0 { 6 } else { 1 },
+                })
+                .collect(),
+            ttl: 300.0,
+        });
+        frame.thrash.push(Thrash {
+            at: walk[2],
+            visits: 6,
+            age: 0.1,
+        });
+
+        // 5. A thread with eight workers: the tether fan.
+        let anchor = pick(0.30, 0.72);
+        for k in 0..8 {
+            let worker = pick(0.14 + f64::from(k) * 0.035, 0.86);
+            frame.tethers.push(live::Tether {
+                anchor,
+                worker,
+                running: k % 4 != 3,
+                spread: (f64::from(k) / 7.0).mul_add(2.0, -1.0),
+            });
+            frame.agents.push(Agent {
+                at: worker,
+                body: Body::Worker,
+                outcome: match k % 3 {
+                    0 => Outcome::Pending,
+                    1 => Outcome::Done,
+                    _ => Outcome::Failed,
+                },
+                travel: f64::from(k) / 8.0,
+                heading: [0.6, -0.8],
+                waiting: false,
+            });
+        }
+        frame.agents.push(Agent {
+            at: anchor,
+            body: Body::Main,
+            outcome: Outcome::Pending,
+            travel: 0.0,
+            heading: [0.0, 0.0],
+            waiting: true,
+        });
+
+        // 6. Scaffolding on files under edit, at four heights.
+        for k in 0..6 {
+            let at = pick(0.50 + f64::from(k) * 0.04, 0.30);
+            frame.scaffolds.push(Scaffold {
+                at,
+                half_width: r * 0.8,
+                rise: unit * 0.12 * f64::from(k + 1),
+                age: 0.1,
+            });
+        }
+
+        // 7. A territory cloud (PRD §10.4).
+        let core = pick(0.72, 0.80);
+        for k in 0..26 {
+            let a = f64::from(k) * 0.618;
+            frame.clouds.push(live::CloudKernel {
+                at: [
+                    (a.fract() - 0.5).mul_add(unit * 5.0, core[0]),
+                    ((a * 1.7).fract() - 0.5).mul_add(unit * 4.0, core[1]),
+                ],
+                radius: unit * 2.4,
+                weight: 1.0,
+            });
+        }
+
+        // 8. All three attention states, including a contention link.
+        let a = pick(0.24, 0.50);
+        let b = pick(0.86, 0.22);
+        frame.attention.push(AttentionMark {
+            kind: MarkKind::NeedsDecision,
+            at: a,
+            other: None,
+            severity: None,
+            pulse: 0.0,
+            weight: 1.0,
+        });
+        frame.attention.push(AttentionMark {
+            kind: MarkKind::DoneVerified,
+            at: pick(0.44, 0.62),
+            other: None,
+            severity: None,
+            pulse: 0.0,
+            weight: 1.0,
+        });
+        frame.attention.push(AttentionMark {
+            kind: MarkKind::DoneUnverified,
+            at: pick(0.56, 0.72),
+            other: None,
+            severity: None,
+            pulse: 0.0,
+            weight: 1.0,
+        });
+        frame.attention.push(AttentionMark {
+            kind: MarkKind::Contention,
+            at: a,
+            other: Some(b),
+            severity: Some(polis_world::contention::Severity::Critical),
+            pulse: 0.0,
+            weight: 1.0,
+        });
+
+        for (name, style) in [("timed", TrailStyle::Timed), ("fade", TrailStyle::Fade)] {
+            let mut canvas = renderer.base.map.clone();
+            let t = live::draw_clouds(&mut canvas, &frame);
+            for (i, colour) in &renderer.base.labels {
+                let o = *i as usize * 3;
+                canvas.pixels[o..o + 3].copy_from_slice(colour);
+            }
+            let ta = live::draw_agents(&mut canvas, &frame, style);
+            let tb = live::draw_attention(&mut canvas, &frame);
+            eprintln!("  [{name}] clouds {t:?}, agents {ta:?}, attention {tb:?}");
+            canvas
+                .write_png(&out.join(format!("notation-{name}.png")))
+                .expect("png");
+
+            // How much of the map did the live layer actually cover?
+            let base = &renderer.base.map;
+            let changed = base
+                .pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(canvas.pixels.as_chunks::<3>().0.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!(
+                "  [{name}] live layer covers {:.1}% of the map",
+                100.0 * changed as f64 / (pixels * pixels) as f64
+            );
         }
         eprintln!("wrote {}", out.display());
     }

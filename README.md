@@ -36,6 +36,47 @@ is in [`docs/verified/`](docs/verified/).
 
 ---
 
+## Start here
+
+If you have never run this before, read
+[`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) instead of this file. It is
+two pages and assumes nothing.
+
+```sh
+polis                  # the first run explains itself and opens the session picker
+polis watch            # pick a session you already ran and watch it replay
+polis map              # this repository, drawn as a city
+polis run -- claude    # start an agent with the map already watching
+polis connect          # let Polis see agents you start yourself
+polis doctor           # what is wrong, and how to fix it
+```
+
+**`polis` with no arguments is the whole product for someone who has read
+nothing.** It detects the checkout, Claude Code and `~/.claude/projects`,
+explains the map in one screen, and — on a machine that has not run it before —
+opens the session picker, because the operator already has hundreds of real
+recorded sessions on disk and watching one is the shortest path from "installed"
+to "I see what this is". After that, bare `polis` maps the checkout you are
+standing in.
+
+**`polis run -- claude` is the one-command connect.** It starts the OTLP
+receiver, opens the map in a second process, and launches Claude Code as a child
+with the twelve-variable telemetry block set **on that process** — not exported
+into your shell, not written to any file. Arguments after `--` are passed
+through untouched and the agent's exit code becomes the command's, so
+`polis run -- claude -p "…"` behaves in a script exactly like `claude -p "…"`.
+Measured on this machine against real Claude Code: 46 telemetry, 3 hook, 1
+filesystem and 15 transcript events from one six-second session, all four
+channels live.
+
+On Windows, `Polis.bat` is double-clickable and offers the same choices with no
+terminal at all — including offering to build Polis the first time. Double-
+clicking `polis.exe` itself is also safe now: with no arguments it opens a
+window, and on the one path where that can fail it prints why and waits for a
+keypress instead of closing the console before it can be read.
+
+---
+
 ## Crate map
 
 ```
@@ -59,14 +100,19 @@ polis-events ──┬── polis-ingest ────────────�
 polis-hook     (depends on nothing at all, not even polis-events)
 ```
 
-Two crates are implemented; six are signatures with `todo!()` bodies and doc
-comments naming the PRD section each one owes.
+Seven of the eight crates are implemented and tested. The remaining stubs are
+`polis-render`'s **wgpu** pipeline modules (`agents`, `camera`, `city`,
+`density`, `marks`) — 22 `todo!()` bodies naming the PRD section each one owes.
+The window does not depend on them: it draws the base map through
+`polis-render`'s deterministic CPU rasteriser and composites the live layers in
+`egui`, which is what PRD §13 asks for anyway (*"text lives in a UI overlay, not
+the GPU layer"*). The GPU path is the optimisation, not the product.
 
-**`polis-events`** is the contract eight crates key on, so it is real code with
-tests: `LogicalPath` and its worktree-stripping `PathMapper` (PRD §7.6 says
-deciding this late is painful, and on Windows it is the most error-prone type in
-the system), the hook wire codec, the event-kind tag table, and the `Event` enum
-whose variant names are the real wire names from `docs/verified/`.
+**`polis-events`** is the contract eight crates key on: `LogicalPath` and its
+worktree-stripping `PathMapper` (PRD §7.6 says deciding this late is painful, and
+on Windows it is the most error-prone type in the system), the hook wire codec,
+the event-kind tag table, and the `Event` enum whose variant names are the real
+wire names from `docs/verified/`.
 
 **`polis-hook`** is the verified reference implementation from
 [`docs/verified/hook-ipc.md`](docs/verified/hook-ipc.md), which passed a 36-row
@@ -84,7 +130,7 @@ rather than a toolchain one. See ADR-0001.
 
 ```sh
 cargo build --workspace           # everything
-cargo test  --workspace           # 628 tests
+cargo test  --workspace           # 973 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -118,12 +164,12 @@ Ordered. Each ends in something demonstrable. Do not skip ahead — PRD §15.
 
 | | Milestone | Delivers | Status |
 |---|---|---|---|
-| **M0** | Event spine | `polis-events` + `polis-ingest`; `polis tail` prints a normalized event stream. Prove the hook's budget under synthetic load. | **Contracts done.** `polis-events` and `polis-hook` are implemented and tested; the four channels in `polis-ingest` are signatures. |
-| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Structure and budgets met on one machine; the render is still being judged.** `polis snapshot` draws any checkout. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Both PRD §13.1 budgets now hold on both real repositories — see below. The geometry is now a partition of the plot adjacency graph rather than of the plane (ADR-0074): solidity 0.995-0.999 -> **0.76-0.83** on four corpora, radial spokes 4-9 -> **0**, boulevards through the civic square 1 -> **0**, and the longest dead-straight district border 46-93 % of the diameter -> **6.7-11.1 %**. All three are asserted by the gate rather than measured in a notebook. |
-| **M2** | Single-session replay | One JSONL file animated over the city, offline. The fastest iteration loop the project has; most of the visual notation gets decided here. | Not started. Fixtures are in `tests/fixtures/transcripts/`. |
-| **M3** | Live, single session | M0 wired into M2. One agent, real time. | Not started. |
-| **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | Not started. Depends on the beta traces channel (ADR-0006). |
-| **M5** | Attention layer | The three states, contention detection, drill-down, linked filesystem view. **The first milestone that delivers the product thesis.** | Not started. |
+| **M0** | Event spine | `polis-events` + `polis-ingest`; `polis tail` prints a normalized event stream. Prove the hook's budget under synthetic load. | **Done.** All four channels run; `polis tail` prints the normalized stream. `polis-hook` passed a 36-row exit-code safety matrix and is registered in exec form (ADR-0016). Observed live against real Claude Code through `polis run`: telemetry, hook, filesystem and transcript events all arriving in one session. |
+| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Done on one machine; the two-machine leg is unobserved.** `polis map` opens the window and `polis snapshot` writes the PNG. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Both PRD §13.1 budgets hold on both real repositories — see below. The geometry is a partition of the plot adjacency graph rather than of the plane (ADR-0074): solidity 0.995-0.999 -> **0.76-0.83** on four corpora, radial spokes 4-9 -> **0**, boulevards through the civic square 1 -> **0**, and the longest dead-straight district border 46-93 % of the diameter -> **6.7-11.1 %**. All three are asserted by the gate rather than measured in a notebook. |
+| **M2** | Single-session replay | One JSONL file animated over the city, offline. The fastest iteration loop the project has; most of the visual notation gets decided here. | **Done.** `polis watch` picks from this machine's own recordings — 187 sessions indexed in 67 ms headers-only — and animates the chosen one over its repository's city with a two-timeline transport clock. 22 759 real events applied in 239 ms (10.5 µs/event, ~190× PRD §13.1's 500/s budget); a 26.1-hour session compresses to 18.4 watchable minutes. |
+| **M3** | Live, single session | M0 wired into M2. One agent, real time. | **Half.** `polis run -- claude` is the connect: receiver up before the agent, telemetry set on the child process only, map opened, exit code and stdio passed through faithfully, and the four channels measurably receiving. What is **not** done is the last hop — the window still reads a recording rather than the live bus, so `polis run` ends by printing the `polis replay` line for the session that just happened. Wiring the live source into the window's per-frame `advance`/`publish`/`load` is the remaining work. |
+| **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | Territory inference, contention and the KDE live in `polis-world`; the iso-contour clouds render in the window. Not exercised against a real multi-agent fleet, which is what would make it done. Depends on the beta traces channel (ADR-0006). |
+| **M5** | Attention layer | The three states, contention detection, drill-down, linked filesystem view. **The first milestone that delivers the product thesis.** | Not started, apart from the model in `polis-world` and the linked filesystem view in the window. |
 | **M6** | Landmarks and polish | Monuments, overgrowth, industrial zoning, scaffolding, trails, follow-thread camera, drift detection. | Not started. |
 
 ### M1, measured
@@ -212,19 +258,39 @@ polis snapshot --synthetic 5000 --out fixture.png   # the shipped fixture
 ## Installing the hooks
 
 ```sh
-polis install-hooks            # writes the .claude/settings.json hooks block
-polis install-hooks --dry-run  # show what it would write
+polis connect              # shows the file, the diff and the backup, then asks
+polis connect --dry-run    # everything, plus the full file it would write
+polis connect --uninstall  # removes what it added and puts the file back
 ```
 
+`polis connect` is `install-hooks` with consent: it names the exact file, prints
+the nineteen registrations, shows a line diff against what is there now, states
+that the current file is copied to `<name>.polis-backup` first, and then waits
+for a yes. With no terminal to ask on it refuses rather than assuming, and
+`--yes` is the explicit override for scripts. `polis install-hooks` is still
+there and unchanged for the non-interactive case.
+
 Nineteen event registrations, in **exec form** — never a shell command, which
-costs 6× on Git Bash and 25× on PowerShell per event (ADR-0016). `WorktreeCreate`
-is deliberately **not** registered: a handler there replaces git's worktree
-creation and then fails it, which would break every worktree on the machine
-(ADR-0002).
+costs 6× on Git Bash and 25× on PowerShell per event (ADR-0016). Two rules are
+enforced twice, once in `polis-ingest` where the block is built and once in
+`polis_app::setup::audit` against the JSON about to be written:
+
+* `WorktreeCreate` is **never** registered. A handler there replaces git's
+  worktree creation and then fails it, which would break every `git worktree`,
+  every `claude --worktree` and every isolated subagent on the machine
+  (ADR-0002, `hooks-schema.md` §9.1).
+* `PreToolUse` is **narrowed and anchored** to `^(Edit|Write|NotebookEdit)$`.
+  Unmatched it is the ~200 call/sec firehose PRD §4.2 exists to avoid, and
+  unanchored `Edit` also matches `NotebookEdit` (`hooks-schema.md` §9.3).
+
+The uninstall is tested rather than asserted: install into a settings file that
+already had other keys and other tools' hooks in it, uninstall, and the parsed
+JSON has to equal what was there before — and when Polis created the file, "put
+it back" means the file is gone.
 
 In an interactive session Claude Code runs no settings-file hook until the
 workspace trust dialog is accepted, so the first launch after installing can look
-like a silent failure. `install-hooks` says so.
+like a silent failure. `connect` says so, on the screen, right after it writes.
 
 ---
 

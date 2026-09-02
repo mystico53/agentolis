@@ -341,6 +341,15 @@ pub struct Tether {
     /// dimmer and thinner rather than dropped, so a thread does not appear to
     /// shed limbs.
     pub running: bool,
+    /// How far, and which way, this tether bows off the straight line, in
+    /// `[-1, 1]`.
+    ///
+    /// Workers of one thread are usually working in **one place**, so their
+    /// tethers share both endpoints and stack into a single opaque ribbon that
+    /// is the loudest thing on the map and says only "this thread delegates".
+    /// Fanning them apart turns that ribbon back into a countable number of
+    /// hands, which is the thing worth knowing.
+    pub spread: f64,
 }
 
 /// A building this thread keeps coming back to (PRD §12).
@@ -819,6 +828,9 @@ pub fn glyph_radius(unit: f64, map_height: f64) -> f64 {
 /// The dash period of [`TrailStyle::Timed`], as a multiple of the glyph radius.
 const DASH_PERIOD: f64 = 1.35;
 
+/// The most dashes one trail segment may be cut into.
+const MAX_DASHES: f64 = 18.0;
+
 /// Draws one trail in the requested notation.
 ///
 /// # The two candidate notations
@@ -886,7 +898,12 @@ fn dashed(canvas: &mut Canvas, a: Px, b: Px, period: f64, duty: f64, width: f64,
     if len < 1e-9 {
         return;
     }
-    let period = period.max(2.0);
+    // A dash period is a *rhythm*, and a rhythm needs a bounded number of
+    // beats. A trail step that crosses the whole map at a fixed period draws
+    // sixty dashes, which reads as a dotted line rather than as a rhythm and
+    // costs sixty polygon fills — measured, that was most of a 6 ms frame. So
+    // a long segment stretches its period instead of subdividing further.
+    let period = period.max(2.0).max(len / MAX_DASHES);
     if duty >= 0.995 {
         canvas.segment(a, b, width, ink, 1.0);
         return;
@@ -911,9 +928,9 @@ fn draw_tether(canvas: &mut Canvas, tether: Tether, r: f64) {
     // thing in the agent band — measured on a real frame, a tether at full tone
     // was the brightest structure on the map and the least informative.
     let (width, tone) = if tether.running {
-        ((r * 0.11).max(MIN_STROKE), 0.34)
+        ((r * 0.09).max(MIN_STROKE * 0.75), 0.16)
     } else {
-        ((r * 0.08).max(MIN_STROKE * 0.85), 0.12)
+        ((r * 0.07).max(MIN_STROKE * 0.6), 0.0)
     };
     let ink = fade(AGENT_TETHER, AGENT_FLOOR, tone);
     // A tether bows away from the straight line so two workers on opposite
@@ -925,7 +942,7 @@ fn draw_tether(canvas: &mut Canvas, tether: Tether, r: f64) {
     let dx = tether.worker[0] - tether.anchor[0];
     let dy = tether.worker[1] - tether.anchor[1];
     let len = dx.mul_add(dx, dy * dy).sqrt().max(1e-6);
-    let bow = (len * 0.10).min(r * 2.2);
+    let bow = (len * 0.075).min(r * 5.0) * tether.spread.clamp(-1.0, 1.0);
     let ctrl = [
         (-dy / len).mul_add(bow, mid[0]),
         (dx / len).mul_add(bow, mid[1]),
@@ -981,10 +998,15 @@ fn draw_scaffold(canvas: &mut Canvas, s: Scaffold, r: f64) {
         return;
     }
     let fresh = 1.0 - s.age.clamp(0.0, 1.0);
-    let ink = fade(AGENT_SCAFFOLD, AGENT_FLOOR, 0.65f64.mul_add(fresh, 0.35));
+    // Scaffolding is a **state**, not an event: "this file has uncommitted work
+    // on it". It is therefore the quietest thing in the agent band — on the
+    // first rendered frame it was the loudest, forty bright frames that read as
+    // the subject of the picture while the operations happening *now* hid
+    // underneath them.
+    let ink = fade(AGENT_SCAFFOLD, AGENT_FLOOR, 0.30f64.mul_add(fresh, 0.10));
     let w = s.half_width.max(r * 0.5);
     let top = s.at[1] - s.rise;
-    let width = (r * 0.12).max(MIN_STROKE);
+    let width = (r * 0.09).max(MIN_STROKE * 0.6);
     // An open frame, never a filled block: the whole point of PRD §8's
     // scaffolding is that it reads as temporary.
     canvas.segment([s.at[0] - w, s.at[1]], [s.at[0] - w, top], width, ink, 1.0);
@@ -1437,9 +1459,9 @@ mod tests {
                 .iter()
                 .map(|p| u8::from(p != &[0, 0, 0]))
                 .collect();
-            assert!(mask.iter().any(|p| *p == 1), "{glyph:?} drew nothing");
+            assert!(mask.contains(&1), "{glyph:?} drew nothing");
             assert!(
-                !seen.iter().any(|s| *s == mask),
+                !seen.contains(&mask),
                 "{glyph:?} draws the same shape as another"
             );
             seen.push(mask);
@@ -1814,6 +1836,7 @@ mod tests {
                 anchor: [200.0, 200.0],
                 worker: [300.0, 120.0],
                 running: true,
+                spread: 0.4,
             }],
             thrash: vec![Thrash {
                 at: [140.0, 200.0],
@@ -1910,6 +1933,7 @@ mod tests {
                     anchor: [ox, oy],
                     worker: [ox + f64::from(w) * 30.0, oy + 60.0],
                     running: w % 2 == 0,
+                    spread: f64::from(w) / 4.0,
                 });
             }
             for i in 0..16 {

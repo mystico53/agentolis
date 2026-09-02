@@ -87,16 +87,33 @@ pub enum DescriptionSource {
     DocComment,
     /// Synthesised from the district's contents. Facts, not intent.
     Inventory,
+    /// Written by a language model from the district's file names and the
+    /// documentation the other three sources found (PRD §12, [`crate::llm`]).
+    ///
+    /// Fenced off from the other four the same way [`Self::Inventory`] is, and
+    /// for a sharper reason: it is the only source that is neither a quotation
+    /// nor a fact. [`DescriptionSource::is_prose`] stays false for it so the
+    /// honest coverage number — *how well does this repository document
+    /// itself* — cannot be inflated by having paid for sentences.
+    Model,
 }
 
 impl DescriptionSource {
-    /// True when a human wrote the words.
+    /// True when a **human** wrote the words.
     ///
-    /// The coverage number that matters. [`DescriptionSource::Inventory`] is
-    /// always available and therefore says nothing about how well the repository
-    /// documents itself.
+    /// The coverage number that matters, and the reason
+    /// [`DescriptionSource::Model`] is excluded: `docs/design/NEIGHBORHOODS-REVIEW.md`
+    /// reports 14 % prose across the operator's repositories, and that number is
+    /// a fact about how repositories are written. A model turning it into 90 %
+    /// would destroy the only measurement there is of the thing the extractor
+    /// exists to find.
     pub fn is_prose(self) -> bool {
-        !matches!(self, Self::Inventory)
+        matches!(self, Self::Readme | Self::Manifest | Self::DocComment)
+    }
+
+    /// True when a model wrote the words.
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
     }
 
     /// A stable name for logs and reports.
@@ -106,6 +123,7 @@ impl DescriptionSource {
             Self::Manifest => "manifest",
             Self::DocComment => "doc-comment",
             Self::Inventory => "inventory",
+            Self::Model => "model",
         }
     }
 }
@@ -136,6 +154,11 @@ impl Description {
     /// True when a human wrote the words — see [`DescriptionSource::is_prose`].
     pub fn is_prose(&self) -> bool {
         self.source.is_prose()
+    }
+
+    /// True when a model wrote the words (PRD §12, [`crate::llm`]).
+    pub fn is_model(&self) -> bool {
+        self.source.is_model()
     }
 }
 
@@ -175,6 +198,10 @@ pub enum SanitiseReject {
     /// header, a high-entropy token, a URL with a password in it, or an
     /// assignment to a name like `api_key`.
     LooksLikeSecret,
+    /// It is text a *tool* wrote, not text about this repository: a linter
+    /// pragma at the top of a file, or a project generator's untouched README.
+    /// See [`looks_like_boilerplate`].
+    Boilerplate,
 }
 
 impl SanitiseReject {
@@ -184,6 +211,7 @@ impl SanitiseReject {
             Self::TooShort => "too-short",
             Self::LooksLikeCode => "looks-like-code",
             Self::LooksLikeSecret => "looks-like-secret",
+            Self::Boilerplate => "boilerplate",
         }
     }
 }
@@ -206,8 +234,13 @@ impl SanitiseReject {
 ///
 /// A partially-redacted secret is still evidence that there is a secret at
 /// `path/to/file`, and a partially-redacted line of code is still unreadable.
-/// So a candidate that trips either rule is dropped whole and the next source is
+/// So a candidate that trips a rule is dropped whole and the next source is
 /// tried. See [`SanitiseReject`].
+///
+/// The third rule is [`looks_like_boilerplate`]: text a tool wrote about
+/// nothing in particular — a linter pragma, a project generator's untouched
+/// README — is not a description of this repository and is rejected the same
+/// way, so the next source gets its turn.
 ///
 /// # Bounding
 ///
@@ -225,6 +258,9 @@ pub fn sanitise(raw: &str, max: usize) -> Result<String, SanitiseReject> {
     }
     if looks_like_code(&text) {
         return Err(SanitiseReject::LooksLikeCode);
+    }
+    if looks_like_boilerplate(&text) {
+        return Err(SanitiseReject::Boilerplate);
     }
     Ok(truncate_chars(&text, max))
 }
@@ -343,7 +379,12 @@ fn strip_tags_and_marks(raw: &str) -> String {
 ///
 /// Every control character, and the Unicode formatting characters that can
 /// reorder or hide the text around them.
-fn is_unsafe_char(c: char) -> bool {
+///
+/// Shared with [`crate::llm::outbound`], which applies the same rule on the way
+/// *out*: text that renders as something other than its bytes is a spoofing
+/// channel whichever direction it is travelling, and two copies of this list
+/// would be one copy too many.
+pub(crate) fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{200B}'..='\u{200F}'
@@ -416,6 +457,92 @@ fn looks_like_code(text: &str) -> bool {
     total > 0 && (letters * 100) / total < 70
 }
 
+/// Linter, formatter and type-checker directives, matched against the start of
+/// a candidate.
+///
+/// A leading `/* eslint-disable */` is a block comment in the position a module
+/// doc comment occupies, and tree-sitter is right to hand it over: it *is* the
+/// first comment in the file. It is simply not prose. Found on
+/// `qurio-toolset`'s `src/components/landing`, whose whole description was the
+/// two words `eslint-disable`.
+///
+/// Prefix-matched, not contained, so a sentence that happens to mention a rule
+/// name survives.
+const PRAGMA_PREFIXES: &[&str] = &[
+    "eslint-disable",
+    "eslint-enable",
+    "eslint-env",
+    "prettier-ignore",
+    "stylelint-disable",
+    "stylelint-enable",
+    "biome-ignore",
+    "deno-lint-ignore",
+    "istanbul ignore",
+    "c8 ignore",
+    "v8 ignore",
+    "jshint ",
+    "jslint ",
+    "ts-nocheck",
+    "ts-ignore",
+    "ts-expect-error",
+    "@ts-",
+    "@flow",
+    "noqa",
+    "type: ignore",
+    "pylint:",
+    "mypy:",
+    "flake8:",
+    "ruff:",
+    // `-*- coding: utf-8 -*-`. The `*`s are markup and are gone by the time
+    // this runs, which is why the leading punctuation is trimmed first.
+    "coding:",
+    "webpackignore",
+    "webpackchunkname",
+    "vite-ignore",
+];
+
+/// Verbatim output of a project generator, matched anywhere in a candidate.
+///
+/// A scaffolded README that nobody edited describes the *generator*, not the
+/// repository, and it lands on the one district that can least afford a wrong
+/// label: the root — PRD §8's civic square, at the historic centre of the map.
+/// Four of the operator's eight repositories had one, and three of those four
+/// were the same sentence.
+///
+/// Kept deliberately short and verbatim. A phrase earns its place here only by
+/// being a string a tool emits, never by being a phrase that sounds generic;
+/// the general "this says nothing new" test is [`says_nothing_new`], and the
+/// general "there is nothing to say" answer is `None`.
+const BOILERPLATE_PHRASES: &[&str] = &[
+    "bootstrapped with create-next-app",
+    "bootstrapped with create react app",
+    "getting started with create react app",
+    "minimal setup to get react working in vite",
+    "this template should help get you started developing with vue",
+    "recommended ide setup",
+    "learn more about the power of turborepo",
+    "your new site is ready",
+    "this project was generated with angular cli",
+];
+
+/// True when the text is a tool's output rather than a description of this
+/// repository.
+///
+/// Two families, and they fail for the same reason: the text is real, it is
+/// where a description would be, and it is about something other than this
+/// directory. See [`PRAGMA_PREFIXES`] and [`BOILERPLATE_PHRASES`].
+pub fn looks_like_boilerplate(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Leading punctuation is stripped before the prefix test because the
+    // markup pass has already been through: `-*- coding: utf-8 -*-` arrives as
+    // `-- coding: utf-8 --`, and `# eslint-disable` as `eslint-disable`.
+    let head = lower.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if PRAGMA_PREFIXES.iter().any(|p| head.starts_with(p)) {
+        return true;
+    }
+    BOILERPLATE_PHRASES.iter().any(|p| lower.contains(p))
+}
+
 /// Key prefixes that are a credential by construction.
 ///
 /// These are published, documented formats. A string starting with one of them
@@ -485,7 +612,12 @@ const SECRET_NAMES: &[&str] = &[
 ///   alphabet, mixing upper case, lower case and digits, with no word structure.
 ///   That last one is the general catch, and it is why the length floor is 20:
 ///   below it, ordinary identifiers start tripping it.
-fn looks_like_secret(text: &str) -> bool {
+///
+/// **Public because it is the outbound rule as well.** [`crate::llm::outbound`]
+/// applies exactly this predicate to every file name and doc snippet before it
+/// leaves the machine. Having one definition of "looks like a secret" rather
+/// than two is the point: a second copy is a copy that rots.
+pub fn looks_like_secret(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if lower.contains("-----begin") {
         return true;
@@ -985,7 +1117,14 @@ pub fn first_sentence(text: &str) -> (&str, &str) {
 // ---------------------------------------------------------------------------
 
 /// Version of the on-disk cache. A bump discards every entry.
-const DESCRIPTION_CACHE_VERSION: u32 = 1;
+///
+/// **Bump this whenever an extraction or sanitising rule changes.** The cache is
+/// keyed on the bytes of the file, not on the rules that read them, so a warm
+/// cache written by the previous rules would keep serving the answer the new
+/// rule exists to refuse — and it would do it only on the machines that had run
+/// before, which is the worst possible way to find out. Version 2 is the
+/// [`SanitiseReject::Boilerplate`] rule.
+const DESCRIPTION_CACHE_VERSION: u32 = 2;
 
 /// One cached extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1149,6 +1288,9 @@ pub struct DescribeStats {
     pub rejected_code: u32,
     /// Candidates thrown away because they carried something credential-shaped.
     pub rejected_secret: u32,
+    /// Candidates thrown away because a tool wrote them: a linter pragma, or a
+    /// project generator's untouched README.
+    pub rejected_boilerplate: u32,
 }
 
 impl DescribeStats {
@@ -1158,12 +1300,13 @@ impl DescribeStats {
             SanitiseReject::TooShort => self.rejected_short += 1,
             SanitiseReject::LooksLikeCode => self.rejected_code += 1,
             SanitiseReject::LooksLikeSecret => self.rejected_secret += 1,
+            SanitiseReject::Boilerplate => self.rejected_boilerplate += 1,
         }
     }
 
     /// Every rejection, however caused.
     pub fn rejected(&self) -> u32 {
-        self.rejected_short + self.rejected_code + self.rejected_secret
+        self.rejected_short + self.rejected_code + self.rejected_secret + self.rejected_boilerplate
     }
 }
 
@@ -1381,6 +1524,23 @@ impl<'a> Describer<'a> {
     /// the district's most-imported file, which
     /// [`crate::imports::ImportGraph::inbound_counts`] already computes and
     /// which PRD §8 uses for monuments.
+    ///
+    /// # An `extra` candidate must sit in the directory itself
+    ///
+    /// A doc comment describes the file it is written in. An [`ANCHOR_NAMES`]
+    /// file is the directory's declared front door and may speak for it; any
+    /// other file speaks for the directory only by proximity, and proximity runs
+    /// out at the first subdirectory. Without this, `qurio-toolset`'s **root**
+    /// — PRD §8's civic square, the most prominent label on the map — was
+    /// described as "a DEV-ONLY Vite plugin", because its most-imported file was
+    /// `vite-plugins/manualReloadPlugin.js`; and `components/MediaWindow` was
+    /// described as a `YouTube` renderer, from
+    /// `MediaWindow/renderers/YouTubeRenderer.jsx`.
+    ///
+    /// This does not make the remaining ones true of the whole district — one
+    /// file's doc comment standing in for a 200-file `services/` tree is a
+    /// judgement no path rule can make. It removes the cases where the rule had
+    /// no basis at all.
     pub fn from_doc_comment(
         &mut self,
         directory: &LogicalPath,
@@ -1391,7 +1551,11 @@ impl<'a> Describer<'a> {
             .iter()
             .filter_map(|name| join(directory, name))
             .filter(|p| exists(p));
-        for path in anchors.chain(extra.iter().cloned()) {
+        let nearby = extra
+            .iter()
+            .filter(|p| p.parent().as_ref() == Some(directory))
+            .cloned();
+        for path in anchors.chain(nearby) {
             let Some(language) = crate::tree::language_for(&path) else {
                 continue;
             };
@@ -1488,6 +1652,54 @@ mod tests {
                 Err(SanitiseReject::LooksLikeCode),
                 "{candidate}"
             );
+        }
+    }
+
+    /// The two families found by reading real output, not by reasoning: a
+    /// linter pragma sitting where a module doc comment goes, and a project
+    /// generator's untouched README.
+    #[test]
+    fn a_tools_own_words_are_not_a_description_of_the_repository() {
+        for candidate in [
+            // `qurio-toolset/src/components/landing`, verbatim.
+            "eslint-disable no-unused-vars, no-console",
+            "prettier-ignore for the table below",
+            "ts-nocheck because the generated types are wrong",
+            "-*- coding: utf-8 -*- for the legacy importer",
+            "noqa: E501 line too long in the fixture",
+            // `stickingplacebooks`, `Squigglo` and `vc-tower/web`, verbatim.
+            "This is a Next.js project bootstrapped with create-next-app.",
+            // `qurio-toolset`, verbatim.
+            "This template provides a minimal setup to get React working in Vite \
+             with HMR and some ESLint rules.",
+            "Getting Started with Create React App and a few notes",
+        ] {
+            assert_eq!(
+                sanitise(candidate, DETAIL_MAX_CHARS),
+                Err(SanitiseReject::Boilerplate),
+                "{candidate}"
+            );
+        }
+        // Caught a rule earlier — `looks_like_code`'s bare-path test — which is
+        // the right answer for a different reason. Asserted so a later change to
+        // either rule cannot let it through.
+        assert!(sanitise(
+            "eslint-disable-next-line react-hooks/exhaustive-deps",
+            DETAIL_MAX_CHARS
+        )
+        .is_err());
+    }
+
+    /// The rule is prefix-and-verbatim on purpose: prose that merely *mentions*
+    /// a tool is still prose, and rejecting it would cost real descriptions.
+    #[test]
+    fn prose_that_merely_mentions_a_tool_survives() {
+        for candidate in [
+            "The build runs eslint-disable comments through a codemod first here",
+            "Vite and Next.js are both supported by this adapter package",
+            "Rules for when to add an eslint-disable, and when to fix the code",
+        ] {
+            assert!(sanitise(candidate, DETAIL_MAX_CHARS).is_ok(), "{candidate}");
         }
     }
 
@@ -1813,6 +2025,40 @@ Documentation | Chat | Contributing
             .expect("doc");
         assert_eq!(doc.source, DescriptionSource::DocComment);
         assert!(describer.stats().files_read >= 3);
+    }
+
+    /// The root of `qurio-toolset` was described as "a DEV-ONLY Vite plugin"
+    /// because its most-imported file lived in `vite-plugins/`. A file speaks
+    /// for the directory it is in, and no further.
+    #[test]
+    fn a_monument_in_a_subdirectory_does_not_describe_the_district() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("plugins")).expect("mkdir");
+        std::fs::write(
+            root.join("plugins/reload.js"),
+            "/* DEV-ONLY plugin that reloads the window. */\n",
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("server.js"),
+            "/* Serves the API that the desktop shell talks to. */\n",
+        )
+        .expect("write");
+        let exists = |p: &LogicalPath| root.join(p.as_str()).exists();
+        let mut describer = Describer::new(root);
+
+        // One level down: not this district's to speak for.
+        assert!(describer
+            .from_doc_comment(&LogicalPath::root(), &[lp("plugins/reload.js")], &exists)
+            .is_none());
+
+        // Directly in the district: allowed. This also pins that a top-level
+        // file's parent *is* the root.
+        let found = describer
+            .from_doc_comment(&LogicalPath::root(), &[lp("server.js")], &exists)
+            .expect("a file in the district itself");
+        assert!(found.label.starts_with("Serves the API"), "{found:?}");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 @echo off
 rem Polis — double-click me.
 rem
-rem A folder dragged onto this file is mapped directly. Otherwise you get a
-rem menu of the git repositories found on this machine.
+rem Offers four things: watch a session you already ran, map a repository,
+rem start an agent with the map watching, or save a picture. A folder dragged
+rem onto this file skips the repository menu.
 
 setlocal
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"

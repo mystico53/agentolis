@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::describe::{DescribeStats, Describer, Description, DescriptionSource};
 use crate::kinds::{kind_of_with, CodeKind, KindMix, KindRules, KindRulesConfig};
+use crate::llm::Freshness;
 use crate::{FileMeta, RepoTree};
 
 // ---------------------------------------------------------------------------
@@ -117,12 +118,40 @@ pub struct Neighborhood {
     /// What it does, when the repository says. `None` is a real answer: a wrong
     /// or generic description is worse than none.
     pub description: Option<Description>,
+    /// How current a model-written description is (PRD §12,
+    /// [`crate::llm::Freshness`]).
+    ///
+    /// [`Freshness::Missing`] for every description that is a quotation from the
+    /// repository — those are re-derived from the file on every run and cannot
+    /// go stale in this sense. It is only ever anything else when
+    /// [`Neighborhoods::apply_model_descriptions`] has put a model's words here.
+    ///
+    /// **A renderer must not draw [`Freshness::Stale`] the same as
+    /// [`Freshness::Fresh`].** A caption reading "Payment processing" over a
+    /// directory that quietly became the notification service is worse than no
+    /// caption: it is confidently wrong, and the operator would trust it.
+    ///
+    /// `#[serde(default)]` so a cache or a corpus written before this field
+    /// existed still loads.
+    #[serde(default)]
+    pub freshness: Freshness,
 }
 
 impl Neighborhood {
     /// True when this is PRD §8's industrial zone — drawn as one mass.
     pub fn is_industrial(&self) -> bool {
         self.kind.is_industrial()
+    }
+
+    /// True when a model wrote this neighborhood's description.
+    pub fn has_model_description(&self) -> bool {
+        self.description.as_ref().is_some_and(Description::is_model)
+    }
+
+    /// True when the description on show has drifted from the district
+    /// (PRD §12). See [`Neighborhood::freshness`].
+    pub fn is_stale(&self) -> bool {
+        self.freshness.is_stale()
     }
 
     /// True when a human wrote this neighborhood's description.
@@ -181,6 +210,14 @@ pub struct NeighborhoodStats {
     pub described: u32,
     /// Neighborhoods whose description a human wrote — the honest number.
     pub described_prose: u32,
+    /// Neighborhoods whose description a model wrote (PRD §12, [`crate::llm`]).
+    ///
+    /// Counted separately from [`NeighborhoodStats::described_prose`] on
+    /// purpose: the prose fraction measures how well the *repository* documents
+    /// itself, and mixing paid-for sentences into it would destroy the only
+    /// measurement of the thing the extractor exists to find.
+    #[serde(default)]
+    pub described_model: u32,
     /// What the description pass cost and threw away.
     pub describe: DescribeStats,
 }
@@ -833,6 +870,7 @@ impl Neighborhoods {
                 collapsed_from,
                 monument: None,
                 description: None,
+                freshness: Freshness::Missing,
                 path: path.clone(),
             });
         }
@@ -856,6 +894,7 @@ impl Neighborhoods {
                 mix: total_mix,
                 described: 0,
                 described_prose: 0,
+                described_model: 0,
                 describe: DescribeStats::default(),
             },
             stems: BTreeMap::new(),
@@ -1038,6 +1077,71 @@ impl Neighborhoods {
             .unwrap_or(u32::MAX);
     }
 
+    /// Puts a model's words on one neighborhood, with how current they are.
+    ///
+    /// `pub(crate)` and index-based because the only caller is
+    /// [`Neighborhoods::apply_model_descriptions`], which has already decided
+    /// that this district wants a model description; letting anything else set
+    /// a [`Description`] with [`DescriptionSource::Model`] on it would put text
+    /// on the map that no cache entry backs, and therefore text whose
+    /// [`crate::llm::Freshness`] means nothing.
+    pub(crate) fn set_model_description(
+        &mut self,
+        index: usize,
+        description: Description,
+        freshness: Freshness,
+    ) {
+        if let Some(hood) = self.order.get_mut(index) {
+            hood.description = Some(description);
+            hood.freshness = freshness;
+        }
+    }
+
+    /// Records how many neighborhoods a model described.
+    pub(crate) fn set_model_described(&mut self, count: u32) {
+        self.stats.described_model = count;
+        self.stats.described = self
+            .order
+            .iter()
+            .filter(|n| n.description.is_some())
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
+    }
+
+    /// True when naming the monument tells the reader something the map has not
+    /// already told them.
+    ///
+    /// Three ways it does not, all found by reading the output on the operator's
+    /// own repositories rather than by reasoning about it:
+    ///
+    /// 1. **It repeats the district's leaf name.** `components/ChatWindow`
+    ///    described as "most imported: `ChatWindow.jsx`" is the label twice.
+    ///    [`crate::describe::says_nothing_new`] alone misses this, because it
+    ///    compares against the *display name* — `components/ChatWindow` — which
+    ///    a leaf name never equals. Compare against the last path component too.
+    /// 2. **The extension is doing the work.** `ChatWindow` and `ChatWindow.jsx`
+    ///    fold to different strings, so the stem is what gets compared.
+    /// 3. **The name is a universal entry point.** "most imported: `index.ts`"
+    ///    is true of most directories and distinguishes none of them. PRD §8
+    ///    still wants that file drawn as a monument and labelled *as a
+    ///    building*; it is a useless label for the *district*.
+    fn monument_says_something(n: &Neighborhood, file_name: &str) -> bool {
+        const ENTRY_POINT_STEMS: &[&str] = &[
+            "index", "main", "mod", "lib", "app", "init", "__init__", "entry", "root",
+        ];
+        let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
+        if ENTRY_POINT_STEMS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(stem))
+        {
+            return false;
+        }
+        let leaf = n.path.file_name().unwrap_or("/");
+        !crate::describe::says_nothing_new(stem, &n.name)
+            && !crate::describe::says_nothing_new(stem, leaf)
+    }
+
     /// The last resort: a description synthesised from what is actually there.
     ///
     /// Deliberately a **statement of fact**, never a guess at intent. It is
@@ -1054,7 +1158,7 @@ impl Neighborhoods {
             .monument
             .as_ref()
             .and_then(|p| p.file_name())
-            .filter(|name| !crate::describe::says_nothing_new(name, &n.name));
+            .filter(|name| Self::monument_says_something(n, name));
         let stem = self.repeated_stem(&n.path, n.file_count, &n.name);
         if monument.is_none() && stem.is_none() {
             return None;
@@ -1450,6 +1554,43 @@ mod tests {
         assert!(!description.is_prose(), "an inventory is not prose");
         assert_eq!(n.stats().described, 1);
         assert_eq!(n.stats().described_prose, 0);
+    }
+
+    /// `components/ChatWindow` described as "most imported: `ChatWindow.jsx`"
+    /// is the label printed twice, and it happened on four districts of
+    /// `qurio-toolset` and `biwt`. So did "most imported: `index.ts`", which is
+    /// true of most directories and tells the operator apart from none of them.
+    #[test]
+    fn a_monument_that_only_repeats_the_district_name_is_not_a_description() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (district, monument) in [
+            // The leaf name, with an extension on it.
+            (
+                "components/ChatWindow",
+                "components/ChatWindow/ChatWindow.jsx",
+            ),
+            // A universal entry point.
+            ("components/ChatWindow", "components/ChatWindow/index.ts"),
+        ] {
+            let paths = fan(district, 30);
+            let files: Vec<FileMeta> = paths.iter().map(|p| meta(p, 10)).collect();
+            let mut tree = RepoTree::default();
+            for f in &files {
+                tree.files.insert(f.path.clone(), f.clone());
+            }
+            let mut n = Neighborhoods::from_files(files.iter(), &NeighborhoodOptions::default());
+            n.set_monuments(&[(lp(monument), 19)]);
+            n.describe(dir.path(), &tree, None);
+            let hood = n.get(&lp(district)).expect("the district");
+            assert!(
+                hood.description.is_none(),
+                "{monument} described {district} as {:?}",
+                hood.description
+            );
+            // The monument itself is untouched: PRD §8 still labels that
+            // building. It is only useless as a label for the district.
+            assert_eq!(hood.monument.as_ref(), Some(&lp(monument)));
+        }
     }
 
     #[test]
