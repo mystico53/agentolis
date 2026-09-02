@@ -8,9 +8,9 @@ use std::sync::Arc;
 use polis_events::LogicalPath;
 
 use super::{
-    candidacy, district_names, model_description, Candidacy, Freshness, LlmConfig, LlmRunner,
-    ModelCache, Neighborhood, Neighborhoods, PlannedDistrict, RepoTree, RunMode, Sketch, Usage,
-    ESTIMATED_OUTPUT_TOKENS_PER_DISTRICT, PROMPT_VERSION,
+    candidacy, district_names, model_description, Candidacy, Freshness, KeyWithheld, LlmConfig,
+    LlmRunner, ModelCache, Neighborhood, Neighborhoods, PlannedDistrict, RepoTree, RunMode, Sketch,
+    Usage, ESTIMATED_OUTPUT_TOKENS_PER_DISTRICT, PROMPT_VERSION,
 };
 use crate::describe::{Description, DescriptionSource};
 use crate::llm::transport::testing::{FakeEndpoint, Reply};
@@ -896,4 +896,76 @@ fn a_background_run_writes_the_cache_and_never_blocks_the_caller() {
     assert!(report.described > 0, "{}", report.summary());
     assert!(path.exists(), "the cache was written");
     assert!(!ModelCache::read(&path).is_empty());
+}
+
+// -- where a key is allowed to go -------------------------------------------
+
+/// A key present in the environment is withheld when the endpoint would receive
+/// it in the clear, and the run is blocked rather than made without it: sending
+/// the district listing to a stranger is not a consolation prize.
+#[test]
+fn a_key_is_withheld_from_a_cleartext_endpoint_and_nothing_is_called() {
+    std::env::set_var("POLIS_TEST_CLEARTEXT_KEY", "not-a-real-key-000000");
+    let tree = tree_with(&[("src/a", 12)]);
+    let mut hoods = hoods_of(&tree);
+    let mut config = config_for("http://collector.example/v1");
+    config.key_env = vec!["POLIS_TEST_CLEARTEXT_KEY".to_owned()];
+    let transport = Arc::new(CannedTransport::new(200, "{}"));
+    let runner = LlmRunner::with_transport(config, Arc::clone(&transport) as Arc<dyn Transport>);
+    std::env::remove_var("POLIS_TEST_CLEARTEXT_KEY");
+
+    assert!(
+        matches!(runner.key_withheld(), Some(KeyWithheld::Cleartext { host }) if host == "collector.example"),
+        "{:?}",
+        runner.key_withheld()
+    );
+    let mut cache = ModelCache::default();
+    let report = runner.run(
+        &mut hoods,
+        &tree,
+        &mut cache,
+        RunMode::Generate { confirmed: true },
+    );
+    assert_eq!(transport.call_count(), 0, "nothing was sent anywhere");
+    let printed = report.summary();
+    assert!(printed.contains("collector.example"), "{printed}");
+    assert!(!printed.contains("not-a-real-key"), "{printed}");
+    // The derived layer is untouched, which is the whole degradation contract.
+    assert!(hoods.all().iter().all(|h| !h.has_model_description()));
+}
+
+/// The same guard, for the case TLS cannot help with: a `.polis/llm.json` that
+/// arrived with a clone naming a host the operator never chose.
+#[test]
+fn a_key_is_withheld_when_the_repository_chose_the_host() {
+    std::env::set_var("POLIS_TEST_REDIRECT_KEY", "not-a-real-key-111111");
+    let tree = tree_with(&[("src/a", 12)]);
+    let mut hoods = hoods_of(&tree);
+    let mut config = LlmConfig::default().with_provider(Provider::Glm);
+    config.enabled = true;
+    config.retry_base_ms = 0;
+    config.key_env = vec!["POLIS_TEST_REDIRECT_KEY".to_owned()];
+    config.base_url = "https://collector.example/v1".to_owned();
+    config.origin = crate::llm::ConfigOrigin::Repository;
+    let transport = Arc::new(CannedTransport::new(200, "{}"));
+    let runner = LlmRunner::with_transport(config, Arc::clone(&transport) as Arc<dyn Transport>);
+    std::env::remove_var("POLIS_TEST_REDIRECT_KEY");
+
+    assert!(
+        matches!(
+            runner.key_withheld(),
+            Some(KeyWithheld::RepoRedirect { .. })
+        ),
+        "{:?}",
+        runner.key_withheld()
+    );
+    let mut cache = ModelCache::default();
+    let report = runner.run(
+        &mut hoods,
+        &tree,
+        &mut cache,
+        RunMode::Generate { confirmed: true },
+    );
+    assert_eq!(transport.call_count(), 0);
+    assert!(!report.summary().contains("not-a-real-key"));
 }

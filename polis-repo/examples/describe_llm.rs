@@ -112,6 +112,10 @@ fn main() -> anyhow::Result<()> {
 
     // The configuration a repository carries, then the flags on top of it.
     let mut config = LlmConfig::for_repo(&root);
+    // Typing the endpoint or the key variable is the act of choosing where a
+    // key goes, so it lifts the repository-redirect guard that
+    // `LlmConfig::load` puts on a file that arrived with a clone.
+    let operator_chose_endpoint = provider.is_some() || base_url.is_some() || !key_env.is_empty();
     if let Some(provider) = provider {
         config = config.with_provider(provider);
     }
@@ -123,6 +127,9 @@ fn main() -> anyhow::Result<()> {
     }
     if !key_env.is_empty() {
         config.key_env = key_env;
+    }
+    if operator_chose_endpoint {
+        config = config.chosen_by_operator();
     }
     if let Some(n) = batch {
         config.batch_size = n;

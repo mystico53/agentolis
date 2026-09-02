@@ -46,7 +46,7 @@ use super::prompt::{
 use super::provider::{ChatProvider, Usage};
 use super::secret::{bound_message, scrub, Secret};
 use super::transport::{DefaultTransport, Transport};
-use super::{LlmConfig, LlmError};
+use super::{KeyWithheld, LlmConfig, LlmError};
 
 // ---------------------------------------------------------------------------
 // Which districts want a model
@@ -433,6 +433,8 @@ pub struct LlmRunner {
     transport: Arc<dyn Transport>,
     provider: Box<dyn ChatProvider>,
     key: Option<Arc<Secret>>,
+    /// Set when a key exists but this endpoint may not have it.
+    key_withheld: Option<KeyWithheld>,
 }
 
 impl LlmRunner {
@@ -447,14 +449,31 @@ impl LlmRunner {
     /// the seam a `ureq`-backed transport would drop into if the dependency
     /// decision in [`super::transport`] is ever revisited.
     pub fn with_transport(config: LlmConfig, transport: Arc<dyn Transport>) -> Self {
-        let key = config.key().map(Arc::new);
+        // The one place a key is picked up, and therefore the one place to ask
+        // whether this endpoint is allowed to receive it. A refusal leaves
+        // `key: None`, which is the degraded state the feature already handles,
+        // and is reported by `blocked` rather than applied in silence.
+        let (key, key_withheld) = match config.key_destination() {
+            Ok(()) => (config.key().map(Arc::new), None),
+            Err(reason) => {
+                // Only worth reporting when a key was actually there to withhold.
+                let withheld = config.key().is_some().then_some(reason);
+                (None, withheld)
+            }
+        };
         let provider = config.provider.client();
         Self {
             config,
             transport,
             provider,
             key,
+            key_withheld,
         }
+    }
+
+    /// Why a key present in the environment is not being used, if it is not.
+    pub fn key_withheld(&self) -> Option<&KeyWithheld> {
+        self.key_withheld.as_ref()
     }
 
     /// The configuration in force.
@@ -616,6 +635,12 @@ impl LlmRunner {
         }
         if let Err(error) = self.config.validate() {
             return Some(error.to_string());
+        }
+        // Before "there is no key": here the key exists and was refused, and
+        // saying "set ZAI_API_KEY" to somebody who already has would send them
+        // looking in the wrong place.
+        if let Some(withheld) = &self.key_withheld {
+            return Some(withheld.to_string());
         }
         if self.key.is_none() && !self.config.key_env.is_empty() {
             return Some(format!("no API key: set {}", self.config.key_source()));

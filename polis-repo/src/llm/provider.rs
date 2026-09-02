@@ -502,11 +502,17 @@ mod tests {
         LlmConfig::default().with_provider(provider)
     }
 
-    fn key(value: &str) -> Arc<Secret> {
-        std::env::set_var("POLIS_TEST_PROVIDER_KEY", value);
-        let secret =
-            Secret::from_env(&["POLIS_TEST_PROVIDER_KEY".to_owned()]).expect("just set it");
-        std::env::remove_var("POLIS_TEST_PROVIDER_KEY");
+    /// A key, built the only way `Secret` allows: through the environment.
+    ///
+    /// `name` must be unique per test. `set_var` is process-global and the test
+    /// harness runs tests in parallel, so two tests sharing one variable name
+    /// race — one removes it between the other's set and read, and the read
+    /// comes back empty. That was an intermittent failure here before the name
+    /// became a parameter.
+    fn key(name: &str, value: &str) -> Arc<Secret> {
+        std::env::set_var(name, value);
+        let secret = Secret::from_env(&[name.to_owned()]).expect("just set it");
+        std::env::remove_var(name);
         Arc::new(secret)
     }
 
@@ -515,7 +521,12 @@ mod tests {
         let config = config(Provider::Glm);
         let request = Provider::Glm
             .client()
-            .request(&config, Some(&key("k-1")), "SYS", "USER")
+            .request(
+                &config,
+                Some(&key("POLIS_TEST_KEY_GLM", "k-1")),
+                "SYS",
+                "USER",
+            )
             .expect("a request");
         assert_eq!(request.url, "https://api.z.ai/api/paas/v4/chat/completions");
         let body: serde_json::Value = serde_json::from_str(&request.body).expect("json");
@@ -538,7 +549,7 @@ mod tests {
         config.request_json_object = false;
         let request = Provider::Glm
             .client()
-            .request(&config, Some(&key("k")), "s", "u")
+            .request(&config, Some(&key("POLIS_TEST_KEY_JSON", "k")), "s", "u")
             .expect("a request");
         let body: serde_json::Value = serde_json::from_str(&request.body).expect("json");
         assert!(body.get("response_format").is_none(), "{body}");
@@ -633,7 +644,12 @@ mod tests {
         let config = config(Provider::Anthropic);
         let request = Provider::Anthropic
             .client()
-            .request(&config, Some(&key("sk-ant-test")), "SYS", "USER")
+            .request(
+                &config,
+                Some(&key("POLIS_TEST_KEY_ANTHROPIC", "sk-ant-test")),
+                "SYS",
+                "USER",
+            )
             .expect("a request");
         assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
         let names: Vec<&str> = request.headers.iter().map(|(n, _)| n.as_str()).collect();

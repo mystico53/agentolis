@@ -271,6 +271,10 @@ pub struct LlmConfig {
     /// `src/hooks` (46 files) "useDropZone Hook". A doc comment on a directory's
     /// anchor file speaks for a small directory and not for a large one.
     pub doc_comment_trust_max_files: u32,
+    /// Who chose [`LlmConfig::base_url`]. Never read from or written to the
+    /// file; see [`ConfigOrigin`].
+    #[serde(skip)]
+    pub origin: ConfigOrigin,
 }
 
 impl Default for LlmConfig {
@@ -292,6 +296,7 @@ impl Default for LlmConfig {
             drift_threshold_permille: cache::DEFAULT_DRIFT_THRESHOLD_PERMILLE,
             request_json_object: true,
             doc_comment_trust_max_files: 25,
+            origin: ConfigOrigin::Operator,
         }
     }
 }
@@ -299,6 +304,84 @@ impl Default for LlmConfig {
 /// The configuration file's path inside a checkout.
 pub fn config_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".polis").join("llm.json")
+}
+
+/// Who chose the endpoint a key would be sent to.
+///
+/// Not a serialised field: a repository cannot promote its own configuration by
+/// writing `"origin": "operator"` into it, because the field is
+/// `#[serde(skip)]` and a file that mentions it is rejected outright by
+/// `deny_unknown_fields`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    /// Built in this process, or from a flag the operator typed. Trusted to
+    /// name the host their key goes to.
+    #[default]
+    Operator,
+    /// Read out of `<repo>/.polis/llm.json` — a file that arrives with a clone
+    /// and that the operator has usually never opened.
+    Repository,
+}
+
+/// Why a key that *is* present in the environment was not attached to a
+/// request.
+///
+/// The key is still in the environment and still readable by
+/// [`LlmConfig::key`]; what this records is that
+/// [`LlmConfig::key_destination`] refused to let it leave for this particular
+/// endpoint. Both variants name a host, never a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyWithheld {
+    /// The endpoint is `http://` and the host is not loopback, so the
+    /// `Authorization` header would cross the network in the clear.
+    Cleartext {
+        /// The host that would have received it.
+        host: String,
+    },
+    /// The repository's own configuration named a host the operator never
+    /// chose. A clone that ships a `.polis/llm.json` must not be able to
+    /// redirect somebody's key to a collector.
+    RepoRedirect {
+        /// The host the repository asked for.
+        host: String,
+        /// The host the provider's own default names.
+        expected: String,
+    },
+}
+
+impl std::fmt::Display for KeyWithheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cleartext { host } => write!(
+                f,
+                "the API key was withheld: {host} would receive it over http://, in the clear. \
+                 Use https://, or a loopback address for a local model."
+            ),
+            Self::RepoRedirect { host, expected } => write!(
+                f,
+                "the API key was withheld: this repository's .polis/llm.json points at {host}, \
+                 which is not the provider's own {expected}. A repository does not get to choose \
+                 where your key goes — pass --base-url yourself if you meant it."
+            ),
+        }
+    }
+}
+
+/// True for a host that never leaves the machine.
+///
+/// Names as well as literals: a local Ollama is reached at `localhost` at least
+/// as often as at `127.0.0.1`, and `::1` is normal on a dual-stack box.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A name that is not an IP literal and is not `localhost` resolves
+        // wherever DNS says, which is not something this can vouch for.
+        Err(_) => false,
+    }
 }
 
 impl LlmConfig {
@@ -317,12 +400,79 @@ impl LlmConfig {
             return Self::default();
         };
         match serde_json::from_slice::<Self>(&bytes) {
-            Ok(config) => config,
+            // The file came out of a checkout, so it does not get to name the
+            // host a key is sent to. See `key_destination`.
+            Ok(mut config) => {
+                config.origin = ConfigOrigin::Repository;
+                config
+            }
             Err(error) => {
                 tracing::debug!(%error, path = %path.display(), "ignoring a malformed llm.json");
                 Self::default()
             }
         }
+    }
+
+    /// Marks this configuration as one the operator chose themselves.
+    ///
+    /// For a caller that has just applied a `--base-url` or `--key-env` the
+    /// operator typed: typing the host *is* the act of choosing it, so the
+    /// repository-redirect rule no longer applies.
+    #[must_use]
+    pub fn chosen_by_operator(mut self) -> Self {
+        self.origin = ConfigOrigin::Operator;
+        self
+    }
+
+    /// Whether a key may be attached to a request for this configuration's
+    /// endpoint, and why not when it may not.
+    ///
+    /// # Two ways a key leaves without anyone deciding it should
+    ///
+    /// The rest of this module keeps a key out of files, logs, argument lists
+    /// and `Debug` output. Those all assume the key reaches the *right server
+    /// over a protected channel*. Two configurations break that assumption, and
+    /// neither of them is exotic:
+    ///
+    /// 1. **`http://` to somewhere that is not this machine.** The header is
+    ///    then readable by every hop in between. A local Ollama is the reason
+    ///    plain HTTP is supported at all, and a local Ollama is on loopback.
+    /// 2. **A host the repository picked.** `.polis/llm.json` arrives with a
+    ///    clone. A file in it saying `base_url: "https://collector.example"`
+    ///    with `key_env: ["ZAI_API_KEY"]` would post the operator's key to a
+    ///    stranger, over TLS, with no error and no prompt.
+    ///
+    /// Both return the key to `None`, which is a state the whole feature
+    /// already degrades through cleanly, and both are reported rather than
+    /// silently applied.
+    pub fn key_destination(&self) -> Result<(), KeyWithheld> {
+        let endpoint = self.endpoint();
+        // An endpoint that will not parse cannot be reached at all; `validate`
+        // is what reports that, and there is nothing to withhold from it.
+        let Ok(parts) = transport::parse_url(&endpoint) else {
+            return Ok(());
+        };
+        if parts.scheme == "http" && !is_loopback_host(&parts.host) {
+            return Err(KeyWithheld::Cleartext { host: parts.host });
+        }
+        if self.origin == ConfigOrigin::Repository {
+            let default = self.provider.default_base_url();
+            let expected = transport::parse_url(&format!("{}{}", default, self.provider.path()))
+                .map(|p| p.host)
+                .unwrap_or_default();
+            // A repository may still point at a model on this machine: that
+            // reaches nobody, and it is how a checked-in Ollama setup works.
+            if !expected.is_empty()
+                && !parts.host.eq_ignore_ascii_case(&expected)
+                && !is_loopback_host(&parts.host)
+            {
+                return Err(KeyWithheld::RepoRedirect {
+                    host: parts.host,
+                    expected,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The defaults for one provider, keeping everything else.
@@ -427,6 +577,105 @@ mod tests {
         );
         assert_eq!(config.key_source(), "ZAI_API_KEY or GLM_API_KEY");
         config.validate().expect("the default is valid");
+    }
+
+    /// A key may cross the network only where the network protects it. Plain
+    /// HTTP is supported for a local Ollama, and a local Ollama is on loopback.
+    #[test]
+    fn a_key_is_never_sent_in_the_clear_to_another_machine() {
+        let mut config = LlmConfig::default().with_provider(Provider::OpenAiCompatible);
+        config.base_url = "http://collector.example/v1".to_owned();
+        assert_eq!(
+            config.key_destination(),
+            Err(KeyWithheld::Cleartext {
+                host: "collector.example".to_owned()
+            })
+        );
+        // The message names the host and never a credential.
+        let printed = config.key_destination().unwrap_err().to_string();
+        assert!(printed.contains("collector.example"), "{printed}");
+        assert!(printed.contains("in the clear"), "{printed}");
+
+        // Loopback, in each of the three spellings a local model is reached by,
+        // is fine: those bytes never reach a wire.
+        for local in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            config.base_url = local.to_owned();
+            assert_eq!(config.key_destination(), Ok(()), "{local}");
+        }
+        // And TLS to anywhere is what the shipped default already does.
+        config.base_url = "https://api.z.ai/api/paas/v4".to_owned();
+        assert_eq!(config.key_destination(), Ok(()));
+    }
+
+    /// `.polis/llm.json` arrives with a clone. It may configure the feature; it
+    /// may not choose who receives the operator's credential.
+    #[test]
+    fn a_repository_cannot_redirect_the_operators_key_to_a_host_it_picked() {
+        let mut config = LlmConfig {
+            origin: ConfigOrigin::Repository,
+            base_url: "https://collector.example/v1".to_owned(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            config.key_destination(),
+            Err(KeyWithheld::RepoRedirect {
+                host: "collector.example".to_owned(),
+                expected: "api.z.ai".to_owned(),
+            }),
+            "TLS does not make a stranger's server the right one"
+        );
+
+        // The provider's own host is what the operator agreed to.
+        config.base_url = "https://api.z.ai/api/paas/v4".to_owned();
+        assert_eq!(config.key_destination(), Ok(()));
+
+        // A repository may still point at a model on this machine.
+        let mut local = LlmConfig::default().with_provider(Provider::Ollama);
+        local.origin = ConfigOrigin::Repository;
+        assert_eq!(local.key_destination(), Ok(()));
+
+        // And an operator who types the host themselves has chosen it.
+        config.base_url = "https://collector.example/v1".to_owned();
+        assert_eq!(
+            config.clone().chosen_by_operator().key_destination(),
+            Ok(())
+        );
+    }
+
+    /// The guard would be worthless if a checked-in file could switch it off.
+    #[test]
+    fn a_config_file_cannot_promote_itself_to_operator_origin() {
+        let dir = std::env::temp_dir().join("polis-llm-origin-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("llm.json");
+
+        // `origin` is `serde(skip)`, and the container denies unknown fields, so
+        // naming it is a parse error and a parse error falls back to defaults.
+        std::fs::write(
+            &path,
+            br#"{"base_url":"https://collector.example","origin":"operator"}"#,
+        )
+        .expect("write");
+        let loaded = LlmConfig::load(&path);
+        assert_eq!(loaded.base_url, LlmConfig::default().base_url);
+        assert_eq!(loaded.origin, ConfigOrigin::Operator, "it is the default");
+
+        // A well-formed file is honoured, and is marked as the repository's.
+        std::fs::write(&path, br#"{"base_url":"https://collector.example"}"#).expect("write");
+        let loaded = LlmConfig::load(&path);
+        assert_eq!(loaded.base_url, "https://collector.example");
+        assert_eq!(loaded.origin, ConfigOrigin::Repository);
+        assert!(loaded.key_destination().is_err(), "and so it is refused");
+
+        // Nothing about the origin is ever written back out.
+        let json = serde_json::to_string(&LlmConfig::default()).expect("serialize");
+        assert!(!json.contains("origin"), "{json}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
