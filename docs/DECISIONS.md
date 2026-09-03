@@ -3922,3 +3922,257 @@ and Polis survived with no panic and no hang — but the now-empty top-level
 directory could not be removed until the window was closed. That is the `notify`
 watcher's handle, and on Windows it means "close Polis before you `rm -rf` the
 checkout".
+
+---
+
+## ADR-0095 — Polis grows a terminal, and the terminal is a server
+
+**Context.** `polis-app/src/run.rs` gave three reasons for launching an agent as a
+foreground child that inherits the real console, and named the alternative in the
+same breath: *"anything else is a pty emulation Polis has no reason to write."*
+All three are re-examined here rather than dismissed.
+
+1. *"A pty emulation Polis has no reason to write."* Satisfied by `ConPTY`
+   without writing one. `alacritty_terminal` **is** that code — the same crate
+   Alacritty itself ships — and nobody should write a VTE state machine twice.
+2. *"The exit code is the agent's."* Does not apply to a window, which has no
+   exit code to donate. `polis run` still does, and is untouched.
+3. *"The window prints to stderr into the agent's UI."* Is *fixed* by a pane, not
+   caused by one.
+
+What changed is the requirement, not the reasoning: `polis run` watches **one**
+agent, and PRD §11's thesis is **several**. One inherited console cannot be
+several agents.
+
+`docs/roadmap/terminal-integration.md` planned this as M7 — ptys inside the
+window — with a session daemon deferred to M8 as "later work".
+
+**Decision.** Build the terminal, and put the ptys in **`polis-sessiond` from the
+first commit**. The window is a thin client that owns the parser, the grid and
+the keyboard, and owns no child process at all. Three reasons, in order of
+weight:
+
+1. **A window that owns agents kills them when it closes.** A GPU driver reset is
+   not rare on Windows and would take an afternoon's work with it. tmux (2007),
+   herdr and cmux each reached the same split independently.
+2. **The pty master is not blocking-readable on Windows.** Measured, and it is
+   the finding that inverted the plan. The roadmap's reader loop —
+   `match reader.read(&mut buf) { Ok(0) | Err(_) => break, … }` — **exits
+   immediately, having read nothing: `Ok(0)` after 6.8 µs, zero bytes.**
+   `alacritty_terminal`'s Windows master is an `UnblockedReader` whose `Read`
+   impl is a non-blocking drain of an internal `piper` pipe; `Ok(0)` means
+   "nothing right now", and end of file arrives separately through
+   `EventedPty::next_child_event`. Readiness comes from a `polling::Poller` and
+   from nowhere else — the same spike against a poller read 89 bytes of real
+   `ConPTY` output in two reads and saw `Exited(ExitStatus(0))` at 13.4 ms.
+   A process whose main thread belongs to winit has nowhere natural to put that
+   loop. **A daemon is one.** The inversion made the hard part easier.
+3. Doing it later means doing it twice.
+
+**The one `unsafe` in Polis.** `EventedReadWrite::register` is an `unsafe fn`,
+because on Unix it lends a file descriptor to the poller. The roadmap asserted
+that neither pty option "forces `unsafe` into our crates"; that is false for this
+one. It is discharged structurally — `PtyHost` owns the `Pty` and the
+`Arc<Poller>` together, both move into the same thread, and the `Pty` is dropped
+inside that thread before it returns — and it is one `#[allow(unsafe_code)]` on
+one call with the argument written above it, not a block of raw FFI. The
+alternative, `portable-pty`, needs no poller and costs roughly ten crates on a
+legacy `winapi` 0.3 stack in the one process that must never be flaky.
+
+**Dependency cost, measured against the existing lock: nine crates.**
+`alacritty_terminal 0.26.0`, and with it `vte`, `home`, `miow`, `piper`,
+`futures-io`, and on Unix `rustix-openpty` and the two `signal-hook` crates.
+`windows-sys` 0.61.2, `polling` 3.11.0, `base64`, `parking_lot`,
+`regex-automata`, `unicode-width` and `serde` were already there — in particular
+there is **no second `windows-sys` generation**. `vte` arrives re-exported as
+`alacritty_terminal::vte` and must never be pinned directly, which is the same
+rule the root manifest already applies to `wgpu` and `winit`.
+
+**Consequences.** Two new members. `polis-term` holds the pty, the wire, the
+parser, the widget, the key table and the font chain, with the egui half behind a
+`ui` feature so `polis-sessiond` takes it with `default-features = false` and
+has no eframe in its graph at all. `polis-app` gains `panes.rs` and
+`Mode::Work`, and `polis work` joins the CLI.
+
+`polis run` is **untouched**: inherited stdio, foreground child, the agent's exit
+code, and its own careful four-step teardown. If Polis ever routes `polis run`
+through a pty that is a separate decision and a separate ADR.
+
+The window's terminal teardown, by contrast, is `drop(client)`. It never owned a
+child, so there is nothing to kill — which is the whole point, and is verified:
+a Polis window force-killed with `Stop-Process -Force` left its `claude` running,
+and the next `polis work` reattached to it and put the screen back.
+
+---
+
+## ADR-0096 — The pane's session id is issued, not inferred
+
+**Context.** A pane and a cloud on the map have to be the same thing, or the
+feature is a terminal bolted onto a map. The join is a session id, and there are
+three ways to get one: infer it, thread it through the hook, or issue it.
+
+**Decision.** Polis generates a v4-shaped uuid **before** spawning and passes
+`claude --session-id <uuid>`. Measured against `claude --help` 2.1.248: the flag
+exists and is **not** gated on `--print`. Every channel then carries it for free —
+the OTLP resource attribute, the `session_id` in every hook payload, and the
+transcript's own filename, `~/.claude/projects/<slug>/<uuid>.jsonl`. Nothing is
+inferred, nothing is timed, nothing is raced.
+
+The uuid is ~15 lines from `(process id, pane ordinal, wall clock nanoseconds)`
+with the version nibble and variant bits set, rather than a `uuid` dependency:
+the requirement is *unique on this machine*, not *unpredictable anywhere*, and
+`uuid` is presently only transitive. This is the same call that wrote out simplex
+noise rather than take `noise` (ADR-0050). Claude Code validates the *shape*, so
+the shape is asserted in `proto.rs`'s tests.
+
+**Rejected: threading a pane id through `polis-hook`.** Tempting, because the
+hook already reads one environment variable and one more `var_os` is
+sub-microsecond against a 3 ms p99 budget. **The env read is not the cost.** The
+hook ships an 8-byte header and opaque bytes, so a pane id goes *into the wire
+format*: a new field, a version bump, a matching `hook_listener` change and a
+re-derived compile-time assertion — to the one binary whose contract is "never
+blocks the agent, never exits non-zero, no dependencies beyond `std`" — in
+exchange for what `--session-id` gives free. `polis-hook` is untouched.
+
+**Rejected: a hook listener port per pane.** Needs zero hook changes and is
+elegant, but needs N sockets and N threads in `Ingest` and multiplies the
+`AddrInUse` singleton logic ADR-0026 established, for nothing over
+`--session-id`. It is the fallback if the flag is ever removed.
+
+**Consequences.** `Dock::pane_for_session` is a lookup, so clicking a cloud can
+focus its terminal in one line, and a tab can name the district its agent is
+working in. A pane running something that is not `claude` gets **no** session id
+and says so, rather than guessing: a false positive points a cloud at the wrong
+terminal, which is worse than pointing at none.
+
+---
+
+## ADR-0097 — Ctrl+C reaches the agent, `⎿` is drawn, and `has_glyph` cannot be trusted to tell you
+
+**Context.** Three findings that look cosmetic and are not. All three were
+measured; the third was measured *wrongly first*, which is the most useful part
+of this record.
+
+**One: `egui-winit` never emits Ctrl+C.** Verified at
+`egui-winit-0.36.1/src/lib.rs:1021-1035` — `is_copy_command` pushes
+`Event::Copy` and **returns**, so `Event::Key { C, ctrl }` is never produced.
+Same for Ctrl+X and Ctrl+V. Ctrl+C is the key that interrupts Claude Code, so
+untreated **the operator cannot stop a runaway agent from inside Polis**. That is
+a safety property, not a convenience.
+
+*Fix:* `eframe::App::raw_input_hook` (`eframe-0.36.1/src/epi.rs:279`) runs before
+egui processes a frame's input. When a pane has focus and no selection,
+`Event::Copy` is rewritten back into the key event — the Windows Terminal rule,
+copy when there is a selection and interrupt when there is not. `Event::Paste` is
+left alone, because pasting is what Ctrl+V means. `tests/keys.rs` asserts
+`\x03`.
+
+**Two: `Ctrl+Alt` must never become a control byte.** On a German, French or
+Polish layout **`AltGr` is reported as Ctrl+Alt**, and `AltGr+Q` is how you type
+`@`. winit delivers the `@` as `Event::Text` and *also* delivers
+`Event::Key { Q, ctrl + alt }`; encoding that as Ctrl+Q would send `@` followed
+by `\x11` into an agent's input box every time somebody typed an email address.
+The combination therefore produces nothing — which is also what makes `Ctrl+Alt`
+safe for the dock's own chords.
+
+**Three: seven glyphs, and an oracle that lies about them.** Claude Code draws
+`⎿` at the head of every tool line and cycles `✻ ✽ ✢` as its spinner. Measured
+through the renderer that will actually draw them, **eframe's four bundled fonts
+cover 8 of the 16 glyphs Claude Code is known to use** — `⎿ ✻ ✽ ✢ ✓ ✗` and the
+braille cells are missing; box-drawing and blocks are present, in Hack. Adding
+the operating system's own `seguisym.ttf` — Segoe UI Symbol, on every Windows
+since 7 — makes it **16 of 16**. Cost: zero bytes of binary and no licence
+question, because Polis *reads* a font the OS installed and redistributes
+nothing. Bundling Cascadia Mono instead would cost 363 KiB and still miss `⎿`,
+`✻` and `✗`.
+
+*And the trap.* `epaint 0.36.1` implements `Fonts::has_glyph` as
+`resolve_face(c) != cached_family.replacement_face_key` — "is this character
+served by a different face than `U+FFFD` is?" That is a **false negative for
+every glyph living in the same face as the replacement character**, which is
+normally the first font in the family; asked about a single-font family it
+reports that nothing at all is covered. Measured that way, the bundled chain
+appears to be missing `─ │ ╭ █ ░ ▶` as well, and this project spent a round
+designing a three-font fallback for a problem that did not exist before the
+oracle was replaced with "lay the character out and compare the atlas rectangle
+it got against the one `U+FFFD` gets". The roadmap's original `cmap`-parsing
+measurement was right all along.
+
+**Consequences.** `polis_term::font::coverage_line` prints
+`terminal glyphs  16/16 (seguisym.ttf)`, or names exactly which are missing and
+what each is for — a cosmetic mystery turned into a one-line diagnosis. On Linux
+none of the candidates is guaranteed present, so `install` degrades to
+replacement characters and says so; CI's ubuntu leg asserts that it degrades
+without panicking, not that coverage holds.
+
+---
+
+## ADR-0098 — The boundary is bytes, the transport is a token on loopback, and the daemon must forget its parent
+
+**Context.** Three decisions about the wire between `polis-sessiond` and the
+window, each of which had an obvious answer that is wrong.
+
+**Bytes, not screens.** The obvious design serialises a styled 45×120 grid per
+pane at 30 Hz. That is the design tmux spent years adding flow control to
+survive, and tmux's own control mode does not do it either: `%output %pane
+<data>` ships raw bytes and the client parses them, which is how iTerm2 renders
+tmux panes as native tabs. Shipping bytes is the single decision that keeps this
+cheap — the VT state machine, the grid and the widget all live on the window's
+side, and the daemon never learns what a cursor is. It also makes backpressure
+free: each subscriber tracks how far into each pane's byte log it has been sent,
+and a client whose queue is full is simply not sent to, so the next event
+coalesces the gap into one larger message. That is the outcome `pause-after`
+buys tmux, without the protocol.
+
+**Loopback TCP with a token, not a named pipe.** The roadmap planned a named pipe
+on Windows and a Unix socket elsewhere, and called it "the only genuinely
+platform-forked code in M8". There is none: `std` has no named-pipe API, so
+`CreateNamedPipeW` means either raw FFI — which `unsafe_code = "deny"` rules out,
+and which `polis_ingest::hook_listener` already refused for the same reason — or
+a Windows-only crate whose Unix twin is a second code path. Polis already binds
+fixed loopback ports (ADR-0026); this is the third.
+
+A loopback port carries no ACL, and *this* one spawns processes on request, so it
+is a meaningfully worse thing to leave open than an event receiver. The daemon
+therefore writes 256 bits of hex — seeded from the OS's own randomness through
+`RandomState` — into a file only this user can read, and serves no call before
+`hello` presents it, compared in constant time. Same shape as Jupyter's, for the
+same reason, and honest about what it defends: a process running **as this user**
+can read the token file, and could equally read `~/.claude` directly. The fence
+is against other users and other origins, not against the operator.
+
+**A daemon must forget its parent.** Found by running the end-to-end pane test
+from inside a Claude Code session: the pane worked, and the screen said
+*"Transcript saving is off — inherited `CLAUDE_CODE_CHILD_SESSION` marker"*.
+Transcript saving is **Channel D**, the one channel that needs no hooks and no
+environment, the one `polis watch` is built on, and the one carrying the
+session's own uuid in its filename. A daemon launched from inside an agent would
+have silently disabled it for every agent it went on to start, and the map would
+have been permanently short a channel for a reason nothing pointed at.
+
+`polis_term::pty::INHERITED_AGENT_MARKERS` names nine session-identity and IPC
+variables, each with its reason, and the daemon clears them from its own
+environment before starting any thread — which is the only place it works, since
+a pty's options can add to a child's environment but cannot take anything away.
+It is a **list and not a prefix rule**: `CLAUDE_CODE_USE_BEDROCK` and
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` are configuration an operator set on purpose, and
+a prefix rule would throw those away along with the identity.
+
+**Consequences.** PRD §2's non-goal says "no server", and this is a local
+background process. The clause means **no cloud, no auth, and nothing leaving the
+box** — all three of which still hold: `bind` refuses anything but `127.0.0.1`,
+there is no account, and nothing is ever sent anywhere. §2 says the shorter thing,
+so it is amended to say the longer one rather than quietly reinterpreted.
+
+The orphaned-daemon failure mode gets three answers: `--idle-timeout` (default
+600 s) exits a daemon holding **no panes and no clients**, and never one holding
+a live agent; `polis-sessiond --status` says what is running from any terminal;
+and `--stop` ends it, with the endpoint file naming its pid so a wedged one can
+still be found. Version skew is refused at `hello` by name in both directions,
+because a daemon left running across an upgrade is the expected case.
+
+Not yet moved: the four ingest channels still start in the window. ADR-0026's
+fixed-port bind makes them a singleton and the daemon is their natural owner, and
+until they move, a detached period records nothing — so "shut the lid for an hour
+and watch it play back on the map" is still ahead. `Mode::Work` constructs
+`Ingest` at a single call site so that stays a one-edit change.

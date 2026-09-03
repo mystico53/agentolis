@@ -35,6 +35,13 @@ Kill and review are supported but demoted to the drill-down layer.
 - Not a code editor or reviewer. Clicking a building opens the file in the user's editor and stops there.
 - Not multi-repo. One repository, one city. Worktrees of that repo are in scope (§7.6); unrelated repos are not.
 - Not a team/multi-user product. Single operator, local machine, local data. No server, no auth, no telemetry leaving the box.
+  - **"No server" means no cloud, no account, and nothing leaving the box.** It
+    does not mean no local background process. `polis-sessiond` (PRD §15 M7)
+    holds the ptys so that agents outlive the window; it binds `127.0.0.1`
+    only, refuses to bind anything else, requires a token from a file only
+    this user can read, and is never reachable from the network. See
+    ADR-0098, which records why this clause is amended here rather than
+    reinterpreted in a commit message.
 - Not 3D. The camera is top-down orthographic with zoom and pan. No orbit, no perspective, no flying.
 
 ---

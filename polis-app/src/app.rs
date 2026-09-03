@@ -80,6 +80,34 @@ use live::{LiveFeed, LiveOptions};
 /// How many frame times the status bar keeps.
 const FRAME_WINDOW: usize = 240;
 
+/// The narrowest the map may be squeezed to before something else gives.
+///
+/// The dock's one real cost is columns: [`crate::panes::MIN_COLS`] times the cell
+/// width is a hard floor, because Claude Code's own layout collapses below it.
+/// So when all three cannot fit, **the rail closes first** — it is the one of
+/// the three that has a keystroke to bring it back, and the map is the product.
+const MAP_MIN_WIDTH: f32 = 360.0;
+
+/// What the right-hand rail takes when it is open.
+///
+/// Its real width is egui's to remember, so this is the estimate the layout
+/// decision uses — it only has to be close enough to choose between "all three
+/// fit" and "they do not".
+const RAIL_WIDTH: f32 = 370.0;
+
+/// The dock, collapsed to a rail of one chip per agent.
+///
+/// Wide enough for a two-digit ordinal, so a waiting agent stays visible with
+/// the dock shut.
+const COLLAPSED_DOCK: f32 = 34.0;
+
+/// The ceiling on terminal-driven repaints — 30 Hz.
+///
+/// At roughly 1.5 ms a frame that is about 4.5 % of one core, which is **above**
+/// PRD §13.1's idle budget and correctly so: an agent producing output is not
+/// idle. [`Repaint::Terminal`] says so in the status bar rather than hiding it.
+const TERMINAL_TICK: Duration = Duration::from_millis(33);
+
 /// A click opens the editor, and a second click on the same file inside this
 /// window does not — an operator exploring the map must not spawn a stack of
 /// editor windows (PRD §12: *"Click a building → open in `$EDITOR` […] Nothing
@@ -115,6 +143,23 @@ pub enum Mode {
         /// Boxed because it is much the largest variant and every other one is a
         /// path or two.
         options: Box<LiveOptions>,
+    },
+    /// `polis work` — the map, and agents running in panes beside it (PRD §15 M7).
+    ///
+    /// The difference from [`Mode::Map`] is not cosmetic: this is the only
+    /// variant that talks to `polis-sessiond`, and therefore the only one whose
+    /// window has agents attached to it. It still owns none of them — the
+    /// daemon does, which is why closing this window leaves every agent running
+    /// (ADR-0098).
+    Work {
+        /// The checkout to draw, and where panes are opened.
+        repo: PathBuf,
+        /// How many agents to start straight away.
+        panes: usize,
+        /// What to run in each. `claude`, normally.
+        program: String,
+        /// Arguments passed to it untouched.
+        args: Vec<String>,
     },
     /// `polis replay` with no argument — pick from this machine's own sessions.
     Pick,
@@ -177,6 +222,16 @@ fn announce(mode: &Mode) {
         Mode::Map { repo } => format!("opening the map for {}", repo.display()),
         Mode::Pick => "opening the session picker".to_owned(),
         Mode::Replay { transcript, .. } => format!("replaying {}", transcript.display()),
+        Mode::Work {
+            repo,
+            panes,
+            program,
+            ..
+        } => format!(
+            "opening {} with {panes} {program} pane(s) — the agents run in \
+             polis-sessiond and outlive this window",
+            repo.display()
+        ),
         Mode::Live { options } => format!(
             "watching {} live — telemetry {}, hooks {}, transcripts {}",
             options.repo().display(),
@@ -228,6 +283,13 @@ pub struct PolisApp {
     /// frame immediately, a working agent wants a heartbeat fast enough to age
     /// it, and an empty map wants only enough to move a clock.
     live_wake: Duration,
+    /// The terminal dock, in [`Mode::Work`] only.
+    ///
+    /// `None` everywhere else, which is what makes every other mode exactly as
+    /// cheap as it was before this existed.
+    dock: Option<Box<crate::panes::Dock>>,
+    /// How many panes `polis work` should open once the city is up.
+    pending_panes: usize,
     /// Which thread the camera is following, and where it last cut to.
     ///
     /// PRD §12 says following is a **cut**, and a cut happens when the agent
@@ -262,6 +324,13 @@ pub enum Repaint {
     /// events waiting" and "there is a clock on screen" are the same reason with
     /// two very different urgencies.
     Live,
+    /// A pane produced output.
+    ///
+    /// Named rather than folded into [`Repaint::Live`] so the status bar stays
+    /// honest: an agent writing to a terminal is **not** idle, and PRD §13.1's
+    /// "< 2 % of one core" is a budget for a window with nothing happening in
+    /// it. Saying so beats hiding it.
+    Terminal,
     /// A recording is playing.
     Playing,
     /// A tween or a pulse is in flight.
@@ -276,6 +345,7 @@ impl Repaint {
             Self::Idle => "idle",
             Self::Loading => "loading",
             Self::Live => "live",
+            Self::Terminal => "terminal",
             Self::Playing => "playing",
             Self::Animating => "animating",
             Self::KeyHeld => "key",
@@ -371,12 +441,42 @@ impl PolisApp {
         if let Some(feed) = feed.as_mut() {
             feed.wake_with(&cc.egui_ctx);
         }
+        let mut dock = None;
+        let mut pending_panes = 0;
+        if let Mode::Work {
+            repo,
+            panes,
+            program,
+            args,
+        } = &mode
+        {
+            let mut built = crate::panes::Dock::start(
+                &cc.egui_ctx,
+                config.state_dir.clone(),
+                repo.clone(),
+                program.clone(),
+                args.clone(),
+                polis_ingest::env::agent_env(&format!(
+                    "http://{}",
+                    polis_ingest::default_otlp_addr()
+                )),
+            );
+            // After `theme`, which resets the font definitions: installing the
+            // terminal family first would be undone by it.
+            built.install_fonts(&cc.egui_ctx);
+            eprintln!("polis: {}", built.status);
+            // Only open what is not already there. Reattaching to three agents
+            // and then starting three more is the one behaviour nobody wants.
+            pending_panes = panes.saturating_sub(built.len());
+            dock = Some(Box::new(built));
+        }
+
         let stage = match mode {
             Mode::Pick => Stage::Picking(Box::new(Picker::start())),
-            Mode::Map { repo } => spawn_load(repo, None, 1.0),
             // The city is this repository's, and nothing is read from disk that a
             // `polis map` would not read: live is the same city with a wire into
-            // it.
+            // it, and `work` is the same city with agents beside it.
+            Mode::Map { repo } | Mode::Work { repo, .. } => spawn_load(repo, None, 1.0),
             Mode::Live { options } => spawn_load(options.repo().to_path_buf(), None, 1.0),
             Mode::Replay {
                 transcript,
@@ -400,6 +500,8 @@ impl PolisApp {
             repaint: Repaint::Loading,
             pending_live: feed,
             live_wake: live::IDLE_TICK,
+            dock,
+            pending_panes,
             followed_to: None,
         }
     }
@@ -529,7 +631,43 @@ impl eframe::App for PolisApp {
             // `Duration::ZERO` is egui's own spelling of "as soon as you can",
             // so a backlog and a heartbeat go through one call.
             Repaint::Live => ctx.request_repaint_after(self.live_wake),
+            // A 30 Hz ceiling on terminal-driven frames. Claude Code's spinner
+            // runs at 8–12 Hz, so this is invisible; the ceiling exists for the
+            // `cat`-a-large-file case, where uncapped repaint pins a core.
+            Repaint::Terminal => ctx.request_repaint_after(TERMINAL_TICK),
             _ => ctx.request_repaint(),
+        }
+    }
+
+    /// Runs before egui processes the frame's input (`eframe-0.36.1/src/epi.rs:279`).
+    ///
+    /// One job: give Ctrl+C back to the agent. `egui-winit` turns it into
+    /// `Event::Copy` and **never emits the key event** — verified at
+    /// `egui-winit-0.36.1/src/lib.rs:1021-1035` — so without this the operator
+    /// cannot interrupt a runaway agent from inside Polis. That is a safety
+    /// property, not a convenience.
+    ///
+    /// The rule is Windows Terminal's: copy when there is a selection, interrupt
+    /// when there is not. `Event::Paste` is left alone, because pasting is what
+    /// Ctrl+V means.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let Some(dock) = self.dock.as_ref() else {
+            return;
+        };
+        if dock.wants_interrupt(ctx) {
+            crate::panes::interrupt_instead_of_copy(&mut raw.events);
+        }
+    }
+
+    /// Lets go of the session daemon. **The agents keep running.**
+    ///
+    /// The whole of the terminal teardown, and its smallness is the point: the
+    /// window never owned a child process, so there is no four-step kill, no
+    /// two-second poll and no `taskkill`. `polis run`'s teardown is untouched
+    /// and still does all of that, because `polis run` really does own its child.
+    fn on_exit(&mut self) {
+        if let Some(dock) = self.dock.as_mut() {
+            dock.shutdown();
         }
     }
 }
@@ -883,6 +1021,62 @@ impl PolisApp {
         // waiting on a human, what the operator is pointing at, and who is
         // working. `jump` and `panel` are collected here and applied once the
         // rail's borrow of the scene is released.
+        // PRD §12's shared highlight is double-buffered, and this is the swap:
+        // it publishes what the rail and the map said about the pointer last
+        // frame, before either of them draws this one.
+        // The dock goes in after `polis-title` and before `polis-rail`, so the
+        // map keeps `available_rect_before_wrap()` and neither panel has to know
+        // about the other.
+        if let Some(dock) = self.dock.as_mut() {
+            // Before anything else in the dock, and before a pane can consume
+            // them: `Ctrl+Alt+…`, `Ctrl+\``, `F6`. Safe to read without
+            // consuming, because `polis_term::input` declines to encode
+            // `Ctrl+Alt` at all — the same rule that keeps `AltGr` working.
+            dock.reserved_chords(&ctx);
+            let outcome = dock.poll();
+            if outcome.active {
+                self.repaint = self.repaint.max_urgency(Repaint::Terminal);
+            }
+            if self.pending_panes > 0 && dock.connected() {
+                self.pending_panes -= 1;
+                dock.open(45, 100);
+            }
+            let collapsed = dock.collapsed;
+            let (minimum, preferred) = (dock.minimum_width(), dock.preferred_width());
+            let available = ui.available_width();
+
+            // Three things want this row and two of them have hard floors. When
+            // they do not all fit, the rail closes rather than the dock
+            // shrinking below eighty columns or the map disappearing.
+            if !collapsed && self.overlay.rail {
+                let rest = available - minimum - RAIL_WIDTH;
+                if rest < MAP_MIN_WIDTH {
+                    self.overlay.rail = false;
+                }
+            }
+            let rail = if self.overlay.rail { RAIL_WIDTH } else { 0.0 };
+            let widest = (available - rail - MAP_MIN_WIDTH).max(minimum);
+
+            egui::Panel::left("polis-terminals")
+                .resizable(!collapsed)
+                .default_size(if collapsed {
+                    COLLAPSED_DOCK
+                } else {
+                    preferred.min(widest)
+                })
+                .size_range(if collapsed {
+                    COLLAPSED_DOCK..=COLLAPSED_DOCK
+                } else {
+                    minimum..=widest
+                })
+                .show(ui, |ui| {
+                    let drew = dock.draw(ui);
+                    if drew.active {
+                        self.repaint = self.repaint.max_urgency(Repaint::Terminal);
+                    }
+                });
+        }
+
         let mut jump: Option<drill::Jump> = None;
         let mut panel = ui::PanelAction::default();
         let mut subject: Option<LogicalPath> = None;
@@ -1141,9 +1335,12 @@ impl Repaint {
             Self::Idle => 0,
             Self::Loading => 1,
             Self::Live => 2,
-            Self::Animating => 3,
-            Self::KeyHeld => 4,
-            Self::Playing => 5,
+            // Above `Live`, whose heartbeat is allowed to be a whole second,
+            // and below the two the operator is driving by hand.
+            Self::Terminal => 3,
+            Self::Animating => 4,
+            Self::KeyHeld => 5,
+            Self::Playing => 6,
         };
         if rank(other) > rank(self) {
             other

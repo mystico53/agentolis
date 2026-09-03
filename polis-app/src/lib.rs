@@ -88,6 +88,7 @@ pub mod format;
 pub mod labels;
 pub mod mapview;
 pub mod palette;
+pub mod panes;
 pub mod run;
 pub mod session;
 pub mod setup;

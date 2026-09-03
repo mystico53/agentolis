@@ -66,6 +66,27 @@ fn dispatch() -> anyhow::Result<i32> {
             };
             polis_app::run(config).map(|()| 0)
         }
+        // PRD §15 M7: the map, and agents in panes beside it. The agents
+        // belong to `polis-sessiond`, so this window can be closed and reopened
+        // around them.
+        Some(Command::Work(args)) => {
+            let repo = cli.repo_root()?;
+            let (program, agent_args) = args.agent();
+            let config = polis_app::config::Config {
+                repo_root: repo.clone(),
+                ..polis_app::config::Config::default()
+            };
+            polis_app::launch(
+                config,
+                polis_app::Mode::Work {
+                    repo,
+                    panes: args.panes.max(1),
+                    program,
+                    args: agent_args,
+                },
+            )
+            .map(|()| 0)
+        }
         // PRD §15 M3, and the front door: every agent working in this
         // repository, live, with no configuration at all. The picker `watch`
         // used to open is `polis replay` with no argument.

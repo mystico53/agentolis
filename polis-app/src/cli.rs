@@ -8,6 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use polis_events::{Channel, DEFAULT_HOOK_PORT};
 use polis_ingest::{default_otlp_addr, ChannelSet, SessionScope};
 
+use crate::run::DEFAULT_AGENT;
+
 /// `polis` — a live, glanceable city map of what your coding agents are doing.
 ///
 /// `watch` is the headline command and the one to try first: it shows every
@@ -27,6 +29,7 @@ use polis_ingest::{default_otlp_addr, ChannelSet, SessionScope};
       polis                  the first run explains itself\n  \
       polis map              this repository, drawn as a city\n  \
       polis run -- claude    start an agent with the map watching\n  \
+      polis work             agents in panes, the city beside them\n  \
       polis replay           pick a past session and watch it back\n  \
       polis connect          add hook detail to what a watch already sees\n  \
       polis doctor           what is wrong, and how to fix it"
@@ -58,6 +61,19 @@ pub enum Command {
     /// What bare `polis` does once the machine has run Polis before, and what
     /// `polis run` opens in its second process.
     Map,
+
+    /// Agents in panes, with the city beside them (PRD §15 M7).
+    ///
+    /// `polis work` opens the map with a terminal dock down the left, and starts
+    /// Claude Code in it. The agents run inside `polis-sessiond`, **not** inside
+    /// the window, so closing the window — or losing it to a GPU driver reset —
+    /// leaves them running; `polis work` again reattaches and puts the same
+    /// screens back, scrollback and all.
+    ///
+    /// `polis run -- claude` is untouched and still the right command for
+    /// wrapping a single agent in a script: it keeps the real console and
+    /// donates the agent's exit code.
+    Work(WorkArgs),
 
     /// Every agent working in this repository, live. **Start here.**
     ///
@@ -151,6 +167,41 @@ pub struct RunArgs {
         value_name = "COMMAND"
     )]
     pub command: Vec<OsString>,
+}
+
+/// `polis work` — PRD §15 M7.
+#[derive(Debug, clap::Args)]
+pub struct WorkArgs {
+    /// How many agents to start. Reattaching counts, so `--panes 3` against a
+    /// daemon already holding two starts one.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    pub panes: usize,
+
+    /// The agent to run in each pane, and its arguments. Defaults to `claude`.
+    ///
+    /// Everything after `--` is passed through untouched, so
+    /// `polis work -- claude --resume` reaches the agent as `claude --resume`.
+    /// A `--session-id` is added for `claude` unless one is already there
+    /// (ADR-0096).
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub command: Vec<OsString>,
+}
+
+impl WorkArgs {
+    /// The program and its arguments, defaulting to a bare `claude`.
+    #[must_use]
+    pub fn agent(&self) -> (String, Vec<String>) {
+        let mut parts = self
+            .command
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned());
+        let program = parts.next().unwrap_or_else(|| DEFAULT_AGENT.to_owned());
+        (program, parts.collect())
+    }
 }
 
 /// `polis watch` — PRD §15 M3, the headline command.

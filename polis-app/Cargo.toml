@@ -22,6 +22,12 @@ polis-layout = { workspace = true }
 polis-render = { workspace = true }
 polis-repo = { workspace = true }
 polis-world = { workspace = true }
+# The window is the session daemon's client, so it takes the `ui` half too:
+# the emulator, the grid widget, the key table and the font chain.
+polis-term = { workspace = true, features = ["ui"] }
+# Named directly so `panes.rs` can spell `TermMode`, which the key table reads.
+# The pin lives in the root manifest; this is the same crate polis-term uses.
+alacritty_terminal = { workspace = true }
 eframe = { workspace = true }
 arc-swap = { workspace = true }
 crossbeam-channel = { workspace = true }

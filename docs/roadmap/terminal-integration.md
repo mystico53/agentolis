@@ -1,6 +1,79 @@
 # M7 — Terminal integration: Claude Code sessions inside the Polis window
 
-*Status: planned, not started. Written 2026-09-02.*
+*Written 2026-09-02, as a plan. See the status block below for what was built.*
+
+> ## Status: built, and built inside out
+>
+> *Updated 2026-09-03. The plan below is preserved as written; this block records
+> what was actually done and where the plan turned out to be wrong.*
+>
+> **M7 and M8 were built together, in the other order.** The ptys live in
+> `polis-sessiond` from the first commit and the window is a thin client, which
+> is what this document scheduled as M8 "later work". Three reasons, and the
+> second is the one that decided it (ADR-0095):
+>
+> 1. A window that owns agents kills them when it closes, and a GPU driver reset
+>    is not rare on Windows.
+> 2. **The reader loop in *Threading — the house pattern, not tokio* does not
+>    work.** On Windows `reader.read(&mut buf)` returns `Ok(0)` after **6.8 µs
+>    having read nothing** — the master is a non-blocking drain, `Ok(0)` means
+>    "no data", and end of file arrives through `next_child_event` instead.
+>    Readiness needs a `polling::Poller` loop, and a process whose main thread
+>    belongs to winit has nowhere natural to put one. A daemon *is* one, so the
+>    inversion made the hard part easier rather than harder.
+> 3. Doing it later means doing it twice.
+>
+> ### What shipped
+>
+> `polis-term` (pty, wire, transport, byte log, emulator, key table, widget,
+> fonts), `polis-sessiond` (the daemon, `--status`, `--stop`, idle timeout),
+> `polis-app/src/panes.rs` (dock, tab strip, focus arbitration, resize debounce),
+> `Mode::Work`, `Repaint::Terminal`, `raw_input_hook`, and `polis work`.
+> 85 tests across the two new crates; the whole workspace is green.
+>
+> Verified by hand, on this machine: Claude Code 2.1.248 renders in a pane
+> (banner, box rules, `⎿`, spinner, `⏵⏵`) with the start-up `DSR`/`DA1` handshake
+> answered in 1.6 s; a Polis window force-killed with `Stop-Process -Force` left
+> its agent running, and the next `polis work` reattached and put the screen back;
+> two windows can attach to the same pane; `--stop` takes every pane's child with
+> it and leaves no orphan.
+>
+> ### Where this document was wrong
+>
+> * **The reader loop.** See above. The single most expensive line in the plan.
+> * **"Neither option forces `unsafe` into our crates."** `EventedReadWrite::register`
+>   is an `unsafe fn`. It is one `#[allow(unsafe_code)]` on one call with the
+>   ownership argument written above it (ADR-0095).
+> * **`windows-sys 0.59.0` (exact match).** `alacritty_terminal 0.26` wants
+>   0.61.2 — which `notify` already pulls in, so the outcome is the same and the
+>   reason is not.
+> * **Named pipes vs Unix sockets, "the only genuinely platform-forked code in
+>   M8".** There is none: it is loopback TCP with a token file, because `std` has
+>   no named-pipe API and `CreateNamedPipeW` means FFI this workspace forbids
+>   (ADR-0098).
+> * **The font measurement was right and is easy to disprove wrongly.** Hack
+>   *does* carry box-drawing, `seguisym.ttf` *does* close the gap at 16/16, and
+>   `epaint`'s `Fonts::has_glyph` will tell you otherwise — it is a false negative
+>   for every glyph sharing a face with `U+FFFD` (ADR-0097).
+>
+> ### What this document did not know
+>
+> * **`Ctrl+Alt` must never encode a control byte.** `AltGr` is reported as
+>   Ctrl+Alt, and `AltGr+Q` is `@` on a German keyboard. The key table would have
+>   sent `@` followed by `\x11` into every prompt containing an email address.
+> * **A daemon inherits its parent's agent identity.** Started from inside a
+>   Claude Code session it passes `CLAUDE_CODE_CHILD_SESSION` on, which turns
+>   transcript saving — Channel D — off for every agent it starts (ADR-0098).
+>
+> ### Still ahead
+>
+> M7b's persisted dock width and collapsed state; M7c's selection, OSC 52 and the
+> `polis doctor` glyph line (the report exists, the command does not print it
+> yet); M7d's map↔pane correlation in both directions (`pane_for_session` is
+> there and unused); M7e entirely. And the four ingest channels still start in the
+> window rather than the daemon — until they move, a detached period records
+> nothing, so "shut the lid for an hour and watch it play back" is not yet real.
+
 
 Polis today watches Claude Code from the outside. `polis run -- claude`
 (`polis-app/src/run.rs`) launches the agent as a **foreground child inheriting
@@ -119,7 +192,7 @@ is tried first:
   `bitflags` 1.3, `lazy_static`, `shared_library`, `winreg` 0.10, `serial2`,
   `filedescriptor`, `downcast-rs`, `nix` 0.28, `shell-words`, `anyhow`.
 
-Record whichever wins, and why, in ADR-0090.
+Record whichever wins, and why, in ADR-0095.
 
 **`unsafe_code = "deny"` check:** neither option forces `unsafe` into our crates.
 Both do their `CreateProcessW`/`CreatePseudoConsole` work internally behind safe
@@ -475,7 +548,7 @@ Paint order per row:
 **Estimated cost for a focused 45×120 pane: ~1–2 ms/frame**, dominated by
 tessellation (~4 000 glyphs → ~16 k vertices), one draw call, ~0 re-shapes after
 frame 1 thanks to `GalleyCache`. **These are estimates and must be replaced by
-measured numbers in ADR-0090 the day M7a runs** — this workspace's culture is
+measured numbers in ADR-0095 the day M7a runs** — this workspace's culture is
 measured numbers.
 
 Scrollback: `term.scroll_display(Scroll::Delta(n))` from `raw_scroll_delta.y /
@@ -506,7 +579,7 @@ worse here. Do not do it.
 
 Add to `polis doctor`: a `Fonts::has_glyph` sweep over the table of glyphs Claude
 Code is known to draw, printing `terminal glyphs  47/47 (Segoe UI Symbol)` or
-naming exactly which are missing. That table *is* the evidence in ADR-0092, and
+naming exactly which are missing. That table *is* the evidence in ADR-0097, and
 it turns a cosmetic mystery into a one-line diagnosis.
 
 ---
@@ -614,7 +687,7 @@ for what `--session-id` gives free. **Do not touch `polis-hook`.**
 (each pane gets its own `POLIS_HOOK_ENDPOINT`; the receiving socket identifies
 the pane) and is elegant — but it needs N sockets and N threads in `Ingest` and
 multiplies the `AddrInUse` singleton logic ADR-0026 carefully established, for
-nothing over `--session-id`. Record it in ADR-0091 as the fallback if
+nothing over `--session-id`. Record it in ADR-0096 as the fallback if
 `--session-id` is ever removed.
 
 **Fallback for a non-`claude` pane:** reuse
@@ -769,7 +842,7 @@ difference between M8 being 4–6 days and being a rewrite:
    is checked in the first hour so the cost is known rather than discovered.
 10. **`run.rs` must not regress.** `polis run -- claude` keeps its inherited
     stdio, foreground child and exit code, unchanged and tested. Only its module
-    docs gain a pointer to ADR-0090. **If M7 ever routes `polis run` through a
+    docs gain a pointer to ADR-0095. **If M7 ever routes `polis run` through a
     PTY, that is a separate decision and a separate ADR.**
 
 ---
@@ -865,7 +938,7 @@ This is why the estimate is days rather than weeks:
   thing, so it needs an explicit amendment rather than a quiet reinterpretation.
 
 **Effort: 4–6 dev-days on top of M7**, given the four constraints above. Gets
-**ADR-0093**.
+**ADR-0098**.
 
 ### Further out, and deliberately not planned
 
@@ -888,11 +961,11 @@ rediscovered and re-costed later.
 
 ## The ADRs
 
-Four, starting at ADR-0090, in the house Context / Decision / Consequences shape
+Four, starting at ADR-0095, in the house Context / Decision / Consequences shape
 with measured numbers and named failure modes. The first three land with M7; the
 fourth with M8.
 
-**ADR-0090 — Polis grows a terminal, because one inherited console cannot be
+**ADR-0095 — Polis grows a terminal, because one inherited console cannot be
 several agents.** The reversal, stated honestly: `run.rs`'s three reasons are
 re-examined rather than dismissed. Reason 1 ("anything else is a pty emulation
 Polis has no reason to write") is satisfied by ConPTY without writing one —
@@ -904,14 +977,14 @@ thesis is several. Records the PTY spike's outcome, the dependency table, the
 rejection of `egui_term` and of a hand-written VTE, and M7a's frame-cost
 measurements.
 
-**ADR-0091 — The pane's session id is issued, not inferred.** `claude
+**ADR-0096 — The pane's session id is issued, not inferred.** `claude
 --session-id <uuid>`. Records why `polis-hook` is not touched (the wire format,
 not the env read, is the cost — with the p99 budget and the 8-byte header quoted
 from `main.rs`), why the per-pane hook port was rejected despite needing no hook
 change, and what the non-`claude` fallback is and why it prefers a false
 negative.
 
-**ADR-0092 — Ctrl+C reaches the agent, and `⎿` is drawn, because both were
+**ADR-0097 — Ctrl+C reaches the agent, and `⎿` is drawn, because both were
 measured to be broken first.** Two findings that look cosmetic and are not:
 `egui-winit 0.36.1 src/lib.rs:1021-1035` never emits Ctrl+C as a key event, fixed
 by `raw_input_hook` with the Windows Terminal selection rule; and seven
@@ -920,7 +993,7 @@ fixed by the system's own `seguisym.ttf` at zero binary cost — with the cmap
 table showing that bundling Cascadia Mono (363 KiB, SIL OFL, otherwise the
 obvious choice) would still miss three of them.
 
-**ADR-0093 (M8) — The agents outlive the window, and the boundary is bytes.**
+**ADR-0098 (M8) — The agents outlive the window, and the boundary is bytes.**
 Records the client–server split and, more importantly, *why it is cheap*: the
 daemon ships raw pane bytes rather than rendered screens, following tmux control
 mode's `%output` rather than the obvious grid-serialisation design, so the parser
@@ -946,11 +1019,11 @@ left dock in `draw_scene`, `Repaint::Terminal`, `raw_input_hook`, `on_exit`,
 `commands.rs` (`polis work`, the `doctor` glyph check),
 `polis-app/src/config.rs` (`TerminalConfig`), `polis-app/src/setup.rs` (extract
 `cmd_shim`), `polis-app/src/run.rs` (module docs only — **no behaviour change**),
-`docs/DECISIONS.md` (ADR-0090/0091/0092), `docs/PRD.md` (§14's crate list gains
+`docs/DECISIONS.md` (ADR-0095/0091/0092), `docs/PRD.md` (§14's crate list gains
 `polis-term`; §15 gains M7; §2's non-goals and §1's framing of the terminal as
 the problem need amending to admit this feature).
 
 **M8, later:** new `polis-sessiond/` (crate) and a transport module shared with
 `polis-app`; `polis-ingest` moves its construction site rather than its code;
 `polis-app/src/panes.rs` swaps its PTY host implementation; `docs/DECISIONS.md`
-(ADR-0093); `docs/PRD.md` (§2's "no server" clause, §15 gains M8).
+(ADR-0098); `docs/PRD.md` (§2's "no server" clause, §15 gains M8).
