@@ -148,6 +148,108 @@ impl Default for Clouds {
     }
 }
 
+/// The reach of a bridge kernel, in world units, before the base map's scale.
+///
+/// Narrow on purpose. A bridge is a band, not a claim: it should reach the
+/// outermost iso level and stop, so the connection reads without the ground
+/// between two lobes being coloured as territory. PRD §6.4 is explicit that the
+/// honest drawing is *"two lobes and a thin connecting band"* and **not** a
+/// shape that "would falsely claim the empty space between".
+const BRIDGE_RADIUS: f32 = 3.0;
+
+/// Weight of one bridge kernel.
+///
+/// [`polis_render::live::CLOUD_ISO`] is `[0.55, 1.60, 3.20]`, so a chain of
+/// kernels at this weight sums into the first band and nowhere near the second.
+/// The band is therefore always the faintest level the notation has, whatever
+/// the lobes either side of it are doing.
+const BRIDGE_WEIGHT: f32 = 0.30;
+
+/// How far apart two kernels have to be to count as separate lobes, as a
+/// multiple of their own reach.
+const LOBE_SEPARATION: f32 = 2.5;
+
+/// Joins one thread's separated lobes with a thin band of low-weight kernels.
+///
+/// PRD §6.4 promises that a thread working in two places is drawn as *"two lobes
+/// and a thin connecting band"*. The field gives the lobes for free — they are
+/// just kernels — but it does **not** give the band: a Gaussian falls off fast,
+/// so two lobes further apart than a few bandwidths sum to nothing in between
+/// and the cloud silently becomes two islands. On a map where every thread is a
+/// colour that is indistinguishable from two unrelated agents, which inverts the
+/// one thing the operator asked for: *"even if the line gets thinner in the
+/// middle, it should be clear that this is one entity working on both of these
+/// things."*
+///
+/// So the band is made explicit. Kernels are clustered by proximity; every
+/// cluster after the first is joined to the heaviest one by a chain of
+/// [`BRIDGE_WEIGHT`] kernels along the straight line between their centroids.
+/// They go through the same field, the same thresholds and the same hatch as
+/// real evidence, so the band cannot introduce a tone, a level or an alpha of
+/// its own — it can only ever be the outermost band, which is what "thinner in
+/// the middle" means in this notation.
+fn bridge_lobes(territory: &Territory) -> Vec<(polis_layout::Point, f32)> {
+    let kernels = &territory.kernels;
+    if kernels.len() < 2 {
+        return Vec::new();
+    }
+    // Greedy single-pass clustering, in the kernels' own order, so the same
+    // field yields the same band on every run (PRD §7.4).
+    let mut centres: Vec<(polis_layout::Point, f32)> = Vec::new();
+    for k in kernels {
+        if k.weight <= 0.0 {
+            continue;
+        }
+        let reach = (k.radius * LOBE_SEPARATION).max(f32::EPSILON);
+        let found = centres.iter_mut().find(|(c, _)| {
+            let dx = c.x - k.centre.x;
+            let dy = c.y - k.centre.y;
+            dx.mul_add(dx, dy * dy) <= reach * reach
+        });
+        match found {
+            Some((c, w)) => {
+                // Weighted running centroid, so a cluster's centre is where its
+                // mass is rather than where its first kernel happened to land.
+                let total = *w + k.weight;
+                c.x = (c.x * *w + k.centre.x * k.weight) / total;
+                c.y = (c.y * *w + k.centre.y * k.weight) / total;
+                *w = total;
+            }
+            None => centres.push((k.centre, k.weight)),
+        }
+    }
+    if centres.len() < 2 {
+        return Vec::new();
+    }
+    let Some((anchor, _)) = centres
+        .iter()
+        .copied()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        return Vec::new();
+    };
+    let mut band = Vec::new();
+    for (centre, _) in &centres {
+        let dx = centre.x - anchor.x;
+        let dy = centre.y - anchor.y;
+        let span = dx.hypot(dy);
+        if span <= f32::EPSILON {
+            continue;
+        }
+        // One kernel per bandwidth keeps the chain continuous without paying for
+        // a kernel per texel.
+        let steps = (span / BRIDGE_RADIUS).ceil().min(64.0) as usize;
+        for i in 1..steps {
+            let f = i as f32 / steps as f32;
+            band.push((
+                polis_layout::Point::new(dx.mul_add(f, anchor.x), dy.mul_add(f, anchor.y)),
+                BRIDGE_WEIGHT,
+            ));
+        }
+    }
+    band
+}
+
 impl Clouds {
     /// Advances the field and returns what to draw.
     ///
@@ -214,6 +316,12 @@ impl Clouds {
             .collect();
         let visible = territory::visible_clouds(&pairs, cap);
         *shown_out = visible.len();
+        // Where one thread's field has separated into lobes, bridge them.
+        // See `bridge_lobes`.
+        let mut bridges: Vec<Vec<(polis_layout::Point, f32)>> = Vec::with_capacity(visible.len());
+        for territory in &visible {
+            bridges.push(bridge_lobes(territory));
+        }
 
         // Base-map pixels to texels: one fixed factor for the life of the city,
         // which is what lets the tween interpolate without re-registering.
@@ -235,6 +343,20 @@ impl Clouds {
                     // evidenced territory look thinly evidenced.
                     radius: f64::from((kernel.radius * scale).max(2.0)),
                     weight: f64::from(kernel.weight),
+                    thread: u16::try_from(rank).unwrap_or(u16::MAX),
+                });
+            }
+            // The band. Bridge kernels are added at the same scale as the real
+            // ones, so the field sums them exactly as it sums evidence — the
+            // connection is drawn by the same machinery that draws the lobes,
+            // which is why it cannot lift the base map or invent a band level
+            // of its own.
+            for (centre, weight) in &bridges[rank] {
+                let at = base.to_map(*centre);
+                kernels.push(CloudKernel {
+                    at: [f64::from(at.x * per_texel), f64::from(at.y * per_texel)],
+                    radius: f64::from((BRIDGE_RADIUS * scale).max(2.0)),
+                    weight: f64::from(*weight),
                     thread: u16::try_from(rank).unwrap_or(u16::MAX),
                 });
             }
@@ -484,5 +606,83 @@ mod tests {
     #[test]
     fn an_empty_world_draws_no_cloud_at_all() {
         assert!(CloudField::sample(&[], 400, 400).is_none());
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::{bridge_lobes, BRIDGE_WEIGHT};
+    use polis_layout::Point;
+    use polis_world::territory::{Kernel, Territory};
+    use std::time::Instant;
+
+    fn territory_with(centres: &[(f32, f32)]) -> Territory {
+        let now = Instant::now();
+        let mut t = Territory::default();
+        t.kernels = centres
+            .iter()
+            .map(|(x, y)| Kernel {
+                centre: Point::new(*x, *y),
+                radius: 4.0,
+                weight: 1.0,
+                at: now,
+            })
+            .collect();
+        t
+    }
+
+    /// A focused thread is one lobe, and one lobe needs no band. Drawing one
+    /// would be inventing a connection where there is nothing to connect.
+    #[test]
+    fn one_lobe_gets_no_band() {
+        let t = territory_with(&[(0.0, 0.0), (2.0, 1.0), (1.0, 2.0)]);
+        assert!(bridge_lobes(&t).is_empty());
+    }
+
+    /// The case the operator asked for: one agent working in two places stays
+    /// visibly one entity.
+    #[test]
+    fn two_lobes_are_joined_and_the_band_lies_between_them() {
+        let t = territory_with(&[(0.0, 0.0), (1.0, 0.0), (100.0, 0.0), (101.0, 0.0)]);
+        let band = bridge_lobes(&t);
+        assert!(!band.is_empty(), "two separated lobes must be joined");
+        for (p, w) in &band {
+            assert!(
+                (*w - BRIDGE_WEIGHT).abs() < f32::EPSILON,
+                "the band is always the faintest level the notation has"
+            );
+            assert!(
+                p.x > -1.0 && p.x < 102.0 && p.y.abs() < 1.0,
+                "the band runs between the lobes, not past them: {p:?}"
+            );
+        }
+        // Every band kernel is lighter than any real one, so the connection can
+        // never read as heavily as the places being connected.
+        assert!(band.iter().all(|(_, w)| *w < 1.0));
+    }
+
+    /// Three lobes join to the heaviest, not in a chain — a chain would route
+    /// the band through a lobe that happened to be in the middle and imply an
+    /// order the evidence does not have.
+    #[test]
+    fn three_lobes_all_reach_the_heaviest() {
+        let mut t = territory_with(&[(0.0, 0.0), (100.0, 0.0), (0.0, 100.0)]);
+        t.kernels[0].weight = 10.0;
+        let band = bridge_lobes(&t);
+        let to_east = band.iter().any(|(p, _)| p.x > 40.0 && p.y.abs() < 1.0);
+        let to_south = band.iter().any(|(p, _)| p.y > 40.0 && p.x.abs() < 1.0);
+        assert!(to_east && to_south, "both outliers reach the anchor");
+    }
+
+    /// Determinism (PRD §7.4): the same field yields the same band.
+    #[test]
+    fn the_band_is_deterministic() {
+        let t = territory_with(&[(0.0, 0.0), (100.0, 0.0), (0.0, 100.0), (50.0, 50.0)]);
+        let a = bridge_lobes(&t);
+        let b = bridge_lobes(&t);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x.0.x - y.0.x).abs() < f32::EPSILON && (x.0.y - y.0.y).abs() < f32::EPSILON);
+        }
     }
 }
