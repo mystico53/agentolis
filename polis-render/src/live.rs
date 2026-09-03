@@ -400,6 +400,16 @@ pub struct Scaffold {
 
 /// One operation mark: PRD §10.1's shape and §10.2's colour, side by side and
 /// never conflated.
+///
+/// Two further fields, and neither is a third *state* channel — both are size,
+/// which is what a proportional-symbol map has always used for "how much" and
+/// "how sure":
+///
+/// * [`Mark::scale`] is how certain the **position** is. A mark at a building
+///   is drawn full size; one placed at a district, or at the agent that ran it,
+///   is drawn smaller because that is a weaker claim about where it happened.
+/// * [`Mark::count`] is how many operations the mark stands for, after
+///   identical ones at one position were aggregated.
 #[derive(Debug, Clone, Copy)]
 pub struct Mark {
     /// Where.
@@ -412,6 +422,50 @@ pub struct Mark {
     pub age: f64,
     /// Arrival pulse in `[0, 1]`, falling to zero over [`PULSE_SECS`].
     pub pulse: f64,
+    /// Positional certainty as a factor on the glyph radius —
+    /// `polis_world::OpSite::scale`. `1.0` is "this building".
+    pub scale: f64,
+    /// How many operations this mark stands for. `1` is a single call.
+    ///
+    /// Aggregation is how volume is kept off the map without losing anything:
+    /// 6 742 shell calls in one session cannot each be a glyph, but "forty runs
+    /// here, and they failed" is one legible mark. Only operations that agree on
+    /// position, shape **and** outcome are ever merged, so a failure can never
+    /// be absorbed into a success.
+    pub count: u32,
+}
+
+impl Mark {
+    /// A single, un-aggregated mark at a building — the plain case, and the one
+    /// tests want to write.
+    #[must_use]
+    pub fn single(at: Px, glyph: Glyph, outcome: Outcome, age: f64, pulse: f64) -> Self {
+        Self {
+            at,
+            glyph,
+            outcome,
+            age,
+            pulse,
+            scale: 1.0,
+            count: 1,
+        }
+    }
+}
+
+/// How much bigger a mark gets for standing in for several operations.
+///
+/// Stepped rather than continuous, and no logarithm: `live` keeps
+/// transcendentals out of the image so a frame is byte-reproducible (see the
+/// module docs). Five steps is as much as the eye reads off a glyph anyway.
+#[must_use]
+pub fn stack_scale(count: u32) -> f64 {
+    match count {
+        0 | 1 => 1.0,
+        2..=3 => 1.12,
+        4..=7 => 1.24,
+        8..=15 => 1.36,
+        _ => 1.50,
+    }
 }
 
 /// What an [`Agent`] is.
@@ -511,6 +565,50 @@ pub struct LiveFrame {
     pub agents: Vec<Agent>,
     /// Attention marks.
     pub attention: Vec<AttentionMark>,
+    /// PRD §6.2's status rail: what has no place on the map. Chrome, drawn
+    /// outside the map frame, and **never empty when something was dropped**.
+    pub rail: Vec<RailRow>,
+}
+
+/// What a [`RailRow`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailKind {
+    /// A thread with no converged territory and no placeable step.
+    ///
+    /// > Until then the thread renders with no cloud — an unplaced marker in
+    /// > the status rail. (PRD §6.2)
+    UnplacedThread,
+    /// Operations of a thread that has no position, so they have none either.
+    /// The count is what stops them being silently dropped.
+    UnplacedOps,
+    /// Workers Polis cannot attach to any thread — uncertainty shown rather
+    /// than guessed around.
+    UnattributedWorkers,
+}
+
+impl RailKind {
+    /// The word the rail prints for this kind.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnplacedThread => "NO TERRITORY",
+            Self::UnplacedOps => "UNPLACED OPS",
+            Self::UnattributedWorkers => "UNATTRIBUTED",
+        }
+    }
+}
+
+/// One row of the status rail.
+#[derive(Debug, Clone)]
+pub struct RailRow {
+    /// Which kind of unplaced thing.
+    pub kind: RailKind,
+    /// A short name — a thread title, or a reason.
+    pub label: String,
+    /// How many things this row stands for.
+    pub count: u32,
+    /// How many of them failed. The reason the rail is worth a glance.
+    pub failed: u32,
 }
 
 /// What each layer cost, measured. PRD §13.1 budgets layers 4 + 5 at under 4 ms.
@@ -831,6 +929,33 @@ const DASH_PERIOD: f64 = 1.35;
 /// The most dashes one trail segment may be cut into.
 const MAX_DASHES: f64 = 18.0;
 
+/// How far the *n*-th traversal of one leg bows off the straight line, as a
+/// multiple of the glyph radius.
+///
+/// This is the fix for the one thing PRD §12 asks the trail for and the trail
+/// was not delivering. A thread that goes `auth.rs → tests.rs → auth.rs` pushes
+/// three steps and draws two segments — and the two segments are **the same
+/// two points in the opposite order**, so the return leg lands exactly on top
+/// of the outbound one and six passes over a building look identical to one.
+/// Watching the M2 recordings you saw marks accumulate and never saw an agent
+/// come back.
+///
+/// So each repeat of a leg bows further off the line, alternating sides, and a
+/// round trip draws as a **lens** rather than as an overstroke: the oscillation
+/// is a shape, which is what survives being read from across the room (PRD §1)
+/// and what the box filter down to thumbnail size keeps.
+const LEG_BOW: f64 = 0.75;
+
+/// The most times one leg's bow keeps growing.
+///
+/// Past six passes the lens is as wide as it can be without reading as
+/// scribble, and "a lot" is the message — which the revisit rosette
+/// ([`Thrash`]) is already carrying as a count.
+const MAX_LEG_BOW: u32 = 6;
+
+/// How many chords a bowed leg is drawn with.
+const BOW_CHORDS: usize = 8;
+
 /// Draws one trail in the requested notation.
 ///
 /// # The two candidate notations
@@ -849,12 +974,22 @@ const MAX_DASHES: f64 = 18.0;
 ///   continuous line hides how many operations a run of it represents, and
 ///   "six operations in one building" versus "six buildings in a row" is
 ///   exactly the distinction §12 wants readable.
+///
+/// # Repeated legs bow apart, in both notations
+///
+/// Neither notation could show a **return**, because a return is the same two
+/// points in the opposite order and both drew it on top of the outbound leg.
+/// [`leg_repeats`] counts how many times each leg has been walked and
+/// [`leg_path`] bows the *n*-th pass off the line, so a backtrack is motion
+/// rather than a counter. See [`LEG_BOW`].
 pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64) {
     if trail.steps.len() < 2 {
         return;
     }
     let ttl = trail.ttl.max(1e-6);
-    for pair in trail.steps.windows(2) {
+    let repeats = leg_repeats(&trail.steps);
+    let mut path: Vec<Px> = Vec::with_capacity(BOW_CHORDS + 1);
+    for (leg, pair) in trail.steps.windows(2).enumerate() {
         let (a, b) = (pair[0], pair[1]);
         // A segment is as old as its *newer* end: the eye reads a stroke as one
         // object, and grading it by its older end makes the whole trail look
@@ -862,9 +997,10 @@ pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64)
         let age = (b.age / ttl).clamp(0.0, 1.0);
         let fresh = 1.0 - age;
         let ink = fade(AGENT_TRAIL, AGENT_FLOOR, 0.75f64.mul_add(fresh, 0.25));
+        leg_path(a.at, b.at, repeats[leg], r, &mut path);
         match style {
             TrailStyle::Fade => {
-                canvas.segment(a.at, b.at, (r * 0.20).max(MIN_STROKE), ink, 1.0);
+                canvas.polyline(&path, (r * 0.20).max(MIN_STROKE), ink, 1.0);
             }
             TrailStyle::Timed => {
                 let width = (r * 0.26 * 0.55f64.mul_add(fresh, 0.45)).max(MIN_STROKE);
@@ -872,7 +1008,7 @@ pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64)
                 // old, and never zero — a trail that vanishes is a trail that
                 // cannot be counted.
                 let duty = 0.72f64.mul_add(smoothstep(fresh), 0.18);
-                dashed(canvas, a.at, b.at, r * DASH_PERIOD, duty, width, ink);
+                dashed_path(canvas, &path, r * DASH_PERIOD, duty, width, ink);
             }
         }
     }
@@ -890,31 +1026,163 @@ pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64)
     }
 }
 
-/// Strokes a dashed segment with a fixed period and a variable duty cycle.
-fn dashed(canvas: &mut Canvas, a: Px, b: Px, period: f64, duty: f64, width: f64, ink: Rgb) {
+/// How many times each leg of a trail has already been walked.
+///
+/// `out[i]` is the number of **earlier** segments joining the same unordered
+/// pair of stops as `steps[i] → steps[i+1]`. Direction is deliberately ignored:
+/// `auth → tests` and `tests → auth` are the same road, and the whole point is
+/// to keep the return leg off the outbound one.
+///
+/// Positions are quantised to whole pixels before keying, because two stops at
+/// the same building come back from the projection at the same pixel and a
+/// float key would call them different roads.
+#[must_use]
+pub fn leg_repeats(steps: &[TrailStep]) -> Vec<u32> {
+    let n = steps.len().saturating_sub(1);
+    let mut out = vec![0u32; n];
+    if n < 2 {
+        return out;
+    }
+    // Sort a key/index list and walk the runs, rather than keeping a map: this
+    // runs on every trail of every frame inside PRD §13.1's 4 ms budget, and a
+    // `BTreeMap` per trail was measured at a fifth of it on a forty-thread
+    // frame. One allocation, one sort, one pass.
+    let key = |p: Px| (p[0].round() as i64, p[1].round() as i64);
+    let mut legs: Vec<([i64; 4], u32)> = Vec::with_capacity(n);
+    for (i, pair) in steps.windows(2).enumerate() {
+        let (a, b) = (key(pair[0].at), key(pair[1].at));
+        // Unordered: the smaller endpoint first. `auth → tests` and
+        // `tests → auth` are the same road.
+        let k = if a <= b {
+            [a.0, a.1, b.0, b.1]
+        } else {
+            [b.0, b.1, a.0, a.1]
+        };
+        legs.push((k, i as u32));
+    }
+    legs.sort_unstable();
+    let mut run = 0u32;
+    for i in 0..legs.len() {
+        if i > 0 && legs[i].0 == legs[i - 1].0 {
+            run += 1;
+        } else {
+            run = 0;
+        }
+        out[legs[i].1 as usize] = run;
+    }
+    // Within one key the sort is by leg index, so the counts are in walk order.
+    out
+}
+
+/// Builds the polyline one leg is drawn along, bowing repeat passes apart.
+///
+/// The first pass is the straight line, so an ordinary trail is unchanged. Each
+/// later pass swings to the other side and a little further out, up to
+/// [`MAX_LEG_BOW`], which turns `A → B → A` into a lens and `A → B → A → B → A`
+/// into a spindle. A degenerate leg — both stops on one pixel — is dropped: it
+/// is the same building twice, which the bead and the rosette already say.
+pub fn leg_path(a: Px, b: Px, repeat: u32, r: f64, out: &mut Vec<Px>) {
+    out.clear();
+    if repeat == 0 {
+        out.push(a);
+        out.push(b);
+        return;
+    }
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
     let len = dx.mul_add(dx, dy * dy).sqrt();
-    if len < 1e-9 {
+    if len < 1e-6 {
+        out.push(a);
+        out.push(b);
+        return;
+    }
+    let n = repeat.min(MAX_LEG_BOW);
+    // Passes alternate sides: 1 → +1, 2 → −1, 3 → +2, 4 → −2, …
+    let rank = f64::from(n.div_ceil(2));
+    let sign = if n % 2 == 1 { 1.0 } else { -1.0 };
+    // Bounded by the leg's own length as well as by the radius, so a short
+    // hop between two neighbouring buildings does not sprout a balloon.
+    let bow = (rank * r * LEG_BOW).min(len * 0.45) * sign;
+    let mid = [f64::midpoint(a[0], b[0]), f64::midpoint(a[1], b[1])];
+    // The normal is taken from the leg's **canonical** direction — the same
+    // smaller-endpoint-first rule [`leg_repeats`] keys on — and not from the
+    // direction of travel. Otherwise the return pass flips both the sign and
+    // the normal, the two cancel, and every pass bows to the same side: the
+    // stack of arcs reads as one thick line again, which was the whole bug.
+    let flip = if (a[0], a[1]) <= (b[0], b[1]) {
+        1.0
+    } else {
+        -1.0
+    };
+    // Quadratic control point: the curve reaches half the control offset, so
+    // the visible bow is `bow / 2`. Doubling it here keeps `LEG_BOW` readable
+    // as "how far the stroke actually moves".
+    let ctrl = [
+        (-dy / len).mul_add(bow * 2.0 * flip, mid[0]),
+        (dx / len).mul_add(bow * 2.0 * flip, mid[1]),
+    ];
+    for i in 0..=BOW_CHORDS {
+        let t = i as f64 / BOW_CHORDS as f64;
+        let u = 1.0 - t;
+        out.push([
+            (t * t).mul_add(b[0], (u * u).mul_add(a[0], 2.0 * u * t * ctrl[0])),
+            (t * t).mul_add(b[1], (u * u).mul_add(a[1], 2.0 * u * t * ctrl[1])),
+        ]);
+    }
+}
+
+/// Strokes a dashed polyline with a fixed period and a variable duty cycle.
+///
+/// The dash phase runs along the **whole** path rather than restarting at every
+/// chord, so a bowed leg keeps the same rhythm as a straight one — the duty
+/// cycle is the time encoding and it must not change because a leg curved.
+fn dashed_path(canvas: &mut Canvas, points: &[Px], period: f64, duty: f64, width: f64, ink: Rgb) {
+    if points.len() < 2 {
+        return;
+    }
+    let mut total = 0.0;
+    for pair in points.windows(2) {
+        let dx = pair[1][0] - pair[0][0];
+        let dy = pair[1][1] - pair[0][1];
+        total += dx.mul_add(dx, dy * dy).sqrt();
+    }
+    if total < 1e-9 {
         return;
     }
     // A dash period is a *rhythm*, and a rhythm needs a bounded number of
     // beats. A trail step that crosses the whole map at a fixed period draws
     // sixty dashes, which reads as a dotted line rather than as a rhythm and
     // costs sixty polygon fills — measured, that was most of a 6 ms frame. So
-    // a long segment stretches its period instead of subdividing further.
-    let period = period.max(2.0).max(len / MAX_DASHES);
+    // a long path stretches its period instead of subdividing further.
+    let period = period.max(2.0).max(total / MAX_DASHES);
     if duty >= 0.995 {
-        canvas.segment(a, b, width, ink, 1.0);
+        canvas.polyline(points, width, ink, 1.0);
         return;
     }
     let on = (period * duty.clamp(0.05, 1.0)).max(MIN_STROKE);
-    let mut t = 0.0;
-    while t < len {
-        let t1 = (t + on).min(len);
-        let p = |u: f64| [(dx / len).mul_add(u, a[0]), (dy / len).mul_add(u, a[1])];
-        canvas.segment(p(t), p(t1), width, ink, 1.0);
-        t += period;
+    let mut walked = 0.0;
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let len = dx.mul_add(dx, dy * dy).sqrt();
+        if len < 1e-9 {
+            continue;
+        }
+        let at = |u: f64| [(dx / len).mul_add(u, a[0]), (dy / len).mul_add(u, a[1])];
+        // The first dash of this chord starts wherever the running phase left
+        // off on the previous one.
+        let phase = walked % period;
+        let mut t = if phase <= 0.0 { 0.0 } else { -phase };
+        while t < len {
+            let start = t.max(0.0);
+            let stop = (t + on).min(len);
+            if stop > start {
+                canvas.segment(at(start), at(stop), width, ink, 1.0);
+            }
+            t += period;
+        }
+        walked += len;
     }
 }
 
@@ -1026,8 +1294,13 @@ fn draw_scaffold(canvas: &mut Canvas, s: Scaffold, r: f64) {
 fn draw_mark(canvas: &mut Canvas, mark: Mark, r: f64) {
     let fresh = 1.0 - mark.age.clamp(0.0, 1.0);
     // Size carries age as well as tone, so the newest operation is the biggest
-    // thing in its neighbourhood even in a screenshot with no colour.
-    let size = r * 0.35f64.mul_add(smoothstep(fresh), 0.65);
+    // thing in its neighbourhood even in a screenshot with no colour — then
+    // positional certainty (`scale`) and multiplicity (`count`). None of the
+    // three is an outcome: colour is the only thing that says how it went.
+    let size = r
+        * 0.35f64.mul_add(smoothstep(fresh), 0.65)
+        * mark.scale.clamp(0.2, 2.0)
+        * stack_scale(mark.count);
     let ink = fade(
         outcome_ink(mark.outcome),
         AGENT_FLOOR,
@@ -1246,17 +1519,9 @@ fn draw_contention(canvas: &mut Canvas, mark: AttentionMark, r: f64) {
             (t * t).mul_add(other[1], (u * u).mul_add(mark.at[1], 2.0 * u * t * ctrl[1])),
         ]);
     }
-    for pair in pts.windows(2) {
-        dashed(
-            canvas,
-            pair[0],
-            pair[1],
-            r * 1.6,
-            duty,
-            width.max(MIN_STROKE),
-            ink,
-        );
-    }
+    // One dash phase along the whole arc: dashing each chord separately
+    // restarted the rhythm sixteen times and read as a bead string.
+    dashed_path(canvas, &pts, r * 1.6, duty, width.max(MIN_STROKE), ink);
     for end in [mark.at, other] {
         canvas.disc(end, r * 0.9, ink, 1.0);
         if mark.pulse > 0.0 {
@@ -1491,13 +1756,7 @@ mod tests {
             let mut c = Canvas::new(160, 160, [0, 0, 0]);
             draw_mark(
                 &mut c,
-                Mark {
-                    at: [80.0, 80.0],
-                    glyph: Glyph::FilledSquare,
-                    outcome: Outcome::Done,
-                    age: 0.0,
-                    pulse,
-                },
+                Mark::single([80.0, 80.0], Glyph::FilledSquare, Outcome::Done, 0.0, pulse),
                 10.0,
             );
             c
@@ -1678,6 +1937,153 @@ mod tests {
         assert!(new > old, "timed trail: new {new} px, old {old} px");
     }
 
+    /// Draws the thrashing notation at the size it is really drawn, for the eye
+    /// rather than for an assertion: one, two, four and six passes over the same
+    /// pair of buildings, plus the revisit rosette beside them.
+    ///
+    /// ```text
+    /// POLIS_OUT=<dir> cargo test -p polis-render --release -- --ignored --nocapture thrashing_sheet
+    /// ```
+    #[test]
+    #[ignore = "writes an image"]
+    fn thrashing_sheet() {
+        let Ok(out) = std::env::var("POLIS_OUT") else {
+            eprintln!("skipped: set POLIS_OUT to a directory");
+            return;
+        };
+        let r = 9.0;
+        let mut c = Canvas::new(760, 260, [20, 21, 24]);
+        for (row, passes) in [1usize, 2, 4, 6].into_iter().enumerate() {
+            let y = 45.0 + row as f64 * 60.0;
+            let (a, b) = (90.0, 330.0);
+            let steps: Vec<TrailStep> = (0..=passes)
+                .map(|i| TrailStep {
+                    at: [if i % 2 == 0 { a } else { b }, y],
+                    age: (passes - i) as f64 * 12.0,
+                    visits: (passes / 2 + 1) as u32,
+                })
+                .collect();
+            draw_trail(&mut c, &Trail { steps, ttl: 300.0 }, TrailStyle::Timed, r);
+            draw_thrash(
+                &mut c,
+                Thrash {
+                    at: [560.0, y],
+                    visits: passes as u32 + 1,
+                    age: 0.1,
+                },
+                r,
+            );
+            c.text(650.0, y - 6.0, &format!("{passes} PASS"), 1.4, AGENT_BODY);
+        }
+        let path = std::path::Path::new(&out).join("thrashing.png");
+        c.write_png(&path).expect("png");
+        eprintln!("wrote {}", path.display());
+    }
+
+    /// PRD §12's other claim, which the trail was silently not delivering:
+    ///
+    /// > you can see backtracking, thrashing (the same building revisited six
+    /// > times), and scope creep in it
+    ///
+    /// `A → B → A` pushes three stops and draws two segments — and the two
+    /// segments are the same two points in the opposite order, so the return
+    /// leg landed exactly on the outbound one. Six passes drew as one line. The
+    /// assertion is the fix in its measurable form: a round trip must cover
+    /// **more** pixels than a one-way trip between the same two buildings.
+    #[test]
+    fn a_return_leg_is_visible_as_motion_and_not_as_an_overstroke() {
+        let stop = |x: f64, age: f64, visits: u32| TrailStep {
+            at: [x, 150.0],
+            age,
+            visits,
+        };
+        let render = |steps: Vec<TrailStep>, style| {
+            let mut c = Canvas::new(300, 300, [0, 0, 0]);
+            draw_trail(&mut c, &Trail { steps, ttl: 300.0 }, style, 9.0);
+            c.pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .filter(|p| *p != &[0, 0, 0])
+                .count()
+        };
+        for style in [TrailStyle::Fade, TrailStyle::Timed] {
+            let one_way = render(vec![stop(60.0, 10.0, 1), stop(240.0, 0.0, 1)], style);
+            let there_and_back = render(
+                vec![
+                    stop(60.0, 20.0, 2),
+                    stop(240.0, 10.0, 1),
+                    stop(60.0, 0.0, 2),
+                ],
+                style,
+            );
+            assert!(
+                there_and_back > one_way + 40,
+                "{style:?}: a return drew {there_and_back} px against {one_way} for one way — \
+                 the two legs are still coincident"
+            );
+        }
+    }
+
+    /// Each further pass swings the other way and a little wider, so an
+    /// oscillation reads as a spindle rather than as a thicker line.
+    #[test]
+    fn repeat_passes_alternate_sides_and_grow() {
+        let a = [0.0, 0.0];
+        let b = [100.0, 0.0];
+        let mut path = Vec::new();
+        leg_path(a, b, 0, 10.0, &mut path);
+        assert_eq!(path, vec![a, b], "the first pass is the straight line");
+
+        let apex = |repeat: u32| {
+            let mut p = Vec::new();
+            leg_path(a, b, repeat, 10.0, &mut p);
+            p[p.len() / 2][1]
+        };
+        let (one, two, three) = (apex(1), apex(2), apex(3));
+        assert!(one > 0.0 && two < 0.0, "passes alternate: {one}, {two}");
+        assert!(three.abs() > one.abs(), "and widen: {three} against {one}");
+        // Past the cap the lens stops growing; the revisit rosette carries the
+        // rest of the count.
+        assert_eq!(apex(MAX_LEG_BOW), apex(MAX_LEG_BOW + 40));
+
+        // And the alternation must survive the *direction* flip, which is what
+        // a return leg is. Pass 2 runs `b → a`; taking the normal from the
+        // direction of travel makes its sign flip and its direction flip
+        // cancel, and it lands back on top of pass 1 — which is the bug this
+        // whole notation exists to fix, reintroduced one level down.
+        let mut back = Vec::new();
+        leg_path(b, a, 2, 10.0, &mut back);
+        let returning = back[back.len() / 2][1];
+        assert!(
+            returning < 0.0 && (returning - two).abs() < 1e-9,
+            "the return pass bows to the far side: {returning} against {two}"
+        );
+    }
+
+    #[test]
+    fn a_leg_is_counted_by_its_road_and_not_by_its_direction() {
+        let s = |x: f64| TrailStep {
+            at: [x, 0.0],
+            age: 0.0,
+            visits: 1,
+        };
+        // A → B → A → B → C: the first three legs are one road walked three
+        // times, the fourth is a new one.
+        let steps = vec![s(0.0), s(50.0), s(0.0), s(50.0), s(90.0)];
+        assert_eq!(leg_repeats(&steps), vec![0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn a_bow_never_outgrows_its_own_leg() {
+        // A short hop between two neighbouring buildings must not sprout a
+        // balloon wider than the gap it spans.
+        let mut path = Vec::new();
+        leg_path([0.0, 0.0], [6.0, 0.0], 5, 12.0, &mut path);
+        let apex = path[path.len() / 2][1].abs();
+        assert!(apex <= 6.0 * 0.45 + 1e-9, "apex {apex} on a 6 px leg");
+    }
+
     /// Severity is not a shade of red (PRD §11.4: colour is never the sole
     /// channel). Two severities have to differ in geometry with the colour held
     /// constant.
@@ -1771,13 +2177,13 @@ mod tests {
                     .collect(),
                 ttl: 300.0,
             }],
-            marks: vec![Mark {
-                at: [150.0, 150.0],
-                glyph: Glyph::Delegate,
-                outcome: Outcome::Pending,
-                age: 0.2,
-                pulse: 0.5,
-            }],
+            marks: vec![Mark::single(
+                [150.0, 150.0],
+                Glyph::Delegate,
+                Outcome::Pending,
+                0.2,
+                0.5,
+            )],
             agents: vec![Agent {
                 at: [150.0, 150.0],
                 body: Body::Main,
@@ -1850,12 +2256,14 @@ mod tests {
                 age: 0.2,
             }],
             marks: (0..6)
-                .map(|i| Mark {
-                    at: [60.0 + f64::from(i) * 36.0, 200.0],
-                    glyph: Glyph::BarredCircle,
-                    outcome: Outcome::Failed,
-                    age: f64::from(i) / 6.0,
-                    pulse: if i == 5 { 1.0 } else { 0.0 },
+                .map(|i| {
+                    Mark::single(
+                        [60.0 + f64::from(i) * 36.0, 200.0],
+                        Glyph::BarredCircle,
+                        Outcome::Failed,
+                        f64::from(i) / 6.0,
+                        if i == 5 { 1.0 } else { 0.0 },
+                    )
                 })
                 .collect(),
             agents: vec![Agent {
@@ -1937,13 +2345,13 @@ mod tests {
                 });
             }
             for i in 0..16 {
-                frame.marks.push(Mark {
-                    at: [ox + f64::from(i % 8) * 18.0, oy + f64::from(i / 8) * 18.0],
-                    glyph: Glyph::BarredCircle,
-                    outcome: Outcome::Pending,
-                    age: f64::from(i) / 16.0,
-                    pulse: 0.0,
-                });
+                frame.marks.push(Mark::single(
+                    [ox + f64::from(i % 8) * 18.0, oy + f64::from(i / 8) * 18.0],
+                    Glyph::BarredCircle,
+                    Outcome::Pending,
+                    f64::from(i) / 16.0,
+                    0.0,
+                ));
             }
             frame.agents.push(Agent {
                 at: [ox, oy],

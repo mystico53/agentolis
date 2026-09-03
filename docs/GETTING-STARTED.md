@@ -22,36 +22,59 @@ Five things, and then you can read any Polis screen.
 | The dense **old core** | The code that was written first. The loose outskirts are the newest. |
 | A **cloud** | An agent, hovering over the part of the tree it is working in. It leaves a fading trail behind it. |
 
-Click a building and the file opens in your editor. That is the only thing
-clicking does. (If it opens the wrong editor, set `POLIS_EDITOR` to a command
-template like `code --goto {path}:{line}`.)
+Clicking a building selects it and opens that file in your editor. That is the
+only thing clicking does. (If it opens the wrong editor, set `POLIS_EDITOR` to a
+command template like `code --goto {path}:{line}`.)
+
+The window says all of this itself the first time it opens, and `h` brings it
+back at any time — together with what the shapes over a building mean (a hollow
+circle is a read, a barred circle an edit, a filled square a write, a filled
+triangle a shell command) and what their colour means (teal succeeded, red
+failed, grey still running).
 
 ---
 
 ## Path 1 — see something move, right now
 
-You need two things. Claude Code used at least once on this machine — if you have
-ever run `claude`, that is done. And Polis itself built: on Windows the first
-option below does that for you, and everywhere else it is
-[two commands](#building-polis).
+You need one thing you probably already have: Claude Code used at least once on
+this machine. If you have ever run `claude`, that is done.
 
 **Windows, without a terminal.** Double-click `Polis.bat` in the Polis folder.
-It will offer to build Polis the first time, which takes a few minutes and
-happens once. Then choose **1. Watch a past session**.
+It offers to build Polis the first time, which takes a few minutes and happens
+once, then offers to put `polis` on your `PATH`. Then choose
+**1. Watch a past session**.
 
-**Anywhere, with a terminal.**
+**Anywhere, with a terminal.** In the folder you cloned Polis into
+(you need [Rust](https://rustup.rs)):
 
 ```
-polis
+cargo build --release -p polis-app
 ```
+
+A few minutes the first time — it compiles a graphics stack — and seconds after
+that. Then, from that same folder:
+
+```
+./target/release/polis
+```
+
+On Windows PowerShell that line is `.\target\release\polis.exe`. Both of them
+work from a fresh clone with nothing else set up; making the command just
+`polis` is [one step further down](#typing-just-polis).
 
 The first time you run it, Polis explains the map and opens a list of every
-coding session already recorded on this machine — most recent first, with the
-repository, how long it ran and how much happened in it. Pick one. It replays
-over that repository's own city: agents move, files light up as they are edited,
-the buildings they leave behind grow.
+coding session already recorded on this machine — most recent first (by the last
+thing that happened in each one), with the repository, how long it ran and how
+much happened in it.
+
+**Pick one** — arrow keys and `Enter`, or click the row, or type in the filter
+box to narrow the list first. It replays over that repository's own city: agents
+move, files light up as they are edited, the buildings they leave behind grow.
 
 It is a recording, so nothing you do here can break anything.
+
+The window explains itself the first time it opens, and `h` brings that back
+along with every key. The ones worth knowing now:
 
 | Key | |
 |---|---|
@@ -59,13 +82,43 @@ It is a recording, so nothing you do here can break anything.
 | `.` `,` | step forward, step back |
 | `]` `[` | faster, slower |
 | `n` | jump to the next interesting moment |
+| `home` `end` | start, end of the recording |
+| `t` | swap the map for the filesystem tree, and back |
+| `f` | follow the selected thread |
+| `i` | the right-hand rail |
+| `s` | the streets layer — which files import which |
+| `esc` | clear the selection |
 | `p` | back to the session list |
-| `h` or `?` | every key, on screen |
+| `h` or `?` | what the map is, what the shapes mean, and every key |
 
 Drag to pan, scroll to zoom, arrow keys and `+` `-` do the same. `r` puts the
-camera back where it started.
+camera back where it started. Click a building to select it and open that file
+in your editor; hover one to see who touched it and when.
 
-Afterwards, `polis watch` opens that list again whenever you want it.
+Afterwards, `polis watch` opens that list again whenever you want it. Like
+`polis map` and `polis replay`, it prints what it is opening and then blocks
+until you close the window — that is a window, not a hang.
+
+### Typing just `polis`
+
+Everything above works from `./target/release/polis`. To type `polis` instead,
+put that folder on your `PATH`:
+
+```powershell
+# Windows PowerShell. Your user PATH, not the machine's; new terminals see it.
+[Environment]::SetEnvironmentVariable('Path',
+  [Environment]::GetEnvironmentVariable('Path','User') + ';C:\path\to\agentolis\target\release', 'User')
+```
+
+```sh
+# macOS / Linux. Put the same line in ~/.bashrc or ~/.zshrc to keep it.
+export PATH="$PWD/target/release:$PATH"
+```
+
+Two shortcuts: `Polis.bat` offers to do it for you on Windows, and `polis
+doctor` prints whichever of these lines applies with this machine's own path
+already filled in. Every `polis …` command in the rest of this guide assumes you
+have done it; if you have not, spell out `./target/release/polis` instead.
 
 ---
 
@@ -110,7 +163,21 @@ polis connect
 ```
 
 It shows you the exact file it wants to write, the exact lines that change, and
-takes a backup — then asks. Nothing is written until you say yes. To undo it:
+takes a backup — then asks. Nothing is written until you say yes.
+
+**Which settings file.** By default that is *this repository's*
+`.claude/settings.json`, so it covers agents you start in this checkout and no
+others. For every repository on this machine, use the user one instead:
+
+```
+polis connect --user
+```
+
+Connecting in one repository and then starting `claude` in another is the
+commonest reason for "I connected and nothing happened". The consent screen
+names which of the two it is about to write, every time.
+
+To undo either:
 
 ```
 polis connect --uninstall
@@ -145,19 +212,25 @@ You need [Rust](https://rustup.rs). Then, in the Polis folder:
 
 ```
 cargo build --release -p polis-app
-cargo build --profile hook -p polis-hook
 ```
 
 The first build compiles a graphics stack and takes a few minutes. After that it
 is seconds. The binary lands in `target/release/polis`
-(`target\release\polis.exe` on Windows); put that folder on your `PATH` and
-`polis` works from anywhere.
+(`target\release\polis.exe` on Windows) and runs from there — see
+[typing just `polis`](#typing-just-polis) for the one line that shortens it.
+
+There is a second, optional build:
+
+```
+cargo build --profile hook -p polis-hook
+```
+
+`polis-hook` is the tiny program Claude Code runs to tell Polis what is
+happening. `polis run` does not need it; `polis connect` does, and `polis doctor
+--fix` will build it for you when it is missing.
 
 On Windows you can skip all of this and double-click `Polis.bat`, which offers to
 build it for you.
-
-The second line builds `polis-hook`, the tiny program Claude Code runs to tell
-Polis what is happening. `polis run` does not need it; `polis connect` does.
 
 ---
 
@@ -166,18 +239,23 @@ Polis what is happening. `polis run` does not need it; `polis connect` does.
 | | |
 |---|---|
 | `polis` | The first run explains itself, then opens the session picker. Afterwards, maps the folder you are in. |
-| `polis watch` | Pick a past session and watch it replay. |
-| `polis map` | This repository as a city, right now. |
+| `polis watch` | Pick a past session and watch it replay. Opens a window and blocks until you close it. |
+| `polis map` | This repository as a city, right now. A window, and blocks. |
 | `polis run -- claude` | Start an agent with the map watching. |
-| `polis connect` | Let Polis see agents you start yourself. `--uninstall` reverses it. |
+| `polis connect` | Let Polis see agents you start yourself, in this repository. `--user` for every repository; `--uninstall` reverses either. |
 | `polis doctor` | What is wrong, and how to fix it. `--fix` applies what it can. |
 | `polis snapshot --out city.png` | Save a picture of the city instead of opening a window. |
-| `polis replay <file>` | Replay one specific recording. |
+| `polis replay <file>` | Replay one specific recording. A window, and blocks. |
 | `polis tail` | The raw event stream as text, no graphics. |
 | `polis env` | Print the settings an agent needs, to paste somewhere yourself. |
 
 Add `--repo <path>` to any of them to point at a different folder, and `--help`
 to any of them for the details.
+
+Polis needs a git repository with at least one commit: the city is built out of
+git history, so a folder that is not a checkout has nothing to draw and a
+checkout with no commits yet draws an empty one. Both say so on screen, with the
+command that fixes them.
 
 ---
 

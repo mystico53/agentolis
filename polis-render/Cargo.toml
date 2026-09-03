@@ -19,11 +19,17 @@ eframe = { workspace = true }
 lyon = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
+# `pacing` reads Channel D records to tell a tool call apart from a paragraph of
+# assistant text; the transcript carries them verbatim as `Value` (PRD §4.4).
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The plan renderer's tests need a repository to draw; PRD §16's fixtures are
 # git checkouts, and a synthetic tree is the one that runs without `bash`.
 polis-repo = { workspace = true }
+# `pacing`'s tests build a `ReplaySchedule` by hand, which needs the parser's
+# `ParseStats` to fill the field the reader would have filled.
+polis-ingest = { workspace = true }
 
 [lints]
 workspace = true

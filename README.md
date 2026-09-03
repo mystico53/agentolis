@@ -42,6 +42,18 @@ If you have never run this before, read
 [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) instead of this file. It is
 two pages and assumes nothing.
 
+From a fresh clone, two commands — the first takes a few minutes, once:
+
+```sh
+cargo build --release -p polis-app
+./target/release/polis                  # .\target\release\polis.exe on Windows
+```
+
+That second line is the whole product for someone who has read nothing. Once the
+binary is [on your `PATH`](#putting-polis-on-your-path) — `polis doctor` prints
+the exact command for this machine, and `Polis.bat` offers to do it for you — it
+is just `polis`:
+
 ```sh
 polis                  # the first run explains itself and opens the session picker
 polis watch            # pick a session you already ran and watch it replay
@@ -50,6 +62,9 @@ polis run -- claude    # start an agent with the map already watching
 polis connect          # let Polis see agents you start yourself
 polis doctor           # what is wrong, and how to fix it
 ```
+
+The three that open a window — `map`, `watch`, `replay` — say on stdout what they
+are opening and do not return until you close it.
 
 **`polis` with no arguments is the whole product for someone who has read
 nothing.** It detects the checkout, Claude Code and `~/.claude/projects`,
@@ -147,6 +162,31 @@ cargo tree  -p polis-hook                     # must print exactly one line
 regression, and CI fails on it.
 
 The first build compiles wgpu and tonic and takes a few minutes.
+
+### Putting Polis on your `PATH`
+
+`cargo build --release -p polis-app` lands the binary in `target/release/polis`
+(`target\release\polis.exe` on Windows). It runs from there as it stands; putting
+that folder on `PATH` is what makes the command `polis`.
+
+```powershell
+# Windows PowerShell — your user PATH, not the machine's. New terminals see it.
+[Environment]::SetEnvironmentVariable('Path',
+  [Environment]::GetEnvironmentVariable('Path','User') + ';C:\path\to\agentolis\target\release', 'User')
+```
+
+Not `setx PATH "%PATH%;…"`: `%PATH%` there is the combined machine **and** user
+value, so that line copies the whole system path into your user one, permanently,
+truncated at 1024 characters.
+
+```sh
+# macOS / Linux — this shell, and then your shell profile to keep it.
+export PATH="$PWD/target/release:$PATH"
+```
+
+`polis doctor` prints whichever of these applies with this machine's own path
+already substituted in, and on Windows `Polis.bat` offers to do it for you the
+first time it runs.
 
 ### House style
 

@@ -65,6 +65,12 @@ pub struct Generated {
     pub city: City,
     /// Where the cold start went.
     pub timing: ColdStart,
+    /// Why this city looks the way it does, when the answer is not "your code".
+    ///
+    /// A repository with no commits draws one small building on a near-black
+    /// field and no error at all, which reads as a broken product rather than an
+    /// empty history. The window shows this above the map instead.
+    pub notice: Option<String>,
 }
 
 impl Generated {
@@ -79,6 +85,7 @@ impl Generated {
 
 /// Generates the city for one checkout.
 pub fn generate(root: &Path) -> anyhow::Result<Generated> {
+    let notice = preflight(root)?;
     let mut timing = ColdStart::default();
     let tree = index(root, &mut timing)?;
     let inputs = layout_inputs(&tree, &mut timing);
@@ -90,7 +97,71 @@ pub fn generate(root: &Path) -> anyhow::Result<Generated> {
         tree,
         city,
         timing,
+        notice,
     })
+}
+
+/// Asks "is there a city here at all?" **before** the walk, and answers it in
+/// the operator's words rather than git's.
+///
+/// The failure this replaces was a first-run blocker: pointing Polis at a folder
+/// that is not a checkout produced
+/// `generating the city for C:\…: reading git history: `git rev-parse --verify
+/// HEAD` failed in C:\…: fatal: not a git repository`, three full-width lines of
+/// plumbing with the path in it twice and no fix anywhere. One `git rev-parse`
+/// — about ten milliseconds, against a three-second cold-start budget — buys a
+/// sentence somebody can act on, and separates the two cases that look identical
+/// on screen and are not: *not a repository at all*, and *a repository with no
+/// commits yet*, which drew one building and said nothing.
+pub fn preflight(root: &Path) -> anyhow::Result<Option<String>> {
+    match polis_repo::git::head_commit_opt(root) {
+        // A commit: the normal case, and the only one with a growth order.
+        Ok(Some(_)) => Ok(None),
+        Ok(None) => Ok(Some(no_commits_notice(root))),
+        Err(error) => {
+            if crate::setup::which("git").is_none() {
+                anyhow::bail!(
+                    "Polis reads the city out of git history, and there is no `git` on \
+                     PATH to read it with.\n\nInstall git from https://git-scm.com and \
+                     run this again."
+                );
+            }
+            if polis_repo::git::self_check(root).is_err() {
+                anyhow::bail!(not_a_repository(root));
+            }
+            // git is there, the folder is a checkout, and it still failed. That
+            // is a real fault and the operator needs the plumbing after all.
+            Err(error).context("asking git for HEAD")
+        }
+    }
+}
+
+/// What to say about a folder that is not a checkout.
+fn not_a_repository(root: &Path) -> String {
+    format!(
+        "Polis needs a git repository, and this folder is not one:\n  \
+         {}\n\n\
+         The city is built out of git history — the growth order is what puts the \
+         code you wrote first in the dense old core — so there is nothing to draw \
+         without it.\n\n\
+         Do one of these:\n  \
+         polis --repo <path-to-a-repository> map\n  \
+         cd into a checkout, then run  polis map\n  \
+         git init  and make one commit here, then run  polis map",
+        root.display()
+    )
+}
+
+/// What to say about a checkout with no commits yet.
+///
+/// Without the path in it: this is drawn in a banner over the map, where the
+/// title bar is already showing the path, and a long absolute path pushed the
+/// sentence onto a fourth line and out of the panel.
+fn no_commits_notice(_root: &Path) -> String {
+    "This repository has no commits yet, so there is nothing to build a city from — \
+     everything in it is untracked. Make one commit (git add -A && git commit -m \
+     \"first\") and run polis again to see it placed."
+        .to_owned()
 }
 
 /// A synthetic city of `files` files, for exercising the window at a scale no
@@ -111,6 +182,7 @@ pub fn synthetic(files: usize, seed: u64) -> Generated {
         tree,
         city,
         timing,
+        notice: None,
     }
 }
 
@@ -177,6 +249,46 @@ mod tests {
         assert!(!generated.city.layout.buildings.is_empty());
         assert!(!generated.city.layout.districts.is_empty());
         assert!(generated.timing.total_ms() >= 0.0);
+    }
+
+    /// The message an operator gets for a folder that is not a checkout has to
+    /// be about their folder and their next command, and must not contain git
+    /// plumbing: `rev-parse` is not a word in this product's vocabulary.
+    #[test]
+    fn a_folder_that_is_not_a_repository_is_explained_not_reported() {
+        let dir = crate::testutil::scratch("citygen-notagit");
+        let error = generate(&dir).expect_err("a bare temp directory is not a checkout");
+        let text = format!("{error:#}");
+        for phrase in ["needs a git repository", "polis --repo", "git init"] {
+            assert!(text.contains(phrase), "missing {phrase:?} in:\n{text}");
+        }
+        for plumbing in ["rev-parse", "fatal:", "--verify"] {
+            assert!(
+                !text.contains(plumbing),
+                "plumbing {plumbing:?} in:\n{text}"
+            );
+        }
+    }
+
+    /// A repository with no commits is drawable and near-empty, which reads as a
+    /// broken product unless the window says why.
+    #[test]
+    fn a_repository_with_no_commits_carries_a_notice() {
+        let dir = crate::testutil::scratch("citygen-unborn");
+        let ok = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return; // no git on this machine; `preflight` says so its own way.
+        }
+        std::fs::write(dir.join("hello.rs"), "fn main() {}\n").expect("a file to not commit");
+        let generated = generate(&dir).expect("an unborn repository still draws");
+        let notice = generated.notice.expect("and it says why it is empty");
+        assert!(notice.contains("no commits yet"), "{notice}");
+        assert!(notice.contains("git commit"), "{notice}");
     }
 
     /// The window walks the checkout plain — `polis snapshot`'s output

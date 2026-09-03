@@ -91,6 +91,7 @@ fn populated(city: &City) -> WorldSnapshot {
         );
         thread.ops.push_back(Operation {
             path: Some(path.clone()),
+            placement: polis_world::OpPlacement::Path(path.clone()),
             tool: ToolKind::Edit,
             glyph: glyphs[i % glyphs.len()],
             outcome: match i % 3 {

@@ -153,6 +153,19 @@ pub enum AttentionKind {
 }
 
 /// Which signal raised a "needs decision" mark.
+///
+/// # The first four are Channel B; the last three are Channel D
+///
+/// PRD §11.2 sources this state from hooks, and a **replayed transcript carries
+/// no hooks**: measured across all three M2 recordings, the attention band was
+/// 0.000% of map area in every one of 1 440 frames, because nothing in a
+/// transcript replay could raise a mark at all. A recording that can never show
+/// the state the product exists for is not evidence that the state works.
+///
+/// So three sources are reconstructed from Channel D, and
+/// [`DecisionSource::is_reconstructed`] says which. They are not equivalent to
+/// the hooks and must not be presented as if they were — see
+/// `docs/replay/README.md` for exactly what a replay can and cannot show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionSource {
     /// `PermissionRequest`. Note that auto-mode denials are invisible here and
@@ -165,6 +178,33 @@ pub enum DecisionSource {
     /// A `Notification` of type `permission_prompt`, `idle_prompt` or
     /// `agent_needs_input`.
     Notification,
+
+    /// **Channel D.** The agent called a tool whose entire purpose is to ask the
+    /// operator — `AskUserQuestion`, `ExitPlanMode` (see
+    /// [`asks_the_operator`]).
+    ///
+    /// This one is *prospective and exact*: the `tool_use` block is the question
+    /// and its `tool_result` is the answer, so the mark's onset and its duration
+    /// are both the real ones. Measured in the operator's own corpus: seven such
+    /// calls in session `29c2fc6f`, with waits from 42 s to 2 h.
+    AskUser,
+    /// **Channel D.** A main agent ended its turn with no tool call and no human
+    /// has replied yet — the transcript's form of the `idle_prompt` /
+    /// `agent_needs_input` notification PRD §11.2 lists under this state.
+    ///
+    /// Also prospective and exact, and by far the most common: 62 / 38 / 6 of
+    /// them in the three recorded sessions, with median waits of 5, 13 and 27
+    /// minutes. This is the reason a replay can show the primary state at all.
+    TurnEnded,
+    /// **Channel D.** A `tool_result` carrying `toolDenialKind`, or an
+    /// `[Request interrupted by user]` record: proof that a permission prompt
+    /// was shown *and answered*.
+    ///
+    /// The only **retrospective** source. Channel D has no record of the prompt
+    /// itself, so the mark arrives with the answer rather than with the
+    /// question — late by however long the operator took to decide. 20 of these
+    /// in `29c2fc6f`, 8 in `6f51089f`.
+    Rejected,
 }
 
 impl DecisionSource {
@@ -175,8 +215,46 @@ impl DecisionSource {
             Self::Elicitation => "elicitation",
             Self::TeammateIdle => "teammate idle",
             Self::Notification => "notification",
+            Self::AskUser => "asked you",
+            Self::TurnEnded => "waiting on you",
+            Self::Rejected => "you said no",
         }
     }
+
+    /// Whether this mark was reconstructed from a transcript rather than
+    /// delivered by a hook.
+    ///
+    /// The distinction is not cosmetic: PRD §17 makes anything that drives an
+    /// alert come from an authoritative channel, and a replayed transcript is
+    /// not one. A live session raises the first four; a replay raises the last
+    /// three and nothing else.
+    pub fn is_reconstructed(self) -> bool {
+        matches!(self, Self::AskUser | Self::TurnEnded | Self::Rejected)
+    }
+
+    /// Whether the mark's onset is the real one.
+    ///
+    /// False only for [`DecisionSource::Rejected`], whose evidence arrives with
+    /// the operator's answer rather than with the question.
+    pub fn onset_is_exact(self) -> bool {
+        !matches!(self, Self::Rejected)
+    }
+}
+
+/// Whether a tool call *is* a question to the operator.
+///
+/// `AskUserQuestion` and `ExitPlanMode` block on a human by construction: the
+/// call cannot return until somebody answers it. That makes them the one
+/// "waiting on you" signal a transcript carries **prospectively** — the mark can
+/// be raised when the call is made, exactly as a `PermissionRequest` hook would
+/// have raised it, with no lookahead and no guessing.
+///
+/// Matched on the wire name because neither is a [`ToolKind`] variant; both
+/// parse to `ToolKind::Other`, and adding variants to that enum for a signal
+/// that only the attention layer reads would put the vocabulary in the wrong
+/// crate.
+pub fn asks_the_operator(tool: &polis_events::ToolKind) -> bool {
+    matches!(tool.name(), "AskUserQuestion" | "ExitPlanMode")
 }
 
 impl AttentionKind {

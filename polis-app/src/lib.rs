@@ -36,6 +36,8 @@
 //! * [`palette`] — every colour, clamped into PRD §10.3's band for its layer.
 //! * [`ui`] — the overlay: status bar, status rail, detail panel, transport.
 //! * [`session`] — the picker, which is `polis replay`'s first-run experience.
+//! * [`explain`] — the four sentences that say what a building is, in one place,
+//!   so the terminal screen and the window cannot drift apart.
 //!
 //! # The front door
 //!
@@ -71,6 +73,7 @@ pub mod cli;
 pub mod clouds;
 pub mod commands;
 pub mod config;
+pub mod explain;
 pub mod format;
 pub mod labels;
 pub mod mapview;

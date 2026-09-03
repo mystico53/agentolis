@@ -2420,9 +2420,11 @@ dependencies = [
  "eframe",
  "lyon",
  "polis-events",
+ "polis-ingest",
  "polis-layout",
  "polis-repo",
  "polis-world",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

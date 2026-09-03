@@ -101,6 +101,7 @@
 
 pub mod attention;
 pub mod contention;
+pub mod place;
 pub mod replay;
 pub mod sessions;
 pub mod snapshot;
@@ -123,6 +124,7 @@ use polis_repo::RepoTree;
 use smallvec::SmallVec;
 
 pub use apply::PendingCall;
+pub use place::{OpPlacement, OpSite, PlacementCensus};
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -132,14 +134,40 @@ pub use apply::PendingCall;
 ///
 /// The cap bounds memory, not meaning: [`Thread::visits`] keeps the revisit
 /// count for every path the thread ever touched, so "the same building revisited
-/// six times" survives the sixty-fifth step falling off the end.
-pub const TRAIL_CAP: usize = 64;
+/// six times" survives the hundred-and-ninety-third step falling off the end.
+///
+/// # Why it is not 64
+///
+/// PRD §12 asks the trail to show *"backtracking, thrashing (the same building
+/// revisited six times), and scope creep"*. A backtrack is only visible if the
+/// **outbound leg is still on the trail when the agent returns**, and 64 was
+/// below the distance a real backtrack covers. Measured over the operator's
+/// three recorded sessions — 2 765 revisits in all — the number of trail steps
+/// between two consecutive visits to one path has a median of 9–31 and a 90th
+/// percentile of 97–418. Against that distribution:
+///
+/// | cap | TTL | round trips fully on the trail |
+/// |---:|---:|---|
+/// | 64 | 300 s | 51.8% / 46.3% / 69.5% |
+/// | 192 | 900 s | **67.6% / 61.8% / 80.2%** |
+/// | 256 | 900 s | 68.3% / 61.8% / 80.2% |
+///
+/// 192 is the knee; 256 buys half a point. The renderer's cost is bounded
+/// separately, by fading and by the per-thread mark cap, not by this.
+pub const TRAIL_CAP: usize = 192;
 
 /// How long a trail step stays on the map before [`World::tick`] drops it.
 ///
 /// > **Trails persist and fade** whether or not you are following, giving you
 /// > history without a timeline scrubber. (PRD §12)
-pub const TRAIL_TTL: Duration = Duration::from_secs(300);
+///
+/// The other half of [`TRAIL_CAP`]'s argument, and the half that bit hardest:
+/// at 300 s the *time* between two visits to one path exceeded the TTL on 54% /
+/// 42% / 31% of real revisits, so the outbound leg had expired before the agent
+/// came back and the backtrack was drawn as a lone arrival. 900 s is fifteen
+/// minutes of history — long enough to hold a real detour, short enough that
+/// the oldest steps have faded most of the way to the band floor by then.
+pub const TRAIL_TTL: Duration = Duration::from_mins(15);
 
 /// How many glyph-bearing operations a thread keeps for the §10.1 shape layer.
 pub const OPS_CAP: usize = 128;
@@ -415,13 +443,18 @@ impl World {
     /// condition and the reason [`territory::Territory::observe`] takes an
     /// `Option<Point>`.
     pub fn position_of(&self, path: &LogicalPath) -> Option<Point> {
-        if let Some(b) = self.layout.building(path) {
-            let c = b.footprint.centroid();
-            if c.is_finite() {
-                return Some(c);
-            }
-        }
-        self.layout.districts.get(path).map(|d| d.centre)
+        place::position_in(&self.layout, path)
+    }
+
+    /// Where one operation is drawn — [`place`]'s four-rung chain, resolved
+    /// against this world's city and the thread that ran it.
+    ///
+    /// `None` for a thread this world does not know, which is a caller error
+    /// rather than a placement result; an operation whose thread exists always
+    /// gets an answer, and that answer may be [`OpSite::Rail`].
+    pub fn site_of(&self, op: &Operation, thread: &ThreadId) -> Option<OpSite> {
+        let t = self.threads.get(thread)?;
+        Some(place::site_of(op, t, &self.layout))
     }
 
     /// Threads in status order — waiting first, then working, then idle, then
@@ -483,6 +516,56 @@ impl World {
         }
         self.health.unmapped_paths += 1;
         None
+    }
+
+    /// Rungs 1–3 of [`place`]'s chain, decided from what a call named.
+    ///
+    /// `own` is the first path the tool's own input resolved to; `cwd` is the
+    /// working directory a shell call ran in. Rung 4 is deliberately not decided
+    /// here — see [`OpPlacement`].
+    pub(crate) fn placement_for(
+        &self,
+        own: Option<&LogicalPath>,
+        cwd: Option<&LogicalPath>,
+    ) -> OpPlacement {
+        if let Some(p) = own {
+            if place::position_in(&self.layout, p).is_some() {
+                return OpPlacement::Path(p.clone());
+            }
+        }
+        if let Some(c) = cwd {
+            if let Some(district) = place::district_for_cwd(&self.layout, c) {
+                return OpPlacement::Cwd(district);
+            }
+        }
+        OpPlacement::Agent
+    }
+
+    /// Counts one operation into [`Health::ops`] on the rung it actually
+    /// resolved to, failures into [`Health::ops_failed`] as well.
+    ///
+    /// Called with the thread already in place, because rung 3 versus rung 4 is
+    /// a question about the thread, not about the call.
+    pub(crate) fn census_op(&mut self, thread: &ThreadId, op: &Operation) {
+        let rung = self.rung_of(thread, op);
+        self.health.ops.count(rung);
+        if op.outcome == Outcome::Failed {
+            self.health.ops_failed.count(rung);
+        }
+    }
+
+    /// Counts an operation that turned out to have failed, once its result
+    /// arrived. The transcript channel learns the outcome long after the call.
+    pub(crate) fn census_op_failed(&mut self, thread: &ThreadId, op: &Operation) {
+        let rung = self.rung_of(thread, op);
+        self.health.ops_failed.count(rung);
+    }
+
+    /// The rung [`place`]'s chain resolves this operation to right now.
+    fn rung_of(&self, thread: &ThreadId, op: &Operation) -> u8 {
+        self.threads
+            .get(thread)
+            .map_or(4, |t| place::site_of(op, t, &self.layout).rung())
     }
 
     /// Registers a working directory, adopting it as a checkout when the mapper
@@ -993,9 +1076,24 @@ impl fmt::Display for ThreadStatus {
 /// as two separate fields — never conflated.
 #[derive(Debug, Clone)]
 pub struct Operation {
-    /// Where it happened. `None` for a call with no path — a `WebSearch`, a
-    /// shell command whose cwd did not resolve.
+    /// What the call *named*: its first resolved path, or a shell call's
+    /// working directory. `None` for a call that named nothing — a `WebSearch`,
+    /// an `AskUserQuestion`.
+    ///
+    /// This is the operation's subject, **not** where it is drawn. A path here
+    /// may have no geometry in the current city (a scratchpad, `~/.claude`, a
+    /// file added since the last layout run), and on one recorded session 868 of
+    /// them did. Where it is drawn is [`Operation::placement`], resolved by
+    /// [`place::site_of`].
     pub path: Option<LogicalPath>,
+    /// Where it is drawn: rung 1, 2 or 3 of [`place`]'s chain, decided when the
+    /// call happened.
+    ///
+    /// Separate from [`Operation::path`] because "which file is this about" and
+    /// "where does this go on the map" are different questions, and collapsing
+    /// them is what let 69 % of all tool failures fall off the map: they happen
+    /// on shell tools, which name no file.
+    pub placement: OpPlacement,
     /// Which tool.
     pub tool: ToolKind,
     /// Shape. Usually [`ToolKind::glyph`], but a shell command that ran the test
@@ -1296,6 +1394,25 @@ pub struct Health {
     pub contention_without_line_ranges: u64,
     /// Working directories adopted as additional checkouts (PRD §7.6).
     pub adopted_worktrees: u64,
+    /// Every operation, by the rung of [`place`]'s chain it landed on when it
+    /// happened.
+    ///
+    /// The map used to draw only operations that resolved to a building, and
+    /// this counter is what makes the rest countable instead of invisible.
+    pub ops: PlacementCensus,
+    /// The subset of [`Health::ops`] that **failed**.
+    ///
+    /// Counted separately and deliberately: a failed shell command is the most
+    /// decision-changing mark on the map (PRD §17), and 69 % of real failures
+    /// are on tools that carry no path. If this ever starts filling
+    /// [`PlacementCensus::rail`], failures are going unseen again.
+    pub ops_failed: PlacementCensus,
+    /// Results that arrived after their operation had already been pushed out
+    /// of [`OPS_CAP`], so the outcome had nowhere to land.
+    ///
+    /// These are marks that stay neutral for ever. Non-zero means the cap is
+    /// too small for the traffic, and it is measured rather than assumed.
+    pub ops_settled_after_eviction: u64,
 }
 
 impl Health {

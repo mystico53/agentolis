@@ -37,6 +37,7 @@ use serde_json::Value;
 
 use crate::attention::{AttentionKind, DecisionSource};
 use crate::contention::Claim;
+
 use crate::{
     verify, DiffPrecision, Observation, Operation, PathScope, ThreadStatus, UnattributedWorker,
     WorkerAttribution, World, AT_MENTION_WEIGHT,
@@ -193,20 +194,27 @@ fn tool_call(
     at: Instant,
 ) {
     working(world, thread, at);
+    // The span carries `file_path` only — never a cwd — so a shell call arrives
+    // here with no paths at all and lands on rung 3, which is the honest answer
+    // for this channel.
+    let first = call.paths.first().map(|(_, p)| p.clone());
+    let placement = world.placement_for(first.as_ref(), None);
+    let op = Operation {
+        path: first,
+        placement,
+        tool: call.tool.clone(),
+        glyph: call.tool.glyph(),
+        outcome: call.outcome,
+        worker: worker.cloned(),
+        at,
+        tool_use: call.tool_use_id.clone(),
+    };
     if let Some(t) = world.threads.get_mut(thread) {
         t.tool_calls = t.tool_calls.saturating_add(1);
         if call.outcome == Outcome::Failed {
             t.failures = t.failures.saturating_add(1);
         }
-        t.push_op(Operation {
-            path: call.paths.first().map(|(_, p)| p.clone()),
-            tool: call.tool.clone(),
-            glyph: call.tool.glyph(),
-            outcome: call.outcome,
-            worker: worker.cloned(),
-            at,
-            tool_use: call.tool_use_id.clone(),
-        });
+        t.push_op(op.clone());
     }
     for (worktree, path) in &call.paths {
         record_path(world, thread, worker, &call.tool, *worktree, path, at);
@@ -216,6 +224,9 @@ fn tool_call(
             world.claims.release(thread, path);
         }
     }
+    // After the observations, not before: rung 3 asks where the *thread* is, and
+    // this call's own step is part of that answer.
+    world.census_op(thread, &op);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +285,7 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
                 .map_or(ToolKind::Other(String::new()), ToolKind::parse);
             let cwd = payload.cwd.clone();
             let inputs = payload.tool_input.as_ref();
-            for (raw, scope) in tool_input_paths(&tool, inputs, cwd.as_deref()) {
+            for (raw, scope, _) in tool_input_paths(&tool, inputs, cwd.as_deref()) {
                 let Some((worktree, path)) = world.resolve_path(cwd.as_deref(), &raw) else {
                     continue;
                 };
@@ -476,8 +487,17 @@ pub(crate) fn transcript(world: &mut World, meta: &EventMeta, event: &Transcript
             let worker = worker_of(world, &thread_id, meta, &event.source, &record, at);
             if event.kind == TranscriptRecordKind::Assistant {
                 assistant(world, &thread_id, worker.as_ref(), &record, at);
+                turn_boundary(world, &thread_id, worker.as_ref(), &record, at);
             } else {
                 user(world, &thread_id, worker.as_ref(), &record, at);
+                answered(
+                    world,
+                    &thread_id,
+                    worker.as_ref(),
+                    &event.record,
+                    &record,
+                    at,
+                );
             }
         }
         TranscriptRecordKind::Attachment => {
@@ -632,10 +652,24 @@ fn assistant(
         let branch = record.envelope.git_branch.clone();
 
         let mut resolved: Vec<(WorktreeId, LogicalPath)> = Vec::new();
-        for (raw, scope) in tool_input_paths(&tool, input, cwd.as_deref()) {
+        // Kept apart because they answer different questions: the tool's own
+        // paths are rung 1 of `place`'s chain, the working directory is rung 2,
+        // and conflating them is what put every shell call a session ever ran on
+        // one pixel at the centre of the map.
+        let mut own: Option<LogicalPath> = None;
+        let mut from_cwd: Option<LogicalPath> = None;
+        for (raw, scope, origin) in tool_input_paths(&tool, input, cwd.as_deref()) {
             let Some((worktree, path)) = world.resolve_path(cwd.as_deref(), &raw) else {
                 continue;
             };
+            match origin {
+                PathOrigin::Input => {
+                    if own.is_none() {
+                        own = Some(path.clone());
+                    }
+                }
+                PathOrigin::Cwd => from_cwd = Some(path.clone()),
+            }
             observe(world, thread, worker, &tool, scope, &path, at);
             record_file(world, thread, &tool, &path, at);
             if tool.is_mutating() {
@@ -653,18 +687,21 @@ fn assistant(
             resolved.push((worktree, path));
         }
 
+        let op = Operation {
+            path: own.clone().or_else(|| from_cwd.clone()),
+            placement: world.placement_for(own.as_ref(), from_cwd.as_ref()),
+            tool: tool.clone(),
+            glyph,
+            outcome: Outcome::Pending,
+            worker: worker.cloned(),
+            at,
+            tool_use: block.id.as_deref().map(ToolUseId::new),
+        };
         if let Some(t) = world.threads.get_mut(thread) {
             t.tool_calls = t.tool_calls.saturating_add(1);
-            t.push_op(Operation {
-                path: resolved.first().map(|(_, p)| p.clone()),
-                tool: tool.clone(),
-                glyph,
-                outcome: Outcome::Pending,
-                worker: worker.cloned(),
-                at,
-                tool_use: block.id.as_deref().map(ToolUseId::new),
-            });
+            t.push_op(op.clone());
         }
+        world.census_op(thread, &op);
 
         if let Some(id) = block.id.as_deref().map(ToolUseId::new) {
             if tool == ToolKind::Agent || tool == ToolKind::Workflow {
@@ -724,6 +761,11 @@ fn settle(
     at: Instant,
 ) {
     let pending = world.pending.remove(id);
+    // Where the failure lands, so PRD §10.2's red is countable even when it is
+    // not visible. A result whose operation has already fallen out of `OPS_CAP`
+    // has nowhere to put its outcome and is counted rather than shrugged at.
+    let mut settled: Option<Operation> = None;
+    let mut evicted = false;
     if let Some(t) = world.threads.get_mut(thread) {
         if let Some(op) = t
             .ops
@@ -732,10 +774,23 @@ fn settle(
             .find(|op| op.tool_use.as_ref() == Some(id))
         {
             op.outcome = outcome;
+            settled = Some(op.clone());
+        } else {
+            evicted = true;
         }
         if outcome == Outcome::Failed {
             t.failures = t.failures.saturating_add(1);
         }
+    }
+    if outcome == Outcome::Failed {
+        match &settled {
+            Some(op) => world.census_op_failed(thread, op),
+            None => world.health.ops_failed.count(4),
+        }
+    }
+    if evicted {
+        world.health.ops_settled_after_eviction =
+            world.health.ops_settled_after_eviction.saturating_add(1);
     }
 
     // A subagent spawn, whichever shape the result took (ADR-0013 routes 1-3).
@@ -1078,6 +1133,15 @@ fn working(world: &mut World, thread: &ThreadId, at: Instant) {
 }
 
 /// Raises a "needs decision" mark and parks the thread on it.
+///
+/// # An authoritative channel supersedes a reconstruction
+///
+/// A live session tails Channel D as well as Channel B (PRD §4.4), so the
+/// transcript-derived sources below fire *alongside* the hooks — the same wait
+/// seen twice. PRD §11.2 draws this state as **a** standing pin above the
+/// building or district, so it gets one pin: a reconstruction yields to a hook
+/// on the same thread and never draws beside it, and a reconstruction replaces
+/// an earlier reconstruction rather than stacking with it.
 fn needs_decision(
     world: &mut World,
     thread: &ThreadId,
@@ -1085,6 +1149,21 @@ fn needs_decision(
     at: Instant,
     path: Option<LogicalPath>,
 ) {
+    let reconstructed_for = |m: &crate::attention::Attention, want: bool| {
+        matches!(
+            &m.kind,
+            AttentionKind::NeedsDecision { thread: t, source: s, .. }
+                if t == thread && s.is_reconstructed() == want
+        )
+    };
+    if source.is_reconstructed() {
+        if world.attention.iter().any(|m| reconstructed_for(m, false)) {
+            return;
+        }
+        world.attention.retain(|m| !reconstructed_for(m, true));
+    } else {
+        world.attention.retain(|m| !reconstructed_for(m, true));
+    }
     if let Some(t) = world.threads.get_mut(thread) {
         t.status = ThreadStatus::Waiting;
         t.last_activity = at;
@@ -1097,6 +1176,125 @@ fn needs_decision(
         },
         at,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Channel D's reconstruction of PRD §11.2 state (a)
+//
+// A replayed transcript carries no hooks, so none of the four hook sources
+// above can fire and the attention layer was — measured — 0.000% of map area in
+// every frame of all three M2 recordings. The three rules below are what a
+// transcript *does* carry. They are marked as reconstructed
+// (`DecisionSource::is_reconstructed`) and documented in docs/replay/README.md,
+// because PRD §17 requires anything that drives an alert to come from an
+// authoritative channel and a recording is not one.
+// ---------------------------------------------------------------------------
+
+/// Raises and clears "needs decision" at an assistant turn boundary.
+///
+/// Two rules, both **prospective** — the mark's onset and duration are the real
+/// ones, exactly as a `PermissionRequest` hook would have given them:
+///
+/// * a `tool_use` for a tool that *is* a question to the operator
+///   ([`crate::attention::asks_the_operator`]) raises the mark, and its
+///   `tool_result` — the answer — clears it on the thread's next call;
+/// * a **main** agent ending its turn with no tool call at all is waiting on a
+///   human, which is the transcript's form of the `idle_prompt` /
+///   `agent_needs_input` notification PRD §11.2 lists under this state.
+///
+/// A main agent making a tool call is the thread making progress, which
+/// [`World::resolve_decisions`] already treats as equivalent to the human having
+/// answered. A **worker's** call is not: a fleet of subagents churning away says
+/// nothing about whether the operator replied.
+fn turn_boundary(
+    world: &mut World,
+    thread: &ThreadId,
+    worker: Option<&WorkerId>,
+    record: &ThreadedRecord,
+    at: Instant,
+) {
+    let calls: Vec<&str> = blocks(record)
+        .iter()
+        .filter(|b| b.kind.as_deref() == Some("tool_use"))
+        .filter_map(|b| b.name.as_deref())
+        .collect();
+    if !calls.is_empty() {
+        if worker.is_none() {
+            world.resolve_decisions(thread);
+            working(world, thread, at);
+        }
+        for name in calls {
+            if crate::attention::asks_the_operator(&ToolKind::parse(name)) {
+                needs_decision(world, thread, DecisionSource::AskUser, at, None);
+            }
+        }
+        return;
+    }
+    // `stop_reason` is the only field that says "this really was the end of the
+    // turn". A text-only record with no stop reason is a streamed fragment, and
+    // treating it as an idle boundary makes the pin flicker on every paragraph.
+    let ended = record
+        .message
+        .as_ref()
+        .and_then(|m| m.stop_reason.as_deref())
+        == Some("end_turn");
+    if worker.is_none() && ended {
+        needs_decision(world, thread, DecisionSource::TurnEnded, at, None);
+    }
+}
+
+/// Reads a `user` record for the operator's answer.
+///
+/// The **retrospective** rule, and the only one: a `tool_result` carrying
+/// `toolDenialKind`, an `interruptedMessageId`, or the literal
+/// `[Request interrupted by user]` record is proof that a permission prompt was
+/// shown *and answered*. Channel D has no record of the prompt itself, so this
+/// mark arrives with the answer rather than with the question — late by however
+/// long the operator took to decide ([`DecisionSource::onset_is_exact`] is
+/// `false` for it).
+///
+/// Anything else that is a genuine human turn — not injected (`isMeta`), not a
+/// tool result, not a subagent's — is the answer to whatever the thread was
+/// waiting for.
+fn answered(
+    world: &mut World,
+    thread: &ThreadId,
+    worker: Option<&WorkerId>,
+    raw: &Value,
+    record: &ThreadedRecord,
+    at: Instant,
+) {
+    if denied(raw, record) {
+        needs_decision(world, thread, DecisionSource::Rejected, at, None);
+        return;
+    }
+    let is_tool_result = blocks(record)
+        .iter()
+        .any(|b| b.kind.as_deref() == Some("tool_result"));
+    if is_tool_result || worker.is_some() || record.is_meta == Some(true) {
+        return;
+    }
+    world.resolve_decisions(thread);
+    working(world, thread, at);
+}
+
+/// Whether a `user` record proves the operator was asked and said no.
+///
+/// `toolDenialKind` (`user-rejected` | `permission-rule` | `automode-blocked` |
+/// `automode-unavailable`) and `interruptedMessageId` are raw envelope fields
+/// that `ThreadedRecord` does not model, so they are read off the verbatim
+/// record — which PRD §4.4's `{ known fields } + Value` rule keeps available
+/// exactly for cases like this.
+fn denied(raw: &Value, record: &ThreadedRecord) -> bool {
+    if raw.get("toolDenialKind").is_some() || raw.get("interruptedMessageId").is_some() {
+        return true;
+    }
+    blocks(record).iter().any(|b| {
+        b.kind.as_deref() == Some("text")
+            && b.text
+                .as_deref()
+                .is_some_and(|t| t.starts_with("[Request interrupted"))
+    })
 }
 
 /// Finishes a thread, raising PRD §11.2's `done` split by verification.
@@ -1425,26 +1623,40 @@ fn tool_input_paths(
     tool: &ToolKind,
     input: Option<&Value>,
     cwd: Option<&str>,
-) -> Vec<(String, PathScope)> {
+) -> Vec<(String, PathScope, PathOrigin)> {
     let mut out = Vec::new();
     if let Some(input) = input {
         for key in ["file_path", "notebook_path", "filename"] {
             if let Some(v) = input.get(key).and_then(Value::as_str) {
-                out.push((v.to_owned(), PathScope::File));
+                out.push((v.to_owned(), PathScope::File, PathOrigin::Input));
             }
         }
         if let Some(v) = input.get("path").and_then(Value::as_str) {
-            out.push((v.to_owned(), PathScope::for_tool(tool)));
+            out.push((v.to_owned(), PathScope::for_tool(tool), PathOrigin::Input));
         }
     }
     // A shell call's only path evidence is its working directory, and it is
     // noisy — weight 0.5 in PRD §6.1's table.
     if out.is_empty() && tool.is_shell() {
         if let Some(cwd) = cwd {
-            out.push((cwd.to_owned(), PathScope::Directory));
+            out.push((cwd.to_owned(), PathScope::Directory, PathOrigin::Cwd));
         }
     }
     out
+}
+
+/// Whether a path came from the tool's own input or from the shell fallback.
+///
+/// The distinction is the difference between rung 1 and rung 2 of
+/// [`crate::place`]'s chain, and it is not recoverable after the fact: both
+/// arrive as a [`LogicalPath`] and a [`PathScope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathOrigin {
+    /// `file_path`, `notebook_path`, `filename` or `path`.
+    Input,
+    /// The record envelope's working directory, for a shell call that named
+    /// nothing.
+    Cwd,
 }
 
 /// Approximates a line delta from an edit's own strings.
@@ -1582,7 +1794,10 @@ mod tests {
     fn a_shell_call_falls_back_to_its_cwd_as_directory_evidence() {
         let input = serde_json::json!({"command": "cargo test"});
         let paths = tool_input_paths(&ToolKind::PowerShell, Some(&input), Some("C:/repo"));
-        assert_eq!(paths, vec![("C:/repo".to_owned(), PathScope::Directory)]);
+        assert_eq!(
+            paths,
+            vec![("C:/repo".to_owned(), PathScope::Directory, PathOrigin::Cwd)]
+        );
         // With no cwd there is nothing to say.
         assert!(tool_input_paths(&ToolKind::Bash, Some(&input), None).is_empty());
     }
@@ -1592,12 +1807,20 @@ mod tests {
         let grep = serde_json::json!({"pattern": "x", "path": "src/auth"});
         assert_eq!(
             tool_input_paths(&ToolKind::Grep, Some(&grep), None),
-            vec![("src/auth".to_owned(), PathScope::Directory)]
+            vec![(
+                "src/auth".to_owned(),
+                PathScope::Directory,
+                PathOrigin::Input
+            )]
         );
         let read = serde_json::json!({"file_path": "C:/repo/src/auth/token.rs"});
         assert_eq!(
             tool_input_paths(&ToolKind::Read, Some(&read), None),
-            vec![("C:/repo/src/auth/token.rs".to_owned(), PathScope::File)]
+            vec![(
+                "C:/repo/src/auth/token.rs".to_owned(),
+                PathScope::File,
+                PathOrigin::Input
+            )]
         );
     }
 

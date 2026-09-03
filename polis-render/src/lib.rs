@@ -101,6 +101,7 @@ pub mod frame;
 pub mod gif;
 pub mod live;
 pub mod marks;
+pub mod pacing;
 pub mod plan;
 pub mod raster;
 

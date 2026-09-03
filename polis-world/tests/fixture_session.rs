@@ -233,10 +233,18 @@ fn trails_decay_and_revisit_counts_do_not() {
         thread.territory.kernels.is_empty() && thread.territory.claim.is_none(),
         "and a dormant territory dissipates entirely (PRD §10.4)"
     );
+    // The fixture's last two records are `assistant` / `stop_reason: end_turn`
+    // with no tool call and no human reply after them, which is PRD §11.2's
+    // primary state — the thread is parked on a human, not merely quiet. That
+    // read used to be unavailable to a replay at all (the attention band was
+    // 0.000% of map area in every frame of every M2 recording); it now comes
+    // from `DecisionSource::TurnEnded`, and `Waiting` is what it looks like in
+    // the status rail. An hour of silence does not resolve it: §11.2 says this
+    // state "persists until resolved", and nobody has resolved it.
     assert_eq!(
         thread.status,
-        ThreadStatus::Idle,
-        "alive but quiet, not finished"
+        ThreadStatus::Waiting,
+        "parked on a human, which outranks 'alive but quiet'"
     );
 }
 

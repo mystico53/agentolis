@@ -42,6 +42,7 @@
     clippy::too_many_lines
 )]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,6 +104,7 @@ pub enum Mode {
 /// [`PolisApp::new`] asserts.
 pub fn launch(config: Config, mode: Mode) -> anyhow::Result<()> {
     let started = Instant::now();
+    announce(&mode);
     // The inner size is in **logical points**, and this machine renders at 1.75
     // points per pixel: a naive `[1600, 1000]` asks for 2800x1750 physical on a
     // 2194x1234 screen, Windows clamps the window, and egui keeps laying out for
@@ -124,6 +126,27 @@ pub fn launch(config: Config, mode: Mode) -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(PolisApp::new(cc, config, mode, started)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Says on stdout that a window is opening and that the command will not return
+/// until it closes.
+///
+/// `polis map`, `polis watch` and `polis replay` printed **nothing** and blocked
+/// until the window closed. On a busy desktop the window opens behind something
+/// else, and the operator is left with a terminal that has hung — the first-run
+/// review lost a three-minute tool call to exactly that. One line fixes it.
+///
+/// Not printed for the map window `polis run` spawns for itself: that child's
+/// stdout is `Stdio::null()`, and the parent has already said what it opened.
+fn announce(mode: &Mode) {
+    let mut out = std::io::stdout().lock();
+    let what = match mode {
+        Mode::Map { repo } => format!("opening the map for {}", repo.display()),
+        Mode::Pick => "opening the session picker".to_owned(),
+        Mode::Replay { transcript, .. } => format!("replaying {}", transcript.display()),
+    };
+    let _ = writeln!(out, "polis: {what} — close the window to return here.");
+    let _ = out.flush();
 }
 
 /// The eframe application.
@@ -474,24 +497,53 @@ impl PolisApp {
         }
     }
 
+    /// The failure screen (PRD §17: does it change a decision?).
+    ///
+    /// A message with newlines in it is *shown* with newlines in it. The first
+    /// version put the whole thing in one wrapped monospace line, so
+    /// `citygen`'s "here are three commands, pick one" arrived as three
+    /// full-width lines of red with the path in it twice, and the only button
+    /// offered a session to somebody who had asked for a map.
     fn draw_failed(&mut self, ui: &mut egui::Ui) {
         let Stage::Failed(error) = &self.stage else {
             return;
         };
         let error = error.clone();
+        let mut lines = error.lines();
+        let headline = lines.next().unwrap_or_default().to_owned();
+        let rest: Vec<String> = lines.map(str::to_owned).collect();
         ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.35);
+            ui.add_space(ui.available_height() * 0.22);
             ui.label(
                 RichText::new("polis could not open this")
                     .size(20.0)
                     .color(palette::selection().color()),
             );
-            ui.label(
-                RichText::new(error)
-                    .monospace()
-                    .color(palette::contention().color()),
-            );
-            if ui.button("pick another session").clicked() {
+            ui.add_space(10.0);
+            ui.scope(|ui| {
+                ui.set_max_width(680.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(headline)
+                            .strong()
+                            .color(palette::contention().color()),
+                    );
+                    for line in rest {
+                        // An indented line is a command to type, and it reads as
+                        // one: monospace, and in the colour the rest of the
+                        // window uses for "you can act on this".
+                        let indented = line.starts_with("  ");
+                        let text = RichText::new(line.trim_end().to_owned());
+                        ui.label(if indented {
+                            text.monospace().color(palette::hover().color())
+                        } else {
+                            text.color(palette::worker().color())
+                        });
+                    }
+                });
+            });
+            ui.add_space(14.0);
+            if ui.button("pick a past session to watch instead").clicked() {
                 self.stage = Stage::Picking(Box::new(Picker::start()));
             }
         });
@@ -499,13 +551,33 @@ impl PolisApp {
 
     fn draw_scene(&mut self, ui: &mut egui::Ui, dt: f32) {
         let ctx = ui.ctx().clone();
+
+        // The first-run explainer, drawn before the scene is borrowed and
+        // painted after everything in it: an `Order::Foreground` area sits above
+        // every panel whatever order it was created in. `explaining` stays true
+        // for the frame that dismisses it, so the dismissing keystroke or click
+        // is spent on the overlay and on nothing else.
+        let explaining = self.overlay.explain;
+        if explaining && ui::explainer(&ctx) {
+            self.overlay.explain = false;
+            crate::explain::remember_dismissed();
+        }
+
         let Stage::Running(scene) = &mut self.stage else {
             return;
         };
 
         // Keys first, because one of them invalidates the base map and the base
         // map is borrowed for the rest of the frame.
-        let keys = read_keys(&ctx);
+        //
+        // While the first-run explainer is up the frame's keys are dropped: the
+        // keystroke that dismisses it must not also toggle a layer, and the
+        // click that dismisses it must not also open an editor.
+        let keys = if explaining {
+            Keys::default()
+        } else {
+            read_keys(&ctx)
+        };
         if keys.toggle_streets {
             self.config.streets = !self.config.streets;
             scene.base = None;
@@ -583,6 +655,12 @@ impl PolisApp {
         }
         if keys.toggle_help {
             self.overlay.help = !self.overlay.help;
+            // The sheet is drawn inside the rail, so `h` with the rail closed
+            // used to do nothing at all — the one key the guide promises shows
+            // "every key, on screen".
+            if self.overlay.help {
+                self.overlay.rail = true;
+            }
         }
         if keys.clear {
             scene.view.selected = None;
@@ -627,8 +705,16 @@ impl PolisApp {
                             .color(palette::district_label().color()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.selectable_label(self.overlay.help, "keys (h)").clicked() {
+                        if ui
+                            .selectable_label(self.overlay.help, "what is this? (h)")
+                            .on_hover_text(
+                                "what a building is, what the shapes and colours mean, \
+                                 and every key",
+                            )
+                            .clicked()
+                        {
                             self.overlay.help = !self.overlay.help;
+                            self.overlay.rail = true;
                         }
                         if ui.selectable_label(self.overlay.rail, "rail (i)").clicked() {
                             self.overlay.rail = !self.overlay.rail;
@@ -642,6 +728,29 @@ impl PolisApp {
                     });
                 });
             });
+
+        // Why this city looks the way it does, when the answer is not "your
+        // code" — an empty history draws an almost empty map, and silence there
+        // reads as a broken product (`citygen::preflight`).
+        if let Some(notice) = scene.generated.notice.clone() {
+            egui::Panel::top("polis-notice")
+                .exact_size(48.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("nothing to draw yet")
+                                .monospace()
+                                .strong()
+                                .color(palette::needs_decision().color()),
+                        );
+                        ui.label(
+                            RichText::new(notice)
+                                .small()
+                                .color(palette::worker().color()),
+                        );
+                    });
+                });
+        }
 
         if self.overlay.rail {
             egui::Panel::right("polis-rail")
@@ -738,7 +847,7 @@ impl PolisApp {
             }
         }
 
-        if let Some(path) = clicked {
+        if let Some(path) = clicked.filter(|_| !explaining) {
             scene.view.selected = Some(path.clone());
             open_in_editor(
                 &mut self.last_editor,
@@ -950,11 +1059,15 @@ fn spawn_load(repo: PathBuf, transcript: Option<PathBuf>, speed: f32) -> Stage {
 }
 
 fn load(repo: &Path, transcript: Option<&Path>, speed: f32) -> anyhow::Result<Loaded> {
-    let generated = citygen::generate(repo)
-        .with_context(|| format!("generating the city for {}", repo.display()))?;
+    // No `.context("generating the city for …")` here, deliberately. The
+    // failures worth a screen — not a checkout, no `git` — are explained in
+    // full by `citygen::preflight`, in the operator's words and with the path
+    // already in them, and `{:#}` would flatten a wrapping context onto the
+    // front of that as a second copy of the same path.
+    let generated = citygen::generate(repo)?;
     let Some(transcript) = transcript else {
         return Ok(Loaded {
-            label: format!("{} · static map (PRD §15 M1)", repo.display()),
+            label: format!("{} · the city as it stands right now", repo.display()),
             generated,
             schedule: None,
             speed,

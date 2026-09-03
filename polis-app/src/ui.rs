@@ -80,6 +80,13 @@ pub struct Overlay {
     pub rail: bool,
     /// Whether the key sheet is up.
     pub help: bool,
+    /// Whether the first-run map explainer is up.
+    ///
+    /// True until this machine has dismissed it once ([`crate::explain`]).
+    /// Nothing else in the window is modal, and this is only modal for one
+    /// keystroke: it exists because three of the four ways into the map never
+    /// show the terminal screen that explains it.
+    pub explain: bool,
 }
 
 impl Default for Overlay {
@@ -88,6 +95,7 @@ impl Default for Overlay {
             view: View::default(),
             rail: true,
             help: false,
+            explain: !crate::explain::dismissed(),
         }
     }
 }
@@ -738,18 +746,86 @@ pub fn transport(
     action
 }
 
-/// The key sheet.
+/// What the city is, as the `h` sheet's first block and the overlay's body.
+///
+/// The keys come second deliberately: someone pressing `h` on a map they cannot
+/// read wants to know what a building is before they want to know what `[` does.
+pub fn what_you_are_looking_at(ui: &mut egui::Ui) {
+    ui.label(heading("WHAT YOU ARE LOOKING AT"));
+    // One paragraph, re-wrapped by egui: the rail is 280–620 points wide and the
+    // overlay is wider still, so the terminal's 78-column line breaks would be
+    // a ragged edge in the middle of the measure.
+    ui.label(
+        RichText::new(crate::explain::paragraph())
+            .color(palette::worker().color())
+            .line_height(Some(18.0)),
+    );
+}
+
+/// The same thing as a two-column legend, for the surfaces with room for one.
+///
+/// `horizontal_wrapped`, not `horizontal`: a label in a plain horizontal layout
+/// does not wrap, and the rail is narrow enough that the second column would be
+/// clipped at exactly the width where it stops being readable.
+pub fn map_legend(ui: &mut egui::Ui) {
+    for (name, what) in crate::explain::READING {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(*name)
+                    .monospace()
+                    .color(palette::hover().color()),
+            );
+            ui.label(dim(*what));
+        });
+    }
+}
+
+/// Shape is the operation, colour is how it went (PRD §10.1, §10.2).
+///
+/// The glyph half already existed and answered half the question: an operator
+/// seeing a barred circle turn red has been told what the shape means and never
+/// what the colour means.
+pub fn notation(ui: &mut egui::Ui) {
+    ui.label(heading("NOTATION"));
+    ui.label(dim("shape is the operation"));
+    crate::mapview::legend(ui);
+    ui.add_space(4.0);
+    ui.label(dim("colour is how it went"));
+    for (outcome, what) in [
+        (
+            polis_events::Outcome::Pending,
+            "in flight, or no result yet",
+        ),
+        (polis_events::Outcome::Done, "it succeeded"),
+        (polis_events::Outcome::Failed, "it failed, or was refused"),
+    ] {
+        ui.horizontal(|ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::Vec2::new(16.0, 14.0), egui::Sense::hover());
+            ui.painter()
+                .circle_filled(rect.center(), 4.0, palette::outcome(outcome).color());
+            ui.label(dim(what));
+        });
+    }
+}
+
+/// The key sheet, under the map explanation it exists to be found from.
 pub fn help(ui: &mut egui::Ui) {
+    what_you_are_looking_at(ui);
+    ui.add_space(4.0);
+    map_legend(ui);
+    ui.separator();
     ui.label(heading("KEYS"));
     for (key, what) in [
         ("drag / arrows", "pan"),
         ("scroll / + -", "zoom"),
-        ("t", "swap map ⇄ filesystem tree"),
+        ("t", "swap the map and the filesystem tree"),
         ("click a building", "select it and open it in your editor"),
         ("hover a building", "who touched it, and when"),
         ("f", "follow the selected thread (cut, never pan)"),
         ("r", "reset the camera"),
-        ("s", "streets layer (PRD §9)"),
+        ("s", "the streets layer — which files import which"),
         ("i", "rail"),
         ("space", "play / pause"),
         (", .", "one event back / on"),
@@ -770,11 +846,78 @@ pub fn help(ui: &mut egui::Ui) {
         });
     }
     ui.separator();
-    ui.label(heading("NOTATION"));
-    ui.label(dim(
-        "shape is the operation, colour is how it went (PRD §10.1, §10.2)",
-    ));
-    crate::mapview::legend(ui);
+    notation(ui);
+}
+
+/// The first-run overlay: what the map is, over the map itself.
+///
+/// Returns true when the operator dismissed it this frame — any key, any click.
+/// The scrim is a full-screen click target so the dismissing click cannot also
+/// land on a building and open an editor, and [`crate::app`] drops the frame's
+/// keys for the same reason.
+pub fn explainer(ctx: &egui::Context) -> bool {
+    let screen = ctx.viewport_rect();
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new("polis-explainer"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            // The scrim is the whole viewport and it is a click target, so the
+            // dismissing click cannot also land on a building underneath.
+            let (rect, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(4, 5, 7, 205));
+            clicked = response.clicked();
+
+            // The card's rectangle is computed rather than anchored. An
+            // `Area::anchor` centres using the size the area had *last* frame,
+            // and this window is deliberately idle — with nothing playing, the
+            // correcting frame never comes and the card sits with its corner at
+            // the centre of the screen, half of it off the edge.
+            let width = (rect.width() - 96.0).clamp(300.0, 620.0);
+            let top = rect.top() + (rect.height() * 0.12).max(16.0);
+            let card = egui::Rect::from_min_size(
+                egui::Pos2::new(rect.center().x - width / 2.0, top),
+                egui::Vec2::new(width, (rect.bottom() - top - 24.0).max(120.0)),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_rgb(14, 16, 20))
+                    .inner_margin(20.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(width - 40.0);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("P O L I S")
+                                        .monospace()
+                                        .size(20.0)
+                                        .color(palette::selection().color()),
+                                );
+                                ui.label(dim(
+                                    "your coding agents, drawn as a city seen from above",
+                                ));
+                                ui.add_space(12.0);
+                                what_you_are_looking_at(ui);
+                                ui.add_space(12.0);
+                                notation(ui);
+                                ui.add_space(14.0);
+                                ui.label(
+                                    RichText::new(crate::explain::DISMISS)
+                                        .color(palette::hover().color()),
+                                );
+                            });
+                    });
+            });
+        });
+    clicked
+        || ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        })
 }
 
 fn status_word(status: ThreadStatus) -> &'static str {
@@ -835,6 +978,57 @@ pub fn describe_thread(thread: &Thread) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pass over a viewport of a known size. `RawInput::screen_rect`'s default
+    /// is 10 000 x 10 000, which is not a window anybody has.
+    fn raw_input(keys: &[egui::Key]) -> egui::RawInput {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1400.0, 900.0));
+        let mut input = egui::RawInput {
+            screen_rect: Some(rect),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(input.viewport_id)
+            .or_default()
+            .inner_rect = Some(rect);
+        for key in keys {
+            input.events.push(egui::Event::Key {
+                key: *key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        input
+    }
+
+    /// The blocker: nothing in the window ever explained the map. It has to
+    /// draw, and it has to go away on one keystroke — a modal that needs to be
+    /// hunted for a close button is worse than no modal.
+    #[test]
+    fn the_explainer_draws_and_any_key_dismisses_it() {
+        let ctx = egui::Context::default();
+        let mut dismissed = true;
+        let mut full = ctx.run_ui(raw_input(&[]), |ui| {
+            dismissed = explainer(ui.ctx());
+        });
+        assert!(!dismissed, "nothing was pressed, so it stays up");
+        assert!(!full.shapes.is_empty(), "it drew nothing at all");
+        // `epaint` panics if a texture delta is dropped unapplied.
+        full.textures_delta.clear();
+
+        let mut full = ctx.run_ui(raw_input(&[egui::Key::Space]), |ui| {
+            dismissed = explainer(ui.ctx());
+        });
+        full.textures_delta.clear();
+        assert!(dismissed, "a keystroke clears it");
+
+        // And `h` reaches the same words from the sheet, forever after.
+        let mut full = ctx.run_ui(raw_input(&[]), help);
+        full.textures_delta.clear();
+    }
 
     #[test]
     fn one_keystroke_swaps_the_two_co_equal_views() {

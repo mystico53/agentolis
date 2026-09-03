@@ -376,27 +376,59 @@ fn classify(event: &RecordedEvent, gap: Option<u64>) -> Option<Interest> {
 }
 
 /// Classifies a transcript record without deserializing the whole thing.
+///
+/// # `Decision` from Channel D
+///
+/// [`Interest::Decision`] used to be reachable from hooks alone, which meant a
+/// scrubber over a replayed session had no "waiting on you" ticks at all — the
+/// same structural gap that left the attention band at 0.000% of map area in
+/// every frame of every M2 recording. The three rules here are the schedule-side
+/// mirror of the ones `apply::turn_boundary` and `apply::answered` use to raise
+/// the mark, so a tick and a pin never disagree about where the operator was
+/// asked.
 fn transcript_interest(kind: &TranscriptRecordKind, record: &Value) -> Option<Interest> {
-    let blocks = record
-        .get("message")
+    // The denial fields sit on the envelope, not inside `message.content`, so
+    // they are checked before the blocks are required to exist at all.
+    if *kind == TranscriptRecordKind::User
+        && (record.get("toolDenialKind").is_some() || record.get("interruptedMessageId").is_some())
+    {
+        return Some(Interest::Decision);
+    }
+    let message = record.get("message");
+    let blocks = message
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array)?;
+    let block_named = |want: &'static str| {
+        blocks
+            .iter()
+            .filter(move |b| b.get("type").and_then(Value::as_str) == Some(want))
+    };
     match *kind {
-        TranscriptRecordKind::Assistant => blocks
-            .iter()
-            .any(|b| {
-                b.get("type").and_then(Value::as_str) == Some("tool_use")
-                    && b.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|n| ToolKind::parse(n).spawns_worker())
-            })
-            .then_some(Interest::Delegation),
-        TranscriptRecordKind::User => blocks
-            .iter()
-            .any(|b| {
-                b.get("type").and_then(Value::as_str) == Some("tool_result")
-                    && b.get("is_error").and_then(Value::as_bool) == Some(true)
-            })
+        TranscriptRecordKind::Assistant => {
+            let tools: Vec<&str> = block_named("tool_use")
+                .filter_map(|b| b.get("name").and_then(Value::as_str))
+                .collect();
+            if tools
+                .iter()
+                .any(|n| crate::attention::asks_the_operator(&ToolKind::parse(n)))
+            {
+                return Some(Interest::Decision);
+            }
+            if tools.iter().any(|n| ToolKind::parse(n).spawns_worker()) {
+                return Some(Interest::Delegation);
+            }
+            // A main agent ending its turn with no tool call is parked on a
+            // human. `agentId` present means a subagent, and a subagent going
+            // quiet is noise (PRD §11.2).
+            let ended = message
+                .and_then(|m| m.get("stop_reason"))
+                .and_then(Value::as_str)
+                == Some("end_turn");
+            (tools.is_empty() && ended && record.get("agentId").is_none())
+                .then_some(Interest::Decision)
+        }
+        TranscriptRecordKind::User => block_named("tool_result")
+            .any(|b| b.get("is_error").and_then(Value::as_bool) == Some(true))
             .then_some(Interest::Failure),
         _ => None,
     }

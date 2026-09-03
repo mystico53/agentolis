@@ -265,23 +265,11 @@ pub fn orientation(out: &mut impl Write, d: &Detected) -> io::Result<()> {
     writeln!(out, "  your coding agents, drawn as a city seen from above")?;
     writeln!(out)?;
     writeln!(out, "  What you are looking at")?;
-    writeln!(
-        out,
-        "    Every building is a file. Every district is a directory."
-    )?;
-    writeln!(
-        out,
-        "    A building's height is its uncommitted work, so the tallest tower"
-    )?;
-    writeln!(
-        out,
-        "    is the biggest unreviewed pile — the skyline points at what needs"
-    )?;
-    writeln!(
-        out,
-        "    you. The old, dense core is the code you wrote first; the loose"
-    )?;
-    writeln!(out, "    outskirts are last month's.")?;
+    // The same strings the window's first-run overlay and `h` sheet render, so
+    // the four ways into the map cannot describe it differently.
+    for line in crate::explain::MAP {
+        writeln!(out, "    {line}")?;
+    }
     writeln!(
         out,
         "    An agent shows up as a cloud over where it is working, and leaves"
@@ -407,6 +395,13 @@ pub fn first_run(cli: &Cli) -> anyhow::Result<()> {
         writeln!(out, "  Opening {} as a city.\n", detected.repo.display())?;
     }
     next_steps(&mut out, &detected)?;
+    // Every command just printed begins with the word `polis`, and on a fresh
+    // checkout that word is not on PATH — the first-run review's first blocker.
+    // Saying so here, next to the commands it applies to, is cheaper than the
+    // operator discovering it one command at a time.
+    if let Some(note) = path_note() {
+        write!(out, "{note}")?;
+    }
     out.flush()?;
     drop(out);
 
@@ -421,6 +416,31 @@ pub fn first_run(cli: &Cli) -> anyhow::Result<()> {
         crate::Mode::Map { repo }
     };
     crate::launch(config, mode)
+}
+
+/// The warning that the commands just printed cannot be typed as written.
+///
+/// `None` when `polis` on `PATH` is this binary, which is the state the guide
+/// assumes and the state [`path_fix`] produces.
+fn path_note() -> Option<String> {
+    let check = check_on_path();
+    if check.status == Status::Ok {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = crate::cli::strip_verbatim(exe.canonicalize().unwrap_or(exe));
+    let mut note = format!(
+        "  Those commands start with the word `polis`, and it is not on PATH\n  \
+         yet — for now, spell it out:\n\n    {} watch\n\n",
+        exe.display()
+    );
+    for line in fix_lines(check.fix.as_deref().unwrap_or_default()) {
+        note.push_str("  ");
+        note.push_str(&line);
+        note.push('\n');
+    }
+    note.push('\n');
+    Some(note)
 }
 
 /// The marker that says this machine has run Polis before.
@@ -478,7 +498,14 @@ pub fn connect(cli: &Cli, args: &ConnectArgs) -> anyhow::Result<()> {
     };
 
     let exists = settings.exists();
-    explain_connect(&mut out, &settings, &hook, exists)?;
+    let scope = if args.settings.is_some() {
+        Scope::Explicit
+    } else if args.user {
+        Scope::User
+    } else {
+        Scope::Project
+    };
+    explain_connect(&mut out, &settings, &hook, exists, scope)?;
 
     let plan = hookenv::plan_hooks(&settings, &hook);
     // Blocked first, and only then the audit. The other order was wrong and this
@@ -601,11 +628,50 @@ fn write_hooks(settings: &Path, hook: &Path) -> anyhow::Result<()> {
 /// been told what a tool will not do can believe the rest of the screen, and the
 /// `WorktreeCreate` one in particular is the difference between a hook system
 /// that is safe to install and one that breaks `git worktree` machine-wide.
+/// Which settings file `polis connect` is about to write, in the operator's
+/// terms rather than clap's.
+///
+/// It matters and it was invisible: connect writes **this repository's**
+/// `.claude/settings.json` by default, so connecting in repo A and then starting
+/// `claude` in repo B sees nothing, and no screen said the choice existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// `<repo>/.claude/settings.json` — this repository only. The default.
+    Project,
+    /// `~/.claude/settings.json` — every repository on this machine.
+    User,
+    /// A path the operator named with `--settings`.
+    Explicit,
+}
+
+impl Scope {
+    /// Which repositories this covers, and the command that gets the other
+    /// answer — separately, so the command is never wrapped mid-line.
+    pub fn describe(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Project => (
+                "That is this repository's own settings file: it covers agents \
+                 started in this checkout, and no others. To cover every \
+                 repository on this machine instead:",
+                Some("polis connect --user"),
+            ),
+            Self::User => (
+                "That is your user settings file: it covers agents started in \
+                 every repository on this machine. To cover this checkout \
+                 alone instead:",
+                Some("polis connect"),
+            ),
+            Self::Explicit => ("That is the file you named with --settings.", None),
+        }
+    }
+}
+
 fn explain_connect(
     out: &mut impl Write,
     settings: &Path,
     hook: &Path,
     exists: bool,
+    scope: Scope,
 ) -> io::Result<()> {
     writeln!(out)?;
     writeln!(out, "  Connect Polis to Claude Code")?;
@@ -624,6 +690,17 @@ fn explain_connect(
         "  so that Claude Code tells Polis when it starts a session, edits a\n  \
          file, finishes a tool call or stops to ask you something."
     )?;
+    writeln!(out)?;
+    // Which repositories this covers. It is the one thing about `connect` that
+    // is invisible and wrong-by-default for half the people who run it: the
+    // project file is written unless `--user` is passed, and nothing said so.
+    let (prose, command) = scope.describe();
+    for line in wrap(prose, 70) {
+        writeln!(out, "  {line}")?;
+    }
+    if let Some(command) = command {
+        writeln!(out, "    {command}")?;
+    }
     writeln!(out)?;
     writeln!(out, "  It registers 19 events, each of which runs")?;
     writeln!(out, "    {} --event <name>", hook.display())?;
@@ -1015,13 +1092,90 @@ impl Check {
 
 /// Runs every check. Pure inspection; nothing here writes.
 pub fn checks(d: &Detected) -> Vec<Check> {
-    let mut out = vec![check_repository(d), check_claude(d), check_transcripts(d)];
+    let mut out = vec![
+        check_on_path(),
+        check_repository(d),
+        check_claude(d),
+        check_transcripts(d),
+    ];
     out.extend(check_ports());
     out.push(check_hook_binary(d));
     out.push(check_hooks(d));
     out.push(check_telemetry_env());
     out.push(check_something_to_watch(d));
     out
+}
+
+/// Can this binary be typed as `polis`?
+///
+/// The first-run review's first blocker: the first command in the getting-started
+/// guide is `polis`, and a fresh checkout builds to `target/release/polis` with
+/// nothing on `PATH`. The guide's remedy was one clause ninety lines further
+/// down — *"put that folder on your `PATH`"* — **with no command for doing so on
+/// any platform**. This is that command, for this machine, with this binary's
+/// own directory already substituted in.
+///
+/// A `Warn` rather than a `Fail`: everything works from a full path, and the
+/// operator plainly ran *something*.
+fn check_on_path() -> Check {
+    let Ok(exe) = std::env::current_exe() else {
+        return Check::ok("polis", "running from an unknown location");
+    };
+    let exe = crate::cli::strip_verbatim(exe.canonicalize().unwrap_or(exe));
+    let dir = exe.parent().unwrap_or(&exe).to_path_buf();
+    let same = |a: &Path| {
+        a.canonicalize()
+            .map(crate::cli::strip_verbatim)
+            .is_ok_and(|found| found == exe)
+    };
+    match which("polis") {
+        Some(found) if same(&found) => Check::ok("polis", format!("{} — on PATH", exe.display())),
+        Some(found) => Check::problem(
+            "polis",
+            Status::Warn,
+            format!(
+                "typing `polis` runs {}, not this one ({})",
+                found.display(),
+                exe.display()
+            ),
+            format!(
+                "put this one first, or run it by its full path:\n  {}",
+                exe.display()
+            ),
+        ),
+        None => Check::problem(
+            "polis",
+            Status::Warn,
+            format!("not on PATH — this binary is {}", exe.display()),
+            path_fix(&dir),
+        ),
+    }
+}
+
+/// The exact command that puts `dir` on `PATH`, for this platform.
+///
+/// Windows gets the user-scoped `SetEnvironmentVariable` form rather than
+/// `setx PATH "%PATH%;…"`, which is the line most guides print and which is a
+/// footgun: `%PATH%` there is the *combined* machine and user value, so it
+/// copies the whole system path into the user one, permanently, truncated at
+/// 1024 characters.
+pub fn path_fix(dir: &Path) -> String {
+    let dir = dir.display();
+    if cfg!(windows) {
+        format!(
+            "add it to PATH for good (PowerShell; new terminals see it):\n  \
+             [Environment]::SetEnvironmentVariable('Path', \
+             [Environment]::GetEnvironmentVariable('Path','User') + ';{dir}', 'User')\n\
+             or just for this terminal:\n  \
+             $env:PATH = \"{dir};$env:PATH\""
+        )
+    } else {
+        format!(
+            "add it to PATH for this shell:\n  \
+             export PATH=\"{dir}:$PATH\"\n\
+             and to ~/.bashrc or ~/.zshrc to make it permanent."
+        )
+    }
 }
 
 /// Is there a city to draw? Without git history there is no growth order and so
@@ -1223,7 +1377,7 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> anyhow::Result<()> {
             check.detail
         )?;
         if let Some(fix) = &check.fix {
-            for (i, line) in wrap(fix, 62).into_iter().enumerate() {
+            for (i, line) in fix_lines(fix).into_iter().enumerate() {
                 let label = if i == 0 { "fix" } else { "" };
                 writeln!(out, "        {label:<18}  {line}")?;
             }
@@ -1658,6 +1812,24 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 }
 
 /// Wraps prose to `width` on word boundaries, for the `fix:` column.
+/// A fix as printed lines: prose is wrapped, a command is not.
+///
+/// A fix is allowed explicit newlines, and a line that starts with two spaces is
+/// a command to copy. Those are emitted verbatim however long they are, because
+/// [`wrap`] breaking a `PATH` one-liner at a space produces something that looks
+/// like a command and does not run.
+fn fix_lines(fix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in fix.split('\n') {
+        if line.starts_with("  ") {
+            out.push(line.trim_end().to_owned());
+        } else {
+            out.extend(wrap(line, 62));
+        }
+    }
+    out
+}
+
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -2095,6 +2267,101 @@ mod tests {
             "the first screen is {} lines",
             text.lines().count()
         );
+    }
+
+    /// The blocker this exists for is that the guide said "put that folder on
+    /// your PATH" and gave no command. Whatever else changes, the fix has to
+    /// name the folder and be one line somebody can paste.
+    #[test]
+    fn the_path_fix_is_a_command_with_the_folder_already_in_it() {
+        let dir = PathBuf::from(if cfg!(windows) {
+            r"C:\coding\agentolis\target\release"
+        } else {
+            "/home/op/agentolis/target/release"
+        });
+        let fix = path_fix(&dir);
+        assert!(
+            fix.contains(&dir.display().to_string()),
+            "the folder is not in it:\n{fix}"
+        );
+        let lines = fix_lines(&fix);
+        let commands: Vec<&String> = lines.iter().filter(|l| l.starts_with("  ")).collect();
+        assert!(commands.len() >= 2, "{lines:?}");
+        // A command is printed whole, however long — a wrapped one does not run.
+        for command in &commands {
+            assert!(
+                command.contains(&dir.display().to_string()),
+                "a broken command: {command}"
+            );
+        }
+        if cfg!(windows) {
+            // `setx PATH "%PATH%;…"` copies the machine path into the user one
+            // and truncates it at 1024 characters. Never that.
+            assert!(!fix.contains("setx"), "{fix}");
+            assert!(fix.contains("SetEnvironmentVariable"), "{fix}");
+        } else {
+            assert!(fix.contains("export PATH="), "{fix}");
+        }
+    }
+
+    /// Prose wraps; a command does not.
+    #[test]
+    fn a_fix_wraps_its_prose_and_never_its_commands() {
+        let long = "  some --very-long-command --with 'a lot of arguments' \
+                    --and-a-path /home/somebody/with/a/deep/directory/tree/inside";
+        let fix = format!("do this thing, which is explained in a sentence long enough to need wrapping at sixty-two columns:\n{long}");
+        let lines = fix_lines(&fix);
+        assert!(lines.len() >= 3, "the prose did not wrap: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.trim() == long.trim()),
+            "the command was broken up: {lines:?}"
+        );
+    }
+
+    /// `polis connect` writes the *project* file by default, and until this was
+    /// on screen nothing anywhere said the choice existed.
+    #[test]
+    fn the_consent_screen_names_the_scope_and_the_other_one() {
+        let mut buffer = Vec::new();
+        explain_connect(
+            &mut buffer,
+            Path::new("/repo/.claude/settings.json"),
+            Path::new("/bin/polis-hook"),
+            false,
+            Scope::Project,
+        )
+        .unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        // The prose is wrapped, so it is asserted at its source; the command is
+        // on its own line and must appear whole.
+        assert!(
+            Scope::Project
+                .describe()
+                .0
+                .contains("this repository's own"),
+            "{text}"
+        );
+        assert!(text.contains("polis connect --user"), "{text}");
+
+        let mut buffer = Vec::new();
+        explain_connect(
+            &mut buffer,
+            Path::new("/home/me/.claude/settings.json"),
+            Path::new("/bin/polis-hook"),
+            true,
+            Scope::User,
+        )
+        .unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            Scope::User
+                .describe()
+                .0
+                .contains("every repository on this machine"),
+            "{text}"
+        );
+        // And the way back to the project file, whole and copyable.
+        assert!(text.lines().any(|l| l.trim() == "polis connect"), "{text}");
     }
 
     #[test]

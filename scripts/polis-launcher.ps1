@@ -75,6 +75,71 @@ if (-not (Test-Path $Exe)) {
   if (-not (Test-Path $Exe)) { Say '  Build failed. The output above says why.' 'Red'; Pause-Exit 1 }
 }
 
+# ------------------------------------------------------------------ on PATH?
+
+# The first command in the getting-started guide is `polis`, and a fresh
+# checkout has it nowhere near PATH. Offering it here - once, with consent, at
+# user scope - is the difference between "it works" and "now go and edit an
+# environment variable". Never `setx PATH "%PATH%;..."`: %PATH% there is the
+# combined machine and user value, so that line copies the system path into the
+# user one, permanently, truncated at 1024 characters.
+
+$BinDir     = Split-Path $Exe -Parent
+$ConfigDir  = Join-Path $env:LOCALAPPDATA 'polis'
+$PathMarker = Join-Path $ConfigDir 'path-offer'
+
+$OnPath = $false
+try {
+  $found = Get-Command polis -ErrorAction SilentlyContinue
+  if ($found) { $OnPath = $true }
+} catch { }
+
+if (-not $OnPath -and -not (Test-Path $PathMarker)) {
+  Title 'Type "polis" from anywhere?'
+  Say ''
+  Say '  Polis is built, but the folder it is in is not on your PATH, so the'
+  Say '  command `polis` only works spelled out in full. This adds'
+  Say ''
+  Say "    $BinDir" 'White'
+  Say ''
+  Say '  to your own user PATH - not the machine''s - and changes nothing else.'
+  Say '  It applies to terminals you open after this. Answered once either way.'
+  Say ''
+  $addIt = Read-Host '  Add it? [Y/n]'
+  if (-not $addIt -or $addIt -match '^[Yy]') {
+    try {
+      $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+      $already = $false
+      if ($current) {
+        foreach ($entry in $current.Split(';')) {
+          if ($entry.Trim().TrimEnd('\') -eq $BinDir.TrimEnd('\')) { $already = $true }
+        }
+      }
+      if (-not $already) {
+        $joined = if ($current) { "$current;$BinDir" } else { $BinDir }
+        [Environment]::SetEnvironmentVariable('Path', $joined, 'User')
+      }
+      # This window too, so the rest of this session can say `polis`.
+      $env:PATH = "$BinDir;$env:PATH"
+      Say ''
+      Say '  Done. In a new terminal, `polis` now works from any folder.' 'Green'
+      Say '  To undo it: Settings -> Environment Variables -> Path (User).' 'DarkGray'
+    } catch {
+      Say ''
+      Say "  Could not write it: $($_.Exception.Message)" 'Yellow'
+      Say '  Everything below still works - this only affects typing `polis`.'
+    }
+  } else {
+    Say ''
+    Say '  Left alone. Run Polis from this file, or spell the path out:' 'DarkGray'
+    Say "    $Exe" 'DarkGray'
+  }
+  try {
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    Set-Content -LiteralPath $PathMarker -Value 'asked' -Encoding utf8
+  } catch { }
+}
+
 # ------------------------------------------------------------ what to do
 
 # How many sessions are already on this machine, so the menu can say. This is

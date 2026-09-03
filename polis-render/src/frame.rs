@@ -84,6 +84,7 @@ use polis_events::{LogicalPath, ThreadId, WorkerId};
 use polis_layout::city::City;
 use polis_layout::{CityLayout, Point};
 use polis_world::attention::{Attention, AttentionKind};
+use polis_world::place;
 use polis_world::snapshot::WorldSnapshot;
 use polis_world::{Thread, ThreadStatus};
 
@@ -157,6 +158,162 @@ const SCAFFOLD_WINDOW: f64 = 180.0;
 /// Diff lines that map to a full-height scaffold.
 const SCAFFOLD_REFERENCE: f64 = 240.0;
 
+/// The largest a coarse mark may be drawn, as a fraction of the map height.
+///
+/// [`live::glyph_radius`] tracks the *block* size, so at close zoom it reaches
+/// its ceiling and every glyph is drawn the size of a building. That is right
+/// for a mark that **is** at a building and wrong for one that is not: a rung-3
+/// mark is a claim about an agent, not about a lot, and letting it grow to
+/// building size turned the seat rosette into one blob. Measured on
+/// `9cab97d7` at `extent 25`: five marks of 27 px radius on a ring of 58 px.
+const COARSE_MARK_CAP: f64 = 0.011;
+
+/// Six unit directions, 60° apart — one per PRD §10.1 shape.
+///
+/// A constant table for the same reason [`live::CIRCLE`] is one: no
+/// transcendental reaches the image, so a frame is byte-reproducible.
+const SEATS: [[f64; 2]; 6] = [
+    [1.000, 0.000],
+    [0.500, 0.866],
+    [-0.500, 0.866],
+    [-1.000, 0.000],
+    [-0.500, -0.866],
+    [0.500, -0.866],
+];
+
+/// Rounded position, glyph and outcome — what makes two operations one mark.
+///
+/// Outcome is in the key, which is the part that matters: a failure can never be
+/// aggregated into a success, however many successes surround it.
+type MarkKey = (i64, i64, u8, u8);
+
+/// Operations that agreed on position, shape and outcome, on their way to one
+/// [`Mark`].
+#[derive(Debug, Clone, Copy)]
+struct MarkAgg {
+    at: Px,
+    glyph: polis_events::Glyph,
+    outcome: polis_events::Outcome,
+    /// Age of the **freshest** member, in world seconds.
+    age: f64,
+    scale: f64,
+    coarse: bool,
+    count: u32,
+}
+
+/// Budget order: failures, then things still in flight, then successes.
+///
+/// This is the only place an outcome decides anything other than a colour, and
+/// it decides *whether there is room*, not what the mark looks like. PRD §17:
+/// the question a mark has to answer is "does it change a decision".
+fn outcome_rank(outcome: polis_events::Outcome) -> u8 {
+    match outcome {
+        polis_events::Outcome::Failed => 0,
+        polis_events::Outcome::Pending => 1,
+        polis_events::Outcome::Done => 2,
+    }
+}
+
+/// The seat a (shape, colour) pair always takes around a coarse position: a unit
+/// direction and a reach **in output pixels**.
+///
+/// **Angle from the shape, radius from the outcome.** Failures ride the inner
+/// ring — closest to the agent, least likely to be crowded or clipped — and the
+/// successes are pushed outward, which is the de-emphasis PRD §17 argues for
+/// without touching shape or colour.
+///
+/// Fixed rather than packed: a seat that moved as counts changed would make the
+/// rosette twitch every frame, and PRD §11.4 spends motion onset on arrivals.
+/// So the geometry is sized from `mark` — the largest a mark at this position
+/// can be drawn — rather than the seats being crammed to fit: one ring holds
+/// six shapes, so its circumference must be at least six mark diameters, and
+/// consecutive rings must be a mark diameter apart.
+fn seat_of(
+    glyph: polis_events::Glyph,
+    outcome: polis_events::Outcome,
+    r: f64,
+    mark: f64,
+) -> ([f64; 2], f64) {
+    // Clear the agent body and its waiting ring (`r * 1.45`) on the inside, and
+    // give six seats room on the outside.
+    let inner = 1.45f64.mul_add(r, mark).max(mark * 2.3);
+    let step = mark * 2.6;
+    (
+        SEATS[usize::from(glyph as u8) % SEATS.len()],
+        f64::from(outcome_rank(outcome)).mul_add(step, inner),
+    )
+}
+
+/// What could not be placed, on its way to PRD §6.2's status rail.
+#[derive(Debug, Default)]
+struct RailBuilder {
+    /// Per thread: label, operations with nowhere to go, of which failed.
+    ops: BTreeMap<ThreadId, (String, u32, u32)>,
+    /// Threads with no position at all — no converged territory, no placeable
+    /// step. PRD §6.2's literal case.
+    threads: Vec<String>,
+}
+
+impl RailBuilder {
+    fn note_op(&mut self, thread: &Thread, op: &polis_world::Operation) {
+        let entry = self
+            .ops
+            .entry(thread.id.clone())
+            .or_insert_with(|| (thread_label(thread), 0, 0));
+        entry.1 = entry.1.saturating_add(1);
+        if op.outcome == polis_events::Outcome::Failed {
+            entry.2 = entry.2.saturating_add(1);
+        }
+    }
+
+    fn rows(self, unattributed: usize) -> Vec<live::RailRow> {
+        let mut rows: Vec<live::RailRow> = Vec::new();
+        for label in self.threads {
+            rows.push(live::RailRow {
+                kind: live::RailKind::UnplacedThread,
+                label,
+                count: 1,
+                failed: 0,
+            });
+        }
+        let mut ops: Vec<(String, u32, u32)> = self.ops.into_values().collect();
+        // Most failures first: the rail is read top-down and the reason to look
+        // at it is the red.
+        ops.sort_by_key(|(label, count, failed)| {
+            (
+                std::cmp::Reverse(*failed),
+                std::cmp::Reverse(*count),
+                label.clone(),
+            )
+        });
+        for (label, count, failed) in ops {
+            rows.push(live::RailRow {
+                kind: live::RailKind::UnplacedOps,
+                label,
+                count,
+                failed,
+            });
+        }
+        if unattributed > 0 {
+            rows.push(live::RailRow {
+                kind: live::RailKind::UnattributedWorkers,
+                label: "no parent link".to_owned(),
+                count: u32::try_from(unattributed).unwrap_or(u32::MAX),
+                failed: 0,
+            });
+        }
+        rows
+    }
+}
+
+/// A short name for a thread, for the rail.
+fn thread_label(thread: &Thread) -> String {
+    thread.title.clone().unwrap_or_else(|| {
+        let s = thread.session_id.as_str();
+        s.get(..8).unwrap_or(s).to_owned()
+    })
+}
+
 /// What the renderer draws, beyond the layers themselves.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameOptions {
@@ -179,6 +336,12 @@ pub struct FrameOptions {
     /// tier; `Some` is the district tier, and it is the one the notation has to
     /// be judged at.
     pub focus: Option<Focus>,
+    /// Draw PRD §6.2's status rail as a column to the right of the map.
+    ///
+    /// **Added to** the canvas width rather than taken out of the map: the rail
+    /// is where everything that has no place on the map goes, and paying for it
+    /// in map area would be a strange trade for a strip of chrome.
+    pub rail: bool,
 }
 
 impl Default for FrameOptions {
@@ -191,9 +354,23 @@ impl Default for FrameOptions {
             caption: true,
             cloud_cap: 6,
             focus: None,
+            rail: true,
         }
     }
 }
+
+/// The status rail's width, as a fraction of the map's.
+const RAIL_FRACTION: f64 = 0.22;
+
+/// The narrowest a status rail is worth drawing, in output pixels.
+const RAIL_MIN: usize = 130;
+
+/// How many characters of the built-in 5x7 font fit across the rail.
+///
+/// `STATUS RAIL` and `EVERY OP PLACED` are the two longest fixed strings on it,
+/// and the type is sized from this rather than from a fraction of the width so
+/// neither can ever be clipped.
+const RAIL_COLUMNS: f64 = 15.0;
 
 /// An agent's identity across frames: a thread, and a worker inside it.
 type AgentKey = (ThreadId, Option<WorkerId>);
@@ -237,6 +414,7 @@ pub struct FrameRenderer {
     /// allocate 5 MB.
     scratch: Canvas,
     caption_height: usize,
+    rail_width: usize,
     motion: BTreeMap<AgentKey, Motion>,
     rise: BTreeMap<LogicalPath, f64>,
     cloud_presence: f64,
@@ -263,12 +441,22 @@ impl FrameRenderer {
         } else {
             0
         };
-        let scratch = Canvas::new(opts.pixels, opts.pixels + caption_height, CAPTION_PLATE);
+        let rail_width = if opts.rail {
+            (((opts.pixels as f64) * RAIL_FRACTION) as usize).max(RAIL_MIN)
+        } else {
+            0
+        };
+        let scratch = Canvas::new(
+            opts.pixels + rail_width,
+            opts.pixels + caption_height,
+            CAPTION_PLATE,
+        );
         Self {
             opts,
             base,
             scratch,
             caption_height,
+            rail_width,
             motion: BTreeMap::new(),
             rise: BTreeMap::new(),
             cloud_presence: 0.0,
@@ -291,10 +479,19 @@ impl FrameRenderer {
         self.base.unit
     }
 
-    /// Output size in pixels, caption strip included.
+    /// Output size in pixels, caption strip and status rail included.
     #[must_use]
     pub fn size(&self) -> (usize, usize) {
-        (self.opts.pixels, self.opts.pixels + self.caption_height)
+        (
+            self.opts.pixels + self.rail_width,
+            self.opts.pixels + self.caption_height,
+        )
+    }
+
+    /// Width of the map area alone — the square everything live is drawn in.
+    #[must_use]
+    pub fn map_pixels(&self) -> usize {
+        self.opts.pixels
     }
 
     /// Sets the free-text label drawn at the left of the caption strip —
@@ -348,6 +545,17 @@ impl FrameRenderer {
     /// Renders and hands back an owned copy, for callers collecting a sequence.
     pub fn render_owned(&mut self, snapshot: &WorldSnapshot, dt: Duration) -> Canvas {
         self.render(snapshot, dt).clone()
+    }
+
+    /// The already-interpolated [`LiveFrame`] this snapshot produces, without
+    /// drawing it.
+    ///
+    /// The census that keeps PRD §10.1's shape channel and §10.2's colour
+    /// channel honest has to count *marks*, not only pixels — "the run glyph
+    /// never appears" is a statement about this struct — so the frame the
+    /// renderer builds is readable from outside the crate.
+    pub fn build_frame(&mut self, snapshot: &WorldSnapshot, dt: Duration) -> LiveFrame {
+        self.build(snapshot, dt.as_secs_f64())
     }
 
     // -----------------------------------------------------------------------
@@ -406,10 +614,15 @@ impl FrameRenderer {
         }
 
         let mut anchors: BTreeMap<ThreadId, Px> = BTreeMap::new();
+        let mut rail = RailBuilder::default();
         for thread in &snap.threads {
             let anchor = thread_anchor(thread, layout, &view);
             if let Some(a) = anchor {
                 anchors.insert(thread.id.clone(), a);
+            } else {
+                // > the thread renders with no cloud — an unplaced marker in
+                // > the status rail (PRD §6.2)
+                rail.threads.push(thread_label(thread));
             }
             let waiting = thread.status == ThreadStatus::Waiting;
 
@@ -458,23 +671,102 @@ impl FrameRenderer {
             }
 
             // --- operation marks (PRD §10.1, §10.2) -------------------------
-            for op in thread.ops.iter().rev().take(MARKS_PER_THREAD) {
-                let Some(path) = op.path.as_ref() else {
-                    continue;
-                };
-                let Some(p) = place(layout, path, &view) else {
-                    continue;
-                };
+            //
+            // Every operation gets a place: `place::site_of` is the whole
+            // fallback chain, and only its fourth rung — a thread with no
+            // position at all — leaves the map, for the status rail below.
+            let mut agg: BTreeMap<MarkKey, MarkAgg> = BTreeMap::new();
+            for op in &thread.ops {
                 let age = secs_since(now, op.at);
                 if age > MARK_TTL {
                     continue;
                 }
-                frame.marks.push(Mark {
-                    at: p,
+                let site = place::site_of(op, thread, layout);
+                let Some(point) = site.point() else {
+                    rail.note_op(thread, op);
+                    continue;
+                };
+                let at = view.at(point);
+                let key = (
+                    at[0].round() as i64,
+                    at[1].round() as i64,
+                    op.glyph as u8,
+                    op.outcome as u8,
+                );
+                let entry = agg.entry(key).or_insert(MarkAgg {
+                    at,
                     glyph: op.glyph,
                     outcome: op.outcome,
-                    age: age / MARK_TTL,
-                    pulse: pulse(age),
+                    age,
+                    scale: site.scale(),
+                    coarse: site.is_coarse(),
+                    count: 0,
+                });
+                entry.count = entry.count.saturating_add(1);
+                // The stack ages with its freshest member: a mark that is still
+                // being added to has not gone cold.
+                entry.age = entry.age.min(age);
+            }
+            // Failures first, then the freshest. The cap is a contrast budget,
+            // and a failed shell command is the most decision-changing mark on
+            // the map (PRD §17) — so what a full map drops is successes.
+            let mut merged: Vec<MarkAgg> = agg.into_values().collect();
+            merged.sort_by(|a, b| {
+                outcome_rank(a.outcome)
+                    .cmp(&outcome_rank(b.outcome))
+                    .then(a.age.total_cmp(&b.age))
+            });
+            // The cap never truncates a failure. It cannot run away — the world
+            // caps `Thread::ops` at `OPS_CAP` and a mark is at least one
+            // operation — and a budget that silently drops the red is the
+            // failure this whole layer was built to stop.
+            let failures = merged
+                .iter()
+                .filter(|m| m.outcome == polis_events::Outcome::Failed)
+                .count();
+            merged.truncate(MARKS_PER_THREAD.max(failures));
+            // Coarse sites stack by construction — every pathless call of one
+            // agent lands on that agent — so each (shape, colour) pair gets a
+            // fixed seat on a ring around the position. Fixed, not packed: a
+            // seat that moved as counts changed would make the ring twitch
+            // every frame.
+            let r = live::glyph_radius(frame.unit, frame.map_height);
+            let lim = frame.map_height;
+            let cap = frame.map_height * COARSE_MARK_CAP;
+            for m in &mut merged {
+                if !m.coarse {
+                    continue;
+                }
+                // The biggest a mark at this position can be drawn — freshest
+                // age, largest stack — is what the seat geometry has to make
+                // room for, and it is capped so a close zoom cannot inflate it.
+                let widest = live::stack_scale(u32::MAX);
+                m.scale = m.scale.min(cap / (r * widest));
+                let inside = m.at[0] >= 0.0 && m.at[1] >= 0.0 && m.at[0] <= lim && m.at[1] <= lim;
+                let (dir, reach) = seat_of(m.glyph, m.outcome, r, r * m.scale * widest);
+                let mut at = [
+                    dir[0].mul_add(reach, m.at[0]),
+                    dir[1].mul_add(reach, m.at[1]),
+                ];
+                // A seat may not push a mark off the map that was on it. The
+                // offset is a drawing device, so bounding it costs nothing; the
+                // position it orbits is the claim, and that is untouched.
+                if inside {
+                    at = [at[0].clamp(r, lim - r), at[1].clamp(r, lim - r)];
+                }
+                m.at = at;
+            }
+            // Drawn in reverse of the budget order, so the failures that won the
+            // budget are also the ones on top.
+            for m in merged.into_iter().rev() {
+                frame.marks.push(Mark {
+                    at: m.at,
+                    glyph: m.glyph,
+                    outcome: m.outcome,
+                    age: m.age / MARK_TTL,
+                    pulse: pulse(m.age),
+                    scale: m.scale,
+                    count: m.count,
                 });
             }
 
@@ -590,6 +882,9 @@ impl FrameRenderer {
                 frame.attention.push(m);
             }
         }
+
+        // --- the status rail (PRD §6.2) -------------------------------------
+        frame.rail = rail.rows(snap.unattributed.len());
         frame
     }
 
@@ -621,17 +916,29 @@ impl FrameRenderer {
     /// and the agents.
     fn compose(&mut self, frame: &LiveFrame, snap: &WorldSnapshot) {
         let w = self.opts.pixels;
-        let map_bytes = w * w * 3;
-        self.scratch.pixels[..map_bytes].copy_from_slice(&self.base.map.pixels[..map_bytes]);
-        for p in self.scratch.pixels[map_bytes..].as_chunks_mut::<3>().0 {
+        let stride = self.scratch.width;
+        // Row by row, because the canvas is wider than the map when the status
+        // rail is on. The rail and caption plates are painted first so nothing
+        // from the previous frame survives outside the map square.
+        for p in self.scratch.pixels.as_chunks_mut::<3>().0 {
             *p = CAPTION_PLATE;
+        }
+        for y in 0..w {
+            let src = y * w * 3;
+            let dst = y * stride * 3;
+            self.scratch.pixels[dst..dst + w * 3]
+                .copy_from_slice(&self.base.map.pixels[src..src + w * 3]);
         }
 
         let clouds = live::draw_clouds(&mut self.scratch, frame);
-        // Layer 3t: the type goes back on top of the clouds (PRD §10.3).
+        // Layer 3t: the type goes back on top of the clouds (PRD §10.3). The
+        // indices are into the *map*, so they are re-strided onto the canvas.
         for (i, colour) in &self.base.labels {
-            let o = *i as usize * 3;
-            self.scratch.pixels[o..o + 3].copy_from_slice(colour);
+            let i = *i as usize;
+            let o = ((i / w) * stride + (i % w)) * 3;
+            if o + 3 <= self.scratch.pixels.len() {
+                self.scratch.pixels[o..o + 3].copy_from_slice(colour);
+            }
         }
         let agents = live::draw_agents(&mut self.scratch, frame, self.opts.trail);
         let attention = live::draw_attention(&mut self.scratch, frame);
@@ -644,6 +951,9 @@ impl FrameRenderer {
         if self.caption_height > 0 {
             self.draw_caption(snap);
         }
+        if self.rail_width > 0 {
+            self.draw_rail(&frame.rail, snap);
+        }
     }
 
     /// The caption strip: chrome, outside the map frame.
@@ -653,6 +963,132 @@ impl FrameRenderer {
     /// image or it is not true at all. So the one thing on this strip that must
     /// catch the eye — a thread waiting on a human — is marked with a **glyph**
     /// rather than with brightness.
+    /// PRD §6.2's status rail: the column where everything that has no place on
+    /// the map is listed instead.
+    ///
+    /// > Until then the thread renders with no cloud — an unplaced marker in the
+    /// > status rail.
+    ///
+    /// Its job is to make "nothing was silently dropped" checkable by looking.
+    /// The rail is never blank: with nothing unplaced it says so, which is a
+    /// different statement from an empty panel and the operator has to be able
+    /// to tell them apart.
+    ///
+    /// Chrome, so it is held below [`plan::ATTENTION_BAND`] like the caption —
+    /// except for the failure count, which is drawn in [`live::AGENT_FAILED`]
+    /// (top channel 168, the agent band's ceiling) and paired with the failed
+    /// operation's own glyph, so it is never a colour-only signal (PRD §11.4).
+    fn draw_rail(&mut self, rows: &[live::RailRow], snap: &WorldSnapshot) {
+        let x0 = self.opts.pixels as f64;
+        let w = self.rail_width as f64;
+        let h = (self.opts.pixels + self.caption_height) as f64;
+        let pad = w * 0.06;
+        // Sized to fit RAIL_COLUMNS characters across, because a rail whose
+        // header runs off its own edge is worse than no rail.
+        let size = ((w - pad * 2.0) / (RAIL_COLUMNS * 6.0)).max(1.0);
+        let line = size * 7.0 * 1.7;
+
+        self.scratch.rect(x0, 0.0, x0 + w, h, CAPTION_PLATE, 1.0);
+        self.scratch
+            .rect(x0, 0.0, x0 + w * 0.018, h, CAPTION_RULE, 1.0);
+
+        let ops: u32 = rows
+            .iter()
+            .filter(|r| r.kind == live::RailKind::UnplacedOps)
+            .map(|r| r.count)
+            .sum();
+        let failed: u32 = rows.iter().map(|r| r.failed).sum();
+        let mut y = pad;
+        self.scratch
+            .text(x0 + pad, y, "STATUS RAIL", size, CAPTION_HEAD);
+        y += line;
+        // The second line is the **live** state; the footer is the running total
+        // since the session started. They are different numbers and the rail
+        // says which is which, because "0 unplaced now" and "18 unplaced ever"
+        // are both true and only one of them is actionable.
+        let head = if rows.is_empty() {
+            "NOW: ALL PLACED".to_owned()
+        } else if failed > 0 {
+            format!("NOW {ops}, {failed} FAIL")
+        } else {
+            format!("NOW {ops} UNPLACED")
+        };
+        self.scratch.text(
+            x0 + pad,
+            y,
+            &head,
+            size,
+            if failed > 0 {
+                live::AGENT_FAILED
+            } else {
+                CAPTION_TEXT
+            },
+        );
+        y += line * 1.35;
+
+        let r = (size * 5.0 * 0.42).max(2.0);
+        for row in rows {
+            if y + line * 2.0 > h - pad {
+                break;
+            }
+            // The glyph is the row's own operation shape when there is one to
+            // show, so a red count always arrives with a shape beside it.
+            let ink = if row.failed > 0 {
+                live::AGENT_FAILED
+            } else {
+                CAPTION_TEXT
+            };
+            live::draw_glyph(
+                &mut self.scratch,
+                [x0 + pad + r, y + size * 3.5],
+                r,
+                match row.kind {
+                    live::RailKind::UnplacedThread => polis_events::Glyph::HollowCircle,
+                    live::RailKind::UnplacedOps => polis_events::Glyph::FilledTriangle,
+                    live::RailKind::UnattributedWorkers => polis_events::Glyph::Delegate,
+                },
+                ink,
+            );
+            let count = if row.failed > 0 {
+                format!("{} ({} FAIL)", row.count, row.failed)
+            } else {
+                row.count.to_string()
+            };
+            self.scratch.text(x0 + pad + r * 2.5, y, &count, size, ink);
+            y += line * 0.85;
+            let width = ((w - pad * 2.0) / (6.0 * size * 0.85)) as usize;
+            debug_assert!(width >= 4);
+            let label: String = row
+                .label
+                .chars()
+                .take(width.max(4))
+                .collect::<String>()
+                .to_uppercase();
+            self.scratch
+                .text(x0 + pad, y, &label, size * 0.85, CAPTION_DIM);
+            y += line * 0.75;
+            self.scratch
+                .text(x0 + pad, y, row.kind.label(), size * 0.85, CAPTION_DIM);
+            y += line * 1.1;
+        }
+
+        // The bottom of the rail carries the counters that say whether the map
+        // above it is complete — the health numbers `place` maintains.
+        let census = snap.health.ops;
+        let foot = [
+            "SINCE START".to_owned(),
+            format!("PLACED {}", census.placed()),
+            format!("RAILED {}", census.rail),
+            format!("FAILED {}", snap.health.ops_failed.total()),
+        ];
+        let mut y = h - pad - line * foot.len() as f64;
+        for text in foot {
+            self.scratch
+                .text(x0 + pad, y, &text, size * 0.85, CAPTION_DIM);
+            y += line;
+        }
+    }
+
     fn draw_caption(&mut self, snap: &WorldSnapshot) {
         let w = self.opts.pixels as f64;
         let y0 = self.opts.pixels as f64;
@@ -747,10 +1183,13 @@ impl FrameRenderer {
             x += r * 2.0 + tw + pad;
         }
         let mut x = legend_x;
+        // Failed first. The legend is truncated from the right when the strip is
+        // narrow, and the one colour the operator must be able to name is the
+        // one that changes a decision (PRD §17).
         for (ink, name) in [
-            (live::AGENT_PENDING, "PENDING"),
-            (live::AGENT_DONE, "DONE"),
             (live::AGENT_FAILED, "FAILED"),
+            (live::AGENT_DONE, "DONE"),
+            (live::AGENT_PENDING, "PENDING"),
         ] {
             let tw = Canvas::text_width(name, size * 0.85);
             if x + r * 2.0 + tw > w - pad {
@@ -802,13 +1241,7 @@ pub fn place(layout: &CityLayout, path: &LogicalPath, view: &View) -> Option<Px>
 /// The city-space position of a path, matching `polis_world::World::position_of`.
 #[must_use]
 pub fn position_of(layout: &CityLayout, path: &LogicalPath) -> Option<Point> {
-    if let Some(b) = layout.buildings.get(path) {
-        let c = b.footprint.centroid();
-        if c.x.is_finite() && c.y.is_finite() {
-            return Some(c);
-        }
-    }
-    layout.districts.get(path).map(|d| d.centre)
+    place::position_in(layout, path)
 }
 
 /// Where a thread's main agent is drawn.
@@ -823,16 +1256,7 @@ pub fn position_of(layout: &CityLayout, path: &LogicalPath) -> Option<Point> {
 /// status rail, exactly as PRD §6.2 asks.
 #[must_use]
 pub fn thread_anchor(thread: &Thread, layout: &CityLayout, view: &View) -> Option<Px> {
-    if let Some(com) = thread.territory.centre_of_mass {
-        if com.x.is_finite() && com.y.is_finite() {
-            return Some(view.at(com));
-        }
-    }
-    thread
-        .trail
-        .iter()
-        .rev()
-        .find_map(|(path, _)| place(layout, path, view))
+    place::thread_position(thread, layout).map(|p| view.at(p))
 }
 
 fn attention_mark(
@@ -1032,6 +1456,7 @@ mod tests {
                 pixels: 420,
                 supersample: 1,
                 caption: false,
+                rail: false,
                 ..FrameOptions::default()
             },
         );
@@ -1067,6 +1492,7 @@ mod tests {
             pixels: 420,
             supersample: 1,
             caption: false,
+            rail: false,
             ..FrameOptions::default()
         };
         let mut r = FrameRenderer::new(&c, opts);
@@ -1316,21 +1742,30 @@ mod tests {
         let world = populated(&c);
         let (_, reader) = snapshot::from_world(&world);
         let snap = reader.load();
-        let frame = r.render(&snap, Duration::from_millis(16));
-        let map_px = 400 * 400;
-        for p in frame.pixels.as_chunks::<3>().0.iter().skip(map_px) {
-            let head = p.iter().copied().max().unwrap_or(0);
-            assert!(head < plan::ATTENTION_BAND.0, "caption pixel at {head}");
+        let frame = r.render(&snap, Duration::from_millis(16)).clone();
+        // Everything outside the 400x400 map square: the caption strip below it
+        // and the status rail to its right. Scanned by coordinate, because the
+        // canvas is wider than the map once the rail is on.
+        let (w, h) = (frame.width, frame.height);
+        let mut inked = 0usize;
+        let mut chrome = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                if x < 400 && y < 400 {
+                    continue;
+                }
+                chrome += 1;
+                let o = (y * w + x) * 3;
+                let p: [u8; 3] = [frame.pixels[o], frame.pixels[o + 1], frame.pixels[o + 2]];
+                let head = p.iter().copied().max().unwrap_or(0);
+                assert!(head < plan::ATTENTION_BAND.0, "chrome pixel at {head}");
+                if p != CAPTION_PLATE {
+                    inked += 1;
+                }
+            }
         }
-        let inked = frame
-            .pixels
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .skip(map_px)
-            .filter(|p| **p != CAPTION_PLATE)
-            .count();
-        assert!(inked > 200, "the caption drew {inked} px");
+        assert!(chrome > 400 * 48, "the chrome area came out at {chrome} px");
+        assert!(inked > 200, "the chrome drew {inked} px");
     }
 
     /// A mark with an unresolvable position is dropped, not stacked at `[0, 0]`
@@ -1408,6 +1843,189 @@ mod tests {
             }
         }
     }
+
+    /// A world whose thread runs shell commands and calls pathless tools, which
+    /// is what a real session mostly does: 6 742 shell calls against 1 104
+    /// edits in one recorded run.
+    fn shelling(city: &City) -> World {
+        let mut world = World::new(RepoTree::default(), city.layout.clone());
+        let t0 = Instant::now();
+        let path = city
+            .layout
+            .buildings
+            .keys()
+            .next()
+            .expect("a city has buildings")
+            .clone();
+        let mut at = t0;
+        // One placeable step, so the thread has a position at all.
+        world.apply(&tool_result(
+            "s",
+            None,
+            ToolKind::Edit,
+            &path,
+            Outcome::Done,
+            at,
+        ));
+        at += Duration::from_secs(1);
+        // Then twelve shell calls with no path of their own, four of them
+        // failing. On the old rule not one of these reached the map.
+        for i in 0..12 {
+            let outcome = if i % 3 == 0 {
+                Outcome::Failed
+            } else {
+                Outcome::Done
+            };
+            let mut meta = EventMeta::now(Channel::Otel).with_session(SessionId::new("s"));
+            meta.observed = at;
+            let call = ToolCall {
+                tool: ToolKind::PowerShell,
+                tool_use_id: Some(ToolUseId::new(format!("toolu_sh_{i}"))),
+                paths: Vec::new(),
+                outcome,
+                duration_ms: Some(4.0),
+            };
+            world.apply(&Event::new(
+                meta,
+                Payload::Otel(Box::new(OtelEvent::ToolResult(Box::new(call)))),
+            ));
+            at += Duration::from_secs(1);
+        }
+        world.tick(at);
+        world
+    }
+
+    /// The defect this whole layer exists to fix: a shell call carries no file
+    /// path, and on the old rule that meant no mark — which hid 69 % of all real
+    /// tool failures and the single most-used tool.
+    #[test]
+    fn a_shell_call_with_no_path_is_still_drawn_and_a_failed_one_is_red() {
+        let c = small_city();
+        let mut r = FrameRenderer::new(&c, FrameOptions::default());
+        let world = shelling(&c);
+        let (_, reader) = snapshot::from_world(&world);
+        let snap = reader.load();
+        let frame = r.build(&snap, 0.016);
+
+        let runs: Vec<&Mark> = frame
+            .marks
+            .iter()
+            .filter(|m| m.glyph == polis_events::Glyph::FilledTriangle)
+            .collect();
+        assert!(
+            !runs.is_empty(),
+            "the run glyph never appeared, though the thread ran twelve commands"
+        );
+        let failed: u32 = runs
+            .iter()
+            .filter(|m| m.outcome == Outcome::Failed)
+            .map(|m| m.count)
+            .sum();
+        assert_eq!(failed, 4, "every failed run has to reach the map");
+        let done: u32 = runs
+            .iter()
+            .filter(|m| m.outcome == Outcome::Done)
+            .map(|m| m.count)
+            .sum();
+        assert_eq!(done, 8);
+        // Aggregated, not repeated: twelve calls at one position become two
+        // marks, because a failure may never be merged into a success.
+        assert_eq!(runs.len(), 2, "shell volume was not aggregated: {runs:?}");
+        // And their positions differ, because each (shape, colour) pair has its
+        // own seat around the agent.
+        assert_ne!(runs[0].at, runs[1].at);
+        // Coarser position, smaller mark — never a different shape or colour.
+        assert!(runs.iter().all(|m| m.scale < 1.0));
+    }
+
+    /// Nothing may be silently dropped. A thread with no position at all has no
+    /// map to draw on, so its operations are counted in the status rail.
+    #[test]
+    fn an_operation_with_nowhere_to_go_lands_in_the_status_rail() {
+        let c = small_city();
+        let mut r = FrameRenderer::new(&c, FrameOptions::default());
+        // A world over an **empty** city: nothing has geometry, so no rung of
+        // the chain can resolve and every operation is rung 4.
+        let mut world = World::new(RepoTree::default(), polis_layout::CityLayout::default());
+        let at = Instant::now();
+        let mut meta = EventMeta::now(Channel::Otel).with_session(SessionId::new("ghost"));
+        meta.observed = at;
+        world.apply(&Event::new(
+            meta,
+            Payload::Otel(Box::new(OtelEvent::ToolResult(Box::new(ToolCall {
+                tool: ToolKind::Bash,
+                tool_use_id: Some(ToolUseId::new("toolu_x")),
+                paths: Vec::new(),
+                outcome: Outcome::Failed,
+                duration_ms: None,
+            })))),
+        ));
+        world.tick(at);
+        let (_, reader) = snapshot::from_world(&world);
+        let snap = reader.load();
+        let frame = r.build(&snap, 0.016);
+        assert!(frame.marks.is_empty(), "nothing could be placed");
+        let ops: u32 = frame
+            .rail
+            .iter()
+            .filter(|row| row.kind == live::RailKind::UnplacedOps)
+            .map(|row| row.count)
+            .sum();
+        assert_eq!(
+            ops, 1,
+            "the unplaced operation was dropped: {:?}",
+            frame.rail
+        );
+        let failed: u32 = frame.rail.iter().map(|row| row.failed).sum();
+        assert_eq!(failed, 1, "the rail lost the failure");
+        assert!(
+            frame
+                .rail
+                .iter()
+                .any(|row| row.kind == live::RailKind::UnplacedThread),
+            "a thread with no position is itself an unplaced marker (PRD §6.2)"
+        );
+        // And it reaches pixels: the rail is chrome, and chrome that draws
+        // nothing is indistinguishable from a rail with nothing in it.
+        let map = r.map_pixels();
+        let canvas = r.render(&snap, Duration::from_millis(16));
+        let (w, h) = (canvas.width, canvas.height);
+        assert!(w > map, "the rail has no column to draw in");
+        let inked = (0..h)
+            .flat_map(|y| (map..w).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let o = (y * w + x) * 3;
+                [canvas.pixels[o], canvas.pixels[o + 1], canvas.pixels[o + 2]] != CAPTION_PLATE
+            })
+            .count();
+        assert!(inked > 100, "the status rail drew {inked} px");
+    }
+
+    /// Every operation the world holds ends up somewhere: on the map, or in the
+    /// rail. The conservation law this layer is for.
+    #[test]
+    fn no_operation_is_lost_between_the_world_and_the_frame() {
+        let c = small_city();
+        let mut r = FrameRenderer::new(&c, FrameOptions::default());
+        let world = shelling(&c);
+        let (_, reader) = snapshot::from_world(&world);
+        let snap = reader.load();
+        let frame = r.build(&snap, 0.016);
+        let held: usize = snap.threads.iter().map(|t| t.ops.len()).sum();
+        let drawn: u32 = frame.marks.iter().map(|m| m.count).sum();
+        let railed: u32 = frame
+            .rail
+            .iter()
+            .filter(|row| row.kind == live::RailKind::UnplacedOps)
+            .map(|row| row.count)
+            .sum();
+        assert_eq!(
+            drawn + railed,
+            u32::try_from(held).unwrap_or(u32::MAX),
+            "{held} operations became {drawn} drawn and {railed} railed"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The recorder
     // -----------------------------------------------------------------------
@@ -1546,65 +2164,44 @@ mod tests {
             _ => vec![("timed", TrailStyle::Timed), ("fade", TrailStyle::Fade)],
         };
         let total = schedule.duration_ms();
-        // A whole session sampled in 96 frames shows nothing: the world clock
-        // ages by *session* time across each compressed gap, so consecutive
-        // frames land minutes or hours apart and every trail and mark has
-        // already expired between them. So unless the caller names a span, the
-        // recorder finds the **busiest window** — the `POLIS_WINDOW_S` seconds
-        // of compressed timeline holding the most events — which is where the
-        // notation is actually under test.
-        let (start_ms, end_ms) =
+        // Where each frame lands on the compressed timeline.
+        //
+        // This used to be "the busiest 45 s window, cut into N equal slices",
+        // and the constant that came out of it — world-seconds per frame — was
+        // doing all the work with nothing checking it: one M2 recording ran at
+        // ~0.9 world-s/frame and read as alive while another spent 43% of its
+        // frames changing fewer than 200 of 1.32M pixels. `crate::pacing`
+        // derives the step from the schedule's own event density instead, and
+        // clamps it to the range the notation can actually draw.
+        let pace = crate::pacing::plan(&schedule, frames);
+        let placements: Vec<u64> =
             if std::env::var("POLIS_FROM").is_ok() || std::env::var("POLIS_TO").is_ok() {
-                ((total as f64 * from) as u64, (total as f64 * to) as u64)
+                let (a, b) = ((total as f64 * from) as u64, (total as f64 * to) as u64);
+                (0..frames)
+                    .map(|i| a + (b - a) * i as u64 / (frames.max(2) as u64 - 1))
+                    .collect()
             } else {
-                // "Busiest" has to mean **tool calls**, not records. A
-                // transcript's event count is dominated by assistant text and
-                // thinking blocks: the densest window by record count in this
-                // session held 13 676 events and *one* file operation, which
-                // renders as an empty map. So the scout pass steps the whole
-                // session and notes when a tool call actually lands.
-                let window = (env_num("POLIS_WINDOW_S", 45.0) * 1000.0) as u64;
-                let mut probe = World::for_replay(city.layout.clone());
-                let mut scout = ReplayDriver::with_origin(schedule.clone(), Instant::now());
-                let mut calls: Vec<u64> = Vec::new();
-                let mut seen = 0u64;
-                while scout.step(&mut probe) {
-                    // The metric is **distinct paths reached**, and getting
-                    // here took three tries. Records are dominated by assistant
-                    // text; tool calls are dominated by calls with no path;
-                    // path *touches* are dominated by one file being hammered,
-                    // which the trail deduplicates into a single step by
-                    // design. What makes a map worth looking at is the session
-                    // spreading out, so that is what the window maximises.
-                    let now: u64 = probe.threads.values().map(|t| t.visits.len() as u64).sum();
-                    if now > seen {
-                        seen = now;
-                        calls.push(scout.clock().position_ms());
-                    }
-                }
-                let mut best = (0u64, 0usize);
-                let mut lo = 0usize;
-                for hi in 0..calls.len() {
-                    while calls[lo] + window < calls[hi] {
-                        lo += 1;
-                    }
-                    if hi - lo + 1 > best.1 {
-                        best = (calls[lo], hi - lo + 1);
-                    }
-                }
-                eprintln!(
-                    "  {} distinct paths reached; the busiest {} s window reaches {}",
-                    calls.len(),
-                    window / 1000,
-                    best.1
-                );
-                (best.0.saturating_sub(2_000), (best.0 + window).min(total))
+                pace.frames_ms.clone()
             };
         let frame_dt = Duration::from_millis(1000 / 24);
         eprintln!(
-            "  {frames} frames at {pixels} px over {:.2}-{:.2} min of the compressed timeline",
-            start_ms as f64 / 60_000.0,
-            end_ms as f64 / 60_000.0
+            "  {} frames at {pixels} px over {:.2}-{:.2} min of the compressed timeline",
+            placements.len(),
+            placements.first().copied().unwrap_or(0) as f64 / 60_000.0,
+            placements.last().copied().unwrap_or(0) as f64 / 60_000.0
+        );
+        eprintln!(
+            "  pacing: {:.3} world-s/frame mean (step {} ms from {:.1} live events/s), \
+             {} live events + {} waiting-on-you moments in the window, \
+             {} frames at the floor, {} at the ceiling — {}",
+            pace.mean_step_secs(),
+            pace.step_ms,
+            pace.events_per_second,
+            pace.live_events,
+            pace.decisions,
+            pace.floored,
+            pace.ceilinged,
+            pace.verdict(),
         );
 
         // Frame the work, not the repository. On a real checkout most of the
@@ -1691,9 +2288,7 @@ mod tests {
             let mut budgeted: Vec<Duration> = Vec::with_capacity(frames);
             let mut draw_total = Duration::ZERO;
             let started = Instant::now();
-            for i in 0..frames {
-                let f = i as f64 / (frames.max(2) - 1) as f64;
-                let target = start_ms + ((end_ms - start_ms) as f64 * f) as u64;
+            for (i, target) in placements.iter().copied().enumerate() {
                 driver.seek(target, &mut world);
                 publisher.force(&world);
                 let snap = reader.load();
@@ -1877,35 +2472,35 @@ mod tests {
         // 1. The shape × colour matrix, one mark per real building.
         for (gi, (glyph, _)) in glyphs.iter().enumerate() {
             for (oi, (outcome, _)) in outcomes.iter().enumerate() {
-                frame.marks.push(Mark {
-                    at: pick(0.10 + gi as f64 * 0.055, 0.12 + oi as f64 * 0.055),
-                    glyph: *glyph,
-                    outcome: *outcome,
-                    age: 0.0,
-                    pulse: 0.0,
-                });
+                frame.marks.push(Mark::single(
+                    pick(0.10 + gi as f64 * 0.055, 0.12 + oi as f64 * 0.055),
+                    *glyph,
+                    *outcome,
+                    0.0,
+                    0.0,
+                ));
             }
         }
         // 2. The same six shapes aged, to show the fade stays inside the band.
         for (gi, (glyph, _)) in glyphs.iter().enumerate() {
             for step in 0..4 {
-                frame.marks.push(Mark {
-                    at: pick(0.10 + gi as f64 * 0.055, 0.32 + f64::from(step) * 0.045),
-                    glyph: *glyph,
-                    outcome: Outcome::Done,
-                    age: f64::from(step) / 3.0,
-                    pulse: 0.0,
-                });
+                frame.marks.push(Mark::single(
+                    pick(0.10 + gi as f64 * 0.055, 0.32 + f64::from(step) * 0.045),
+                    *glyph,
+                    Outcome::Done,
+                    f64::from(step) / 3.0,
+                    0.0,
+                ));
             }
         }
         // 3. An arrival, mid-pulse.
-        frame.marks.push(Mark {
-            at: pick(0.50, 0.14),
-            glyph: Glyph::FilledSquare,
-            outcome: Outcome::Done,
-            age: 0.0,
-            pulse: 0.55,
-        });
+        frame.marks.push(Mark::single(
+            pick(0.50, 0.14),
+            Glyph::FilledSquare,
+            Outcome::Done,
+            0.0,
+            0.55,
+        ));
 
         // 4. A trail that backtracks and thrashes (PRD §12).
         let walk: Vec<Px> = [
