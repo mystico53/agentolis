@@ -4,37 +4,55 @@
 //! > Continuous gradients turn to mush and you lose the ability to say "that
 //! > file is in the core of this thread's work" versus "it's at the fringe."
 //!
-//! > Implementation: splat Gaussian kernels into an offscreen R16F density
-//! > texture (512²), then threshold in a fragment shader to produce bands.
-//! > Metaballs, essentially.
+//! This is the window's half of that layer, and it is deliberately **not** a
+//! second implementation. The field, the thresholds, the contour, the hatch, the
+//! cross-hatch on contested ground and the tween all come from
+//! [`polis_render::live`]; this module maps kernels into a fixed texel frame,
+//! hands them over, and uploads what comes back. A visual language with two
+//! definitions has none, and the previous version proved it — see below.
 //!
-//! This is that algorithm on the CPU, into an `egui` texture rather than an
-//! `R16Float` render target. `polis-render` owns the GPU version; the window
-//! needs the layer to exist today, and the two agree about what is being
-//! computed because both are the same three steps: **sum the kernels, threshold
-//! at fixed levels, fill discrete bands.**
+//! # What was here before, and why it had to go
 //!
-//! # Three findings from `docs/verified/gpu-stack.md` §5 are honoured here
+//! The first version thresholded the field into three bands and **filled** each
+//! one with a translucent colour: `bands[0].alpha(0.42)` through
+//! `bands[2].alpha(0.70)`, one `Color32` per texel, no texel left unpainted.
 //!
-//! 1. **The field is unbounded.** Additive blending means N overlapping kernels
-//!    sum to ≈N, not to 1. The thresholds are therefore levels on an open scale,
-//!    not fractions of a maximum.
-//! 2. **Normalising by the observed maximum is a trap.** The probe measured it:
-//!    one hot cluster consumed the whole range and every other territory
-//!    collapsed into a single fringe band. The reference is **fixed** — one
-//!    full-weight kernel is 1.0 — and hot spots clip into the core band.
-//! 3. **Hard steps, never a `smoothstep`.** [`BANDS`] is an `if` chain over
-//!    three levels and the assertion that keeps it that way counts distinct
-//!    colours in the output.
+//! That is an area fill, and the same construction was measured on the
+//! rasteriser's side of the house: it inked two thirds of its own footprint,
+//! lifted 40 % of the city by more than six levels, and moved the median
+//! luminance of the base map underneath it from `L 22` to `L 45` — the map
+//! fogging into pale grey exactly where the activity was, which is the one place
+//! it must not. PRD §10.3 puts clouds beneath the district outlines *so the map
+//! stays readable*, and a wash makes that sentence false however low the alpha
+//! goes.
 //!
-//! # Why the grid is anchored in map space, not on screen
+//! What is drawn instead is what [`polis_render::live::paint_cloud_bands`]
+//! draws: a contour stroke on each level's boundary, widest on the outermost
+//! because that silhouette is what survives being seen from across the room,
+//! plus a hatch whose spacing tightens toward the core, crossed where two
+//! territories claim the same ground. Every mark is **opaque** and every other
+//! texel is fully transparent, so the city underneath is not merely recoverable,
+//! it is untouched — measured at **zero** disturbed pixels, and a median
+//! luminance that moves by `0.000` levels, over 192 frames of six real sessions
+//! replayed side by side (`polis-render/tests/cloud_measure.rs`).
 //!
-//! A screen-anchored field would have to be recomputed and re-uploaded on every
-//! pan and every zoom, which is exactly the kind of per-frame work PRD §13.1's
-//! idle budget rules out. Anchored to the kernels' own bounding box in base-map
-//! pixels, it changes only when the world does, so panning around a still world
-//! uploads nothing. Zooming in makes the cloud softer, which is the correct
-//! answer for the layer PRD §12 calls *fuzzy above, exact below*.
+//! # Nearest, not linear, and that is not a detail
+//!
+//! A sparse mark stretched with a linear filter is a smear whose edges land at
+//! every intermediate alpha, and a half-transparent cloud tone composites into
+//! the base map's own contrast band — which is the fill this module just stopped
+//! drawing, arriving by the back door. [`egui::TextureOptions::NEAREST`] keeps a
+//! mark a mark at every zoom.
+//!
+//! # Why the texel frame is fixed to the whole base map
+//!
+//! The grid used to be anchored to the territories' own bounding box, which
+//! moves whenever a territory grows a lobe. PRD §13 asks for the cloud density
+//! to be **tweened between updates**, and a tween across a moving coordinate
+//! frame either resamples every frame or jumps. Anchoring the texel grid to the
+//! base map instead makes the frame constant for the life of the city: the
+//! *image* is still only the cloud's own rectangle, so nothing large is
+//! uploaded, but the field the tween interpolates never has to be re-registered.
 
 // The field is a numeric grid: every cast here lands in a texel index that is
 // clamped on purpose.
@@ -44,48 +62,58 @@
     clippy::cast_sign_loss
 )]
 
-use eframe::egui::{self, Color32, Pos2, Rect};
+use eframe::egui::{self, Color32, Rect};
+use polis_render::live::{self, CloudField, CloudKernel, CloudTween, CLOUD_CROWD, CLOUD_TONES};
+use polis_render::raster::Canvas;
 use polis_world::snapshot::WorldSnapshot;
 use polis_world::territory::{self, Territory};
 
-use crate::basemap::BaseMap;
-use crate::palette;
+use crate::basemap::{BaseMap, BASE_MAP_PIXELS};
 
-/// The density grid's edge, in texels.
+/// The cloud field's edge, in texels, across the **whole base map**.
 ///
-/// PRD §10.4 specifies 512² for the GPU target. This is the CPU version and it
-/// only ever covers the territories' own bounding box rather than the whole
-/// viewport, so a quarter of the linear resolution lands in the same place while
-/// costing a sixteenth of the upload.
-pub const GRID: usize = 256;
+/// PRD §10.4 specifies 512² for the GPU target. This is a thousand and
+/// twenty-four because it is a CPU rasterisation the operator zooms into: at
+/// 1 600 base-map pixels that is 1.56 px per texel, so a contour stroke is still
+/// a stroke at the district tier rather than a staircase.
+///
+/// It is not what the layer costs. The field is only ever sampled, thresholded
+/// and painted over the territories' own bounding rectangle — a few hundred
+/// texels on a side in practice — and the lattice underneath it is capped at
+/// 256² by `polis_render::live` whatever the rectangle's size.
+pub const TEXELS: usize = 1024;
 
-/// Iso levels, fringe to core, on the fixed reference where one full-weight
-/// kernel peaks at 1.0.
-pub const BANDS: [f32; 3] = [0.10, 0.34, 0.75];
+/// Transparent, and distinguishable from every cloud tone.
+const NOTHING: [u8; 3] = [0, 0, 0];
 
-/// How far past a kernel's radius the Gaussian is evaluated. Beyond this the
-/// truncated kernel is zero, so the loop can stop.
-const KERNEL_EXTENT: f32 = 1.0;
+/// A field within this fraction of its target on every texel has arrived, and
+/// the layer stops repainting until the world moves again (PRD §13.1's idle
+/// budget: *"< 2 % of one core"*).
+const SETTLED: f32 = 0.02;
 
-/// One kernel's peak, subtracted so the kernel reaches exactly zero at its own
-/// edge and adjacent splats do not seam.
-const TRUNCATION: f32 = 0.011_109; // exp(-4.5)
-
-/// The rasterised cloud layer: one texture, recomputed only when the world
-/// changes.
+/// The rasterised cloud layer: one texture, repainted while it is moving.
 pub struct Clouds {
     texture: Option<egui::TextureHandle>,
     /// The base-map rectangle the texture covers.
     rect: Rect,
-    /// The snapshot generation the field was built from.
+    /// The world the target was built from.
     generation: u64,
-    /// The cloud cap in force when it was built.
+    /// The cloud cap in force when the target was built.
     cap: usize,
+    /// Where the world says the field should be.
+    target: Option<CloudField>,
+    /// Where it is (PRD §13's tween).
+    tween: CloudTween,
+    /// Whether the tween has arrived and the texture can be left alone.
+    settled: bool,
     /// How many kernels went in, for the status bar.
     pub kernels: usize,
-    /// How many territories got a cloud, out of how many threads.
+    /// How many territories got a cloud.
     pub shown: usize,
-    /// How long the last rebuild took.
+    /// Texels two or more territories both claim — PRD §6.4's contention signal,
+    /// visible before a write collides.
+    pub contested: usize,
+    /// How long the last repaint took.
     pub build_ms: f64,
 }
 
@@ -94,7 +122,9 @@ impl std::fmt::Debug for Clouds {
         f.debug_struct("Clouds")
             .field("kernels", &self.kernels)
             .field("shown", &self.shown)
+            .field("contested", &self.contested)
             .field("generation", &self.generation)
+            .field("settled", &self.settled)
             .field("build_ms", &self.build_ms)
             .finish_non_exhaustive()
     }
@@ -106,265 +136,239 @@ impl Default for Clouds {
             texture: None,
             rect: Rect::NOTHING,
             generation: u64::MAX,
-            cap: 0,
+            cap: usize::MAX,
+            target: None,
+            tween: CloudTween::default(),
+            settled: false,
             kernels: 0,
             shown: 0,
+            contested: 0,
             build_ms: 0.0,
         }
     }
 }
 
 impl Clouds {
-    /// Rebuilds the field if the world moved, and returns what to draw.
+    /// Advances the field and returns what to draw.
     ///
     /// `cap` is PRD §10.4's cloud cap: *"Forty threads means forty systems and
     /// the map vanishes under haze."* Which territories survive it is
     /// [`polis_world::territory::visible_clouds`]'s decision, not this module's.
+    ///
+    /// `dt` is **presentation** seconds. The tween is an animation, so it runs
+    /// on the clock the viewer experiences and not on the world's — the same
+    /// split `polis_render::frame` makes, and for the same reason: a cloud
+    /// should take the same third of a second to arrive whether a replay is at
+    /// 1× or 64×.
     pub fn update(
         &mut self,
         ctx: &egui::Context,
         base: &BaseMap,
         snapshot: &WorldSnapshot,
         cap: usize,
+        dt: f32,
     ) -> Option<(&egui::TextureHandle, Rect)> {
         if self.generation != snapshot.generation || self.cap != cap {
-            self.rebuild(ctx, base, snapshot, cap);
+            self.target =
+                Self::target_field(base, snapshot, cap, &mut self.kernels, &mut self.shown);
             self.generation = snapshot.generation;
             self.cap = cap;
+            self.settled = false;
+        }
+        if !self.settled {
+            self.advance(ctx, f64::from(dt));
         }
         let texture = self.texture.as_ref()?;
         Some((texture, self.rect))
     }
 
-    fn rebuild(
-        &mut self,
-        ctx: &egui::Context,
+    /// Whether the layer still owes the window a frame.
+    ///
+    /// The window repaints on its own while agents move; this is what keeps a
+    /// cloud arriving smoothly in a world that is otherwise still.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        !self.settled
+    }
+
+    /// Drops the tween. Called when the replay is scrubbed, because easing
+    /// across a cut would draw a cloud sliding through the city.
+    pub fn reset(&mut self) {
+        self.tween.reset();
+        self.generation = u64::MAX;
+        self.settled = false;
+    }
+
+    /// The visible territories' kernels, in texel coordinates.
+    fn target_field(
         base: &BaseMap,
         snapshot: &WorldSnapshot,
         cap: usize,
-    ) {
-        let started = std::time::Instant::now();
+        kernels_out: &mut usize,
+        shown_out: &mut usize,
+    ) -> Option<CloudField> {
         let pairs: Vec<(&polis_world::Thread, &Territory)> = snapshot
             .threads
             .iter()
             .map(|thread| (thread, &thread.territory))
             .collect();
         let visible = territory::visible_clouds(&pairs, cap);
-        self.shown = visible.len();
+        *shown_out = visible.len();
 
-        // Splats in base-map pixels: centre, radius, weight.
-        let mut splats: Vec<(Pos2, f32, f32)> = Vec::new();
-        let scale = base.map_px_per_world();
-        for territory in &visible {
+        // Base-map pixels to texels: one fixed factor for the life of the city,
+        // which is what lets the tween interpolate without re-registering.
+        let per_texel = TEXELS as f32 / BASE_MAP_PIXELS as f32;
+        let scale = base.map_px_per_world() * per_texel;
+        let mut kernels: Vec<CloudKernel> = Vec::new();
+        for (rank, territory) in visible.iter().enumerate() {
             for kernel in &territory.kernels {
-                let radius = (kernel.radius * scale).max(2.0);
-                splats.push((base.to_map(kernel.centre), radius, kernel.weight));
+                if kernel.weight <= 0.0 {
+                    continue;
+                }
+                let at = base.to_map(kernel.centre);
+                kernels.push(CloudKernel {
+                    at: [f64::from(at.x * per_texel), f64::from(at.y * per_texel)],
+                    // PRD §6.4's bandwidth, already `base / sqrt(effective_n)`
+                    // and already clamped by `polis_world`. The renderer must not
+                    // second-guess it: the width of the cloud *is* the width of
+                    // the claim, and it is the only thing that makes a thinly
+                    // evidenced territory look thinly evidenced.
+                    radius: f64::from((kernel.radius * scale).max(2.0)),
+                    weight: f64::from(kernel.weight),
+                    thread: u16::try_from(rank).unwrap_or(u16::MAX),
+                });
             }
         }
-        self.kernels = splats.len();
-        if splats.is_empty() {
+        *kernels_out = kernels.len();
+        CloudField::sample(&kernels, TEXELS, TEXELS)
+    }
+
+    /// One tween step, and the repaint it implies.
+    fn advance(&mut self, ctx: &egui::Context, dt: f64) {
+        let started = std::time::Instant::now();
+        let Some(field) = self
+            .tween
+            .advance(self.target.clone(), dt, live::CLOUD_TWEEN_RATE)
+        else {
             self.texture = None;
             self.rect = Rect::NOTHING;
+            self.contested = 0;
+            self.settled = self.target.is_none();
             self.build_ms = started.elapsed().as_secs_f64() * 1_000.0;
             return;
-        }
+        };
 
-        let mut min = Pos2::new(f32::INFINITY, f32::INFINITY);
-        let mut max = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (centre, radius, _) in &splats {
-            let r = radius * KERNEL_EXTENT;
-            min.x = min.x.min(centre.x - r);
-            min.y = min.y.min(centre.y - r);
-            max.x = max.x.max(centre.x + r);
-            max.y = max.y.max(centre.y + r);
-        }
-        // Square the box so texels are square and the field is not stretched.
-        let side = (max.x - min.x).max(max.y - min.y).max(1.0);
-        let centre = Pos2::new(f32::midpoint(min.x, max.x), f32::midpoint(min.y, max.y));
-        let rect = Rect::from_center_size(centre, egui::Vec2::splat(side));
+        let bands = field.bands();
+        self.contested = bands
+            .crowd
+            .iter()
+            .zip(bands.cells.iter())
+            .filter(|(c, b)| **c >= CLOUD_CROWD && **b != live::NO_BAND)
+            .count();
 
-        let mut field = vec![0.0f32; GRID * GRID];
-        let per_texel = side / GRID as f32;
-        for (centre, radius, weight) in &splats {
-            splat(&mut field, rect, per_texel, *centre, *radius, *weight);
-        }
+        // The notation itself, rasterised by `polis_render::live` so the window
+        // and the headless renderer cannot disagree about a single stroke.
+        let mut canvas = Canvas::new(bands.width, bands.height, NOTHING);
+        live::paint_cloud_bands_into(&mut canvas, &bands, [bands.x0, bands.y0]);
 
-        let image = threshold(&field);
+        // Opaque where a mark landed, fully transparent everywhere else. There
+        // is no intermediate alpha anywhere in this image, which is what stops
+        // the layer compositing into the base map's own contrast band.
+        let pixels: Vec<Color32> = canvas
+            .pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| {
+                if CLOUD_TONES.contains(p) {
+                    Color32::from_rgb(p[0], p[1], p[2])
+                } else {
+                    Color32::TRANSPARENT
+                }
+            })
+            .collect();
+        let image = egui::ColorImage::new([bands.width, bands.height], pixels);
         match &mut self.texture {
-            Some(handle) => handle.set(image, egui::TextureOptions::LINEAR),
+            Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
             None => {
                 self.texture =
-                    Some(ctx.load_texture("polis-clouds", image, egui::TextureOptions::LINEAR));
+                    Some(ctx.load_texture("polis-clouds", image, egui::TextureOptions::NEAREST));
             }
         }
-        self.rect = rect;
+
+        let per_texel = BASE_MAP_PIXELS as f32 / TEXELS as f32;
+        self.rect = Rect::from_min_max(
+            egui::pos2(bands.x0 as f32 * per_texel, bands.y0 as f32 * per_texel),
+            egui::pos2(
+                (bands.x0 + bands.width) as f32 * per_texel,
+                (bands.y0 + bands.height) as f32 * per_texel,
+            ),
+        );
+        self.settled = match &self.target {
+            Some(t) => t.aligned_with(field) && Self::close(&t.density, &field.density),
+            None => false,
+        };
         self.build_ms = started.elapsed().as_secs_f64() * 1_000.0;
     }
-}
 
-/// Adds one truncated Gaussian to the field, over its own footprint only.
-///
-/// Restricting the loop to the kernel's own bounding box is what makes the
-/// whole layer cost the sum of the kernels' areas rather than
-/// `kernels × GRID²`.
-fn splat(field: &mut [f32], rect: Rect, per_texel: f32, centre: Pos2, radius: f32, weight: f32) {
-    let to_texel = |v: f32, lo: f32| (v - lo) / per_texel;
-    let r = radius * KERNEL_EXTENT;
-    let x0 = to_texel(centre.x - r, rect.min.x).floor().max(0.0) as usize;
-    let x1 = (to_texel(centre.x + r, rect.min.x).ceil() as usize).min(GRID);
-    let y0 = to_texel(centre.y - r, rect.min.y).floor().max(0.0) as usize;
-    let y1 = (to_texel(centre.y + r, rect.min.y).ceil() as usize).min(GRID);
-    for ty in y0..y1 {
-        let y = rect.min.y + (ty as f32 + 0.5) * per_texel;
-        for tx in x0..x1 {
-            let x = rect.min.x + (tx as f32 + 0.5) * per_texel;
-            let dx = (x - centre.x) / radius;
-            let dy = (y - centre.y) / radius;
-            let d2 = dx * dx + dy * dy;
-            if d2 > 1.0 {
-                continue;
-            }
-            // Exactly the probe's kernel: truncated at the quad edge so
-            // adjacent splats do not seam.
-            let g = (-4.5 * d2).exp() - TRUNCATION;
-            if g > 0.0 {
-                field[ty * GRID + tx] += g * weight;
-            }
-        }
+    /// Whether the tween has arrived, to within a hundredth of the target's own
+    /// peak. Relative rather than absolute, so a faint territory is allowed to
+    /// settle as readily as a dense one.
+    fn close(target: &[f32], now: &[f32]) -> bool {
+        let peak = target.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+        target
+            .iter()
+            .zip(now.iter())
+            .all(|(a, b)| (a - b).abs() <= peak * SETTLED)
     }
-}
-
-/// Thresholds the field into three discrete bands.
-///
-/// Hard steps and a transparent floor, never a `smoothstep`: PRD §10.4's
-/// "never a continuous blur" is the whole reason this layer is bands at all.
-fn threshold(field: &[f32]) -> egui::ColorImage {
-    let bands = palette::cloud_bands();
-    // Alpha, not tone, for this one layer: a cloud is context and has to let
-    // the city read through it — PRD §10.3 puts clouds *beneath* district
-    // outlines and labels for exactly that reason. The three steps are far
-    // enough apart that "core" and "fringe" are still distinguishable at a
-    // glance, which is the whole point of bands over a blur.
-    let colours = [
-        bands[0].alpha(0.42),
-        bands[1].alpha(0.56),
-        bands[2].alpha(0.70),
-    ];
-    let pixels = field
-        .iter()
-        .map(|&d| {
-            if d >= BANDS[2] {
-                colours[2]
-            } else if d >= BANDS[1] {
-                colours[1]
-            } else if d >= BANDS[0] {
-                colours[0]
-            } else {
-                Color32::TRANSPARENT
-            }
-        })
-        .collect();
-    egui::ColorImage::new([GRID, GRID], pixels)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polis_render::live::CLOUD_ISO;
     use std::collections::HashSet;
 
-    fn field_with(splats: &[(Pos2, f32, f32)]) -> Vec<f32> {
-        let rect = Rect::from_min_size(Pos2::ZERO, egui::Vec2::splat(100.0));
-        let mut field = vec![0.0f32; GRID * GRID];
-        for (c, r, w) in splats {
-            splat(&mut field, rect, 100.0 / GRID as f32, *c, *r, *w);
-        }
-        field
+    fn field(splats: &[([f64; 2], f64, f64, u16)]) -> CloudField {
+        let kernels: Vec<CloudKernel> = splats
+            .iter()
+            .map(|(at, radius, weight, thread)| CloudKernel {
+                at: *at,
+                radius: *radius,
+                weight: *weight,
+                thread: *thread,
+            })
+            .collect();
+        CloudField::sample(&kernels, 400, 400).expect("a field")
     }
 
-    /// `docs/verified/gpu-stack.md` §5's central finding, reproduced on the CPU:
+    fn paint(field: &CloudField) -> Canvas {
+        let bands = field.bands();
+        let mut canvas = Canvas::new(bands.width, bands.height, NOTHING);
+        live::paint_cloud_bands_into(&mut canvas, &bands, [bands.x0, bands.y0]);
+        canvas
+    }
+
+    /// `docs/verified/gpu-stack.md` §5's central finding, on the CPU:
     /// overlapping kernels **sum**, so the field is unbounded and the thresholds
     /// cannot be fractions of a maximum.
     #[test]
     fn overlapping_kernels_sum_past_one() {
-        let one = field_with(&[(Pos2::new(50.0, 50.0), 20.0, 1.0)]);
-        let peak_one = one.iter().copied().fold(0.0f32, f32::max);
+        let one = field(&[([200.0, 200.0], 60.0, 1.0, 0)]);
         assert!(
-            (peak_one - (1.0 - TRUNCATION)).abs() < 0.01,
-            "one kernel peaks at ~0.989, got {peak_one}"
+            (one.peak() - 1.0).abs() < 0.02,
+            "one full-weight kernel peaks at ~1, got {}",
+            one.peak()
         );
-
-        let three = field_with(&[
-            (Pos2::new(50.0, 50.0), 20.0, 1.0),
-            (Pos2::new(52.0, 50.0), 20.0, 1.0),
-            (Pos2::new(51.0, 52.0), 20.0, 1.0),
+        let three = field(&[
+            ([200.0, 200.0], 60.0, 1.0, 0),
+            ([206.0, 200.0], 60.0, 1.0, 0),
+            ([203.0, 206.0], 60.0, 1.0, 0),
         ]);
-        let peak_three = three.iter().copied().fold(0.0f32, f32::max);
         assert!(
-            peak_three > 2.5,
-            "three overlapping kernels summed to {peak_three}"
-        );
-    }
-
-    /// The kernel is truncated at its own edge, so two adjacent territories do
-    /// not leave a seam and a kernel contributes nothing outside its radius.
-    #[test]
-    fn a_kernel_is_exactly_zero_outside_its_radius() {
-        let field = field_with(&[(Pos2::new(50.0, 50.0), 10.0, 1.0)]);
-        let per_texel = 100.0 / GRID as f32;
-        let at = |x: f32, y: f32| field[(y / per_texel) as usize * GRID + (x / per_texel) as usize];
-        assert!(at(50.0, 50.0) > 0.9);
-        // Exactly zero, not approximately: a truncated kernel contributes
-        // nothing at all outside its radius, which is what stops two adjacent
-        // territories from seaming.
-        #[allow(clippy::float_cmp)]
-        {
-            assert_eq!(at(50.0, 12.0), 0.0, "well outside the radius");
-            assert_eq!(at(9.0, 9.0), 0.0, "the corner of the grid");
-        }
-    }
-
-    /// PRD §10.4: 2–3 levels, hard steps. The regression this guards against is
-    /// somebody replacing the `if` chain with a `smoothstep`, which would
-    /// produce thousands of distinct colours instead of four.
-    #[test]
-    fn the_output_has_exactly_four_distinct_colours() {
-        let field = field_with(&[
-            (Pos2::new(40.0, 50.0), 25.0, 1.4),
-            (Pos2::new(60.0, 50.0), 25.0, 1.4),
-            (Pos2::new(50.0, 50.0), 12.0, 2.0),
-        ]);
-        let image = threshold(&field);
-        let distinct: HashSet<[u8; 4]> = image
-            .pixels
-            .iter()
-            .map(|c| [c.r(), c.g(), c.b(), c.a()])
-            .collect();
-        assert!(
-            distinct.len() <= 4,
-            "transparent plus three bands, got {}",
-            distinct.len()
-        );
-        assert_eq!(distinct.len(), 4, "all three bands should be present");
-    }
-
-    /// Multi-lobed shapes come free from field addition (PRD §6.4): an agent
-    /// working in `auth` with one worker in `tests` gets two lobes and a thin
-    /// connecting band, not a bounding box over the empty space between.
-    #[test]
-    fn two_separated_kernels_make_two_lobes_and_not_one_blob() {
-        let field = field_with(&[
-            (Pos2::new(25.0, 50.0), 15.0, 1.0),
-            (Pos2::new(75.0, 50.0), 15.0, 1.0),
-        ]);
-        let per_texel = 100.0 / GRID as f32;
-        let row = (50.0 / per_texel) as usize;
-        let at = |x: f32| field[row * GRID + (x / per_texel) as usize];
-        assert!(at(25.0) > BANDS[2], "left lobe has a core");
-        assert!(at(75.0) > BANDS[2], "right lobe has a core");
-        assert!(
-            at(50.0) < BANDS[0],
-            "the empty space between them is not claimed: {}",
-            at(50.0)
+            three.peak() > 2.5,
+            "three overlapping kernels summed to {}",
+            three.peak()
         );
     }
 
@@ -373,30 +377,112 @@ mod tests {
     /// every other territory into the fringe band. A fixed reference does not.
     #[test]
     fn a_hot_cluster_does_not_flatten_the_rest_of_the_map() {
-        let field = field_with(&[
-            (Pos2::new(20.0, 20.0), 10.0, 1.0),
-            (Pos2::new(70.0, 70.0), 10.0, 3.0),
-            (Pos2::new(72.0, 70.0), 10.0, 3.0),
+        let f = field(&[
+            ([80.0, 80.0], 40.0, 1.0, 0),
+            ([300.0, 300.0], 40.0, 3.0, 1),
+            ([308.0, 300.0], 40.0, 3.0, 1),
         ]);
-        let per_texel = 100.0 / GRID as f32;
-        let at = |x: f32, y: f32| field[(y / per_texel) as usize * GRID + (x / per_texel) as usize];
-        let lonely = at(20.0, 20.0);
-        let peak = field.iter().copied().fold(0.0f32, f32::max);
+        let lonely = f.at(80.0, 80.0);
+        let peak = f.peak();
         assert!(peak > 5.0, "the cluster is hot: {peak}");
         assert!(
-            lonely >= BANDS[2],
-            "the lone territory keeps its own core band at the fixed reference: {lonely}"
+            f64::from(lonely) >= CLOUD_ISO[0],
+            "the lone territory lost its band at the fixed reference: {lonely}"
         );
         assert!(
-            lonely / peak < BANDS[1],
-            "and would have been demoted to fringe had the field been normalised by {peak}"
+            f64::from(lonely / peak) < CLOUD_ISO[0],
+            "and would have vanished had the field been normalised by {peak}"
+        );
+    }
+
+    /// PRD §10.4: 2–3 levels, hard steps — and PRD §10.3: a cloud is a set of
+    /// marks the city shows through.
+    ///
+    /// The regression this guards against is somebody replacing the `if` chain
+    /// with a `smoothstep`, or the band with a fill. A fill leaves no
+    /// transparent texel inside its own rectangle; this one leaves most of them.
+    #[test]
+    fn the_layer_draws_opaque_marks_and_leaves_the_rest_transparent() {
+        let f = field(&[
+            ([160.0, 200.0], 90.0, 1.4, 0),
+            ([240.0, 200.0], 90.0, 1.4, 0),
+            ([200.0, 200.0], 50.0, 2.0, 0),
+        ]);
+        let canvas = paint(&f);
+        let distinct: HashSet<[u8; 3]> = canvas.pixels.as_chunks::<3>().0.iter().copied().collect();
+        assert!(
+            distinct.len() <= 4,
+            "transparent plus at most three bands, got {}",
+            distinct.len()
+        );
+        let inked = canvas
+            .pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|p| **p != NOTHING)
+            .count();
+        let banded = f
+            .bands()
+            .cells
+            .iter()
+            .fold(0usize, |n, b| n + usize::from(*b != live::NO_BAND));
+        assert!(inked > 200, "the cloud drew almost nothing: {inked} px");
+        assert!(
+            inked * 100 / banded.max(1) <= 35,
+            "the cloud inked {}% of its own banded region: that is a fill",
+            inked * 100 / banded.max(1)
+        );
+    }
+
+    /// Multi-lobed shapes come free from field addition (PRD §6.4): an agent
+    /// working in `auth` with one worker in `tests` gets two lobes and a thin
+    /// connecting band, not a bounding box over the empty space between.
+    #[test]
+    fn two_separated_kernels_make_two_lobes_and_not_one_blob() {
+        let f = field(&[
+            ([100.0, 200.0], 45.0, 1.0, 0),
+            ([300.0, 200.0], 45.0, 1.0, 0),
+        ]);
+        assert!(f64::from(f.at(100.0, 200.0)) >= CLOUD_ISO[0], "left lobe");
+        assert!(f64::from(f.at(300.0, 200.0)) >= CLOUD_ISO[0], "right lobe");
+        assert!(
+            f64::from(f.at(200.0, 200.0)) < CLOUD_ISO[0],
+            "the empty space between them is claimed: {}",
+            f.at(200.0, 200.0)
+        );
+    }
+
+    /// PRD §6.4: two territories overlapping is a denser region, *"which is
+    /// exactly the contention signal"* — and the layer says which, not just how
+    /// dense.
+    #[test]
+    fn two_territories_on_one_place_are_marked_as_contested() {
+        let solo = field(&[
+            ([190.0, 200.0], 70.0, 1.0, 0),
+            ([210.0, 200.0], 70.0, 1.0, 0),
+        ]);
+        let pair = field(&[
+            ([190.0, 200.0], 70.0, 1.0, 0),
+            ([210.0, 200.0], 70.0, 1.0, 1),
+        ]);
+        assert!(
+            solo.bands().crowd.iter().all(|c| *c < CLOUD_CROWD),
+            "one territory was drawn as contested ground"
+        );
+        assert!(
+            pair.bands().crowd.iter().any(|c| *c >= CLOUD_CROWD),
+            "two territories on one place left no contested ground"
+        );
+        assert_ne!(
+            paint(&solo).pixels,
+            paint(&pair).pixels,
+            "contested ground is drawn exactly like uncontested ground"
         );
     }
 
     #[test]
     fn an_empty_world_draws_no_cloud_at_all() {
-        let field = field_with(&[]);
-        let image = threshold(&field);
-        assert!(image.pixels.iter().all(|c| c.a() == 0));
+        assert!(CloudField::sample(&[], 400, 400).is_none());
     }
 }

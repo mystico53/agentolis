@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::attention::{AttentionKind, DecisionSource};
-use crate::contention::Claim;
+use crate::contention::{Actor, Claim};
 
 use crate::{
     verify, DiffPrecision, Observation, Operation, PathScope, ThreadStatus, UnattributedWorker,
@@ -219,9 +219,20 @@ fn tool_call(
     for (worktree, path) in &call.paths {
         record_path(world, thread, worker, &call.tool, *worktree, path, at);
         if call.tool.is_mutating() && call.outcome.is_settled() {
-            // The write landed; Channel A is one of the two release triggers the
-            // 30 s TTL backs up (ADR-0044).
-            world.claims.release(thread, path);
+            // Channel A is one of the two landing triggers the 30 s TTL backs up
+            // (ADR-0044). Its logs never carry `agent_id`, so on a subagent's
+            // edit this names the main agent and matches nothing — which is
+            // correct, and the TTL is the backstop.
+            //
+            // A failed call wrote nothing, so its reservation is released; a
+            // successful one *did* write, and its claim stays for the rest of
+            // the TTL because that is when a sibling can write over it.
+            let actor = actor_of(thread, worker);
+            if call.outcome == Outcome::Failed {
+                world.claims.release(&actor, path);
+            } else {
+                world.claims.landed(&actor, path, at);
+            }
         }
     }
     // After the observations, not before: rung 3 asks where the *thread* is, and
@@ -302,6 +313,23 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
                         .by_worker(worker.clone());
                     register_claim(world, claim);
                 }
+            }
+            if let Some(command) = payload
+                .tool_input
+                .as_ref()
+                .and_then(|v| v.get("command"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+            {
+                shell_evidence(
+                    world,
+                    &thread_id,
+                    worker.as_ref(),
+                    &tool,
+                    cwd.as_deref(),
+                    &command,
+                    at,
+                );
             }
             working(world, &thread_id, at);
         }
@@ -413,7 +441,7 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
 ///
 /// So this never attributes and never raises attention. It updates disk truth —
 /// which is what makes a file edited outside Claude Code still show up — and
-/// releases a claim when the write it was covering lands.
+/// marks a claim landed when the write it was covering reaches the disk.
 pub(crate) fn fs(world: &mut World, meta: &EventMeta, event: &FsEvent) {
     let at = meta.observed;
     match event {
@@ -421,7 +449,7 @@ pub(crate) fn fs(world: &mut World, meta: &EventMeta, event: &FsEvent) {
             let file = world.file_entry(&path.1);
             file.last_touched = Some(at);
             file.deleted = false;
-            release_sole_claim(world, &path.1);
+            land_sole_claim(world, &path.1, at);
         }
         FsEvent::Removed { path } => {
             // A vacant lot that goes to seed rather than vanishing (PRD §7.5).
@@ -449,18 +477,29 @@ pub(crate) fn fs(world: &mut World, meta: &EventMeta, event: &FsEvent) {
     }
 }
 
-/// Releases a claim when exactly one thread holds the path.
+/// Marks a claim landed when exactly one actor holds the path.
 ///
-/// With two or more live claims the write landing is not evidence about *which*
-/// of them landed, and clearing them would erase the contention that is the
-/// whole reason to be watching. The 30 s TTL handles that case.
-fn release_sole_claim(world: &mut World, path: &LogicalPath) {
+/// > The filesystem does not know which agent wrote. (PRD §4.3)
+///
+/// With two or more live claims the write is not evidence about *which* of them
+/// landed, and restarting the wrong one's TTL would be a small lie about the
+/// only state the operator has to be able to trust. The 30 s TTL handles that
+/// case, and Channel D reports the landing per actor anyway.
+fn land_sole_claim(world: &mut World, path: &LogicalPath, at: Instant) {
     let sole = match world.claims.claims_on(path) {
-        [only] => Some(only.thread.clone()),
+        [only] => Some(only.actor()),
         _ => None,
     };
-    if let Some(thread) = sole {
-        world.claims.release(&thread, path);
+    if let Some(actor) = sole {
+        world.claims.landed(&actor, path, at);
+    }
+}
+
+/// The claim key for a thread and the worker that acted inside it.
+fn actor_of(thread: &ThreadId, worker: Option<&WorkerId>) -> Actor {
+    Actor {
+        thread: thread.clone(),
+        worker: worker.cloned(),
     }
 }
 
@@ -687,6 +726,14 @@ fn assistant(
             resolved.push((worktree, path));
         }
 
+        // PRD §6.1's shell row, read sharply: the paths the command itself
+        // names. Scope evidence only — the operation still places by `cwd` or on
+        // its thread, because "what is this thread working on" and "where does
+        // this mark go" are different questions (`crate::shell`).
+        if let Some(command) = command.as_deref() {
+            shell_evidence(world, thread, worker, &tool, cwd.as_deref(), command, at);
+        }
+
         let op = Operation {
             path: own.clone().or_else(|| from_cwd.clone()),
             placement: world.placement_for(own.as_ref(), from_cwd.as_ref()),
@@ -810,20 +857,32 @@ fn settle(
     // where it did not — which is 65% of subagent results (ADR-0004).
     let patch = sidecar.and_then(|s| s.get("structuredPatch"));
     let exact = patch.and_then(patch_totals);
+    // The branch the *claim* has to carry, or the line-range upgrade below tiers
+    // its own thread's edit as `Medium` ("different branches") when it is on the
+    // one branch this session has ever been on. `PendingCall` does not carry a
+    // branch; the thread does, and it is the same one the original claim used.
+    let branch = world.threads.get(thread).and_then(|t| t.branch.clone());
     for (worktree, path) in &pending.paths {
         if pending.tool.is_mutating() {
             if let Some((added, removed, range)) = exact {
                 let file = world.file_entry(path);
                 file.add_diff(added, removed, DiffPrecision::Exact);
-                // Upgrade the claim now that a line range exists: the Critical
-                // tier only becomes reachable here.
+                // Upgrade the claim now that a line range exists — the Critical
+                // tier only becomes reachable here — and register it as
+                // **already landed**, because `structuredPatch` is proof the
+                // write happened. Registering it as pending and then landing it
+                // would be two statements about one fact.
                 let claim = Claim::write(thread.clone(), path.clone(), at)
-                    .in_checkout(*worktree, None)
+                    .in_checkout(*worktree, branch.as_deref())
                     .with_lines(range.0, range.1)
-                    .by_worker(worker.cloned());
+                    .by_worker(worker.cloned())
+                    .already_landed();
                 register_claim(world, claim);
             } else if let Some((added, removed)) = pending.approx_diff {
-                world.health.contention_without_line_ranges += 1;
+                // An edit with no `structuredPatch`, which is 65 % of subagent
+                // results. It is *not* a contention hit — nothing collided here
+                // — so it belongs to its own counter (ADR-0004).
+                world.health.edits_without_line_ranges += 1;
                 let file = world.file_entry(path);
                 file.add_diff(added, removed, DiffPrecision::Approximate);
             }
@@ -836,7 +895,18 @@ fn settle(
             world.file_entry(path).total_lines = u32::try_from(total).ok();
         }
         if pending.tool.is_mutating() && outcome.is_settled() {
-            world.claims.release(thread, path);
+            // A failed edit wrote nothing, so its reservation goes; a successful
+            // one is a hazard for the rest of the TTL. This one line is what
+            // took the operator's real collisions from zero to visible: a
+            // transcript's `tool_result` lands under a second after its
+            // `tool_use`, and deleting the claim there meant two workers 4.7 s
+            // apart never held claims at the same instant.
+            let actor = actor_of(thread, worker);
+            if outcome == Outcome::Failed {
+                world.claims.release(&actor, path);
+            } else {
+                world.claims.landed(&actor, path, at);
+            }
         }
     }
 
@@ -1505,6 +1575,35 @@ fn register_claim(world: &mut World, claim: Claim) {
     let degraded = claim.lines.is_none();
     if world.claims.claim(claim).is_some() && degraded {
         world.health.contention_without_line_ranges += 1;
+    }
+}
+
+/// Records the paths a shell command names as territory evidence (PRD §6.1).
+///
+/// Weighted at [`crate::shell::SHELL_ARGUMENT_WEIGHT`] and capped per command;
+/// everything that makes this safe is in [`crate::shell`]'s module docs.
+fn shell_evidence(
+    world: &mut World,
+    thread: &ThreadId,
+    worker: Option<&WorkerId>,
+    tool: &ToolKind,
+    cwd: Option<&str>,
+    command: &str,
+    at: Instant,
+) {
+    if !tool.is_shell() {
+        return;
+    }
+    for (path, scope) in world.shell_evidence(cwd, command) {
+        world.observe(&Observation {
+            thread: thread.clone(),
+            worker: worker.cloned(),
+            path,
+            tool: tool.clone(),
+            scope,
+            at,
+            weight: Some(crate::shell::SHELL_ARGUMENT_WEIGHT),
+        });
     }
 }
 

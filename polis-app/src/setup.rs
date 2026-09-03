@@ -1346,29 +1346,42 @@ fn check_something_to_watch(d: &Detected) -> Check {
     if d.replayable > 0 {
         Check::ok(
             "something to watch",
-            format!("{} sessions ready to replay — polis watch", d.replayable),
+            format!("{} sessions ready to replay — polis replay", d.replayable),
         )
     } else {
         Check::problem(
             "something to watch",
             Status::Warn,
             "no replayable sessions found",
-            "run an agent once (polis run -- claude), then: polis watch",
+            "start an agent in this repository (`claude` on its own is enough), then:              polis watch",
         )
     }
 }
 
-/// `polis doctor` (PRD §4).
-pub fn doctor(cli: &Cli, args: &DoctorArgs) -> anyhow::Result<()> {
-    let repo = cli.repo_root().context("resolving the repository root")?;
-    let detected = detect(&repo);
-    let list = checks(&detected);
+/// The "what can Polis see right now" half of `polis doctor` (PRD §15 M3).
+///
+/// First, and separate from the machine inventory below it, because an operator
+/// runs this command for one of two reasons and they want different halves. "The
+/// map is empty and I do not know why" is answered here, usually with *"nothing
+/// is wrong; no agent is running in this repository"*. "I am setting Polis up"
+/// is answered by the checks.
+fn write_live_section(
+    out: &mut impl Write,
+    live: &crate::status::Connectivity,
+) -> anyhow::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "  what Polis can see right now")?;
+    live.write(out)?;
+    if let Some(roster) = &live.roster {
+        writeln!(out)?;
+        crate::watch::write_roster(out, roster)?;
+    }
+    Ok(())
+}
 
-    let mut out = io::stdout().lock();
-    writeln!(out)?;
-    writeln!(out, "  polis doctor — {}", repo.display())?;
-    writeln!(out)?;
-    for check in &list {
+/// One line per [`Check`], with its fix indented under it.
+fn write_checks(out: &mut impl Write, list: &[Check]) -> anyhow::Result<()> {
+    for check in list {
         writeln!(
             out,
             "  {}  {:<18}  {}",
@@ -1383,6 +1396,28 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `polis doctor` (PRD §4).
+pub fn doctor(cli: &Cli, args: &DoctorArgs) -> anyhow::Result<()> {
+    let repo = cli.repo_root().context("resolving the repository root")?;
+    let detected = detect(&repo);
+    let list = checks(&detected);
+
+    // What is and is not connected, before what is and is not installed: an
+    // operator running `polis doctor` because the map looked empty needs the
+    // answer to "why am I seeing less than I expected" first, and that answer is
+    // usually "nothing is wrong, no agent is running here" (PRD §15 M3).
+    let live = crate::status::Connectivity::inspect(&repo, polis_ingest::SessionScope::ThisRepo);
+
+    let mut out = io::stdout().lock();
+    writeln!(out)?;
+    writeln!(out, "  polis doctor — {}", repo.display())?;
+    write_live_section(&mut out, &live)?;
+    writeln!(out)?;
+    writeln!(out, "  this machine")?;
+    write_checks(&mut out, &list)?;
     writeln!(out)?;
 
     let problems = list

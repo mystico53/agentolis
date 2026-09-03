@@ -5,8 +5,13 @@ coding agents out on it. Buildings are files, districts are folders, and a
 building grows taller as uncommitted work piles up in it — so the skyline points
 at whatever most needs looking at.
 
-You do not have to set anything up to see it. Everything below takes a couple of
+You do not have to set anything up to see it — not for a recording, and not for
+the agents running on this machine right now. Everything below takes a couple of
 minutes.
+
+If you want one line before the rest of the page: **`polis watch`** shows every
+agent working in the folder you are standing in, live, with no configuration at
+all.
 
 ---
 
@@ -34,7 +39,54 @@ failed, grey still running).
 
 ---
 
-## Path 1 — see something move, right now
+## Path 1 — see your agents, right now
+
+**`polis watch` is the command.** Point it at a repository and it shows every
+Claude Code session working in that repository at this moment — including the
+ones you started yourself, in another terminal, that Polis knows nothing about.
+
+You do not have to set anything up for this. Not hooks, not environment
+variables, not a wrapper around `claude`. Every Claude Code session writes a
+running log of itself to a file on this machine, and that file records which
+folder it is working in, so Polis can simply read them.
+
+```
+polis watch
+```
+
+That opens the window. Leave it open on a second monitor, then start an agent
+however you normally start one — `claude` on its own in another terminal is
+enough — and it appears on the map. Start a second one and it appears too.
+
+If you would rather have the answer as text, without a window:
+
+```
+polis watch --list
+```
+
+which prints which agents are working here, which are working somewhere else on
+this machine, and which of Polis's three sources of information are connected. It
+opens nothing and takes no ports, so it is safe to run while a window is open.
+
+**When nothing shows up.** The window and `polis watch --list` both say why. The
+first line is the one that matters — it is the source that needs no setup — and
+it says either *"no agent is running in this repository"*, which is usually
+simply true, or exactly what is stopping it. `polis doctor` says the same thing
+at more length, with the command that fixes each problem.
+
+**One window, one repository.** An agent working in a *different* checkout is
+listed and labelled rather than drawn, because a foreign `src/main.rs` is not
+this repository's `src/main.rs`. To watch that one, open a second window with
+`polis -C <that folder> watch`.
+
+**What it cannot tell you.** Nothing in a session's log says the session ended,
+so a watch reports a quiet agent as *idle* and cannot tell "waiting for you" from
+"closed". [Path 3](#path-3--more-detail-than-a-watch-can-get-on-its-own) is how
+you fix that, and it is optional.
+
+---
+
+## Path 2 — watch a session you already ran
 
 You need one thing you probably already have: Claude Code used at least once on
 this machine. If you have ever run `claude`, that is done.
@@ -83,8 +135,9 @@ along with every key. The ones worth knowing now:
 | `]` `[` | faster, slower |
 | `n` | jump to the next interesting moment |
 | `home` `end` | start, end of the recording |
-| `t` | swap the map for the filesystem tree, and back |
-| `f` | follow the selected thread |
+| `t` | swap the map for the filesystem tree, and back — the same selection in both |
+| `a` | jump to the next thing waiting on you, worst first |
+| `f` | follow the next thread — a cut, never a pan; again to move on |
 | `i` | the right-hand rail |
 | `s` | the streets layer — which files import which |
 | `esc` | clear the selection |
@@ -92,12 +145,13 @@ along with every key. The ones worth knowing now:
 | `h` or `?` | what the map is, what the shapes mean, and every key |
 
 Drag to pan, scroll to zoom, arrow keys and `+` `-` do the same. `r` puts the
-camera back where it started. Click a building to select it and open that file
-in your editor; hover one to see who touched it and when.
+camera back where it started. Click a building — or its row in the tree — to
+select it and open that file in your editor; hover one to see exactly which
+threads touched it, when, and what is contending for it.
 
-Afterwards, `polis watch` opens that list again whenever you want it. Like
-`polis map` and `polis replay`, it prints what it is opening and then blocks
-until you close the window — that is a window, not a hang.
+Afterwards, `polis replay` with no argument opens that list again whenever you
+want it. Like `polis watch` and `polis map`, it prints what it is opening and
+then blocks until you close the window — that is a window, not a hang.
 
 ### Typing just `polis`
 
@@ -122,11 +176,22 @@ have done it; if you have not, spell out `./target/release/polis` instead.
 
 ---
 
-## Path 2 — connect your own agents
+## Path 3 — more detail than a watch can get on its own
 
-Two ways, and the first needs no configuration at all.
+`polis watch` already sees every agent here, and for most of what the map draws
+that is all it needs. Two things add to it, and both are optional.
 
-### The easy one: let Polis start the agent
+| What it adds | How |
+|---|---|
+| Token counts, cost, and which **subagent** made each tool call | `polis run -- claude` |
+| Sub-second latency, and knowing an agent **finished** rather than went quiet | `polis connect` |
+
+That second one is worth a sentence. Nothing in a session's log says the session
+ended, so a watch cannot tell "waiting for you" from "closed" — it reports both
+as idle and says so. A hook can, because Claude Code fires one when a session
+stops.
+
+### Telemetry: let Polis start the agent
 
 ```
 polis run -- claude
@@ -134,14 +199,14 @@ polis run -- claude
 
 This starts Claude Code for you, in this terminal, exactly as if you had typed
 `claude` — same prompt, same keys, same exit code. The difference is that Polis
-has already set up everything the agent needs to report what it is doing, opened
-the map beside it, and started listening. Nothing is changed in your shell or in
-any configuration file.
+opens a `polis watch` window beside it and sets the twelve settings the agent
+needs to report its token counts and its subagents — on that one process, not in
+your shell and not in any file.
 
-One honest caveat while you are here: today that map window shows the city, and
-the session plays back **afterwards** rather than live. Polis is listening and
-counting the whole time — it tells you how much it heard when the agent exits —
-and drawing it as it happens is the next thing being built.
+You do not need this command to see an agent. `polis watch` on its own already
+shows the one you started yourself; this adds detail to the one it launches. If a
+watch window is already open, `polis run` uses that one rather than opening a
+second.
 
 Anything you would normally pass to `claude` goes after the `--`:
 
@@ -153,10 +218,12 @@ polis run -- claude -p "fix the failing test"
 When the agent exits, Polis prints what it saw and the one command that replays
 the session you just ran.
 
-### The other one: let Polis watch agents you start yourself
+### Hooks: the one thing a watch cannot do on its own
 
-If you would rather keep typing `claude` on its own, Polis needs a small block
-added to Claude Code's settings file so it gets told what is happening.
+Claude Code can be told to run a tiny program whenever something happens. That
+reaches Polis in under a millisecond, and — the part that matters — it fires when
+a session **stops**, which is the only way to tell a finished agent from an idle
+one. Adding it needs a small block in Claude Code's settings file.
 
 ```
 polis connect
@@ -238,14 +305,14 @@ build it for you.
 
 | | |
 |---|---|
+| `polis watch` | **Start here.** Every agent working in this repository, live, with nothing set up. `--list` prints the answer as text and opens nothing; `--machine` includes agents working in other repositories. |
 | `polis` | The first run explains itself, then opens the session picker. Afterwards, maps the folder you are in. |
-| `polis watch` | Pick a past session and watch it replay. Opens a window and blocks until you close it. |
 | `polis map` | This repository as a city, right now. A window, and blocks. |
-| `polis run -- claude` | Start an agent with the map watching. |
-| `polis connect` | Let Polis see agents you start yourself, in this repository. `--user` for every repository; `--uninstall` reverses either. |
+| `polis run -- claude` | `polis watch`, plus token and subagent detail for the agent it starts. |
+| `polis connect` | Add hook detail — including knowing when a session ends — in this repository. `--user` for every repository; `--uninstall` reverses either. |
 | `polis doctor` | What is wrong, and how to fix it. `--fix` applies what it can. |
 | `polis snapshot --out city.png` | Save a picture of the city instead of opening a window. |
-| `polis replay <file>` | Replay one specific recording. A window, and blocks. |
+| `polis replay` | Pick a past session and watch it back. With a file, replays that one. A window, and blocks. |
 | `polis tail` | The raw event stream as text, no graphics. |
 | `polis env` | Print the settings an agent needs, to paste somewhere yourself. |
 

@@ -6,26 +6,29 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use polis_events::{Channel, DEFAULT_HOOK_PORT};
-use polis_ingest::{default_otlp_addr, ChannelSet};
+use polis_ingest::{default_otlp_addr, ChannelSet, SessionScope};
 
 /// `polis` — a live, glanceable city map of what your coding agents are doing.
 ///
-/// Four commands are the whole product for a first-time user, and they are
-/// listed first in the help for that reason: `watch` (replay a session you
-/// already have), `map` (this repository as a city), `run` (launch an agent with
-/// the map watching) and `connect` (let Polis see agents you start yourself).
-/// Everything else is for operating it.
+/// `watch` is the headline command and the one to try first: it shows every
+/// agent working in a repository, **including the ones started in another
+/// terminal**, and it needs no configuration at all. Everything else is either a
+/// narrower view of the same thing (`map` is the city with no agents on it,
+/// `replay` is a session played back) or a way to add detail to a watch (`run`
+/// launches an agent with telemetry set on it, `connect` installs the hooks).
 #[derive(Debug, Parser)]
 #[command(
     name = "polis",
     version,
     about,
     after_help = "Start here:\n  \
+      polis watch            every agent working in this repository, live\n  \
+      polis watch --list     …the same answer as text, opening nothing\n  \
       polis                  the first run explains itself\n  \
-      polis watch            pick a past session and watch it replay\n  \
       polis map              this repository, drawn as a city\n  \
       polis run -- claude    start an agent with the map watching\n  \
-      polis connect          let Polis see agents you start yourself\n  \
+      polis replay           pick a past session and watch it back\n  \
+      polis connect          add hook detail to what a watch already sees\n  \
       polis doctor           what is wrong, and how to fix it"
 )]
 pub struct Cli {
@@ -56,11 +59,21 @@ pub enum Command {
     /// `polis run` opens in its second process.
     Map,
 
-    /// Pick one of this machine's own past sessions and watch it replay.
+    /// Every agent working in this repository, live. **Start here.**
     ///
-    /// The same window as `polis replay` with no argument, under the name
-    /// somebody looking for it would guess.
-    Watch,
+    /// The headline command, and the one that needs no setup whatsoever. Every
+    /// Claude Code session on this machine writes a JSONL transcript carrying
+    /// the directory it is working in, whether or not Polis launched it — so an
+    /// agent the operator started themselves, in another terminal, appears here
+    /// with no hooks, no environment variables and no wrapper. Sessions that
+    /// start *after* the window opens are picked up as they appear, and sessions
+    /// in other repositories are reported rather than silently drawn onto the
+    /// wrong city.
+    ///
+    /// `polis live` is the same command under the name the milestone used.
+    /// `--list` prints the roster as text and opens nothing.
+    #[command(alias = "live")]
+    Watch(WatchArgs),
 
     /// Register Polis's hooks with Claude Code, with explicit consent.
     ///
@@ -95,7 +108,9 @@ pub enum Command {
     /// Animate a recorded session over the city (PRD §15 M2).
     ///
     /// The fastest iteration loop the project has, and it ships independently as
-    /// a PR-summary or standup artifact.
+    /// a PR-summary or standup artifact. With **no argument** it opens the
+    /// picker: every session this machine has ever recorded, most recent first.
+    /// That used to be what `polis watch` did, and `watch` is now the live view.
     Replay(ReplayArgs),
 
     /// Generate the city and write it to a PNG without opening a window.
@@ -136,6 +151,90 @@ pub struct RunArgs {
         value_name = "COMMAND"
     )]
     pub command: Vec<OsString>,
+}
+
+/// `polis watch` — PRD §15 M3, the headline command.
+#[derive(Debug, clap::Args)]
+pub struct WatchArgs {
+    /// Print what is running as text and exit. Opens no window and binds no
+    /// port, so it is safe to run beside a watch that is already up.
+    ///
+    /// The fastest answer to "is anything working in here right now", and the
+    /// form that fits in a script or a status line.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Draw every agent on the machine, not only the ones working in this
+    /// checkout.
+    ///
+    /// Off by default, and the default is the load-bearing one: a foreign
+    /// checkout's `src/main.rs` shares a logical path with this one's, so
+    /// without the filter two unrelated agents render as a contention over one
+    /// building. With the filter on, sessions elsewhere are still *listed* —
+    /// they are never silently dropped — they are simply not drawn.
+    #[arg(long)]
+    pub machine: bool,
+
+    /// Do not start these channels at all. Repeatable.
+    ///
+    /// A second Polis on this machine wants `--without otel --without hook`:
+    /// those two bind ports, and the transcript channel alone is enough for
+    /// presence and activity. `transcript` cannot usefully be switched off —
+    /// it is the channel that makes a watch work with no setup — but nothing
+    /// here stops an operator who insists.
+    #[arg(long = "without", value_enum)]
+    pub without: Vec<ChannelArg>,
+
+    /// OTLP/gRPC bind address. **Only** change this for tests: agents export to
+    /// 4317, so another port yields an empty map that looks healthy.
+    #[arg(long, default_value_t = default_otlp_addr())]
+    pub otlp_addr: SocketAddr,
+
+    /// Hook datagram bind address. Same warning as `--otlp-addr`.
+    #[arg(long, default_value_t = SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_HOOK_PORT))]
+    pub hook_addr: SocketAddrV4,
+
+    /// `~/.claude/projects`, or an override.
+    #[arg(long, value_name = "DIR")]
+    pub projects: Option<PathBuf>,
+}
+
+impl WatchArgs {
+    /// The live window's configuration for a checkout.
+    ///
+    /// The one line that matters is [`SessionScope`]: it is what makes Channel D
+    /// discover *this repository's live agents* and publish a roster, rather
+    /// than opening a tail on every session that has ever run on the machine.
+    pub fn options(&self, repo: PathBuf) -> crate::app::live::LiveOptions {
+        let mut options = crate::app::live::LiveOptions::for_repo(repo);
+        options.scope = if self.machine {
+            crate::app::live::Scope::Machine
+        } else {
+            crate::app::live::Scope::Repo
+        };
+        options.ingest.sessions = self.sessions();
+        options.ingest.otlp_addr = self.otlp_addr;
+        options.ingest.hook_addr = self.hook_addr;
+        options.ingest.channels = self
+            .without
+            .iter()
+            .copied()
+            .map(Channel::from)
+            .fold(ChannelSet::ALL, ChannelSet::without);
+        if let Some(projects) = &self.projects {
+            options.ingest.claude_projects_dir.clone_from(projects);
+        }
+        options
+    }
+
+    /// Which of this machine's sessions Channel D follows.
+    pub fn sessions(&self) -> SessionScope {
+        if self.machine {
+            SessionScope::EveryRepo
+        } else {
+            SessionScope::ThisRepo
+        }
+    }
 }
 
 /// `polis connect` — PRD §4.2, with consent.

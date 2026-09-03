@@ -15,6 +15,7 @@
 //! | [`snapshot`] | §5 the `arc-swap` snapshot the renderer reads |
 //! | [`replay`] | §15 M2 — the offline transcript driver and its transport clock |
 //! | [`sessions`] | §15 M2 — the index of the operator's own sessions |
+//! | [`shell`] | §6.1 — the path evidence inside a shell command line |
 //! | [`verify`] | §11.2 — which shell commands count as "tests ran" |
 //!
 //! # The shape of the API, for the three crates that render it
@@ -104,6 +105,7 @@ pub mod contention;
 pub mod place;
 pub mod replay;
 pub mod sessions;
+pub mod shell;
 pub mod snapshot;
 pub mod territory;
 pub mod verify;
@@ -179,6 +181,51 @@ pub const OPS_CAP: usize = 128;
 /// produces [`ThreadStatus::Done`].
 pub const IDLE_AFTER: Duration = Duration::from_secs(60);
 
+/// How long a quiet thread stays in the world before [`World::tick`] retires it.
+///
+/// **Deliberately the same 30 minutes as `polis_ingest::live::LIVE_WINDOW`**,
+/// which is the point at which the ingest side stops paying to follow a
+/// session. Two different numbers here would mean either a thread that outlives
+/// every channel that could ever update it again, or one that vanishes off the
+/// map while its transcript is still being read.
+///
+/// It has to exist at all because *a session never ends on disk*: the JSONL
+/// format has no session-end record (`docs/verified/jsonl-schema.md` enumerates
+/// all 19 types and none of them closes a session), so without a retirement rule
+/// a Polis left open on the operator's second monitor accumulates one [`Thread`]
+/// per session for as long as it runs — each holding a trail, an operation ring,
+/// a visit map and a territory. PRD §13.1 budgets an idle cost, and an
+/// unbounded thread map is how that budget is lost slowly enough not to notice.
+pub const THREAD_RETIRE_AFTER: Duration = Duration::from_mins(30);
+
+/// How long an unattributable worker is remembered before it is dropped.
+///
+/// Longer than [`THREAD_RETIRE_AFTER`] on purpose: an unattributed worker is
+/// waiting to be *adopted* (ADR-0013 route 3 adopts on the parent `Workflow`
+/// call, which can arrive long after the journal that named the worker), and
+/// forgetting it early would turn a recoverable link into a permanent one.
+pub const UNATTRIBUTED_TTL: Duration = Duration::from_mins(60);
+
+/// Most contention marks the attention layer carries at once.
+///
+/// PRD §11.2's other two states are bounded by the number of threads;
+/// contention is bounded by the number of contended **files**, which under
+/// PRD §16's synthetic load was 1 600 after [`contention::MAX_CLAIMS_PER_PATH`]
+/// had already cut the pairings down from 480 000. Thirty-two red links is well
+/// past the point where a thirty-third changes a decision (PRD §17), and the
+/// overflow is counted in [`Health::contention_over_cap`] rather than dropped
+/// silently.
+pub const MAX_CONTENTION_MARKS: usize = 32;
+
+/// Hard ceiling on live threads, whatever the clock says.
+///
+/// The retirement rule above is the one that normally binds; this is the guard
+/// against the case it cannot see — a burst of sessions inside one retirement
+/// window. PRD §16's synthetic load is *"100 threads × 400 subagents"*, so the
+/// ceiling sits well above the load the product is specified to survive and only
+/// ever evicts the stalest non-waiting thread.
+pub const MAX_THREADS: usize = 256;
+
 /// Evidence weight of an `@`-mentioned file (ADR-0017).
 ///
 /// **Not from PRD §6.1's table**, which only covers tool calls. A file the
@@ -215,6 +262,14 @@ pub struct World {
     /// §11.2 attention marks, **ordered by severity**:
     /// `contention > needs-decision > done`.
     pub attention: Vec<attention::Attention>,
+    /// §11.3's early warning: pairs of threads whose clouds overlap, worst
+    /// first.
+    ///
+    /// Deliberately **not** in [`World::attention`]. See
+    /// [`contention::TerritoryOverlap`] for why a signal that fires before
+    /// anything is destroyed must not compete for the eye with the one that
+    /// fires while it is.
+    pub overlaps: Vec<contention::TerritoryOverlap>,
     /// Channel health for the status bar (PRD §4.5, §17).
     pub health: Health,
     /// Workers seen with no thread to attribute them to.
@@ -278,6 +333,7 @@ impl World {
             files: BTreeMap::new(),
             claims: contention::ClaimTable::default(),
             attention: Vec::new(),
+            overlaps: Vec::new(),
             health,
             unattributed: BTreeMap::new(),
             mapper,
@@ -339,6 +395,7 @@ impl World {
         let now = self.now;
 
         self.claims.expire(now);
+        self.health.claim_paths_evicted = self.claims.paths_evicted();
         for thread in self.threads.values_mut() {
             thread.territory.decay(now);
             thread.fade_trail(now);
@@ -349,8 +406,121 @@ impl World {
             }
         }
         self.refresh_contention(now);
+        self.refresh_overlaps(now);
         attention::expire(&mut self.attention, now);
+        // After the marks have been expired, never before: a thread is retired
+        // only when nothing on the attention layer still points at it, so the
+        // rule below reads a list that is already current.
+        self.retire_threads(now);
+        self.expire_unattributed(now);
         attention::sort(&mut self.attention);
+    }
+
+    /// Retires threads that have gone quiet, and enforces [`MAX_THREADS`].
+    ///
+    /// # The clock never takes a thread the operator still has to act on
+    ///
+    /// A thread is retired for silence only when **nothing on the attention
+    /// layer still points at it**. That is one rule covering both states PRD
+    /// §11.2 says persist:
+    ///
+    /// * *needs decision* — a thread blocked on a human, which may sit there for
+    ///   hours. That *is* the product (PRD §1: *"get to the thread that is
+    ///   waiting on a human"*).
+    /// * *done, unverified* — *"really `needs review`"*, and *"the second most
+    ///   important thing on the map"*. It says code was changed and never
+    ///   tested, which is actionable however old it is.
+    ///
+    /// *Done, verified* decays to nothing inside a minute (PRD §11.2's 20 s plus
+    /// its ramp), so a thread that finished cleanly retires on the ordinary
+    /// silence rule and one that finished dirty does not. [`MAX_THREADS`] is the
+    /// only thing that overrides this, because unbounded growth is the one
+    /// outcome worse than losing a mark.
+    ///
+    /// # Every way a session ends looks the same, and that is honest
+    ///
+    /// A session that ended, one that crashed and one whose transcript was
+    /// deleted mid-tail are **indistinguishable on disk** — the JSONL format has
+    /// no session-end record at all — so all three leave by this one door on
+    /// silence alone rather than being told apart by invented evidence. None of
+    /// them can leave anything behind: see [`World::forget_thread`].
+    fn retire_threads(&mut self, now: Instant) {
+        let stale: Vec<ThreadId> = self
+            .threads
+            .values()
+            .filter(|t| {
+                now.saturating_duration_since(t.last_activity) > THREAD_RETIRE_AFTER
+                    && !self.attention.iter().any(|m| m.kind.mentions_thread(&t.id))
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in stale {
+            self.forget_thread(&id);
+            self.health.threads_retired = self.health.threads_retired.saturating_add(1);
+        }
+
+        // The ceiling, which the clock rule above cannot enforce on its own
+        // because a mark protects a thread indefinitely. Stalest first, and a
+        // thread *currently blocked on a human* is never a candidate however old
+        // it is — a fleet of blocked threads pushes the ceiling rather than
+        // being silently dropped by it, because the whole product is getting to
+        // them.
+        while self.threads.len() > MAX_THREADS {
+            let victim = self
+                .threads
+                .values()
+                .filter(|t| t.status != ThreadStatus::Waiting)
+                .min_by(|a, b| a.last_activity.cmp(&b.last_activity).then(a.id.cmp(&b.id)))
+                .map(|t| t.id.clone());
+            let Some(victim) = victim else {
+                // Every thread is waiting on a human. The ceiling yields; the
+                // alternative is deleting the marks the operator is looking for.
+                break;
+            };
+            self.forget_thread(&victim);
+            self.health.threads_retired = self.health.threads_retired.saturating_add(1);
+            self.health.threads_evicted = self.health.threads_evicted.saturating_add(1);
+        }
+    }
+
+    /// Removes a thread and every reference to it, so nothing dangles.
+    ///
+    /// A half-removed thread is worse than a leaked one: an attention mark whose
+    /// thread is gone has no position, a claim whose claimant is gone raises
+    /// contention against nobody, and a `touched_by` entry pointing at a missing
+    /// thread makes a building's drill-down list name a thread the rail cannot
+    /// show. All four are cleared here, and the file walk is bounded by what the
+    /// thread itself touched rather than by the size of the city.
+    pub fn forget_thread(&mut self, id: &ThreadId) {
+        let Some(thread) = self.threads.remove(id) else {
+            return;
+        };
+        self.claims.release_thread(id);
+        self.attention.retain(|m| !m.kind.mentions_thread(id));
+        for path in thread.visits.keys() {
+            if let Some(file) = self.files.get_mut(path) {
+                file.touched_by.retain(|t| t != id);
+            }
+        }
+        self.files_generation = self.files_generation.wrapping_add(1);
+        self.spawns.retain(|_, t| t != id);
+        self.workflow_runs.retain(|_, t| t != id);
+    }
+
+    /// Drops unattributable workers that are never going to be adopted.
+    ///
+    /// [`UnattributedWorker`] is the honest model of a worker with no parent
+    /// link, and honesty is not a licence to remember it for ever: the map is
+    /// about what is happening now, and a worker last seen an hour ago is not.
+    fn expire_unattributed(&mut self, now: Instant) {
+        let before = self.unattributed.len();
+        self.unattributed
+            .retain(|_, w| now.saturating_duration_since(w.last_seen) <= UNATTRIBUTED_TTL);
+        let dropped = before - self.unattributed.len();
+        if dropped > 0 {
+            self.health.unattributed_workers =
+                u64::try_from(self.unattributed.len()).unwrap_or(u64::MAX);
+        }
     }
 
     /// Clears every live layer and rebases the clock to `now`, keeping the
@@ -662,9 +832,23 @@ impl World {
     /// pair of claims that produced it: rebuilding is cheaper and more honest
     /// than trying to expire the marks separately.
     fn refresh_contention(&mut self, now: Instant) {
-        let hits = self.claims.hits(now);
+        let mut hits = self.claims.hits(now);
         self.attention
             .retain(|m| !matches!(m.kind, attention::AttentionKind::Contention(_)));
+        // `hits` is already worst-first. Past the ceiling the rest are counted
+        // rather than drawn: the cap is on **contention only**, because it is
+        // the only one of PRD §11.2's three states whose count grows with the
+        // number of *files* rather than with the number of threads, and a cap on
+        // the whole list would let a storm of red links bury every amber pin —
+        // which is state (a), "the primary state; it is what the product is
+        // for".
+        let over = hits.len().saturating_sub(MAX_CONTENTION_MARKS);
+        if over > 0 {
+            hits.truncate(MAX_CONTENTION_MARKS);
+            self.health.contention_over_cap = u64::try_from(over).unwrap_or(u64::MAX);
+        } else {
+            self.health.contention_over_cap = 0;
+        }
         for hit in hits {
             let since = hit.challenger.at;
             self.attention.push(attention::Attention {
@@ -672,6 +856,92 @@ impl World {
                 since,
             });
         }
+    }
+
+    /// Rebuilds PRD §11.3's early warning: which threads' clouds overlap.
+    ///
+    /// > Two clouds overlapping means two orchestrators are claiming the same
+    /// > district, and it fires *before* anyone collides — while redirecting one
+    /// > is still cheap. Surface it as a **distinct, quieter signal** than
+    /// > file-level contention.
+    ///
+    /// Quieter is implemented, not merely described: this list is separate from
+    /// [`World::attention`], so an overlap can never take a slot from a red link
+    /// or an amber pin, and it carries a score rather than a
+    /// [`contention::Severity`] because nothing here is being destroyed yet.
+    ///
+    /// `since` is carried forward for a pair that was already overlapping, so a
+    /// surface can fade it in over its own age. A signal that restarted its
+    /// animation on every tick would be the opposite of quiet.
+    fn refresh_overlaps(&mut self, now: Instant) {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeMap<(ThreadId, ThreadId), Instant> = self
+            .overlaps
+            .iter()
+            .map(|o| ((o.a.clone(), o.b.clone()), o.since))
+            .collect();
+
+        // Only converged territories have a cloud to overlap (PRD §6.2), so the
+        // pairing runs over those and not over every thread in the world — and
+        // each is summarised **once**, not once per pairing. At PRD §16's
+        // hundred threads that is the difference between 100 reductions and
+        // 9 900 of them, which was 18.7 ms of a 16.6 ms frame
+        // ([`contention::OVERLAP_KERNELS`]).
+        let claimed: Vec<(&ThreadId, contention::CloudSummary, &LogicalPath)> = self
+            .threads
+            .values()
+            .filter_map(|t| {
+                let claim = t.territory.claim.as_ref()?;
+                let summary = contention::CloudSummary::of(&t.territory)?;
+                Some((&t.id, summary, claim))
+            })
+            .collect();
+
+        let mut out: Vec<contention::TerritoryOverlap> = Vec::new();
+        for (i, (id_a, ta, claim_a)) in claimed.iter().enumerate() {
+            for (id_b, tb, claim_b) in claimed.iter().skip(i + 1) {
+                let Some(score) = contention::overlap_of(ta, tb) else {
+                    continue;
+                };
+                // `claimed` walks a `BTreeMap`, so `id_a < id_b` already; the
+                // pair key is stable without sorting it again.
+                let key = ((*id_a).clone(), (*id_b).clone());
+                let since = previous.get(&key).copied().unwrap_or(now);
+                out.push(contention::TerritoryOverlap {
+                    a: key.0,
+                    b: key.1,
+                    claim_a: (*claim_a).clone(),
+                    claim_b: (*claim_b).clone(),
+                    score,
+                    since,
+                });
+            }
+        }
+        // Worst first, then the same-district pairs, then by thread so the
+        // order does not depend on how the pairing happened to run (PRD §7.4).
+        out.sort_by(|x, y| {
+            y.score
+                .partial_cmp(&x.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(y.same_district().cmp(&x.same_district()))
+                .then(x.a.cmp(&y.a))
+                .then(x.b.cmp(&y.b))
+        });
+        let over = out.len().saturating_sub(contention::MAX_OVERLAPS);
+        out.truncate(contention::MAX_OVERLAPS);
+        self.health.overlaps_over_cap = u64::try_from(over).unwrap_or(u64::MAX);
+        // Debug-only: the pair keys must be unique, or `since` would be carried
+        // forward from whichever duplicate happened to be written last.
+        debug_assert_eq!(
+            out.iter()
+                .map(|o| (&o.a, &o.b))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            out.len(),
+            "one overlap per pair of threads"
+        );
+        self.overlaps = out;
     }
 
     /// The generation counters the snapshot publisher keys its `Arc` caches on.
@@ -1391,7 +1661,23 @@ pub struct Health {
     pub otel_tool_results_without_worker: u64,
     /// Contention hits that had to degrade to file level for want of a line
     /// range (ADR-0004).
+    ///
+    /// **Counts hits, not edits.** It is incremented only where a claim
+    /// actually collided with another and the pair had no line range to tier
+    /// on, so it answers *"how much of the red on this map is imprecise"*. The
+    /// far larger number of edits that merely *lack* a line range is
+    /// [`Health::edits_without_line_ranges`]; conflating the two made this read
+    /// 1 768 on a session with 8 contention hits, which is not an answer to any
+    /// question an operator has.
     pub contention_without_line_ranges: u64,
+    /// Mutating tool results whose diff had to be approximated because
+    /// `structuredPatch` was absent (ADR-0004).
+    ///
+    /// The denominator behind [`FileState::diff_precision`] being
+    /// [`DiffPrecision::Approximate`], and the measure of how much of Channel
+    /// D's 65 % subagent gap this run actually hit. It is **not** a contention
+    /// number: none of these edits need have collided with anything.
+    pub edits_without_line_ranges: u64,
     /// Working directories adopted as additional checkouts (PRD §7.6).
     pub adopted_worktrees: u64,
     /// Every operation, by the rung of [`place`]'s chain it landed on when it
@@ -1407,6 +1693,40 @@ pub struct Health {
     /// are on tools that carry no path. If this ever starts filling
     /// [`PlacementCensus::rail`], failures are going unseen again.
     pub ops_failed: PlacementCensus,
+    /// Live contention hits that did not fit inside [`MAX_CONTENTION_MARKS`].
+    ///
+    /// Non-zero means the map is showing the worst thirty-two collisions and
+    /// there are more. Counted rather than hidden, because "how bad is it" is
+    /// the question a red link is answering.
+    pub contention_over_cap: u64,
+    /// Territory overlaps that did not fit inside
+    /// [`contention::MAX_OVERLAPS`].
+    ///
+    /// The early warning's own overflow. Non-zero means more than sixteen pairs
+    /// of orchestrators are working in each other's districts, which is itself
+    /// the answer to "should I redirect somebody".
+    pub overlaps_over_cap: u64,
+    /// Logical paths the claim table dropped at
+    /// [`contention::MAX_CLAIMED_PATHS`].
+    ///
+    /// Mirrors [`contention::ClaimTable::paths_evicted`] into the status bar:
+    /// non-zero means some collisions were structurally unobservable, which the
+    /// operator must be told rather than left to assume.
+    pub claim_paths_evicted: u64,
+    /// Threads retired for silence, or evicted by [`MAX_THREADS`].
+    ///
+    /// The number an operator checks when the rail is shorter than the number of
+    /// agents they know they started: a session that has been quiet for
+    /// [`THREAD_RETIRE_AFTER`] leaves the map, and this is the count of them.
+    pub threads_retired: u64,
+    /// Of those, the ones the [`MAX_THREADS`] ceiling took rather than the
+    /// clock.
+    ///
+    /// Non-zero means more threads were live at once than the ceiling allows,
+    /// which is a fact about the fleet and not a fault — but it is the only way
+    /// to tell "the rail is short because agents finished" from "the rail is
+    /// short because it ran out of room".
+    pub threads_evicted: u64,
     /// Results that arrived after their operation had already been pushed out
     /// of [`OPS_CAP`], so the outcome had nowhere to land.
     ///

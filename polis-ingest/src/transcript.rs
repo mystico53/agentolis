@@ -2281,6 +2281,7 @@ fn monotonise(parsed: Vec<(Event, Option<WallTime>)>) -> Vec<RecordedEvent> {
 enum Followed {
     Session(Box<SessionTailer>),
     Projects(Box<ProjectsTailer>),
+    Live(Box<crate::live::LiveTailer>),
 }
 
 impl Followed {
@@ -2288,12 +2289,17 @@ impl Followed {
         match self {
             Self::Session(t) => t.poll(out),
             Self::Projects(t) => t.poll(out),
+            Self::Live(t) => t.poll(out),
         }
     }
 
     fn rescan(&mut self) {
-        if let Self::Projects(t) = self {
-            let _ = t.rescan();
+        match self {
+            Self::Session(_) => {}
+            Self::Projects(t) => {
+                let _ = t.rescan();
+            }
+            Self::Live(t) => t.rescan(),
         }
     }
 
@@ -2307,6 +2313,18 @@ impl Followed {
                 .parent()
                 .map_or_else(|| t.session_dir().to_path_buf(), Path::to_path_buf),
             Self::Projects(t) => t.projects_dir().to_path_buf(),
+            Self::Live(t) => t.projects_dir().to_path_buf(),
+        }
+    }
+
+    /// The roster, and the reason the channel is degraded, for a live watch.
+    ///
+    /// Published after every rescan so that the window, the status rail and
+    /// `polis doctor` all read one value rather than three approximations of it.
+    fn roster(&self) -> Option<crate::live::Roster> {
+        match self {
+            Self::Live(t) => Some(t.roster()),
+            _ => None,
         }
     }
 }
@@ -2319,6 +2337,10 @@ pub struct TranscriptTailer {
     health: Arc<Mutex<SourceHealth>>,
     handle: Option<JoinHandle<()>>,
     mapper: PathMapper,
+    /// Published by the thread after every rescan when this is a live watch
+    /// ([`TranscriptTailer::start_live`]); `None` for the replay and
+    /// single-session modes, which have no roster to publish.
+    roster: Arc<Mutex<Option<crate::live::Roster>>>,
 }
 
 impl TranscriptTailer {
@@ -2368,6 +2390,47 @@ impl TranscriptTailer {
         ))
     }
 
+    /// Watches one repository's live agents, with zero configuration
+    /// (PRD §15 M3).
+    ///
+    /// The difference from [`TranscriptTailer::start_discovering`] is what it
+    /// refuses to do. That one opens a tail on every session that has ever run
+    /// on the machine and follows each from its end; this one discovers the same
+    /// set but follows only the sessions that are **alive and in `scope`**,
+    /// catches each of them up from a bounded tail so the map is populated the
+    /// instant the window opens, and publishes a [`crate::live::Roster`] saying
+    /// which agents it can see — including the ones in other repositories, which
+    /// are reported and deliberately not drawn.
+    ///
+    /// Infallible: a missing `~/.claude/projects` is a machine on which no agent
+    /// has ever run. The channel reports itself degraded, with the reason, and
+    /// starts watching for the directory to appear (ADR-0011).
+    pub fn start_live(
+        projects_dir: &Path,
+        scope: crate::live::Scope,
+        sink: EventSink,
+        mapper: PathMapper,
+    ) -> Self {
+        let tailer = crate::live::LiveTailer::open(projects_dir, scope);
+        Self::spawn(Followed::Live(Box::new(tailer)), sink, mapper)
+    }
+
+    /// The live roster, when this tailer was started by
+    /// [`TranscriptTailer::start_live`].
+    pub fn roster(&self) -> Option<crate::live::Roster> {
+        match self.roster.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// The slot the roster is published into, for a caller that outlives this
+    /// handle — [`crate::Ingest`] keeps one so the window can read the roster
+    /// without downcasting a `Box<dyn IngestSource>`.
+    pub fn roster_slot(&self) -> Arc<Mutex<Option<crate::live::Roster>>> {
+        Arc::clone(&self.roster)
+    }
+
     /// Replays a transcript offline as fast as it can be parsed (PRD §15 M2).
     ///
     /// The fastest iteration loop the project has: minutes per iteration, real
@@ -2408,14 +2471,18 @@ impl TranscriptTailer {
     fn spawn(mut followed: Followed, sink: EventSink, mapper: PathMapper) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let health = Arc::new(Mutex::new(SourceHealth::Running));
+        let roster: Arc<Mutex<Option<crate::live::Roster>>> =
+            Arc::new(Mutex::new(followed.roster()));
         let thread_stop = Arc::clone(&stop);
         let thread_health = Arc::clone(&health);
+        let thread_roster = Arc::clone(&roster);
         let handle = std::thread::Builder::new()
             .name("polis-transcript".to_owned())
             .spawn(move || {
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
                 let watcher = install_watcher(&followed.watch_root(), wake_tx);
-                if let Err(reason) = &watcher {
+                let watcher_failed = watcher.as_ref().err().map(ToString::to_string);
+                if let Some(reason) = &watcher_failed {
                     set_health(
                         &thread_health,
                         SourceHealth::Degraded {
@@ -2428,6 +2495,24 @@ impl TranscriptTailer {
                 while !thread_stop.load(Ordering::Relaxed) {
                     if ticks.is_multiple_of(RESCAN_EVERY) {
                         followed.rescan();
+                        // A live watch republishes its roster on every rescan
+                        // and reports "the directory an agent writes into is not
+                        // there" as a degraded channel rather than as silence,
+                        // which is the failure this milestone exists to fix.
+                        if let Some(current) = followed.roster() {
+                            let reason = current.error.clone().or_else(|| watcher_failed.clone());
+                            set_health(
+                                &thread_health,
+                                match reason {
+                                    None => SourceHealth::Running,
+                                    Some(reason) => SourceHealth::Degraded { reason },
+                                },
+                            );
+                            match thread_roster.lock() {
+                                Ok(mut slot) => *slot = Some(current),
+                                Err(poisoned) => *poisoned.into_inner() = Some(current),
+                            }
+                        }
                     }
                     ticks = ticks.wrapping_add(1);
                     buf.clear();
@@ -2453,6 +2538,7 @@ impl TranscriptTailer {
             health,
             handle,
             mapper,
+            roster,
         }
     }
 

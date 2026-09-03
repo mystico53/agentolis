@@ -46,6 +46,7 @@ pub mod bus;
 pub mod env;
 pub mod fswatch;
 pub mod hook_listener;
+pub mod live;
 pub mod normalize;
 pub mod otlp;
 pub mod transcript;
@@ -54,10 +55,12 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use polis_events::{Channel, ControlEvent, PathMapper, DEFAULT_HOOK_PORT, EVENT_BUS_CAPACITY};
 
 pub use bus::{BusStats, BusTotals, EventSink, EventSource, Push};
+pub use live::{Activity, Fit, LiveSession, Roster, Scope};
 
 /// The default OTLP/gRPC endpoint (PRD §4.1).
 ///
@@ -172,8 +175,45 @@ pub struct IngestConfig {
     /// Channels to start. A milestone that does not need a channel leaves it off
     /// rather than starting it and ignoring it.
     pub channels: ChannelSet,
+    /// Which of the machine's sessions Channel D follows (PRD §15 M3).
+    pub sessions: SessionScope,
     /// Bus capacity. [`polis_events::EVENT_BUS_CAPACITY`] outside tests.
     pub bus_capacity: usize,
+}
+
+/// Which of this machine's Claude Code sessions Channel D follows.
+///
+/// The zero-setup answer to *"show me every agent active in this repository"*:
+/// every session on the machine already writes a JSONL transcript carrying its
+/// `cwd`, so the only question is which of them this window is about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionScope {
+    /// Every session under the projects directory, each followed from its end,
+    /// with no roster. What `polis tail` and the M0/M2 paths use.
+    #[default]
+    All,
+    /// Only sessions whose `cwd` is inside the repository being watched, with a
+    /// live [`Roster`] and a bounded catch-up. What `polis watch` uses.
+    ThisRepo,
+    /// Every session, with a live [`Roster`]. `polis watch --all-repos`.
+    ///
+    /// Note the events still land in a world whose [`PathMapper`] is rooted at
+    /// one checkout, so another repository's file operations have no building to
+    /// draw on. This exists to answer "what is running on this machine", not to
+    /// draw two cities at once.
+    EveryRepo,
+}
+
+impl SessionScope {
+    /// The [`Scope`] this maps to, given the watched repository's mapper.
+    /// `None` for [`SessionScope::All`], which uses the older tailer.
+    pub fn to_scope(self, mapper: &PathMapper) -> Option<Scope> {
+        match self {
+            Self::All => None,
+            Self::ThisRepo => Some(Scope::Repo(mapper.clone())),
+            Self::EveryRepo => Some(Scope::Everything),
+        }
+    }
 }
 
 impl IngestConfig {
@@ -198,6 +238,7 @@ impl IngestConfig {
             hook_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_HOOK_PORT),
             claude_projects_dir,
             channels: ChannelSet::ALL,
+            sessions: SessionScope::All,
             bus_capacity: EVENT_BUS_CAPACITY,
         }
     }
@@ -206,6 +247,13 @@ impl IngestConfig {
     #[must_use]
     pub fn with_channels(mut self, channels: ChannelSet) -> Self {
         self.channels = channels;
+        self
+    }
+
+    /// This configuration watching one repository's live agents (PRD §15 M3).
+    #[must_use]
+    pub fn watching(mut self, sessions: SessionScope) -> Self {
+        self.sessions = sessions;
         self
     }
 }
@@ -305,6 +353,11 @@ pub struct Ingest {
     hook_conflict: Option<String>,
     /// Where the hook endpoint file was published, when it was.
     endpoint: Option<PathBuf>,
+    /// The live roster Channel D publishes, when this stack was started with a
+    /// [`SessionScope`] other than [`SessionScope::All`]. Held here rather than
+    /// reached through `sources`, because `Box<dyn IngestSource>` cannot be
+    /// downcast without adding `Any` to the trait every channel implements.
+    roster: Option<Arc<Mutex<Option<live::Roster>>>>,
 }
 
 impl Ingest {
@@ -330,6 +383,7 @@ impl Ingest {
             hook_addr,
             claude_projects_dir,
             channels,
+            sessions,
             bus_capacity,
         } = config;
         let (sink, source) = bus::channel(bus_capacity);
@@ -339,6 +393,7 @@ impl Ingest {
             sink: Some(sink.clone()),
             hook_conflict: None,
             endpoint: None,
+            roster: None,
         };
 
         // Order is Channel order, and it is deliberate: the two channels that
@@ -354,7 +409,7 @@ impl Ingest {
             ingest.start_fs(&repo_root, &sink, mapper.clone());
         }
         if channels.contains(Channel::Transcript) {
-            ingest.start_transcripts(&claude_projects_dir, &sink, mapper);
+            ingest.start_transcripts(&claude_projects_dir, &sink, mapper, sessions);
         }
         (ingest, source)
     }
@@ -433,7 +488,35 @@ impl Ingest {
         }
     }
 
-    fn start_transcripts(&mut self, projects_dir: &Path, sink: &EventSink, mapper: PathMapper) {
+    fn start_transcripts(
+        &mut self,
+        projects_dir: &Path,
+        sink: &EventSink,
+        mapper: PathMapper,
+        sessions: SessionScope,
+    ) {
+        // The zero-setup path (PRD §15 M3). It cannot fail to start: a machine
+        // with no `~/.claude/projects` is one on which no agent has ever run,
+        // and the watch has to survive that and pick the directory up when the
+        // operator's first session creates it.
+        if let Some(scope) = sessions.to_scope(&mapper) {
+            let tailer =
+                transcript::TranscriptTailer::start_live(projects_dir, scope, sink.clone(), mapper);
+            self.roster = Some(tailer.roster_slot());
+            if let Some(roster) = tailer.roster() {
+                if let Some(reason) = roster.error {
+                    // Reported, never fatal: every other channel keeps running
+                    // and the map still draws (ADR-0011).
+                    tracing::warn!(%reason, "live session discovery degraded");
+                    sink.push_control(ControlEvent::ChannelDegraded {
+                        channel: Channel::Transcript,
+                        reason,
+                    });
+                }
+            }
+            self.sources.push(Box::new(tailer));
+            return;
+        }
         match transcript::TranscriptTailer::start_discovering(projects_dir, sink.clone(), mapper) {
             Ok(tailer) => self.sources.push(Box::new(tailer)),
             Err(error) => self.degrade(
@@ -489,6 +572,20 @@ impl Ingest {
     /// Where the hook endpoint file was published, when it was.
     pub fn endpoint_file(&self) -> Option<&Path> {
         self.endpoint.as_deref()
+    }
+
+    /// Every session Polis can see right now, and what each is doing.
+    ///
+    /// `None` unless this stack was started with a [`SessionScope`] other than
+    /// [`SessionScope::All`] — the older tailer follows every session on the
+    /// machine and has no notion of which repository a watch is about, so it has
+    /// no roster to report.
+    pub fn roster(&self) -> Option<live::Roster> {
+        let slot = self.roster.as_ref()?;
+        match slot.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Bus counters: what was dropped, per channel (PRD §4.5).

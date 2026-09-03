@@ -51,11 +51,20 @@ use polis_world::attention::AttentionKind;
 use polis_world::snapshot::WorldSnapshot;
 use polis_world::{Thread, ThreadStatus};
 
+use polis_render::{live, salience};
+
 use crate::basemap::{BaseMap, MapShape};
 use crate::camera::{Camera, ZoomTier};
 use crate::clouds::Clouds;
 use crate::labels::{LabelPlacer, Priority};
 use crate::palette;
+
+/// How many of a thread's most recent operations the alarm scans for failures.
+///
+/// The same 48 the glyph loop draws, so an alarm can never be about a failure
+/// the operator cannot then find inside it — and the world caps `Thread::ops` at
+/// `polis_world::OPS_CAP` anyway.
+const MARKS_SCANNED: usize = 48;
 
 /// A building touched more recently than this is under construction, and gets
 /// PRD §8's scaffolding overlay: *"Temporary-looking overlay on the building.
@@ -227,7 +236,7 @@ pub fn draw(
     }
 
     // --- 3. Clouds — beneath district outlines and labels (PRD §10.3) -------
-    if let Some((texture, cloud_rect)) = clouds.update(ui.ctx(), base, snapshot, cloud_cap) {
+    if let Some((texture, cloud_rect)) = clouds.update(ui.ctx(), base, snapshot, cloud_cap, dt) {
         let screen = Rect::from_min_max(
             camera.to_screen(cloud_rect.min),
             camera.to_screen(cloud_rect.max),
@@ -247,6 +256,12 @@ pub fn draw(
 
     // --- 4. Agents: trails, tethers, workers, operation glyphs --------------
     let mut animating = draw_agents(&painter, base, camera, snapshot, state, tier);
+    // PRD §13 tweens the cloud density, so the window owes itself a frame while
+    // a territory is still arriving, drifting or dissipating.
+    animating |= clouds.animating();
+
+    // --- 4b. The alarm: failure given area (PRD §11.4) ----------------------
+    animating |= draw_alarms(&painter, base, camera, snapshot, rect);
 
     // --- 5. Attention: the top of the contrast range ------------------------
     animating |= draw_attention(&painter, base, camera, snapshot);
@@ -592,12 +607,137 @@ fn draw_agents(
             }
             // PRD §10.4's drift: the redirect signal, drawn as a leading edge
             // only while the centre of mass is actually migrating.
-            if let Some(drift) = thread.territory.drift() {
-                let px = base.map_px_per_world() * camera.scale();
-                let tip = anchor + Vec2::new(drift.x * px, -drift.y * px) * 2.0;
-                painter.line_segment([anchor, tip], Stroke::new(2.0, ink.alpha(0.75)));
-                painter.circle_filled(tip, 3.0, ink.alpha(0.75));
+            if let Some(mark) = thread.territory.drift_mark() {
+                draw_drift(painter, base, camera, &mark, ink);
             }
+        }
+    }
+    animating
+}
+
+/// PRD §10.4's leading-edge mark — the redirect signal.
+///
+/// > A territory whose centre of mass is migrating out of `src/auth` toward
+/// > `tests/` has a scope that is changing, and it is visible *while it is
+/// > happening* — well before contention fires. […] This is the redirect signal,
+/// > and it is the one thing here that no existing tool provides.
+///
+/// Two things about the drawing are decisions rather than taste:
+///
+/// * **The mark sits at the front of the field, not at the centre of mass.** The
+///   centre of mass is where the thread has *been*; a mark there says "this
+///   thread exists". The leading edge is where the scope is going, which is the
+///   thing the operator would redirect.
+/// * **Shape carries it, not colour.** PRD §11.4: *"Colour alone is never the
+///   sole channel for any state."* The chevron is the channel; past the
+///   threshold the mark gains weight and length rather than saturation, so a
+///   drifting thread reads at a glance in the same ink as a still one.
+///
+/// The geometry is [`polis_world::territory::DriftMark`]'s, in city units.
+/// Nothing is decided here.
+fn draw_drift(
+    painter: &egui::Painter,
+    base: &BaseMap,
+    camera: &Camera,
+    mark: &polis_world::territory::DriftMark,
+    ink: palette::Ink,
+) {
+    let tail = camera.to_screen(base.to_map(mark.tail));
+    let tip = camera.to_screen(base.to_map(mark.tip));
+    let along = tip - tail;
+    let length = along.length();
+    if length < 2.0 {
+        return;
+    }
+    let unit = along / length;
+    let normal = Vec2::new(-unit.y, unit.x);
+    // At the threshold this is 1; a thread that has left is 3. Weight, not hue.
+    let weight = (mark.ratio / polis_world::territory::DRIFT_THRESHOLD).clamp(1.0, 3.0);
+    painter.line_segment([tail, tip], Stroke::new(1.0 * weight, ink.alpha(0.45)));
+    let arm = 5.0f32.mul_add(weight, 4.0);
+    for side in [1.0f32, -1.0] {
+        painter.line_segment(
+            [tip, tip - unit * arm + normal * (arm * 0.6 * side)],
+            Stroke::new(1.4 * weight, ink.alpha(0.95)),
+        );
+    }
+}
+
+/// Layer 4's alarm: PRD §10.2's failure colour given the **area** PRD §11.4
+/// needs (`polis_render::salience`).
+///
+/// # Why this is here and not only in the headless renderer
+///
+/// The window is the product. Until this call existed, the salience fix lived
+/// entirely in `polis_render::live`, which is the path every measurement runs
+/// through and *not* the path the operator looks at — so the map on the second
+/// monitor still showed a failing session as two red glyph outlines while the
+/// test suite reported the problem solved. The geometry is computed once, in
+/// `polis_render::salience::strokes`, and drawn twice; neither rasteriser owns
+/// the notation.
+///
+/// Drawn at **every** zoom tier, including `City`, where the operation glyphs
+/// are not drawn at all. That is deliberate and it is the whole point: "which
+/// building failed" is a question you walk to the screen to answer, and "that
+/// district is in trouble" is one you must be able to answer from a chair on the
+/// other side of the room.
+fn draw_alarms(
+    painter: &egui::Painter,
+    base: &BaseMap,
+    camera: &Camera,
+    snapshot: &WorldSnapshot,
+    rect: Rect,
+) -> bool {
+    let now = snapshot.at;
+    let ttl = polis_world::TRAIL_TTL.as_secs_f32();
+    let mut marks: Vec<live::Mark> = Vec::new();
+    for thread in &snapshot.threads {
+        for op in thread.ops.iter().rev().take(MARKS_SCANNED) {
+            if op.outcome != polis_events::Outcome::Failed {
+                continue;
+            }
+            let Some(path) = &op.path else { continue };
+            let Some(map) = base.geometry.position_of(path) else {
+                continue;
+            };
+            let age = now.saturating_duration_since(op.at).as_secs_f32() / ttl;
+            if age >= 1.0 {
+                continue;
+            }
+            let at = camera.to_screen(map);
+            marks.push(live::Mark::single(
+                [f64::from(at.x), f64::from(at.y)],
+                op.glyph,
+                op.outcome,
+                f64::from(age),
+                live::pulse_at(now.saturating_duration_since(op.at).as_secs_f64()),
+            ));
+        }
+    }
+    if marks.is_empty() {
+        return false;
+    }
+    // The glyph radius the window is using, so the alarm clears the marks it is
+    // about at every tier.
+    let r = match camera.tier() {
+        ZoomTier::Building => 6.0,
+        ZoomTier::District => 3.6,
+        ZoomTier::City => 3.0,
+    };
+    let mut animating = false;
+    for alarm in salience::alarms(&marks, r, f64::from(rect.height())) {
+        animating |= alarm.pulse > 0.0;
+        for stroke in salience::strokes(alarm, r) {
+            let ink = palette::Ink::agent(stroke.ink).alpha(1.0);
+            let points: Vec<Pos2> = stroke
+                .points
+                .iter()
+                .map(|p| Pos2::new(p[0] as f32, p[1] as f32))
+                .collect();
+            painter.add(egui::Shape::line(
+                points,
+                Stroke::new(stroke.width as f32, ink),
+            ));
         }
     }
     animating
@@ -689,7 +829,10 @@ fn draw_attention(
 
 /// Where an attention mark points: the file it names, else the thread's
 /// territory, else nothing.
-fn mark_position(
+///
+/// Public because the attention list jumps the camera to exactly where the map
+/// drew the mark. Two answers to "where is this state" would be two maps.
+pub fn mark_position(
     base: &BaseMap,
     snapshot: &WorldSnapshot,
     thread: &ThreadId,

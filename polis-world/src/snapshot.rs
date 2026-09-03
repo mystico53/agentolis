@@ -60,6 +60,14 @@ pub struct WorldSnapshot {
     pub threads: Vec<Thread>,
     /// Attention marks in PRD §11.1 order.
     pub attention: Vec<crate::attention::Attention>,
+    /// PRD §11.3's early warning: pairs of threads whose clouds overlap, worst
+    /// first.
+    ///
+    /// Kept out of [`WorldSnapshot::attention`] on purpose — a signal that
+    /// fires *before* anything is destroyed must not compete for the eye with
+    /// the one that fires while it is. See
+    /// [`crate::contention::TerritoryOverlap`].
+    pub overlaps: Vec<crate::contention::TerritoryOverlap>,
     /// Channel health, for the status bar.
     pub health: Health,
     /// Per-file live state — the source of PRD §7.3's building height.
@@ -84,6 +92,7 @@ impl WorldSnapshot {
             layout,
             threads: Vec::new(),
             attention: Vec::new(),
+            overlaps: Vec::new(),
             health: Health::default(),
             files: Arc::new(BTreeMap::new()),
             unattributed: Vec::new(),
@@ -241,6 +250,7 @@ impl SnapshotPublisher {
             layout: Arc::clone(&state.layout),
             threads: world.threads_for_rail().into_iter().cloned().collect(),
             attention: world.attention.clone(),
+            overlaps: world.overlaps.clone(),
             health: world.health.clone(),
             files: Arc::clone(&state.files),
             unattributed: world.unattributed.values().cloned().collect(),

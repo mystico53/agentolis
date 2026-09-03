@@ -139,6 +139,7 @@ fn populated(city: &City) -> WorldSnapshot {
             centre,
             weight: 1.4,
             radius: layout.extent * 0.06,
+            at: now,
         });
     }
     thread.territory = territory;

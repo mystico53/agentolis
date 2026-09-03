@@ -22,7 +22,7 @@
 
 use clap::Parser as _;
 use polis_app::cli::{Cli, Command};
-use polis_app::{commands, run, setup};
+use polis_app::{commands, run, setup, watch};
 
 fn main() {
     // Captured before `parse`, which can exit the process on `--help`: this is
@@ -66,13 +66,10 @@ fn dispatch() -> anyhow::Result<i32> {
             };
             polis_app::run(config).map(|()| 0)
         }
-        Some(Command::Watch) => {
-            let config = polis_app::config::Config {
-                repo_root: cli.repo_root()?,
-                ..polis_app::config::Config::default()
-            };
-            polis_app::launch(config, polis_app::Mode::Pick).map(|()| 0)
-        }
+        // PRD §15 M3, and the front door: every agent working in this
+        // repository, live, with no configuration at all. The picker `watch`
+        // used to open is `polis replay` with no argument.
+        Some(Command::Watch(args)) => watch::watch(&cli, args),
         Some(Command::Connect(args)) => setup::connect(&cli, args).map(|()| 0),
         Some(Command::Tail(args)) => commands::tail(&cli, args).map(|()| 0),
         Some(Command::InstallHooks(args)) => commands::install_hooks(&cli, args).map(|()| 0),

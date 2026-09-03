@@ -705,6 +705,22 @@ and demonstrable. Terminal emulation is famous for the last 10 % costing as much
 as the first 90 %; this estimate assumes that and is still the honest number, not
 the optimistic one.
 
+### What M7 must leave in place for M8
+
+Four constraints, none of which costs M7 anything, and which together are the
+difference between M8 being 4–6 days and being a rewrite:
+
+1. **Write the per-pane raw byte log from day one.** M7a already plans it as the
+   fixture `tests/grid.rs` needs — just make it permanent rather than test-only.
+   In M8 it becomes pane history, and pane history is what makes reattach work.
+2. **The UI reads only `ScreenSnapshot`, never the `Term` directly.** Already the
+   M7 design; this note records *why* it matters — that boundary is where the
+   process split lands.
+3. **PTY spawn / resize / kill live behind one type**, not scattered across
+   `panes.rs`, so M8 swaps an implementation rather than hunting call sites.
+4. **`Ingest` construction in `Mode::Work` stays a single call site**, so it can
+   be replaced by "connect to the daemon" in one edit.
+
 ---
 
 ## Risks, ranked
@@ -778,10 +794,103 @@ the optimistic one.
 
 ---
 
+## M8 — The session server
+
+*Later work. M7 ships first and unchanged in scope.*
+
+tmux, herdr and cmux independently made the same decision: **the PTYs live in a
+background process and the UI is a thin client.** tmux made it in 2007 because it
+was built for SSH sessions that drop, and the other two inherited the pattern.
+M7 as written does the opposite — closing the Polis window, or a GPU driver reset
+(not rare on Windows), takes every running agent with it.
+
+### The design — a deliberately dumb daemon
+
+| | Owns |
+|---|---|
+| **`polis-sessiond`** (new binary, or `polis serve`) | the PTYs; a per-pane raw byte log; the ingest channels (OTLP :4317, hook UDP :45177, fs-notify, transcript tail); an event recording written continuously while detached |
+| **the window** (thin client) | the VT parser, the grid, the widget, `World`, the map — **everything from M7, unchanged** |
+
+- **Pane output crosses the boundary as raw bytes, not screens.** This is the one
+  decision that keeps M8 cheap. The obvious design — serialise a 45×120 styled
+  grid at 30 Hz per pane — is expensive and is why tmux carries so much flow
+  control machinery. **tmux control mode does not do that:** `%output %pane
+  <data>` ships the raw bytes and the client parses them, which is exactly how
+  iTerm2 renders tmux panes as native tabs. So the daemon stays dumb and M7's
+  parser, grid and widget move over untouched.
+- **Transport:** newline-delimited JSON — `{id, method, params}` / `{id, result}`
+  / `{id, error}` — over a named pipe on Windows and a Unix socket elsewhere.
+  That is herdr's shape, which is the proven one on this platform pair. Async
+  events pushed after an `events.subscribe`, tmux-control-mode style.
+- **Reattach** = replay each pane's byte log through the parser to rebuild its
+  screen, replay the event recording through the existing `ReplayDriver` to catch
+  the map up, then follow live. Both halves already exist. The user-visible
+  result is worth stating: you shut the lid for an hour, reopen the window, and
+  **watch the detached hour play out on the map** before catching up to live.
+- **Flow control:** adopt tmux's `pause-after` → `%pause` / `%continue` with a
+  milliseconds-behind figure, replacing M7's naive 30 Hz repaint cap with the
+  principled version tmux arrived at after years of it being wrong.
+- **IDs carry sigils** — `$session`, `@tab`, `%pane` — and are always preferred
+  to names. tmux's own documentation is emphatic about this.
+
+### What it buys
+
+Agents survive the window closing, survive a GPU driver reset, survive a closed
+lid. Detach and reattach. And, later, SSH or phone access to a running herd.
+
+### Reused, not built
+
+This is why the estimate is days rather than weeks:
+
+- `Ingest` / `IngestConfig` / `EventSource` move wholesale.
+- **ADR-0026's fixed-port bind already makes the ingest a singleton**, and a
+  daemon is its natural owner — arguably more natural than the window is today.
+- `drain_bus` + `RecordingClock` + `RecordingHeader` already write exactly the
+  recording a detached period needs (ADR-0049).
+- `ReplayDriver` + `ReplayClock` already replay it, including the idle-gap
+  compression that makes a long detached period watchable.
+- M7's per-pane byte log becomes pane history.
+
+### Risks
+
+- **Version skew** between daemon and window, which must be detected at attach
+  and refused loudly rather than papered over.
+- The permanent **"is the daemon running?"** support surface, and stale sockets.
+- A **daemon orphaned** with live agents nobody is watching — the failure mode
+  that makes people distrust background processes.
+- **Named pipes vs Unix sockets** need one abstraction; this is the only genuinely
+  platform-forked code in M8.
+- **PRD §2 says "no server."** That clause means no cloud, no auth and nothing
+  leaving the box — not "no local background process" — but it says the shorter
+  thing, so it needs an explicit amendment rather than a quiet reinterpretation.
+
+**Effort: 4–6 dev-days on top of M7**, given the four constraints above. Gets
+**ADR-0093**.
+
+### Further out, and deliberately not planned
+
+The city could also move server-side. `polis-render` is already a CPU rasteriser
+that draws the city headlessly with no window at all — that is how the GIFs in
+`docs/replay/` were produced — so a daemon that renders the map and serves it
+remotely is a smaller step than it sounds. It is flagged here and **not** scoped,
+because unlike a local daemon it runs squarely into PRD §2's "not a team product,
+single operator, local data."
+
+### The rejected third option
+
+**Speak tmux control mode and host real tmux panes**, the way iTerm2 does. It
+would give persistence, detach and a battle-tested protocol for free, and it is
+genuinely the least-code answer. It is ruled out because **tmux has no native
+Windows support**, and Windows is the reference platform. Recorded so it is not
+rediscovered and re-costed later.
+
+---
+
 ## The ADRs
 
-Three, starting at ADR-0090, in the house Context / Decision / Consequences shape
-with measured numbers and named failure modes.
+Four, starting at ADR-0090, in the house Context / Decision / Consequences shape
+with measured numbers and named failure modes. The first three land with M7; the
+fourth with M8.
 
 **ADR-0090 — Polis grows a terminal, because one inherited console cannot be
 several agents.** The reversal, stated honestly: `run.rs`'s three reasons are
@@ -811,6 +920,17 @@ fixed by the system's own `seguisym.ttf` at zero binary cost — with the cmap
 table showing that bundling Cascadia Mono (363 KiB, SIL OFL, otherwise the
 obvious choice) would still miss three of them.
 
+**ADR-0093 (M8) — The agents outlive the window, and the boundary is bytes.**
+Records the client–server split and, more importantly, *why it is cheap*: the
+daemon ships raw pane bytes rather than rendered screens, following tmux control
+mode's `%output` rather than the obvious grid-serialisation design, so the parser
+and widget cross the boundary unchanged. Records what was reused rather than
+built (ADR-0026's singleton bind, ADR-0049's recording format, `ReplayDriver`),
+the rejection of hosting real tmux over control mode (no native Windows), the
+version-skew and orphaned-daemon failure modes, and the amendment PRD §2's
+"no server" clause needs — that it means no cloud, no auth and nothing leaving
+the box, not no local background process.
+
 ---
 
 ## Files touched
@@ -829,3 +949,8 @@ left dock in `draw_scene`, `Repaint::Terminal`, `raw_input_hook`, `on_exit`,
 `docs/DECISIONS.md` (ADR-0090/0091/0092), `docs/PRD.md` (§14's crate list gains
 `polis-term`; §15 gains M7; §2's non-goals and §1's framing of the terminal as
 the problem need amending to admit this feature).
+
+**M8, later:** new `polis-sessiond/` (crate) and a transport module shared with
+`polis-app`; `polis-ingest` moves its construction site rather than its code;
+`polis-app/src/panes.rs` swaps its PTY host implementation; `docs/DECISIONS.md`
+(ADR-0093); `docs/PRD.md` (§2's "no server" clause, §15 gains M8).

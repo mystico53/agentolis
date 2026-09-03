@@ -193,12 +193,19 @@ fn a_claim_expires_at_the_ttl_and_the_link_goes_with_it() {
 }
 
 #[test]
-fn a_landed_write_releases_the_claim_before_the_ttl() {
+fn a_landed_write_keeps_its_claim_and_a_failed_one_releases_it() {
+    // PRD §11.3's early release is for the write that **did not happen**. A
+    // write that did happen is not a reservation any more; it is a hazard, and
+    // the thirty seconds is its duration. Deleting it on landing is what made
+    // the operator's real collisions render as nothing: in a transcript the
+    // result follows the call by under a second, so two workers 4.7 s apart
+    // never held claims at the same instant.
     let mut w = world();
     let t0 = Instant::now();
+
+    // ADR-0044: Channel A's `tool_result` is one of the two landing triggers.
     w.apply(&pre_edit("a", "src/auth.ts", "main", t0));
     assert_eq!(w.claims.len(), 1);
-    // ADR-0044: Channel A's `tool_result` is one of the two release triggers.
     w.apply(&tool_result(
         "a",
         None,
@@ -207,11 +214,29 @@ fn a_landed_write_releases_the_claim_before_the_ttl() {
         Outcome::Done,
         t0 + Duration::from_secs(1),
     ));
-    assert!(w.claims.is_empty());
+    let landed = w
+        .claims
+        .claims_on(&LogicalPath::new("src/auth.ts").unwrap());
+    assert_eq!(landed.len(), 1, "the claim survives the write landing");
+    assert!(landed[0].has_landed(), "and it says the bytes are on disk");
 
-    // And Channel C's `Modified` is the other.
+    // Which is what lets a sibling four seconds later collide with it.
+    w.apply(&pre_edit(
+        "b",
+        "src/auth.ts",
+        "main",
+        t0 + Duration::from_secs(5),
+    ));
+    w.tick(t0 + Duration::from_secs(5));
+    assert!(
+        w.attention
+            .iter()
+            .any(|m| matches!(m.kind, AttentionKind::Contention(_))),
+        "a write that landed is still a thing to write over"
+    );
+
+    // Channel C's `Modified` is the other landing trigger.
     w.apply(&pre_edit("a", "src/other.ts", "main", t0));
-    assert_eq!(w.claims.len(), 1);
     let mut meta = EventMeta::now(Channel::Fs);
     meta.observed = t0 + Duration::from_secs(2);
     w.apply(&Event::new(
@@ -223,7 +248,35 @@ fn a_landed_write_releases_the_claim_before_the_ttl() {
             ),
         }),
     ));
-    assert!(w.claims.is_empty());
+    let other = w
+        .claims
+        .claims_on(&LogicalPath::new("src/other.ts").unwrap());
+    assert_eq!(other.len(), 1);
+    assert!(other[0].has_landed());
+
+    // A **failed** write wrote nothing, so its reservation goes at once — this
+    // is the early release, doing the job it is actually for.
+    w.apply(&pre_edit("a", "src/gone.ts", "main", t0));
+    assert_eq!(
+        w.claims
+            .claims_on(&LogicalPath::new("src/gone.ts").unwrap())
+            .len(),
+        1
+    );
+    w.apply(&tool_result(
+        "a",
+        None,
+        ToolKind::Edit,
+        "src/gone.ts",
+        Outcome::Failed,
+        t0 + Duration::from_secs(1),
+    ));
+    assert!(
+        w.claims
+            .claims_on(&LogicalPath::new("src/gone.ts").unwrap())
+            .is_empty(),
+        "nothing was written, so there is nothing to write over"
+    );
 }
 
 #[test]
@@ -728,7 +781,13 @@ fn a_subagent_edit_with_no_sidecar_degrades_and_marks_itself() {
         state.diff_precision,
         polis_world::DiffPrecision::Approximate
     );
-    assert!(w.health.contention_without_line_ranges > 0);
+    // The edit lacked a line range; nothing collided with it. Those are two
+    // different counters and this test is about the first.
+    assert!(w.health.edits_without_line_ranges > 0);
+    assert_eq!(
+        w.health.contention_without_line_ranges, 0,
+        "a lone degraded edit is not a contention hit"
+    );
 }
 
 #[test]

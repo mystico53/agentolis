@@ -9,17 +9,18 @@
 //! main thread     eframe/winit event loop, egui overlay, the world, the driver
 //! index thread    the session scan, so the picker opens instantly
 //! load thread     git walk + tree-sitter + layout + transcript read
+//! wake thread     live only: watches the bus depth and asks for a frame
 //! ```
 //!
-//! The world is driven on the main thread deliberately. PRD §5 says the
-//! renderer must sample a lock-free snapshot rather than block on a writer, and
-//! that is exactly what happens here — [`SnapshotPublisher`] publishes and
-//! [`SnapshotReader`] loads — but with a *recording* there is no second writer:
-//! `polis-world` applies 22 759 real events in 239 ms, so a whole session is
-//! four frames of work and a thread would buy latency Polis does not have.
-//! Moving the publisher to a world thread is a two-line change when live ingest
-//! lands, and the shape here is already the shape that needs: `advance`,
-//! `publish`, `load`, once per frame, never per event.
+//! The world is driven on the main thread deliberately, in a replay and live
+//! alike. PRD §5 says the renderer must sample a lock-free snapshot rather than
+//! block on a writer, and that is exactly what happens here —
+//! [`SnapshotPublisher`] publishes and [`SnapshotReader`] loads. `polis-world`
+//! applies 22 759 real events in 239 ms, so PRD §13.1's whole 500 events/sec
+//! budget is 84 µs of a 16.6 ms frame, and a world thread would buy a channel
+//! hop between the click that selects a building and the world that knows about
+//! it. The shape is one shape for both sources: `advance`, `publish`, `load`,
+//! once per frame, never per event. [`live`] states the measurement in full.
 //!
 //! # The idle budget is a repaint discipline
 //!
@@ -27,10 +28,16 @@
 //! > this thing runs all day on the operator's second monitor. (PRD §13.1)
 //!
 //! `egui` repaints on input and on request, and nothing else. So this file
-//! requests a repaint in exactly four cases: a transport is playing, an
-//! animation is in flight, a key is held, or a background job is still running.
-//! [`Repaint`] is that decision made once, in one place, with a name attached so
-//! the status bar can say which of the four is keeping the window awake.
+//! requests a repaint in exactly five cases: a transport is playing, an
+//! animation is in flight, a key is held, a background job is still running, or
+//! a live feed has work or something alive to age. [`Repaint`] is that decision
+//! made once, in one place, with a name attached so the status bar can say which
+//! of the five is keeping the window awake.
+//!
+//! The live case is the one that could have cost the whole budget, and does not:
+//! the window is woken by [`live::LiveFeed`]'s waker thread when an event is
+//! actually queued, so a quiet map renders once a second to move a clock and
+//! otherwise sleeps.
 
 // The frame loop is arithmetic against a pixel grid and a millisecond clock, and
 // `too_many_lines` on `ui()` would only push one ordered sequence of panels into
@@ -41,6 +48,8 @@
     clippy::cast_sign_loss,
     clippy::too_many_lines
 )]
+
+pub mod live;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -60,11 +69,13 @@ use crate::camera::Camera;
 use crate::citygen::{self, ColdStart, Generated};
 use crate::clouds::Clouds;
 use crate::config::Config;
+use crate::drill;
 use crate::mapview::{self, ViewState};
 use crate::palette;
 use crate::session::Picker;
 use crate::treeview::TreeView;
 use crate::ui::{self, Overlay, View, Vitals};
+use live::{LiveFeed, LiveOptions};
 
 /// How many frame times the status bar keeps.
 const FRAME_WINDOW: usize = 240;
@@ -92,6 +103,19 @@ pub enum Mode {
         /// Initial playback speed.
         speed: f32,
     },
+    /// `polis watch` — this repository's city with the four ingest channels
+    /// feeding it in real time (PRD §15 M3).
+    ///
+    /// The only mode with a second writer to the bus, and the only one where an
+    /// operator can be looking at an empty map for a legitimate reason — so it
+    /// is the only one that has to keep saying what it is doing. See [`live`].
+    Live {
+        /// How to start the four channels, and which agents belong on this map.
+        ///
+        /// Boxed because it is much the largest variant and every other one is a
+        /// path or two.
+        options: Box<LiveOptions>,
+    },
     /// `polis replay` with no argument — pick from this machine's own sessions.
     Pick,
 }
@@ -105,6 +129,15 @@ pub enum Mode {
 pub fn launch(config: Config, mode: Mode) -> anyhow::Result<()> {
     let started = Instant::now();
     announce(&mode);
+    // Before the window, not after. Creating a surface and picking an adapter
+    // is hundreds of milliseconds; a hook datagram that arrives with nothing
+    // bound is gone for good, and an OTel exporter that finds nothing listening
+    // drops its first batch — which is the session start. The bounded bus holds
+    // what arrives while the city is generated.
+    let feed = match &mode {
+        Mode::Live { options } => Some(Box::new(LiveFeed::start(options))),
+        _ => None,
+    };
     // The inner size is in **logical points**, and this machine renders at 1.75
     // points per pixel: a naive `[1600, 1000]` asks for 2800x1750 physical on a
     // 2194x1234 screen, Windows clamps the window, and egui keeps laying out for
@@ -123,7 +156,7 @@ pub fn launch(config: Config, mode: Mode) -> anyhow::Result<()> {
     eframe::run_native(
         "polis",
         options,
-        Box::new(move |cc| Ok(Box::new(PolisApp::new(cc, config, mode, started)))),
+        Box::new(move |cc| Ok(Box::new(PolisApp::new(cc, config, mode, feed, started)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -144,6 +177,13 @@ fn announce(mode: &Mode) {
         Mode::Map { repo } => format!("opening the map for {}", repo.display()),
         Mode::Pick => "opening the session picker".to_owned(),
         Mode::Replay { transcript, .. } => format!("replaying {}", transcript.display()),
+        Mode::Live { options } => format!(
+            "watching {} live — telemetry {}, hooks {}, transcripts {}",
+            options.repo().display(),
+            options.ingest.otlp_addr,
+            options.ingest.hook_addr,
+            options.ingest.claude_projects_dir.display()
+        ),
     };
     let _ = writeln!(out, "polis: {what} — close the window to return here.");
     let _ = out.flush();
@@ -179,6 +219,22 @@ pub struct PolisApp {
     last_editor: Option<(LogicalPath, Instant)>,
     /// What is keeping the window awake, for the status bar.
     repaint: Repaint,
+    /// A live feed started before the window existed, waiting for the city it
+    /// will drive. Moved into the [`Scene`] the moment the load thread lands.
+    pending_live: Option<Box<LiveFeed>>,
+    /// How long [`Repaint::Live`] is willing to sleep. `ZERO` is "now".
+    ///
+    /// The one wake reason with a variable interval: a backlog wants the next
+    /// frame immediately, a working agent wants a heartbeat fast enough to age
+    /// it, and an empty map wants only enough to move a clock.
+    live_wake: Duration,
+    /// Which thread the camera is following, and where it last cut to.
+    ///
+    /// PRD §12 says following is a **cut**, and a cut happens when the agent
+    /// moves — not once a frame. Without this the camera would be re-centred
+    /// sixty times a second and the operator could neither pan nor zoom for as
+    /// long as they were following anything.
+    followed_to: Option<(polis_events::ThreadId, Option<LogicalPath>)>,
 }
 
 impl std::fmt::Debug for PolisApp {
@@ -199,6 +255,13 @@ pub enum Repaint {
     Idle,
     /// A background job is running.
     Loading,
+    /// A live feed has a backlog to apply, or something alive to age.
+    ///
+    /// The fifth reason, added with PRD §15 M3. Its interval is
+    /// `PolisApp::live_wake` rather than a constant, because "there are 4 000
+    /// events waiting" and "there is a clock on screen" are the same reason with
+    /// two very different urgencies.
+    Live,
     /// A recording is playing.
     Playing,
     /// A tween or a pulse is in flight.
@@ -212,6 +275,7 @@ impl Repaint {
         match self {
             Self::Idle => "idle",
             Self::Loading => "loading",
+            Self::Live => "live",
             Self::Playing => "playing",
             Self::Animating => "animating",
             Self::KeyHeld => "key",
@@ -264,6 +328,10 @@ struct Scene {
     reader: SnapshotReader,
     snapshot: Arc<WorldSnapshot>,
     driver: Option<ReplayDriver>,
+    /// The live feed, when this scene is one (PRD §15 M3). Mutually exclusive
+    /// with [`Scene::driver`]: a recording and a wire are two sources for one
+    /// world, and mixing them would put a seek in front of an arrival.
+    feed: Option<Box<LiveFeed>>,
     label: String,
     view: ViewState,
     tree: TreeView,
@@ -281,6 +349,7 @@ impl PolisApp {
         cc: &eframe::CreationContext<'_>,
         config: Config,
         mode: Mode,
+        feed: Option<Box<LiveFeed>>,
         started: Instant,
     ) -> Self {
         theme(&cc.egui_ctx);
@@ -296,9 +365,19 @@ impl PolisApp {
         );
         eprintln!("polis: adapter {adapter}");
 
+        let mut feed = feed;
+        // The ports had to be bound before there was a context to wake, and the
+        // waker needs one — so this is where the two halves meet.
+        if let Some(feed) = feed.as_mut() {
+            feed.wake_with(&cc.egui_ctx);
+        }
         let stage = match mode {
             Mode::Pick => Stage::Picking(Box::new(Picker::start())),
             Mode::Map { repo } => spawn_load(repo, None, 1.0),
+            // The city is this repository's, and nothing is read from disk that a
+            // `polis map` would not read: live is the same city with a wire into
+            // it.
+            Mode::Live { options } => spawn_load(options.repo().to_path_buf(), None, 1.0),
             Mode::Replay {
                 transcript,
                 repo,
@@ -319,6 +398,9 @@ impl PolisApp {
             skip_frame: false,
             last_editor: None,
             repaint: Repaint::Loading,
+            pending_live: feed,
+            live_wake: live::IDLE_TICK,
+            followed_to: None,
         }
     }
 
@@ -444,6 +526,9 @@ impl eframe::App for PolisApp {
         match self.repaint {
             Repaint::Idle => {}
             Repaint::Loading => ctx.request_repaint_after(crate::session::POLL),
+            // `Duration::ZERO` is egui's own spelling of "as soon as you can",
+            // so a backlog and a heartbeat go through one call.
+            Repaint::Live => ctx.request_repaint_after(self.live_wake),
             _ => ctx.request_repaint(),
         }
     }
@@ -458,15 +543,19 @@ impl PolisApp {
             Err(TryRecvError::Empty) => return,
             Ok(Ok(loaded)) => loaded,
             Ok(Err(error)) => {
+                // No city means no map to feed, so the channels come down with
+                // it rather than filling a bus nobody will ever drain.
+                self.pending_live = None;
                 self.stage = Stage::Failed(error);
                 return;
             }
             Err(TryRecvError::Disconnected) => {
+                self.pending_live = None;
                 self.stage = Stage::Failed("the city could not be generated".to_owned());
                 return;
             }
         };
-        self.stage = Stage::Running(Box::new(build_scene(loaded)));
+        self.stage = Stage::Running(Box::new(build_scene(loaded, self.pending_live.take())));
     }
 
     fn draw_picker(&mut self, ui: &mut egui::Ui) {
@@ -664,6 +753,8 @@ impl PolisApp {
         }
         if keys.clear {
             scene.view.selected = None;
+            scene.view.follow = None;
+            self.overlay.attention_cursor = None;
             self.overlay.help = false;
         }
         if keys.back_to_picker || action.back_to_picker {
@@ -672,6 +763,11 @@ impl PolisApp {
         }
 
         // --- Advance the world: advance, publish, load. Once per frame. -----
+        //
+        // One shape, two sources. A recording advances a clock; a live feed
+        // drains a bus. Both then publish exactly once and the renderer loads
+        // exactly once, which is PRD §5's "decouple event rate from frame rate"
+        // written out: nothing here runs per event.
         if let Some(driver) = &mut scene.driver {
             apply_transport(driver, &action, &mut scene.world);
             if driver.clock().is_playing() {
@@ -683,6 +779,14 @@ impl PolisApp {
             }
             scene.publisher.publish(&scene.world);
             scene.snapshot = scene.reader.load();
+        }
+        if let Some(feed) = &mut scene.feed {
+            let now = Instant::now();
+            let pumped = feed.pump(&mut scene.world, now);
+            scene.publisher.publish(&scene.world);
+            scene.snapshot = scene.reader.load();
+            self.live_wake = feed.wake_after(&scene.snapshot, pumped.backlog);
+            self.repaint = self.repaint.max_urgency(Repaint::Live);
         }
 
         let snapshot = Arc::clone(&scene.snapshot);
@@ -729,6 +833,27 @@ impl PolisApp {
                 });
             });
 
+        // --- Live mode says what it is doing, always ------------------------
+        //
+        // > The operator ran a real agent for minutes and saw an empty map with
+        // > no explanation.
+        //
+        // A silent empty map is the exact failure this milestone exists to fix,
+        // so the strip is unconditional and the explanation appears whenever
+        // there is nothing on the map to explain itself.
+        if let Some(feed) = scene.feed.as_deref() {
+            let now = Instant::now();
+            // Created after `polis-status`, so it stacks directly above it.
+            egui::Panel::bottom("polis-live")
+                .exact_size(24.0)
+                .show(ui, |ui| live::strip(ui, feed, &snapshot, now));
+            if snapshot.threads.is_empty() {
+                egui::Panel::top("polis-live-waiting")
+                    .exact_size(live::waiting_height(feed))
+                    .show(ui, |ui| live::waiting(ui, feed, now));
+            }
+        }
+
         // Why this city looks the way it does, when the answer is not "your
         // code" — an empty history draws an almost empty map, and silence there
         // reads as a broken product (`citygen::preflight`).
@@ -752,6 +877,15 @@ impl PolisApp {
                 });
         }
 
+        // --- The drill-down rail --------------------------------------------
+        //
+        // Three things in one column, in the order PRD §1 ranks them: what is
+        // waiting on a human, what the operator is pointing at, and who is
+        // working. `jump` and `panel` are collected here and applied once the
+        // rail's borrow of the scene is released.
+        let mut jump: Option<drill::Jump> = None;
+        let mut panel = ui::PanelAction::default();
+        let mut subject: Option<LogicalPath> = None;
         if self.overlay.rail {
             egui::Panel::right("polis-rail")
                 .default_size(370.0)
@@ -771,18 +905,67 @@ impl PolisApp {
                                 );
                                 ui.separator();
                             }
-                            let subject = scene
+                            // PRD §1's primary decision comes first on the
+                            // column, above everything the operator might merely
+                            // be curious about.
+                            jump = ui::attention_list(ui, &snapshot, self.overlay.attention_cursor);
+                            subject = scene
                                 .view
                                 .selected
                                 .clone()
                                 .or_else(|| scene.view.hovered.clone());
-                            if let Some(path) = subject {
-                                ui::building_panel(ui, &snapshot, &path);
+                            if let Some(path) = &subject {
+                                panel = ui::building_panel(ui, &snapshot, path);
                                 ui.separator();
                             }
                             ui::status_rail(ui, &snapshot, &mut scene.view);
                         });
                 });
+        }
+        if keys.attention {
+            jump = self.overlay.next_attention(&snapshot);
+        }
+        if let Some(thread) = panel.follow {
+            scene.view.follow = if scene.view.follow.as_ref() == Some(&thread) {
+                None
+            } else {
+                Some(thread)
+            };
+        }
+        if keys.follow {
+            let threads: Vec<polis_events::ThreadId> =
+                snapshot.threads.iter().map(|t| t.id.clone()).collect();
+            let prefer = subject.as_ref().and_then(|path| {
+                drill::facts(&snapshot, path)
+                    .touches
+                    .first()
+                    .map(|t| t.thread.clone())
+            });
+            scene.view.follow =
+                drill::next_follow(scene.view.follow.as_ref(), &threads, prefer.as_ref());
+        }
+        if panel.open_editor {
+            if let Some(path) = &subject {
+                open_in_editor(
+                    &mut self.last_editor,
+                    &self.config.editor_command,
+                    path,
+                    &scene.generated.root,
+                );
+            }
+        }
+
+        // A jump is *go there now*, so it releases the camera from whatever it
+        // was bound to; following is *stay with it*, and the two fighting over
+        // the camera every frame would look like a bug in both.
+        let mut cut_to = None;
+        if let Some(jump) = jump {
+            if let Some(path) = &jump.path {
+                scene.view.selected = Some(path.clone());
+                scene.tree.reveal(path);
+            }
+            scene.view.follow = None;
+            cut_to = mapview::mark_position(base, &snapshot, &jump.thread, jump.path.as_ref());
         }
 
         // --- The central area: the map, or the tree that is co-equal with it -
@@ -806,13 +989,36 @@ impl PolisApp {
                 if keys.reset_camera {
                     *camera = Camera::fit(base.edge(), base.geometry.median_building_px, rect);
                 }
-                // PRD §12: follow is a **cut**, never a pan.
+                // PRD §12: follow is a **cut**, never a pan — and a cut only
+                // when the agent has actually moved. Re-centring every frame
+                // would take the pan and the zoom away from the operator for as
+                // long as they were following, which is the opposite of what
+                // binding the camera to a thread is for.
                 if let Some(id) = scene.view.follow.clone() {
                     if let Some(thread) = snapshot.thread(&id) {
-                        if let Some(centre) = thread.territory.centre_of_mass {
-                            camera.cut_to(base.to_map(centre));
+                        // Where the thread *is*, not where its territory
+                        // averages out to: agents jump discontinuously across
+                        // the tree and the last step is the jump.
+                        let at = thread.trail.back().map(|(path, _)| path.clone());
+                        let moved = self.followed_to.as_ref() != Some(&(id.clone(), at.clone()));
+                        if moved {
+                            self.followed_to = Some((id, at.clone()));
+                            let point = at
+                                .as_ref()
+                                .and_then(|path| base.geometry.position_of(path))
+                                .or_else(|| {
+                                    thread.territory.centre_of_mass.map(|c| base.to_map(c))
+                                });
+                            if let Some(point) = point {
+                                drill::drill_to(camera, point);
+                            }
                         }
                     }
+                } else {
+                    self.followed_to = None;
+                }
+                if let Some(at) = cut_to {
+                    drill::drill_to(camera, at);
                 }
                 frame = mapview::draw(
                     ui,
@@ -832,12 +1038,23 @@ impl PolisApp {
                 }
             }
             View::Tree => {
-                let centre_on = scene.tree.draw(ui, &snapshot, &mut scene.view);
-                if let Some(path) = centre_on {
+                let out = scene.tree.draw(ui, &snapshot, &mut scene.view);
+                // The tree's row is the map's building: the same click, the same
+                // camera cut, the same editor (PRD §12, *co-equal*).
+                if let Some(path) = out.centre_on {
                     if let (Some(camera), Some(at)) =
                         (scene.camera.as_mut(), base.geometry.position_of(&path))
                     {
-                        camera.cut_to(at);
+                        drill::drill_to(camera, at);
+                    }
+                }
+                clicked = out.clicked;
+                if let (Some(camera), Some(at)) = (scene.camera.as_mut(), cut_to) {
+                    drill::drill_to(camera, at);
+                }
+                if let Some(path) = &scene.view.hovered {
+                    if let Some(pos) = ctx.pointer_hover_pos() {
+                        ui::hover_card(&ctx, pos, &snapshot, path);
                     }
                 }
                 frame.tier = scene
@@ -871,10 +1088,10 @@ impl PolisApp {
 
         let camera = scene.camera;
         let vitals = Vitals {
-            mode: if scene.driver.is_some() {
-                "replay"
-            } else {
-                "map"
+            mode: match (scene.driver.is_some(), scene.feed.is_some()) {
+                (_, true) => "live",
+                (true, _) => "replay",
+                _ => "map",
             },
             view: self.overlay.view,
             tier: frame.tier,
@@ -897,7 +1114,12 @@ impl PolisApp {
             vitals.frame_p99 = p99;
             let repaint = self.repaint;
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                ui::status_bar(ui, &snapshot, vitals);
+                // The attention count on the bar is a control: the rail can be
+                // shut, and PRD §1's primary decision must never be more than
+                // one click away.
+                if ui::status_bar(ui, &snapshot, vitals) {
+                    self.overlay.rail = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(repaint.label())
@@ -918,9 +1140,10 @@ impl Repaint {
         let rank = |r: Self| match r {
             Self::Idle => 0,
             Self::Loading => 1,
-            Self::Animating => 2,
-            Self::KeyHeld => 3,
-            Self::Playing => 4,
+            Self::Live => 2,
+            Self::Animating => 3,
+            Self::KeyHeld => 4,
+            Self::Playing => 5,
         };
         if rank(other) > rank(self) {
             other
@@ -944,6 +1167,13 @@ struct Keys {
     toggle_help: bool,
     toggle_streets: bool,
     reset_camera: bool,
+    /// `f` — bind the camera to the next thread (PRD §12).
+    follow: bool,
+    /// `a` — jump to the next attention state, worst first.
+    ///
+    /// The one key that is the whole product in one keystroke: PRD §1's
+    /// *"get to the thread that is waiting on a human"*.
+    attention: bool,
     clear: bool,
     back_to_picker: bool,
     play: bool,
@@ -971,6 +1201,8 @@ fn read_keys(ctx: &egui::Context) -> Keys {
         toggle_help: i.key_pressed(egui::Key::H) || i.key_pressed(egui::Key::Questionmark),
         toggle_streets: i.key_pressed(egui::Key::S),
         reset_camera: i.key_pressed(egui::Key::R),
+        follow: i.key_pressed(egui::Key::F),
+        attention: i.key_pressed(egui::Key::A),
         clear: i.key_pressed(egui::Key::Escape),
         back_to_picker: i.key_pressed(egui::Key::P),
         play: i.key_pressed(egui::Key::Space),
@@ -1110,7 +1342,7 @@ fn load(repo: &Path, transcript: Option<&Path>, speed: f32) -> anyhow::Result<Lo
     })
 }
 
-fn build_scene(loaded: Loaded) -> Scene {
+fn build_scene(loaded: Loaded, feed: Option<Box<LiveFeed>>) -> Scene {
     let Loaded {
         generated,
         schedule,
@@ -1119,6 +1351,17 @@ fn build_scene(loaded: Loaded) -> Scene {
     } = loaded;
     let timing = generated.timing;
     let mut world = World::new(generated.tree.clone(), generated.city.layout.clone());
+    let mut feed = feed;
+    let label = match feed.as_mut() {
+        None => label,
+        Some(feed) => {
+            // `World::new` derives the mapper from the checkout *and every
+            // registered worktree* (PRD §7.6), which the feed could not know
+            // when it bound its ports before the git walk had run.
+            feed.adopt_mapper(world.mapper());
+            format!("{label} · live")
+        }
+    };
     let driver = schedule.map(|schedule| {
         let mut driver = ReplayDriver::new(schedule);
         driver.clock_mut().set_speed(speed);
@@ -1140,6 +1383,7 @@ fn build_scene(loaded: Loaded) -> Scene {
         reader,
         snapshot,
         driver,
+        feed,
         label,
         view: ViewState::default(),
         tree: TreeView::default(),

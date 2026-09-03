@@ -104,6 +104,7 @@ pub mod marks;
 pub mod pacing;
 pub mod plan;
 pub mod raster;
+pub mod salience;
 
 use eframe::{egui, egui_wgpu, wgpu};
 use polis_world::snapshot::WorldSnapshot;

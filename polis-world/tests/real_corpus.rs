@@ -135,6 +135,40 @@ fn the_session_index_matches_what_is_on_disk() {
     );
 }
 
+/// How many sessions changed on disk between two scans, reported by name.
+///
+/// A warm scan re-reads exactly the sessions that changed underneath it, and on
+/// this machine that number is **not** reliably zero: the operator runs agents,
+/// and a live agent appends to its transcript between the two scans. Asserting
+/// zero made this test fail whenever the corpus was being used for the thing the
+/// corpus is for. The cache's contract is "an *unchanged* file is never read
+/// twice" — `(size, mtime)` is the key — so that is what is asserted, with the
+/// changed set named, so a real cache regression is still a failure and not a
+/// shrug.
+fn changed_between(first: &SessionIndex, second: &SessionIndex) -> usize {
+    let before: std::collections::BTreeMap<_, _> = first
+        .sessions
+        .iter()
+        .map(|s| (s.transcript.clone(), (s.bytes, s.modified_ms)))
+        .collect();
+    let changed: Vec<&std::path::Path> = second
+        .sessions
+        .iter()
+        .filter(|s| before.get(&s.transcript) != Some(&(s.bytes, s.modified_ms)))
+        .map(|s| s.transcript.as_path())
+        .collect();
+    if !changed.is_empty() {
+        eprintln!(
+            "  {} session(s) changed between the two scans (a live agent is writing):",
+            changed.len()
+        );
+        for path in changed.iter().take(4) {
+            eprintln!("    {}", path.display());
+        }
+    }
+    changed.len()
+}
+
 #[test]
 fn a_full_index_counts_tool_calls_and_caches_them() {
     let Some(projects) = projects_dir() else {
@@ -168,8 +202,18 @@ fn a_full_index_counts_tool_calls_and_caches_them() {
     );
     eprintln!("  cold {cold:?}, warm (cached) {warm:?}");
     assert_eq!(first.scanned, first.len(), "a cold scan reads every file");
-    assert_eq!(second.from_cache, second.len(), "a warm scan reads none");
-    assert_eq!(second.scanned, 0);
+
+    let changed = changed_between(&first, &second);
+    assert!(
+        second.scanned <= changed,
+        "a warm scan reads only what changed: {} read, {changed} changed",
+        second.scanned
+    );
+    assert_eq!(
+        second.from_cache,
+        second.len() - second.scanned,
+        "everything else came from the cache untouched"
+    );
     assert!(
         warm < cold || cold < Duration::from_millis(50),
         "the cache must be the fast path: cold {cold:?}, warm {warm:?}"

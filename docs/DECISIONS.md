@@ -3708,3 +3708,217 @@ the `--config -` stdin mechanism actually delivers the header. The run classifie
 it as non-retryable, made one attempt, logged one error line and left both
 districts on their derived descriptions. **A successful completion has not been
 observed**: no key was present in this environment.
+
+---
+
+## ADR-0090 — A claim is keyed by actor, because every real contention is inside one session
+
+**Context.** PRD §11.3 says to register an `Edit`/`Write` claim "keyed by
+**thread**", and PRD §3 defines a thread as a main agent *plus its worker
+subtree*. Those two sentences together make contention unrepresentable in the
+case it actually occurs: a session that fans out to a dozen parallel subagents is
+a whole fleet inside one `ThreadId`, so "a second live claim from a different
+thread" can never fire however many workers collide.
+
+**Decision.** Key the claim on `Actor = (thread, worker)`. A hit is a second live
+claim from a different **actor**, and `Contention::within_one_thread()` reports
+whether both ends belong to one session so a surface can word it correctly.
+
+**Evidence, on the operator's own corpus.** `contention_on_real_sessions.rs`
+replays two real sessions and asserts the result:
+
+| session | events | contentions | class |
+|---|---:|---:|---|
+| `settings.css` session | 4 604 | 1 | `worker a6bb0ab5e…` vs `worker a79d04997…` on `src/components/custom/settings/settings.css`, High / FileLevel |
+| 69-worker fan-out | 37 687 | 3 | `polis-render/src/live.rs`, `polis-world/src/apply.rs`, `polis-app/src/cli.rs`, each worker-vs-worker |
+
+**Four of four real contentions are worker-versus-worker inside a single
+session.** A `ThreadId`-keyed table represents none of them; the number it
+reports on this corpus is `0`. Contention is PRD §11.1's top-ranked state — the
+only one where work is actively being destroyed — so a table that cannot
+represent the common case is not a conservative choice, it is a silent one.
+
+**Consequence we are accepting.** `edits_without_line_ranges` is 1 768 against 8
+hits, so PRD §11.3's **Critical** tier ("same branch, overlapping line ranges")
+is effectively unreachable from the transcript and every file-level hit lands at
+**High**. That is reported in `Health` rather than papered over, and it means the
+severity ladder currently has three usable rungs, not four.
+
+---
+
+## ADR-0091 — The alarm is area and motion, not a redder red
+
+**Context.** By M4 the colour channel was correct — every failure placed, drawn
+in `AGENT_FAILED` at the mark — and worth nothing from a metre away. Measured:
+the reddest frame in 1 440 held **142 red pixels out of 1.21 M**, two glyph
+outlines. An independent review: *"a failing session and a clean one are
+distinguishable in about a second by reading one number, and not distinguishable
+by peripheral vision, which is what PRD §11.4 actually asks for."*
+
+**Decision.** Treat it as an **area and motion-onset** problem, exactly as PRD
+§11.4 frames it (*"peripheral vision is poor at colour and good at motion
+onset"*, *"colour alone is never the sole channel"*). Cluster nearby failures
+into one **alarm** per region and draw three things: an expanding arrival ring
+gone in ≤400 ms, a heavy broken steady-state ring with radial ticks, and
+persistence that never fades below `ALARM_FLOOR`.
+
+**Measured on a real session** (`29c2fc6f`, 14 979 events, 120 frames, 68 of them
+carrying an alarm), reddest frame #102, 60×60 thumbnail:
+
+| notation | peak red-excess | hot px of 3 600 | share |
+|---|---:|---:|---:|
+| M4, no alarm | 42 | 3 | 0.08 % |
+| **M5, alarm** | **70** | **42** | **1.17 %** |
+
+Fourteen times the area. Making the red redder would have bought nothing and
+would have broken PRD §10.3's band scheme; the alarm is drawn at the ceiling of
+`AGENT_BAND` (channel 168 against a base map clamped at 48) rather than being
+promoted into layer 5, which PRD §11.2 reserves for exactly three states.
+
+**Bounded on purpose,** because PRD §17's default failure mode is a map that
+panics: one ring per region, `ALARM_CAP` of eight worst-by-count, and
+`ALARM_MAP_CAP` so no ring exceeds 9 % of the map.
+
+**Honest limit.** 1.17 % of the thumbnail is fourteen times better and is still
+about one part in a hundred. Whether that clears "readable in peripheral vision"
+is a human judgement this project has not run a human trial on. The channel PRD
+§11.4 actually names — motion onset — is implemented and asserted
+(`an_arriving_pin_pulses_outward_and_is_gone_in_four_hundred_milliseconds`: 48 px
+at rest, 73 px mid-pulse) and cannot be measured from a still frame at all.
+
+---
+
+## ADR-0092 — `TurnEnded` must not fire for a headless session, and the transcript already says which is which
+
+**Status: open defect, not yet fixed. Found by the M3/M4/M5 end-to-end
+verification.**
+
+**Context.** `DecisionSource::TurnEnded` raises *needs decision* when a main agent
+ends its turn with no tool call and no human has replied yet. It is the most
+common source by far — 62 / 38 / 6 occurrences in the three recorded sessions,
+median waits of 5, 13 and 27 minutes — and it is the reason a replay can show
+PRD §11.2's primary state at all. It is also correct: for an interactive session,
+"turn ended, nobody has answered" *is* the operator being waited on.
+
+**The defect.** For a headless `claude -p` session it is never correct. The
+process has exited; no human is going to reply; the mark can never resolve. And
+`World::retire_threads` deliberately never retires a thread that an attention
+mark still points at — rightly, because a thread blocked on a human may sit for
+hours and that *is* the product. The two rules compose into an unbounded pile of
+false alarms.
+
+**Observed.** Twelve headless sessions run in one scratch checkout: twelve threads
+on the map, twelve amber `WAITING ON YOU` pins, every one of them for a process
+that had already exited, ageing past three minutes and climbing. That is PRD
+§17's *"beautiful swarm view that makes the operator feel informed while telling
+them nothing actionable"* arriving through a door we built.
+
+**The fix, and why it is cheap.** Every threaded transcript record carries
+`entrypoint`. `docs/verified/jsonl-schema.md` records it as **STABLE 100 %** with
+values `"cli"` (125 553) and `"sdk-cli"` (120), and
+`polis-ingest/src/transcript.rs:182` already parses it into
+`TranscriptRecord::entrypoint`. **No code in `polis-world` reads it.** Gate
+`TurnEnded` on an interactive entrypoint and the false pins disappear; the other
+six `DecisionSource` variants are unaffected, because each of them is evidence of
+a question that was actually asked.
+
+**Why it was not fixed in this change.** The verification pass owns `README.md`
+and this file; `polis-world` belongs to the milestone that will carry the fix.
+
+**Blast radius.** Negligible for an operator typing at a terminal — `sdk-cli` is
+0.1 % of the real corpus. Total for anyone driving a fleet with `claude -p`,
+which is the shape PRD §16's synthetic load ("100 threads × 400 subagents")
+assumes and the shape a scripted fleet actually has.
+
+---
+
+## ADR-0093 — The cold-start budget is a per-parseable-file cost, and ADR-0082's Django row is not representative
+
+**Context.** ADR-0082 concluded that "a genuine 5 000-file repository is inside"
+PRD §13.1's 3-second cold-start budget, resting on Django: 7 014 files, cold
+2 998 ms, of which imports 423 ms. The end-to-end verification could not
+reproduce that ratio anywhere.
+
+**Measured.** Five thousand and forty files, one language each, nothing cached,
+release build, this machine:
+
+| all 5 040 files are | walk | history | imports | diff | layout | render | **cold** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `.py` | 16 | 75 | 2 896 | 68 | 263 | 606 | **3 923** |
+| `.ts` | 15 | 69 | 3 945 | 69 | 250 | 589 | **4 936** |
+| `.rs` | 15 | 59 | 4 915 | 73 | 264 | 608 | **5 933** |
+| `.rs`, zero `use` statements | 14 | 68 | 5 161 | 67 | 248 | 597 | **6 156** |
+| `.js` | 15 | 70 | 6 557 | 66 | 255 | 631 | **7 595** |
+
+**Every grammar Polis ships misses the budget at 5 000 parseable files.**
+Stripping every import statement made it slightly *worse*, so the cost is
+per-file parsing, not edge resolution.
+
+**The rate is 0.86–1.30 ms per parseable file,** and it is corroborated outside
+the synthetic set: `qurio-toolset`, a real checkout of 1 557 files, spends
+1 340 ms in imports on a cold cache — 0.86 ms/file, which extrapolates to ~4.3 s
+at 5 000.
+
+**Therefore ADR-0082's Django row is an artefact of file mix, not a refutation.**
+423 ms over 7 014 files is 0.06 ms/file, fourteen times below every other
+measurement taken here. Django's tree is largely `.html`, `.po`, migrations and
+static assets; most of those files were never handed to a grammar. ADR-0082's
+conclusion should be read as *"a repository with a typical mix of parseable and
+non-parseable files is inside the budget"*, which is true, and not as *"5 000
+files is inside the budget"*, which is not.
+
+**Decision.** Record the real curve and leave the budget missed rather than
+restate it. The mitigation that already exists is that the import cache is keyed
+on **content, not path**, so only the first sight of a given tree pays: every
+later launch of the same 5 040-file repository is **816 ms**. What is not yet
+built is anything that makes the *first* launch honest — a progress indication, a
+first frame that draws before imports finish, or a parse budget that yields.
+`polis snapshot` currently prints the budget beside the measurement and says
+nothing when it is over.
+
+---
+
+## ADR-0094 — What the M3/M4/M5 verification could not verify
+
+**Context.** A verification that only reports what passed is an advertisement.
+These are the things this round tried to establish and could not, recorded so the
+next round does not have to rediscover them.
+
+**Hooks were never observed firing from a real agent on this machine.** Claude
+Code runs no settings-file hook until the workspace trust dialog has been
+accepted, and a scratch checkout created by an agent has not been. The remedy
+Claude Code itself prints is to set `hasTrustDialogAccepted` in the operator's
+`~/.claude.json`, which a verification agent must not do on the operator's
+behalf. Channel B was therefore driven through the **real `polis-hook` binary**
+over the real wire instead — contention, `PermissionRequest` and `Stop` all
+arrived and rendered — which tests the transport and the world but not Claude
+Code's own invocation of the hook. `polis install-hooks` already warns about this
+exact trap at install time.
+
+**`cargo doc` is not clean, and was not clean before this round.** Ten warnings,
+all in `polis-repo` (`llm/prompt.rs`, `describe.rs`, `imports.rs`), all public
+docs linking to private items, plus two unresolved `Describer::describe` links.
+`polis-repo` has no uncommitted changes, so these arrive from the committed LLM
+work rather than from M3-M5. They are ten one-line doc-link fixes and are left
+for whoever owns that crate.
+
+**The two-machine determinism leg is still unobserved.** Byte-identical across
+runs, processes, input permutation, `RandomState` order and now **optimization
+profiles** — the fixture digests are `hamlet=23203396b91ae4bc` and
+`town=22d10d8e6e4762df` in debug and in release — but this remains one machine.
+
+**Port conflicts recover, with one rough edge.** A foreign listener on 4317 makes
+Channel A stop with an exact message, emit `control.degraded`, and leave the
+other three channels running; `--allow-second` behaves exactly as documented
+(warns, skips Channel B, does not clobber the primary's endpoint file). The rough
+edge: for a few hundred milliseconds after a Polis is killed, Windows has not yet
+released the UDP socket, so the next Polis reports "another polis is already
+receiving hook events" and names a pid that has just died. It self-heals and no
+operator action is needed, but the message is briefly wrong.
+
+**A live watch holds a handle on the directory it watches.** Deleting the watched
+repository out from under a running window removed every file including `.git`
+and Polis survived with no panic and no hang — but the now-empty top-level
+directory could not be removed until the window was closed. That is the `notify`
+watcher's handle, and on Windows it means "close Polis before you `rm -rf` the
+checkout".

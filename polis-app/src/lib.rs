@@ -33,6 +33,9 @@
 //! * [`labels`] — the collision and decluttering PRD §13 calls "the one
 //!   genuinely hard thing a map engine would have bought you".
 //! * [`treeview`] — the linked filesystem view, co-equal with the map.
+//! * [`drill`] — PRD §12's *exact below*: one computation of who touched a file
+//!   and when, shared by the hover card, the detail panel and the tree, plus the
+//!   ordered attention list the *unblock* decision is made from.
 //! * [`palette`] — every colour, clamped into PRD §10.3's band for its layer.
 //! * [`ui`] — the overlay: status bar, status rail, detail panel, transport.
 //! * [`session`] — the picker, which is `polis replay`'s first-run experience.
@@ -47,6 +50,12 @@
 //! * [`setup`] — what bare `polis` does on a machine that has never run it
 //!   (detect, explain in one screen, open the session picker), plus `polis
 //!   connect` and `polis doctor`.
+//! * [`mod@watch`] — `polis watch`, the headline command: point it at a
+//!   repository and see every agent working in it, with **no** configuration at
+//!   all. This is the front door; the two below add detail on top of it.
+//! * [`status`] — [`status::Connectivity`], the one place that says which
+//!   channels are delivering and which are not, read by the window's status
+//!   area, `polis doctor` and `polis watch` alike.
 //! * [`mod@run`] — `polis run -- claude`, which launches an agent with the telemetry
 //!   environment already set on it, the receiver already listening and the map
 //!   already open.
@@ -73,6 +82,7 @@ pub mod cli;
 pub mod clouds;
 pub mod commands;
 pub mod config;
+pub mod drill;
 pub mod explain;
 pub mod format;
 pub mod labels;
@@ -82,8 +92,10 @@ pub mod run;
 pub mod session;
 pub mod setup;
 pub mod snapshot;
+pub mod status;
 pub mod treeview;
 pub mod ui;
+pub mod watch;
 
 #[cfg(test)]
 pub(crate) mod testutil;

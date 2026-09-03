@@ -86,6 +86,7 @@ use polis_layout::{CityLayout, Point};
 use polis_world::attention::{Attention, AttentionKind};
 use polis_world::place;
 use polis_world::snapshot::WorldSnapshot;
+use polis_world::territory;
 use polis_world::{Thread, ThreadStatus};
 
 use crate::live::{
@@ -107,9 +108,6 @@ pub const TRANSIT: f64 = 0.45;
 /// How fast a scaffold's rise chases its target, in units of "fraction of the
 /// remaining gap per second".
 const RISE_RATE: f64 = 4.0;
-
-/// How fast a cloud fades in or out, per presentation second.
-const CLOUD_RATE: f64 = 2.5;
 
 /// How long an operation mark survives, in **world** seconds.
 ///
@@ -352,7 +350,7 @@ impl Default for FrameOptions {
             streets: false,
             trail: TrailStyle::Timed,
             caption: true,
-            cloud_cap: 6,
+            cloud_cap: territory::CLOUD_CAP,
             focus: None,
             rail: true,
         }
@@ -417,7 +415,10 @@ pub struct FrameRenderer {
     rail_width: usize,
     motion: BTreeMap<AgentKey, Motion>,
     rise: BTreeMap<LogicalPath, f64>,
-    cloud_presence: f64,
+    /// The tweened territory field (PRD §13). Lives here rather than on
+    /// [`LiveFrame`] because it is animation state, and a `LiveFrame` has to
+    /// stay a pure description of one moment.
+    cloud_tween: live::CloudTween,
     label: String,
     timings: LiveTimings,
     frames: u64,
@@ -459,7 +460,7 @@ impl FrameRenderer {
             rail_width,
             motion: BTreeMap::new(),
             rise: BTreeMap::new(),
-            cloud_presence: 0.0,
+            cloud_tween: live::CloudTween::default(),
             label: String::new(),
             timings: LiveTimings::default(),
             frames: 0,
@@ -574,44 +575,55 @@ impl FrameRenderer {
             ..LiveFrame::default()
         };
 
-        // Which threads get a cloud (PRD §10.4's cap): waiting first, then most
-        // recently active, which is the same order the status rail uses.
-        let mut ranked: Vec<&Thread> = snap.threads.iter().collect();
-        ranked.sort_by(|a, b| {
-            a.status
-                .rail_rank()
-                .cmp(&b.status.rail_rank())
-                .then(b.last_activity.cmp(&a.last_activity))
-                .then(a.id.cmp(&b.id))
-        });
+        // Which threads get a cloud is PRD §10.4's policy, and it lives in
+        // `polis_world::territory` with the dormancy rule it trades against —
+        // **not** here. The renderer had its own copy of the ranking and could
+        // not see dormancy at all, so a quiet territory kept a cap slot the
+        // policy had already retired.
+        let pairs: Vec<(&Thread, &territory::Territory)> = snap
+            .threads
+            .iter()
+            .map(|thread| (thread, &thread.territory))
+            .collect();
+        let selection = territory::select_clouds(
+            &pairs,
+            &snap.attention,
+            territory::CloudPolicy::default().with_cap(self.opts.cloud_cap),
+        );
 
         // The cloud field is the sum over the visible territories: PRD §6.4's
         // "overlap is field addition", which is also the early-warning
-        // contention signal, so the fields must not be kept apart.
-        let mut any_cloud = false;
-        for thread in ranked.iter().take(self.opts.cloud_cap) {
-            if thread.territory.claim.is_none() {
-                continue;
-            }
-            for k in &thread.territory.kernels {
+        // contention signal, so the *values* must not be kept apart. The kernels
+        // still carry which territory dropped them, because a sum cannot tell
+        // one busy thread from two threads on one file and only the second is
+        // news — see [`CloudKernel::thread`].
+        for (rank, territory) in selection.visible.iter().enumerate() {
+            for k in &territory.kernels {
                 if k.weight <= 0.0 {
                     continue;
                 }
-                any_cloud = true;
                 frame.clouds.push(CloudKernel {
                     at: view.at(k.centre),
+                    // PRD §6.4's bandwidth, `base / sqrt(effective_n)` and
+                    // already clamped by `polis_world`, straight through the
+                    // camera. The renderer must not second-guess it: the width
+                    // of the cloud *is* the width of the claim.
                     radius: f64::from(k.radius) * view.scale(),
                     weight: f64::from(k.weight),
+                    thread: u16::try_from(rank).unwrap_or(u16::MAX),
                 });
             }
         }
-        // Presence eases so a territory does not pop into existence when its
-        // eighth observation crosses the convergence threshold.
-        let target = if any_cloud { 1.0 } else { 0.0 };
-        self.cloud_presence = chase(self.cloud_presence, target, dt, CLOUD_RATE);
-        for k in &mut frame.clouds {
-            k.weight *= self.cloud_presence;
-        }
+        // PRD §13's *"interpolate everything ... tween cloud density between
+        // updates"*, and the reason a territory does not pop into existence the
+        // frame its eighth observation crosses the convergence threshold. The
+        // **field** is tweened rather than a global presence scalar: a scalar
+        // fades every cloud in the world together, so one thread converging
+        // brightens every other thread's cloud with it, and a territory that
+        // merely *drifts* gets no interpolation at all.
+        let map_px = self.opts.pixels;
+        let target = live::CloudField::sample(&frame.clouds, map_px, map_px);
+        self.cloud_tween.advance(target, dt, live::CLOUD_TWEEN_RATE);
 
         let mut anchors: BTreeMap<ThreadId, Px> = BTreeMap::new();
         let mut rail = RailBuilder::default();
@@ -876,9 +888,19 @@ impl FrameRenderer {
             frame.scaffolds.truncate(MAX_SCAFFOLDS);
         }
 
+        // --- the alarm (PRD §10.2 given area) -------------------------------
+        // Built from the marks the frame will actually draw, after aggregation
+        // and after the per-thread budget, so the ring can never be about a
+        // failure the operator cannot see inside it.
+        frame.alarms = crate::salience::alarms(
+            &frame.marks,
+            live::glyph_radius(frame.unit, frame.map_height),
+            frame.map_height,
+        );
+
         // --- attention (PRD §11.2) ------------------------------------------
         for mark in &snap.attention {
-            if let Some(m) = attention_mark(mark, &anchors, layout, &view, now) {
+            if let Some(m) = attention_mark(mark, &anchors, &snap.threads, layout, &view, now) {
                 frame.attention.push(m);
             }
         }
@@ -930,7 +952,9 @@ impl FrameRenderer {
                 .copy_from_slice(&self.base.map.pixels[src..src + w * 3]);
         }
 
-        let clouds = live::draw_clouds(&mut self.scratch, frame);
+        let clouds = self.cloud_tween.field().map_or(Duration::ZERO, |field| {
+            live::draw_cloud_field(&mut self.scratch, field)
+        });
         // Layer 3t: the type goes back on top of the clouds (PRD §10.3). The
         // indices are into the *map*, so they are re-strided onto the canvas.
         for (i, colour) in &self.base.labels {
@@ -1262,12 +1286,16 @@ pub fn thread_anchor(thread: &Thread, layout: &CityLayout, view: &View) -> Optio
 fn attention_mark(
     mark: &Attention,
     anchors: &BTreeMap<ThreadId, Px>,
+    threads: &[Thread],
     layout: &CityLayout,
     view: &View,
     now: Instant,
 ) -> Option<AttentionMark> {
     let pulse = f64::from(mark.pulse(now));
     let weight = f64::from(mark.weight(now));
+    // The slow channel: PRD §11.4 fixes the arrival at 400 ms and says nothing
+    // about the next five minutes, which is where every real wait lives.
+    let urgency = f64::from(mark.urgency(now));
     match &mark.kind {
         AttentionKind::NeedsDecision { thread, at, .. } => {
             let p = at
@@ -1281,6 +1309,7 @@ fn attention_mark(
                 severity: None,
                 pulse,
                 weight,
+                urgency,
             })
         }
         AttentionKind::Done { thread, verified } => {
@@ -1296,16 +1325,31 @@ fn attention_mark(
                 severity: None,
                 pulse,
                 weight,
+                urgency,
             })
         }
         AttentionKind::Contention(c) => {
-            // A relation, so it needs two places. When a thread has no anchor
-            // the contended file itself stands in — the operator still has to be
-            // shown where the collision is.
-            let path = place(layout, c.path(), view);
-            let (a, b) = c.threads();
-            let pa = anchors.get(a).copied().or(path)?;
-            let pb = anchors.get(b).copied().or(path)?;
+            // A relation, so it needs two places — and the two places are the
+            // two **claimants**, not the two threads. Asking `Contention` for
+            // its `threads()` and looking each one up in `anchors` gives the
+            // *same* point twice whenever both claimants are workers of one
+            // session, which is a link of zero length, which is the badge on a
+            // dot PRD §11.2c forbids. It is also the only case the operator's
+            // real corpus contains: 4 of 4 contentions there are
+            // worker-versus-worker inside one session
+            // (`polis-world/tests/contention_on_real_sessions.rs`).
+            //
+            // `Contention::link` exists for exactly this and places each end
+            // with `place::agent_position`, which puts a worker at its own
+            // focus. When a thread is missing, or a worker has no focus yet, it
+            // falls back to the contended building itself — the operator still
+            // has to be shown where the collision is, and a coincident pair is
+            // reported by `ContentionLink::is_degenerate` rather than faked
+            // apart.
+            let link = c.link(layout, |id| threads.iter().find(|t| &t.id == id));
+            let site = link.site.map(|p| view.at(p));
+            let pa = link.at_a.map(|p| view.at(p)).or(site)?;
+            let pb = link.at_b.map(|p| view.at(p)).or(site)?;
             Some(AttentionMark {
                 kind: MarkKind::Contention,
                 at: pa,
@@ -1313,6 +1357,7 @@ fn attention_mark(
                 severity: Some(c.severity),
                 pulse,
                 weight,
+                urgency,
             })
         }
     }
@@ -1338,13 +1383,10 @@ fn secs_since(now: Instant, then: Instant) -> f64 {
     now.saturating_duration_since(then).as_secs_f64()
 }
 
-/// PRD §11.4's arrival pulse: 1 at onset, 0 at 400 ms.
+/// PRD §11.4's arrival pulse: 1 at onset, 0 at 400 ms. See [`live::pulse_at`],
+/// which the window shares.
 fn pulse(age_secs: f64) -> f64 {
-    if age_secs >= live::PULSE_SECS {
-        0.0
-    } else {
-        1.0 - age_secs / live::PULSE_SECS
-    }
+    live::pulse_at(age_secs)
 }
 
 /// An exponential-shaped chase with no transcendental in it.
@@ -1782,9 +1824,15 @@ mod tests {
             },
             Instant::now(),
         );
-        assert!(
-            attention_mark(&mark, &BTreeMap::new(), &c.layout, &view, Instant::now()).is_none()
-        );
+        assert!(attention_mark(
+            &mark,
+            &BTreeMap::new(),
+            &[],
+            &c.layout,
+            &view,
+            Instant::now()
+        )
+        .is_none());
     }
 
     /// PRD §12's thrashing example, end to end: a building touched six times
@@ -2582,18 +2630,27 @@ mod tests {
             });
         }
 
-        // 7. A territory cloud (PRD §10.4).
+        // 7. Two territory clouds that overlap (PRD §10.4, §6.4).
+        //
+        // Two rather than one, because the sheet exists to show the notation
+        // and the overlap *is* a notation: where both territories reach fringe
+        // level the hatch crosses, which is the ground two threads are both
+        // claiming and the earliest warning §11.2c has.
         let core = pick(0.72, 0.80);
-        for k in 0..26 {
-            let a = f64::from(k) * 0.618;
-            frame.clouds.push(live::CloudKernel {
-                at: [
-                    (a.fract() - 0.5).mul_add(unit * 5.0, core[0]),
-                    ((a * 1.7).fract() - 0.5).mul_add(unit * 4.0, core[1]),
-                ],
-                radius: unit * 2.4,
-                weight: 1.0,
-            });
+        for territory in 0..2u16 {
+            let shift = f64::from(territory) * unit * 3.2;
+            for k in 0..26 {
+                let a = f64::from(k) * 0.618;
+                frame.clouds.push(live::CloudKernel {
+                    at: [
+                        (a.fract() - 0.5).mul_add(unit * 5.0, core[0] + shift),
+                        ((a * 1.7).fract() - 0.5).mul_add(unit * 4.0, core[1] + shift * 0.4),
+                    ],
+                    radius: unit * 2.4,
+                    weight: 1.0,
+                    thread: territory,
+                });
+            }
         }
 
         // 8. All three attention states, including a contention link.
@@ -2606,6 +2663,7 @@ mod tests {
             severity: None,
             pulse: 0.0,
             weight: 1.0,
+            urgency: 0.0,
         });
         frame.attention.push(AttentionMark {
             kind: MarkKind::DoneVerified,
@@ -2614,6 +2672,7 @@ mod tests {
             severity: None,
             pulse: 0.0,
             weight: 1.0,
+            urgency: 0.0,
         });
         frame.attention.push(AttentionMark {
             kind: MarkKind::DoneUnverified,
@@ -2622,6 +2681,7 @@ mod tests {
             severity: None,
             pulse: 0.0,
             weight: 1.0,
+            urgency: 0.0,
         });
         frame.attention.push(AttentionMark {
             kind: MarkKind::Contention,
@@ -2630,6 +2690,7 @@ mod tests {
             severity: Some(polis_world::contention::Severity::Critical),
             pulse: 0.0,
             weight: 1.0,
+            urgency: 0.0,
         });
 
         for (name, style) in [("timed", TrailStyle::Timed), ("fade", TrailStyle::Fade)] {

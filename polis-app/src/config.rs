@@ -24,9 +24,13 @@ pub struct Config {
     /// > **Cap the number of visible clouds.** Forty threads means forty systems
     /// > and the map vanishes under haze.
     ///
-    /// PRD §17 open question 1 asks what the right cap is, and whether dormant
-    /// threads should dissipate entirely or leave a faint residue. It is
-    /// configurable until that is answered against a real fleet.
+    /// PRD §17 open question 1 asked what the right cap is, and whether dormant
+    /// threads should dissipate entirely or leave a faint residue. Both are now
+    /// answered against a real fleet —
+    /// [`polis_world::territory::CLOUD_CAP`] carries the measurement and
+    /// [`polis_world::territory::DORMANT_AFTER`] the dormancy sweep — and this
+    /// setting defaults to that answer. It stays configurable because the
+    /// measurement is one repository's.
     pub cloud_cap: usize,
     /// Whether the streets layer is on. Off by default at the widest zoom
     /// (PRD §9).
@@ -109,7 +113,7 @@ impl Default for Config {
             // PRD §17 open question 1: unanswered against a real fleet, so this
             // is a starting value and not a finding. Forty threads means forty
             // systems and the map vanishes under haze (PRD §10.4).
-            cloud_cap: 12,
+            cloud_cap: polis_world::territory::CLOUD_CAP,
             // Off at the widest zoom (PRD §9).
             streets: false,
             channels: ChannelConfig::default(),
