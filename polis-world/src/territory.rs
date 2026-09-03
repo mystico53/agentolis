@@ -32,7 +32,7 @@
 //! rounds to zero and `A` is the untrimmed ancestor. Keeping both means retuning
 //! [`TRIM_FRACTION`] cannot silently disable the check.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use polis_events::LogicalPath;
@@ -64,6 +64,29 @@ pub const TRIM_FRACTION: f32 = 0.2;
 
 /// Minimum ancestor depth before a territory may be emitted (PRD §6.2).
 pub const MIN_CLAIM_DEPTH: usize = 2;
+
+/// The share of a thread's weight a cluster must carry to count as a lobe
+/// (PRD §6.4).
+///
+/// Low, deliberately. A lobe is not a claim: it says "this thread is also
+/// working here", and the operator's own words for what that must look like
+/// were *"even if the line gets thinner in the middle, it should be clear that
+/// this is one entity working on both of these things"*. Set high enough and an
+/// orchestrator's smaller lobes vanish and it reads as two unrelated agents;
+/// set at zero and a single stray read raises a lobe, which is the failure
+/// §6.2's trim exists to prevent. 8% is below the smallest real lobe measured
+/// on this repository (`polis-events`, 62 of 3 386 calls ≈ 1.8% — deliberately
+/// excluded) and above a stray touch.
+pub const MIN_LOBE_MASS: f32 = 0.08;
+
+/// How many lobes one territory may draw.
+///
+/// PRD §10.4 caps clouds because "forty threads means forty systems and the map
+/// vanishes under haze"; the same argument applies within one thread. Past a
+/// handful of lobes the thread is working everywhere, and the honest rendering
+/// of "everywhere" is the heaviest few plus the connecting band, not a wash
+/// over the whole city.
+pub const MAX_LOBES: usize = 6;
 
 /// Fewest observations that can agree.
 ///
@@ -200,6 +223,14 @@ pub struct Territory {
     pub kernels: Vec<Kernel>,
     /// The claimed ancestor directory, once [`Territory::has_converged`].
     pub claim: Option<LogicalPath>,
+    /// PRD §6.4's lobes, heaviest first — where this thread is working when a
+    /// single ancestor cannot say it.
+    ///
+    /// A focused thread has one lobe and a [`Territory::claim`]; an
+    /// orchestrator spread across the tree has several lobes and no claim,
+    /// because their common ancestor is the root. Before this existed such a
+    /// thread drew nothing at all, which is the one case §6.4 was written for.
+    pub lobes: Vec<Lobe>,
     /// Weighted centre of the whole live field. The drift vector is measured
     /// against this.
     pub centre_of_mass: Option<Point>,
@@ -389,6 +420,7 @@ impl Territory {
                 depth: 0,
                 mass_ratio: 0.0,
                 trimmed: 0,
+                lobes: Vec::new(),
             };
         }
 
@@ -430,6 +462,7 @@ impl Territory {
                 depth: 0,
                 mass_ratio: 0.0,
                 trimmed: trim,
+                lobes: Vec::new(),
             };
         };
 
@@ -445,13 +478,70 @@ impl Territory {
         let mass_ratio = inside / total;
         let depth = ancestor.depth();
         let claim = (depth >= MIN_CLAIM_DEPTH && mass_ratio > CONVERGENCE_MASS).then_some(ancestor);
+        let lobes = Self::lobes_of(retained, &self.evidence, total);
         Convergence {
             claim,
             observations: n,
             depth,
             mass_ratio,
             trimmed: trim,
+            lobes,
         }
+    }
+
+    /// PRD §6.4's lobes: the places this thread is actually working, when there
+    /// is more than one.
+    ///
+    /// §6.2 takes a single ancestor over every retained observation, which is
+    /// right for a focused thread and wrong for the case §6.4 exists to
+    /// describe: *"An agent working in `auth` with one worker in `tests` gets
+    /// two lobes and a thin connecting band."* The moment a thread has two
+    /// well-separated lobes their common ancestor collapses toward the root, so
+    /// the depth gate rejects it and the thread gets **no cloud at all** — the
+    /// two sections contradict each other.
+    ///
+    /// Measured on this repository: one orchestrator with 101 workers made
+    /// 3 386 path-bearing calls across 18 top-level directories. Its trimmed
+    /// ancestor is the repo root, depth 0, so it drew nothing — while every one
+    /// of its workers was in a nameable place.
+    ///
+    /// So the depth-and-mass test is applied **per cluster** instead. Evidence
+    /// is grouped by its own [`MIN_CLAIM_DEPTH`]-deep prefix, and a group
+    /// becomes a lobe when it carries at least [`MIN_LOBE_MASS`] of the whole.
+    /// A focused thread yields exactly one lobe and behaves as before; an
+    /// orchestrator yields several and can finally be drawn.
+    fn lobes_of(retained: &[usize], evidence: &VecDeque<Evidence>, total: f32) -> Vec<Lobe> {
+        if total <= 0.0 {
+            return Vec::new();
+        }
+        // BTreeMap, not HashMap: this feeds what gets drawn, and PRD §7.4 does
+        // not allow iteration order to reach the picture.
+        let mut by_prefix: BTreeMap<LogicalPath, f32> = BTreeMap::new();
+        for idx in retained {
+            let e = &evidence[*idx];
+            let Some(prefix) = e.path.ancestor_at(MIN_CLAIM_DEPTH) else {
+                // Shallower than the gate allows on its own — a top-level file
+                // cannot name a lobe, exactly as it cannot name a claim.
+                continue;
+            };
+            *by_prefix.entry(prefix).or_insert(0.0) += e.weight;
+        }
+        let mut lobes: Vec<Lobe> = by_prefix
+            .into_iter()
+            .filter_map(|(path, weight)| {
+                let mass = weight / total;
+                (mass >= MIN_LOBE_MASS).then_some(Lobe { path, mass })
+            })
+            .collect();
+        // Heaviest first, ties by path so the order is stable across machines.
+        lobes.sort_by(|a, b| {
+            b.mass
+                .partial_cmp(&a.mass)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        lobes.truncate(MAX_LOBES);
+        lobes
     }
 
     /// The current bandwidth — the uncertainty knob (PRD §6.4).
@@ -665,7 +755,13 @@ impl Territory {
     ///   district waits for [`DRIFT_CONFIRMATIONS`] consecutive outside
     ///   observations. One read elsewhere moves nothing.
     fn refresh_claim(&mut self) {
-        let Some(candidate) = self.converged_claim() else {
+        let convergence = self.convergence();
+        // Lobes track the evidence directly. They need no hysteresis of their
+        // own: PRD §6.3's smoothing already lives on the kernel weights the
+        // field is drawn from, and a lobe that stops being worked simply loses
+        // mass and drops below MIN_LOBE_MASS.
+        self.lobes = convergence.lobes;
+        let Some(candidate) = convergence.claim else {
             return;
         };
         match self.claim.clone() {
@@ -750,6 +846,11 @@ impl Territory {
 pub struct Convergence {
     /// The ancestor, when both gates pass.
     pub claim: Option<LogicalPath>,
+    /// PRD §6.4's lobes — the separate places this thread is working, heaviest
+    /// first. Empty for a thread with nothing converged anywhere; one entry for
+    /// a focused thread; several for an orchestrator whose workers are spread
+    /// across the tree, which is the case a single ancestor cannot express.
+    pub lobes: Vec<Lobe>,
     /// How many observations are live.
     pub observations: usize,
     /// `depth(A)`. Must reach [`MIN_CLAIM_DEPTH`].
@@ -758,6 +859,25 @@ pub struct Convergence {
     pub mass_ratio: f32,
     /// How many observations the trim dropped.
     pub trimmed: usize,
+}
+
+/// One place a thread is working (PRD §6.4).
+///
+/// A territory is a density field, not a boundary, and a thread that delegates
+/// has more than one centre. A lobe names one of them so the field can be drawn
+/// as *"two lobes and a thin connecting band"* rather than collapsing to a
+/// single ancestor that is either too broad to mean anything or missing
+/// entirely.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lobe {
+    /// The directory this lobe covers, exactly [`MIN_CLAIM_DEPTH`] deep.
+    pub path: LogicalPath,
+    /// Share of the thread's whole weight that sits inside it, in `[0, 1]`.
+    ///
+    /// Carried so the renderer can make a minor lobe read as minor: the band
+    /// between a heavy lobe and a light one should be thin, and the light lobe
+    /// smaller, because that is what is true.
+    pub mass: f32,
 }
 
 /// The raw drift measurement over [`DRIFT_WINDOW`] (PRD §10.4).
@@ -1059,7 +1179,12 @@ pub fn select_clouds<'a>(
     let mut ranked: Vec<(u8, &(&crate::Thread, &Territory))> = Vec::new();
     for pair in territories {
         let (thread, territory) = pair;
-        if territory.claim.is_none() || territory.kernels.is_empty() {
+        // A thread with lobes but no claim is the orchestrator case (PRD §6.4):
+        // its workers are each somewhere nameable, but their common ancestor is
+        // the root, so §6.2's single-ancestor gate rejects it. Drawing nothing
+        // there is what made a 101-worker session invisible on its own map.
+        if (territory.claim.is_none() && territory.lobes.is_empty()) || territory.kernels.is_empty()
+        {
             unplaced += 1;
             continue;
         }
