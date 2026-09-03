@@ -225,6 +225,50 @@ const CHARS_PER_TOKEN: u64 = 4;
 /// errs towards over-quoting a bill rather than under-quoting one.
 const ESTIMATED_OUTPUT_TOKENS_PER_DISTRICT: u64 = 90;
 
+/// How many characters of user prompt one call may carry.
+///
+/// Batching by a fixed count of districts assumes districts are the same size,
+/// and they are not: `src/services` in one real repository holds 224 files
+/// against a median district of nine. Eight of those in one call built a prompt
+/// large enough that GLM-5.3-Flash — a reasoning model, which spends output on
+/// `reasoning_content` before it writes a word of answer — ran past the request
+/// timeout. Measured: every failure in a real run was `transport: timed out`,
+/// and every one of them was a batch containing one of the two largest
+/// districts.
+///
+/// 6 000 characters is about 1 500 input tokens, which the model answers well
+/// inside the timeout while still batching the small districts that make
+/// batching worth having.
+const MAX_BATCH_PROMPT_CHARS: usize = 6_000;
+
+/// Groups districts into calls by PROMPT SIZE, not by count.
+///
+/// `config.batch_size` stays as an upper bound on districts per call; this only
+/// ever makes a batch smaller. A district whose own brief already exceeds the
+/// budget still gets a call to itself rather than being dropped — the cap is on
+/// how many are grouped, never on whether one is described at all.
+fn batch_briefs(briefs: &[DistrictBrief], config: &LlmConfig) -> Vec<Vec<DistrictBrief>> {
+    let max_count = config.batch_size.max(1);
+    let mut batches: Vec<Vec<DistrictBrief>> = Vec::new();
+    let mut batch: Vec<DistrictBrief> = Vec::new();
+    let mut chars = 0usize;
+    for brief in briefs {
+        let cost = user_prompt(std::slice::from_ref(brief)).len();
+        let full = batch.len() >= max_count;
+        let over = !batch.is_empty() && chars + cost > MAX_BATCH_PROMPT_CHARS;
+        if full || over {
+            batches.push(std::mem::take(&mut batch));
+            chars = 0;
+        }
+        batch.push(brief.clone());
+        chars += cost;
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
 impl Plan {
     /// True when there is nothing to do.
     pub fn is_empty(&self) -> bool {
@@ -584,16 +628,16 @@ impl LlmRunner {
         }
 
         districts.truncate(self.config.max_districts_per_run as usize);
-        let calls = u32::try_from(districts.len().div_ceil(self.config.batch_size.max(1)))
-            .unwrap_or(u32::MAX);
 
         // Priced from the exact bytes that would be sent, not from a guess at
         // how big a district is.
         let system = system_prompt();
+        let briefs: Vec<DistrictBrief> = districts.iter().map(|d| d.brief.clone()).collect();
+        let planned = batch_briefs(&briefs, &self.config);
+        let calls = u32::try_from(planned.len()).unwrap_or(u32::MAX);
         let mut input_chars = 0u64;
-        for chunk in districts.chunks(self.config.batch_size.max(1)) {
-            let briefs: Vec<DistrictBrief> = chunk.iter().map(|d| d.brief.clone()).collect();
-            input_chars += (system.len() + user_prompt(&briefs).len()) as u64;
+        for batch in &planned {
+            input_chars += (system.len() + user_prompt(batch).len()) as u64;
         }
         let estimated_input_tokens = input_chars / CHARS_PER_TOKEN;
         let estimated_output_tokens = districts.len() as u64 * ESTIMATED_OUTPUT_TOKENS_PER_DISTRICT;
@@ -679,12 +723,8 @@ impl LlmRunner {
             return report;
         }
 
-        let batch_size = self.config.batch_size.max(1);
-        let batches: Vec<Vec<DistrictBrief>> = plan
-            .districts
-            .chunks(batch_size)
-            .map(|c| c.iter().map(|d| d.brief.clone()).collect())
-            .collect();
+        let briefs: Vec<DistrictBrief> = plan.districts.iter().map(|d| d.brief.clone()).collect();
+        let batches = batch_briefs(&briefs, &self.config);
         let outcomes = self.call_batches(&batches);
 
         let mut report = RunReport::from_plan(mode, plan);

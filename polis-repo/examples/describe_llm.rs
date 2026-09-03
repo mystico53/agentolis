@@ -193,6 +193,27 @@ fn main() -> anyhow::Result<()> {
 
     // --- what it would cost -------------------------------------------------
     println!("\n{}", report.summary());
+
+    // RunReport collects every failure and nothing printed them, so a run that
+    // described 8 of 40 districts reported only the count and gave the operator
+    // no way to find out why. Degradation is meant to be graceful, not silent.
+    if !report.errors.is_empty() {
+        println!("\n{} error(s):", report.errors.len());
+        let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for e in &report.errors {
+            // Group by the error's first clause so a repeated timeout reads as
+            // "12x transport: timed out" instead of twelve near-identical lines.
+            let head = e.split_once(" (").map_or(e.as_str(), |(h, _)| h);
+            *seen.entry(head).or_default() += 1;
+        }
+        for (head, count) in seen {
+            if count == 1 {
+                println!("  {head}");
+            } else {
+                println!("  {count}x {head}");
+            }
+        }
+    }
     let plan = &report.plan;
     println!(
         "provider {} · model {} · endpoint {} · key from {} ({})",

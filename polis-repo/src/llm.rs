@@ -285,7 +285,7 @@ impl Default for LlmConfig {
             model: "glm-5.3-flash".to_owned(),
             base_url: "https://api.z.ai/api/paas/v4".to_owned(),
             key_env: vec!["ZAI_API_KEY".to_owned(), "GLM_API_KEY".to_owned()],
-            timeout_secs: 60,
+            timeout_secs: 180,
             max_retries: 2,
             retry_base_ms: 500,
             max_concurrency: 4,
