@@ -153,6 +153,9 @@ fn session_schedule(sample: &SessionSummary, mapper: &PathMapper) -> Option<Repl
 /// two things.
 #[derive(Debug)]
 struct Replayed {
+    /// Contentions between two workers of ONE agent that reached the operator's
+    /// attention list. Must be zero: detected, deliberately not alarmed.
+    raised_within_thread: usize,
     /// Every distinct contention seen at any point during the replay, keyed by
     /// the pair of actors and the path they were fighting over.
     seen: BTreeMap<(Actor, Actor, LogicalPath), (Severity, ContentionPrecision)>,
@@ -207,6 +210,7 @@ fn replay(sample: &SessionSummary) -> Option<Replayed> {
     let origin = Instant::now();
     let mut driver = ReplayDriver::with_origin(schedule, origin);
 
+    let mut raised_within_thread = 0usize;
     let mut seen: BTreeMap<(Actor, Actor, LogicalPath), (Severity, ContentionPrecision)> =
         BTreeMap::new();
     let mut two_ended: BTreeSet<LogicalPath> = BTreeSet::new();
@@ -237,10 +241,19 @@ fn replay(sample: &SessionSummary) -> Option<Replayed> {
         since_tick = 0;
         ticks += 1;
         world.tick(now);
-        for mark in &world.attention {
-            let AttentionKind::Contention(hit) = &mark.kind else {
-                continue;
-            };
+        // Harvested from the CLAIM TABLE, not from raised attention.
+        //
+        // What these tests prove is that a ThreadId-keyed table could not
+        // represent a collision between two workers of one session — that is a
+        // claim about DETECTION, and it still holds. Whether such a collision is
+        // then *raised* as a red alarm is a separate decision, and it is now
+        // `false` (see `polis_world::CONTENTION_WITHIN_THREAD`): an orchestrator
+        // sequencing two workers onto one file is coordinated work, and on the
+        // operator's live map it produced 32 of 36 attention items and buried
+        // the amber pins. `raised_within_thread` below pins that separation, so
+        // neither half can regress silently.
+        for hit in world.claims.hits(now) {
+            let hit = &hit;
             let (a, b) = hit.actors();
             let key = (a, b, hit.path().clone());
             let entry = seen.entry(key).or_insert((hit.severity, hit.precision));
@@ -256,8 +269,17 @@ fn replay(sample: &SessionSummary) -> Option<Replayed> {
                 two_ended.insert(hit.path().clone());
             }
         }
+        // What actually reached the operator's attention list.
+        for mark in &world.attention {
+            if let AttentionKind::Contention(hit) = &mark.kind {
+                if hit.is_within_thread() {
+                    raised_within_thread += 1;
+                }
+            }
+        }
     }
     Some(Replayed {
+        raised_within_thread,
         seen,
         within_thread,
         links_with_two_ends: two_ended.len(),
@@ -450,5 +472,33 @@ fn every_real_collision_is_one_a_thread_keyed_table_could_not_represent() {
         within, total,
         "worker-versus-worker is not an edge case; on this corpus it is the \
          only case, and a table keyed by ThreadId rendered exactly none of it"
+    );
+}
+
+/// The correction the operator's own map forced.
+///
+/// A gate correctly found that a collision between two workers of one session
+/// could never fire, because `ClaimTable` was keyed on `ThreadId` and a thread
+/// is a session. Fixing the detection was right. Raising every one of them as a
+/// red alarm was not: on the operator's live map it produced 32 of 36 attention
+/// items, all reading "same file · two workers of one agent", each outranking
+/// the amber pins by PRD §11.1's ordering — and their verdict was "i dont need
+/// the contention at all". PRD §11.3 defines contention as *"a relation between
+/// two threads"*, which this never was.
+///
+/// So both halves are pinned here: the collision is still **detected**, and it
+/// is still **not raised**.
+#[test]
+fn a_worker_pair_inside_one_agent_is_detected_but_never_alarmed() {
+    let Some(r) = named(SETTINGS_CSS_SESSION) else {
+        return;
+    };
+    assert!(
+        r.within_thread > 0,
+        "the detection this test exists to protect must still find the pair"
+    );
+    assert_eq!(
+        r.raised_within_thread, 0,
+        "coordinated work inside one agent must not spend the attention budget          that exists to keep real collisions and pending decisions visible"
     );
 }

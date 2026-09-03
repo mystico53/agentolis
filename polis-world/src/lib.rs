@@ -198,6 +198,24 @@ pub const IDLE_AFTER: Duration = Duration::from_secs(60);
 /// unbounded thread map is how that budget is lost slowly enough not to notice.
 pub const THREAD_RETIRE_AFTER: Duration = Duration::from_mins(30);
 
+/// The ceiling on how long a standing attention mark may hold a silent thread.
+///
+/// [`World::retire_threads`] will not take a thread the operator still has to
+/// act on, and only `Done { verified: true }` marks decay
+/// ([`attention::AttentionKind::decays`]) — so a *needs decision* Polis never
+/// saw answered, or a *done, unverified*, pinned its thread to the rail
+/// **forever**. That is not a queue that stays useful; it is how a rail meant to
+/// be read in under a second accumulates every session of the day, and a
+/// `Waiting` thread is exempt from [`IDLE_AFTER`] and from [`MAX_THREADS`]
+/// eviction as well, so nothing else could ever clear it.
+///
+/// Eight retirement windows. Past four hours of total silence the mark cannot be
+/// resolved by anything: `polis_ingest::live::LIVE_WINDOW` stopped following the
+/// session seven windows ago, so no channel can ever update it, and what is left
+/// is a session that ended rather than a decision that is waiting. The operator
+/// who wants one gone sooner has the rail's `✕` ([`World::dismiss_thread`]).
+pub const MARK_HOLD_MAX: Duration = Duration::from_hours(4);
+
 /// How long an unattributable worker is remembered before it is dropped.
 ///
 /// Longer than [`THREAD_RETIRE_AFTER`] on purpose: an unattributed worker is
@@ -216,6 +234,26 @@ pub const UNATTRIBUTED_TTL: Duration = Duration::from_mins(60);
 /// overflow is counted in [`Health::contention_over_cap`] rather than dropped
 /// silently.
 pub const MAX_CONTENTION_MARKS: usize = 32;
+
+/// Whether two workers of the **same** agent writing one file raise contention.
+///
+/// `false`, and that is a correction rather than a preference. PRD §11.3 defines
+/// contention as *"a relation between two threads, not a property of one"*, and
+/// two workers an orchestrator dispatched onto the same file are one thread
+/// doing coordinated work — the sequencing is the orchestrator's, and no human
+/// decision is pending on it.
+///
+/// It was briefly enabled after a gate correctly found that worker-vs-worker
+/// collisions inside one session could never fire. The fix went too far: on the
+/// operator's own live map it produced 32 of 36 attention items, all reading
+/// "same file · two workers of one agent", every one outranking the amber pins
+/// by §11.1's ordering — burying the one state PRD §11.2 calls *"the primary
+/// state; it is what the product is for"*. That is PRD §17's named failure mode
+/// exactly: a signal that makes the operator feel informed while telling them
+/// nothing actionable.
+///
+/// Cross-thread contention is untouched and still fires.
+pub const CONTENTION_WITHIN_THREAD: bool = false;
 
 /// Hard ceiling on live threads, whatever the clock says.
 ///
@@ -433,9 +471,13 @@ impl World {
     ///
     /// *Done, verified* decays to nothing inside a minute (PRD §11.2's 20 s plus
     /// its ramp), so a thread that finished cleanly retires on the ordinary
-    /// silence rule and one that finished dirty does not. [`MAX_THREADS`] is the
-    /// only thing that overrides this, because unbounded growth is the one
-    /// outcome worse than losing a mark.
+    /// silence rule and one that finished dirty does not.
+    ///
+    /// Two things override it, because unbounded growth is the one outcome worse
+    /// than losing a mark: [`MAX_THREADS`], and [`MARK_HOLD_MAX`] — past which a
+    /// mark is holding a thread no channel can still reach, so it is history
+    /// rather than a queue item. [`World::dismiss_thread`] is the operator's own
+    /// override, for the one they can see is finished before either fires.
     ///
     /// # Every way a session ends looks the same, and that is honest
     ///
@@ -449,8 +491,10 @@ impl World {
             .threads
             .values()
             .filter(|t| {
-                now.saturating_duration_since(t.last_activity) > THREAD_RETIRE_AFTER
-                    && !self.attention.iter().any(|m| m.kind.mentions_thread(&t.id))
+                let quiet = now.saturating_duration_since(t.last_activity);
+                quiet > THREAD_RETIRE_AFTER
+                    && (quiet > MARK_HOLD_MAX
+                        || !self.attention.iter().any(|m| m.kind.mentions_thread(&t.id)))
             })
             .map(|t| t.id.clone())
             .collect();
@@ -481,6 +525,32 @@ impl World {
             self.health.threads_retired = self.health.threads_retired.saturating_add(1);
             self.health.threads_evicted = self.health.threads_evicted.saturating_add(1);
         }
+    }
+
+    /// Closes one thread because the operator said so — the rail's `✕`.
+    ///
+    /// Every automatic rule here is a rule about *silence*, and silence is the
+    /// only evidence a transcript can offer: there is no session-end record, so
+    /// a session that ended, one that crashed and one still sitting at a prompt
+    /// are indistinguishable (see [`World::retire_threads`]). The operator is
+    /// the one party who actually knows, and until this existed there was no way
+    /// to tell Polis — a thread pinned by a standing mark outlived every clock
+    /// the world has.
+    ///
+    /// **Not a tombstone.** Nothing here remembers the dismissal, so the next
+    /// event for that session builds the thread again through
+    /// [`World::thread_entry`] exactly as a first sighting would. Closing an
+    /// agent that turns out to still be working costs one row for one event,
+    /// which is the right price: the alternative is a filter that hides a live
+    /// agent, and a map that omits work is worse than one that shows work you
+    /// had finished with.
+    pub fn dismiss_thread(&mut self, id: &ThreadId) {
+        if !self.threads.contains_key(id) {
+            return;
+        }
+        self.forget_thread(id);
+        self.health.threads_retired = self.health.threads_retired.saturating_add(1);
+        self.health.threads_dismissed = self.health.threads_dismissed.saturating_add(1);
     }
 
     /// Removes a thread and every reference to it, so nothing dangles.
@@ -835,6 +905,20 @@ impl World {
         let mut hits = self.claims.hits(now);
         self.attention
             .retain(|m| !matches!(m.kind, attention::AttentionKind::Contention(_)));
+        // Two workers of ONE agent on one file is not a collision (ADR: see
+        // `CONTENTION_WITHIN_THREAD`). The orchestrator sequenced them; nobody's
+        // work is being destroyed, and nothing is being asked of the operator.
+        // Measured on the operator's own live map: 32 of 36 attention items were
+        // this, every one of them ranked above the amber pins by §11.1's
+        // ordering, and the operator's verdict on the result was "i dont need
+        // the contention at all".
+        //
+        // §11.3's contention is "a relation between two threads", and this never
+        // was one. It is dropped before the cap so it cannot spend the budget
+        // that exists to keep real collisions visible.
+        if !CONTENTION_WITHIN_THREAD {
+            hits.retain(|h| !h.is_within_thread());
+        }
         // `hits` is already worst-first. Past the ceiling the rest are counted
         // rather than drawn: the cap is on **contention only**, because it is
         // the only one of PRD §11.2's three states whose count grows with the
@@ -882,29 +966,37 @@ impl World {
             .map(|o| ((o.a.clone(), o.b.clone()), o.since))
             .collect();
 
-        // Only converged territories have a cloud to overlap (PRD §6.2), so the
-        // pairing runs over those and not over every thread in the world — and
-        // each is summarised **once**, not once per pairing. At PRD §16's
+        // Only *placed* territories have a cloud to overlap (PRD §6.2, §6.4), so
+        // the pairing runs over those and not over every thread in the world —
+        // and each is summarised **once**, not once per pairing. At PRD §16's
         // hundred threads that is the difference between 100 reductions and
         // 9 900 of them, which was 18.7 ms of a 16.6 ms frame
         // ([`contention::OVERLAP_KERNELS`]).
-        let claimed: Vec<(&ThreadId, contention::CloudSummary, &LogicalPath)> = self
+        //
+        // `district` is the claim when there is one and the heaviest lobe
+        // otherwise ([`territory::Placement::district`]). It is what
+        // `TerritoryOverlap::same_district` compares, and an orchestrator's
+        // heaviest lobe is the honest answer to "which district is this thread
+        // in" — the alternative was to leave it out of the pairing entirely,
+        // which is what a claim-only filter did and why §11.3's early warning
+        // never fired for the threads it was written about.
+        let placed: Vec<(&ThreadId, contention::CloudSummary, &LogicalPath)> = self
             .threads
             .values()
             .filter_map(|t| {
-                let claim = t.territory.claim.as_ref()?;
+                let district = t.territory.placement().district()?;
                 let summary = contention::CloudSummary::of(&t.territory)?;
-                Some((&t.id, summary, claim))
+                Some((&t.id, summary, district))
             })
             .collect();
 
         let mut out: Vec<contention::TerritoryOverlap> = Vec::new();
-        for (i, (id_a, ta, claim_a)) in claimed.iter().enumerate() {
-            for (id_b, tb, claim_b) in claimed.iter().skip(i + 1) {
+        for (i, (id_a, ta, claim_a)) in placed.iter().enumerate() {
+            for (id_b, tb, claim_b) in placed.iter().skip(i + 1) {
                 let Some(score) = contention::overlap_of(ta, tb) else {
                     continue;
                 };
-                // `claimed` walks a `BTreeMap`, so `id_a < id_b` already; the
+                // `placed` walks a `BTreeMap`, so `id_a < id_b` already; the
                 // pair key is stable without sorting it again.
                 let key = ((*id_a).clone(), (*id_b).clone());
                 let since = previous.get(&key).copied().unwrap_or(now);
@@ -1719,6 +1811,13 @@ pub struct Health {
     /// agents they know they started: a session that has been quiet for
     /// [`THREAD_RETIRE_AFTER`] leaves the map, and this is the count of them.
     pub threads_retired: u64,
+    /// Of those, the ones the operator closed by hand from the rail's `✕`
+    /// ([`World::dismiss_thread`]).
+    ///
+    /// Separate from the clock's count because it answers a different question:
+    /// a rail shorter than the fleet is expected after a dismissal and is a bug
+    /// report without one.
+    pub threads_dismissed: u64,
     /// Of those, the ones the [`MAX_THREADS`] ceiling took rather than the
     /// clock.
     ///

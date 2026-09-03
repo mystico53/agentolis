@@ -16,7 +16,7 @@ use polis_events::{
 use polis_layout::CityLayout;
 use polis_world::attention::{AttentionKind, DecisionSource};
 use polis_world::contention::{ContentionPrecision, Severity};
-use polis_world::{ThreadStatus, World};
+use polis_world::{ThreadStatus, World, MARK_HOLD_MAX};
 
 const REPO: &str = "C:/repo";
 
@@ -347,7 +347,7 @@ fn a_permission_request_parks_the_thread_and_the_answer_frees_it() {
 }
 
 #[test]
-fn a_pin_never_expires_on_a_timer() {
+fn a_pin_never_expires_while_anything_could_still_resolve_it() {
     let mut w = world();
     let t0 = Instant::now();
     w.apply(&hook(
@@ -356,16 +356,28 @@ fn a_pin_never_expires_on_a_timer() {
         t0,
         HookPayload::default(),
     ));
-    w.tick(t0 + Duration::from_hours(6));
+    w.tick(t0 + MARK_HOLD_MAX);
     assert_eq!(
         w.attention.len(),
         1,
-        "needs-decision persists until resolved, however long that takes"
+        "needs-decision persists until resolved, and hours of waiting is what          waiting on a human looks like"
     );
     assert_eq!(
         w.thread(&thread("a")).unwrap().status,
         ThreadStatus::Waiting
     );
+
+    // The one end of it. No timer expires the pin — `AttentionKind::decays` is
+    // still false for `NeedsDecision` — but past `MARK_HOLD_MAX` of total
+    // silence `polis_ingest::live::LIVE_WINDOW` stopped following the session
+    // seven retirement windows ago, so no channel can ever answer this
+    // question. The thread is retired and the mark goes with it, which is the
+    // difference between a queue and a rail that accumulates every session of
+    // the day. Nothing here is a *timer on the pin*: it is the pin losing the
+    // thread it was about.
+    w.tick(t0 + MARK_HOLD_MAX + Duration::from_secs(1));
+    assert!(w.thread(&thread("a")).is_none());
+    assert!(w.attention.is_empty());
 }
 
 #[test]

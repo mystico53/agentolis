@@ -40,7 +40,8 @@ use polis_events::{
 use polis_repo::{FileMeta, RepoTree};
 use polis_world::territory::{DECAY_HALF_LIFE, DRIFT_CONFIRMATIONS};
 use polis_world::{
-    ThreadStatus, WorkerAttribution, World, MAX_THREADS, THREAD_RETIRE_AFTER, UNATTRIBUTED_TTL,
+    ThreadStatus, WorkerAttribution, World, MARK_HOLD_MAX, MAX_THREADS, THREAD_RETIRE_AFTER,
+    UNATTRIBUTED_TTL,
 };
 
 // ---------------------------------------------------------------------------
@@ -781,12 +782,18 @@ fn two_workers_of_one_thread_writing_one_file_is_contention() {
     assert_ne!(a, b, "the two ends are different actors");
     assert_eq!(a.thread, b.thread, "of one thread");
 
+    // Detected — and deliberately NOT raised. Two workers an orchestrator
+    // dispatched onto one file are one thread doing coordinated work, and
+    // PRD §11.3 defines contention as "a relation between two threads". Raising
+    // it produced 32 of 36 attention items on the operator's live map, every one
+    // outranking the amber pins by §11.1's ordering, and their verdict was "i
+    // dont need the contention at all". See `polis_world::CONTENTION_WITHIN_THREAD`.
     assert!(
-        world
+        !world
             .attention
             .iter()
             .any(|m| matches!(m.kind, polis_world::attention::AttentionKind::Contention(_))),
-        "and it reaches the attention layer, which is what makes it visible"
+        "coordinated work inside one agent must not spend the attention budget"
     );
 }
 
@@ -891,6 +898,78 @@ fn a_thread_the_operator_still_has_to_act_on_is_never_retired_by_the_clock() {
         "a thread with a live mark stays until the operator deals with it"
     );
     assert_eq!(world.health.threads_retired, 0);
+}
+
+#[test]
+fn a_mark_holds_a_thread_but_not_for_ever() {
+    // The other half of the rule above. `NeedsDecision` never decays
+    // (`AttentionKind::decays`), so before `MARK_HOLD_MAX` a question Polis
+    // never saw answered — the operator answered it in the terminal, or closed
+    // the session on top of it — pinned its thread to the rail permanently, and
+    // a `Waiting` thread is exempt from `IDLE_AFTER` and from the `MAX_THREADS`
+    // eviction too. Nothing in the world could ever clear it.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    world.apply(&edit_event("a", "src/auth/token.rs", t0));
+    let asked = t0 + Duration::from_secs(1);
+    world.apply(&asks_event("a", asked));
+    let a = ThreadId::of_session(SessionId::new("a"));
+
+    world.tick(asked + MARK_HOLD_MAX);
+    assert!(
+        world.thread(&a).is_some(),
+        "inside the hold, the operator's queue is the operator's queue"
+    );
+
+    world.tick(asked + MARK_HOLD_MAX + Duration::from_secs(1));
+    assert!(
+        world.thread(&a).is_none(),
+        "past {MARK_HOLD_MAX:?} of silence no channel can still resolve the mark, so it is          history like every other ending"
+    );
+    assert!(world.attention.is_empty(), "and the mark goes with it");
+    assert_eq!(world.health.threads_retired, 1);
+}
+
+#[test]
+fn the_operator_can_close_a_thread_and_its_next_event_brings_it_back() {
+    // There is no session-end record, so silence is all the world can infer
+    // from. The operator is the one party who knows the session is closed.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    world.apply(&edit_event("a", "src/auth/token.rs", t0));
+    world.apply(&asks_event("a", t0 + Duration::from_secs(1)));
+    world.apply(&edit_event("b", "src/render/frame.rs", t0));
+    let a = ThreadId::of_session(SessionId::new("a"));
+    let b = ThreadId::of_session(SessionId::new("b"));
+
+    world.dismiss_thread(&a);
+
+    assert!(world.thread(&a).is_none(), "the row the operator closed");
+    assert!(world.thread(&b).is_some(), "and only that one");
+    assert!(
+        world.attention.is_empty(),
+        "the mark that was pinning it goes too, or the rail loses a row the          attention list still names"
+    );
+    assert!(
+        world
+            .file(&LogicalPath::new("src/auth/token.rs").unwrap())
+            .is_some_and(|f| f.touched_by.iter().all(|t| t != &a)),
+        "and nothing dangles, exactly as retirement leaves nothing"
+    );
+    assert_eq!(world.health.threads_dismissed, 1);
+    assert_eq!(world.health.threads_retired, 1);
+
+    // Nothing was remembered, so an agent that turns out to still be working
+    // costs one row for one event rather than being hidden for good.
+    world.apply(&edit_event(
+        "a",
+        "src/auth/session.rs",
+        t0 + Duration::from_secs(2),
+    ));
+    assert!(
+        world.thread(&a).is_some(),
+        "a dismissal is not a filter: the next event is a first sighting"
+    );
 }
 
 #[test]

@@ -100,8 +100,82 @@ pub struct ViewState {
     pub streets: bool,
     /// The thread the camera is bound to (PRD §12: cut, do not pan).
     pub follow: Option<ThreadId>,
+    /// The selected thread. Set by clicking a rail row or a thread's anchor.
+    ///
+    /// > **Shared selection and highlight state** between the map and the tree.
+    /// > (PRD §12)
+    ///
+    /// The rail is the third view of the same threads and behaves the same
+    /// way. Separate from [`Self::follow`] because they are different verbs:
+    /// following moves the *camera* and can only be on one thread; selecting
+    /// says which thread the operator is reading about, and an operator
+    /// following one thread while reading another is a normal thing to do.
+    pub selected_thread: Option<ThreadId>,
+    /// The thread under the pointer, as every view **reads** it this frame.
+    ///
+    /// Written by the rail when a row is hovered and by the map when a thread's
+    /// own marks are, and read by both — which is what makes the highlight
+    /// travel in either direction.
+    hovered_thread: Option<ThreadId>,
+    /// What the views have said about the pointer **during** this frame.
+    ///
+    /// Hover has to be double-buffered because the two views are drawn in
+    /// sequence, and whichever runs second would otherwise be the only one able
+    /// to answer: the rail is drawn before the map, so with a single field the
+    /// map could light a row and the rail could never light a cloud. Swapping
+    /// once per frame gives both directions the same one-frame latency —
+    /// 16 ms, and symmetric, which is the part that matters — instead of one
+    /// direction working and the other silently not.
+    next_hovered_thread: Option<ThreadId>,
     /// Tween state, so agents move rather than teleport.
     pub motion: Motion,
+}
+
+impl ViewState {
+    /// Publishes what the views said about the pointer last frame, and starts a
+    /// fresh answer. Called once, by the caller that draws both views.
+    ///
+    /// A pointer that has left every view writes nothing, so the highlight
+    /// clears by itself on the next frame.
+    pub fn begin_frame(&mut self) {
+        self.hovered_thread = self.next_hovered_thread.take();
+    }
+
+    /// A view reporting that the pointer is over this thread.
+    pub fn hover_thread(&mut self, id: &ThreadId) {
+        self.next_hovered_thread = Some(id.clone());
+    }
+
+    /// The thread under the pointer, as of this frame.
+    #[must_use]
+    pub fn hovered_thread(&self) -> Option<&ThreadId> {
+        self.hovered_thread.as_ref()
+    }
+
+    /// Whether this thread is the one the operator is pointing at or has
+    /// selected — the highlight the map and the rail share.
+    #[must_use]
+    pub fn emphasises(&self, id: &ThreadId) -> bool {
+        self.hovered_thread.as_ref() == Some(id) || self.selected_thread.as_ref() == Some(id)
+    }
+
+    /// Whether the operator has **asked about** this thread, by any of the three
+    /// verbs that mean it: pointing at it, selecting it, or following it.
+    ///
+    /// This is the gate on PRD §12's *"exact below"* — the marks that answer a
+    /// question rather than set a scene. Ownership tethers are the first of
+    /// them: drawn ambiently they were a line across the whole map per worker,
+    /// and one session on this machine has a hundred workers.
+    ///
+    /// Wider than [`Self::emphasises`] by [`Self::follow`] on purpose. Emphasis
+    /// is a *highlight* and follow is a *camera binding*, so they are different
+    /// verbs (see the field docs) — but both are the operator saying "this one",
+    /// and a thread the camera is bound to is exactly a thread being
+    /// interrogated.
+    #[must_use]
+    pub fn interrogates(&self, id: &ThreadId) -> bool {
+        self.emphasises(id) || self.follow.as_ref() == Some(id)
+    }
 }
 
 /// Eased positions, so a worker glides between buildings instead of jumping
@@ -255,7 +329,11 @@ pub fn draw(
     draw_districts(&painter, base, camera, snapshot, vis, tier);
 
     // --- 4. Agents: trails, tethers, workers, operation glyphs --------------
-    let mut animating = draw_agents(&painter, base, camera, snapshot, state, tier);
+    // The pointer is read before the layer rather than after it, because the
+    // agent layer is where a thread is picked: PRD §12's shared highlight has to
+    // be settled on the same frame the rail is drawn, not one frame behind it.
+    let pointer = response.hover_pos();
+    let mut animating = draw_agents(&painter, base, camera, snapshot, state, tier, pointer);
     // PRD §13 tweens the cloud density, so the window owes itself a frame while
     // a territory is still arriving, drifting or dissipating.
     animating |= clouds.animating();
@@ -267,7 +345,6 @@ pub fn draw(
     animating |= draw_attention(&painter, base, camera, snapshot);
 
     // --- Selection and hover, which are the operator's own attention --------
-    let pointer = response.hover_pos();
     if let Some(p) = pointer {
         let map = camera.to_map(p);
         out.hovered = base.geometry.building_at(map).cloned();
@@ -507,6 +584,23 @@ fn skyline(
 }
 
 /// Layer 4 (PRD §10.3): trails, tethers, workers and operation glyphs.
+///
+/// # One thread, one colour
+///
+/// Everything here that *is* the thread — its trail, its tethers, its workers'
+/// bodies, its anchor ring — is drawn in `palette::thread_*` at that role's own
+/// brightness, so the operator can match a mark on the map against the
+/// rectangle in the rail without reading a single character. The operation
+/// glyphs are the exception and keep PRD §10.2's outcome colour; the reason is
+/// written out on `polis_render::live::Mark`.
+///
+/// # Picking, which is the other half of PRD §12's shared highlight
+///
+/// `pointer` is the map's pointer, and the nearest thread mark under it wins
+/// [`ViewState::hovered_thread`] — which is what the rail reads to light the
+/// matching row. Anchors and worker bodies only: a trail is a long thin thing
+/// that crosses half the city, and picking one would mean the pointer selected
+/// a different thread every few pixels of travel.
 fn draw_agents(
     painter: &egui::Painter,
     base: &BaseMap,
@@ -514,15 +608,58 @@ fn draw_agents(
     snapshot: &WorldSnapshot,
     state: &mut ViewState,
     tier: ZoomTier,
+    pointer: Option<Pos2>,
 ) -> bool {
     let mut animating = false;
     let now = snapshot.at;
     let ttl = polis_world::TRAIL_TTL.as_secs_f32();
+    // Nearest pickable mark to the pointer, and whose it is.
+    let mut pick: Option<(f32, ThreadId)> = None;
+    let mut consider = |at: Pos2, radius: f32, id: &ThreadId| {
+        if let Some(p) = pointer {
+            let d = (at - p).length();
+            if d <= radius && pick.as_ref().is_none_or(|(best, _)| d < *best) {
+                pick = Some((d, id.clone()));
+            }
+        }
+    };
 
     for thread in &snapshot.threads {
+        let tint = palette::thread_slot(&thread.id);
+        // Emphasis is **weight**, never a different colour: a highlighted
+        // thread has to stay the colour the rail says it is, or the one thing
+        // the swatch promises stops being true at exactly the moment the
+        // operator is checking it (PRD §11.4).
+        let lift = if state.emphasises(&thread.id) {
+            1.0
+        } else {
+            0.0
+        };
+
         // --- Trails: history without a timeline scrubber (PRD §12) ----------
-        let mut points: Vec<(Pos2, f32)> = Vec::with_capacity(thread.trail.len());
-        for (path, at) in &thread.trail {
+        //
+        // Drawn only for the thread the operator is asking about, for the same
+        // reason as the tether below it. TRAIL_CAP is 192 points held for
+        // TRAIL_TTL = 15 minutes, so five live threads put up to 960 persisting
+        // segments across the city at once — measured on the operator's own map,
+        // and their verdict was "still lines everywhere!!". §12 wants a trail to
+        // show backtracking and thrashing; a permanent cobweb over every
+        // district shows neither, and buries the buildings it is drawn on.
+        //
+        // The ambient answer to "whose work is this" is the thread's colour,
+        // which is on every building it has touched. The trail is the exact
+        // answer to "where has this one been", and §12 asks for exactly that
+        // split: fuzzy above, exact below.
+        let mut points: Vec<(Pos2, f32)> = if state.interrogates(&thread.id) {
+            Vec::with_capacity(thread.trail.len())
+        } else {
+            Vec::new()
+        };
+        for (path, at) in thread
+            .trail
+            .iter()
+            .filter(|_| state.interrogates(&thread.id))
+        {
             let Some(map) = base.geometry.position_of(path) else {
                 continue;
             };
@@ -537,7 +674,10 @@ fn draw_agents(
             if fade <= 0.02 {
                 continue;
             }
-            painter.line_segment([a, b], Stroke::new(1.4, palette::trail().aged(fade)));
+            painter.line_segment(
+                [a, b],
+                Stroke::new(1.4 + lift, palette::thread_trail(tint).aged(fade)),
+            );
         }
 
         // --- Operation glyphs: shape says what, colour says how it went -----
@@ -563,12 +703,30 @@ fn draw_agents(
             }
         }
 
-        // --- Tethers and workers -------------------------------------------
+        // --- Workers, and the tethers only the asked-about thread gets ------
+        //
+        // Ownership is carried ambiently by `tint`: the worker's body, the
+        // thread's anchor ring, its trail, its cloud and the rail's swatch are
+        // one hue. The *line* back to the anchor is the exact answer to a
+        // question about one thread, so it is drawn only for the thread the
+        // operator is pointing at, has selected or is following.
+        // `polis_render::live::draw_tether` carries the measurement.
         let anchor = thread
             .territory
             .centre_of_mass
             .map(|p| camera.to_screen(base.to_map(p)));
-        for worker in &thread.workers {
+        let tethered = state.interrogates(&thread.id);
+        // The renderer's rank, so the window and a recorded frame stop at the
+        // same sixteen hands: running first, then the most recently active.
+        let mut ranked: Vec<&polis_world::Worker> = thread.workers.iter().collect();
+        ranked.sort_by(|a, b| {
+            b.running
+                .cmp(&a.running)
+                .then(b.last_activity.cmp(&a.last_activity))
+                .then(a.id.cmp(&b.id))
+        });
+        let fan = live::TETHERS_PER_THREAD.min(ranked.len()).max(2) - 1;
+        for (rank, worker) in ranked.iter().enumerate() {
             let Some(focus) = &worker.focus else { continue };
             let Some(map) = base.geometry.position_of(focus) else {
                 continue;
@@ -576,13 +734,14 @@ fn draw_agents(
             let (eased, moving) = state.motion.ease(&worker.id, map);
             animating |= moving;
             let at = camera.to_screen(eased);
-            if let Some(anchor) = anchor {
-                painter.line_segment(
-                    [anchor, at],
-                    Stroke::new(
-                        1.0,
-                        palette::tether().alpha(if worker.running { 0.5 } else { 0.2 }),
-                    ),
+            if let Some(anchor) = anchor.filter(|_| tethered && rank < live::TETHERS_PER_THREAD) {
+                draw_tether(
+                    painter,
+                    anchor,
+                    at,
+                    (rank as f32 / fan as f32).mul_add(2.0, -1.0),
+                    worker.running,
+                    tint,
                 );
             }
             let r = if worker.running { 5.0 } else { 3.5 };
@@ -592,27 +751,105 @@ fn draw_agents(
                     at + Vec2::new(r * 0.8, r * 0.7),
                     at + Vec2::new(-r * 0.8, r * 0.7),
                 ],
-                palette::worker().alpha(if worker.running { 0.95 } else { 0.45 }),
+                palette::thread(tint).alpha(if worker.running { 0.95 } else { 0.45 }),
                 Stroke::NONE,
             ));
+            consider(at, r + 4.0, &thread.id);
         }
 
         // The thread's own mark, at its territory's centre of mass.
         if let Some(anchor) = anchor {
+            // Two rings, two channels. The outer one is the thread's identity
+            // and never changes; the inner dot is `status`, which does. Before
+            // this the anchor was drawn in the status colour alone, so four
+            // threads in the same state were four identical rings.
             let ink = palette::status(thread.status);
-            let _ = palette::anchor();
-            painter.circle_stroke(anchor, 7.0, Stroke::new(1.8, ink.alpha(0.9)));
+            painter.circle_stroke(
+                anchor,
+                7.0,
+                Stroke::new(1.8 + lift * 1.2, palette::thread_anchor(tint).alpha(0.95)),
+            );
             if thread.status == ThreadStatus::Working {
                 painter.circle_filled(anchor, 2.4, ink.alpha(0.9));
+            }
+            if lift > 0.0 {
+                // The highlight itself is a *shape* — a second ring standing off
+                // the first — so it survives greyscale and the periphery, where
+                // PRD §11.4 says colour does not.
+                painter.circle_stroke(anchor, 11.5, Stroke::new(1.2, palette::hover().alpha(0.8)));
             }
             // PRD §10.4's drift: the redirect signal, drawn as a leading edge
             // only while the centre of mass is actually migrating.
             if let Some(mark) = thread.territory.drift_mark() {
-                draw_drift(painter, base, camera, &mark, ink);
+                draw_drift(painter, base, camera, &mark, palette::thread_anchor(tint));
             }
+            consider(anchor, 12.0, &thread.id);
         }
     }
+    if let Some((_, id)) = pick {
+        state.hover_thread(&id);
+    }
     animating
+}
+
+/// How far a tether bows off the straight line, at most, in screen pixels.
+///
+/// `polis_render::live::draw_tether` states it as five glyph radii; the window's
+/// worker mark is five pixels, so this is the same number in the units the
+/// overlay works in. It is a cap on `len * 0.075`, which is what does the work
+/// on the short tethers — a fan of workers inside one district would otherwise
+/// bow by a few pixels and stay a ribbon.
+const TETHER_BOW: f32 = 26.0;
+
+/// One tether, in the window, drawn exactly as `polis_render::live::draw_tether`
+/// draws it in a recorded frame.
+///
+/// > A visual language with two definitions has none.
+///
+/// So the geometry is that function's: a quadratic bow whose sign and size come
+/// from `spread`, eight segments, solid while the worker is running and dashed
+/// once it has finished — a **shape** difference, because PRD §11.4 says
+/// peripheral vision cannot do the three-grey-levels one. The ink is that
+/// module's constant faded to that module's tones (0.70 running, 0.34
+/// finished), in the thread's own hue.
+///
+/// Who gets one is decided by the caller: [`ViewState::interrogates`], and the
+/// reasoning is on `polis_render::live::draw_tether`.
+fn draw_tether(
+    painter: &egui::Painter,
+    anchor: Pos2,
+    worker: Pos2,
+    spread: f32,
+    running: bool,
+    tint: u8,
+) {
+    let (width, tone) = if running { (1.6, 0.70) } else { (1.2, 0.34) };
+    let ink = palette::thread_tether(tint).aged(tone);
+    let d = worker - anchor;
+    let len = d.length().max(1e-3);
+    let bow = (len * 0.075).min(TETHER_BOW) * spread.clamp(-1.0, 1.0);
+    let mid = anchor + d * 0.5;
+    let ctrl = mid + Vec2::new(-d.y / len, d.x / len) * bow;
+    let steps = 8;
+    let pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let u = 1.0 - t;
+            Pos2::new(
+                (t * t).mul_add(worker.x, (u * u).mul_add(anchor.x, 2.0 * u * t * ctrl.x)),
+                (t * t).mul_add(worker.y, (u * u).mul_add(anchor.y, 2.0 * u * t * ctrl.y)),
+            )
+        })
+        .collect();
+    if running {
+        painter.add(egui::Shape::line(pts, Stroke::new(width, ink)));
+    } else {
+        // One segment on, one off: four dashes along the bow, the same period
+        // the renderer uses.
+        for pair in pts.as_chunks::<2>().0 {
+            painter.line_segment([pair[0], pair[1]], Stroke::new(width, ink));
+        }
+    }
 }
 
 /// PRD §10.4's leading-edge mark — the redirect signal.
@@ -744,6 +981,17 @@ fn draw_alarms(
 }
 
 /// Layer 5 (PRD §11.2): the three attention states.
+///
+/// # The beacons are computed in `polis-render` and drawn here
+///
+/// `polis_render::salience::beacons` returns the region rings PRD §11.1's
+/// ordering needs — one per pending decision, two per contention — in device
+/// pixels, and this function paints them with `egui`. The geometry is not
+/// re-derived: the window is the product and the canvas is the evidence, and a
+/// notation the two rasterisers each own a copy of drifts in the direction of
+/// the one nobody is measuring. That is exactly how the amber pin ended up
+/// being a 20-pixel mast in the window while the headless renderer drew a plate,
+/// a halo and an escalation ramp.
 fn draw_attention(
     painter: &egui::Painter,
     base: &BaseMap,
@@ -752,6 +1000,75 @@ fn draw_attention(
 ) -> bool {
     let mut animating = false;
     let now = snapshot.at;
+
+    // One pass to place every mark in screen space, so the rings can be
+    // clustered before anything is painted. `r` matches `draw_alarms`' own
+    // glyph radius per tier, so an amber ring clears the glyphs it is about.
+    let r = match camera.tier() {
+        ZoomTier::Building => 6.0,
+        ZoomTier::District => 3.6,
+        ZoomTier::City => 3.0,
+    };
+    let map_height = f64::from(painter.clip_rect().height()).max(1.0);
+    let mut placed: Vec<live::AttentionMark> = Vec::new();
+    for mark in &snapshot.attention {
+        let pulse = f64::from(mark.pulse(now));
+        let weight = f64::from(mark.weight(now));
+        let urgency = f64::from(mark.urgency(now));
+        let (kind, at, other, severity, sited) = match &mark.kind {
+            AttentionKind::NeedsDecision { thread, at, .. } => {
+                let (p, sited) = decision_position(base, snapshot, thread, at.as_ref());
+                let Some(p) = p else { continue };
+                (live::MarkKind::NeedsDecision, p, None, None, sited)
+            }
+            AttentionKind::Done { thread, verified } => {
+                let Some(p) = mark_position(base, snapshot, thread, None) else {
+                    continue;
+                };
+                let kind = if *verified {
+                    live::MarkKind::DoneVerified
+                } else {
+                    live::MarkKind::DoneUnverified
+                };
+                (kind, p, None, None, true)
+            }
+            AttentionKind::Contention(contention) => {
+                let (a, b) = contention.threads();
+                let (Some(pa), Some(pb)) = (
+                    mark_position(base, snapshot, a, Some(contention.path())),
+                    mark_position(base, snapshot, b, Some(contention.path())),
+                ) else {
+                    continue;
+                };
+                (
+                    live::MarkKind::Contention,
+                    pa,
+                    Some(pb),
+                    Some(contention.severity),
+                    true,
+                )
+            }
+        };
+        let screen = camera.to_screen(at);
+        placed.push(live::AttentionMark {
+            kind,
+            at: [f64::from(screen.x), f64::from(screen.y)],
+            other: other.map(|p| {
+                let s = camera.to_screen(p);
+                [f64::from(s.x), f64::from(s.y)]
+            }),
+            severity,
+            pulse,
+            weight,
+            urgency,
+            sited,
+        });
+    }
+    let (decisions, contended) = salience::beacons(&placed, r, map_height);
+    // The primary state, region first: the ring reads from across the room and
+    // the pin reads once the operator has walked over.
+    animating |= paint_beacons(painter, &decisions, r);
+
     for mark in &snapshot.attention {
         let pulse = mark.pulse(now);
         if pulse > 0.0 {
@@ -762,7 +1079,7 @@ fn draw_attention(
         }
         match &mark.kind {
             AttentionKind::NeedsDecision { thread, at, .. } => {
-                let Some(p) = mark_position(base, snapshot, thread, at.as_ref()) else {
+                let (Some(p), _) = decision_position(base, snapshot, thread, at.as_ref()) else {
                     continue;
                 };
                 pin(
@@ -824,6 +1141,32 @@ fn draw_attention(
             }
         }
     }
+    // …and contention's rings last, because PRD §11.1 puts it above the other
+    // two and because a terminal hidden under a pin is a terminal the operator
+    // does not walk to.
+    animating |= paint_beacons(painter, &contended, r);
+    animating
+}
+
+/// Paints one set of `polis_render::salience` rings. Returns whether any of
+/// them is still animating an arrival.
+fn paint_beacons(painter: &egui::Painter, beacons: &[salience::Alarm], r: f64) -> bool {
+    let mut animating = false;
+    for beacon in beacons {
+        animating |= beacon.pulse > 0.0;
+        for stroke in salience::strokes(*beacon, r) {
+            let ink = palette::Ink::attention(stroke.ink).alpha(1.0);
+            let points: Vec<Pos2> = stroke
+                .points
+                .iter()
+                .map(|p| Pos2::new(p[0] as f32, p[1] as f32))
+                .collect();
+            painter.add(egui::Shape::line(
+                points,
+                Stroke::new(stroke.width as f32, ink),
+            ));
+        }
+    }
     animating
 }
 
@@ -844,8 +1187,48 @@ pub fn mark_position(
         }
     }
     let thread = snapshot.thread(thread)?;
-    let centre = thread.territory.centre_of_mass?;
-    Some(base.to_map(centre))
+    if let Some(centre) = thread.territory.centre_of_mass {
+        return Some(base.to_map(centre));
+    }
+    // PRD §6.4's lobes, and §6.2's claim. Reading `centre_of_mass` alone and
+    // stopping was the window's half of the same bug the rail had: a caller
+    // that tests one shape of a placed territory has quietly decided the other
+    // shape is unplaced, which is how a thread with 483 calls came to have
+    // nowhere on the map to put its pin.
+    let scope = match thread.territory.placement() {
+        polis_world::territory::Placement::Claim(path) => Some(path.clone()),
+        polis_world::territory::Placement::Lobes(lobes) => lobes.first().map(|l| l.path.clone()),
+        polis_world::territory::Placement::Nowhere => None,
+    };
+    if let Some(p) = scope.and_then(|path| base.geometry.position_of(&path)) {
+        return Some(p);
+    }
+    thread
+        .trail
+        .iter()
+        .rev()
+        .find_map(|(path, _)| base.geometry.position_of(path))
+}
+
+/// Where a **pending decision** points, and whether that place is the real one.
+///
+/// The same chain as [`mark_position`], plus PRD §8's civic square as a last
+/// resort — because an agent blocked on a human is the one state the map is not
+/// allowed to lose, and in the operator's own screenshot all three
+/// `WAITING ON YOU` rows belonged to threads with no territory at all. The
+/// second element is `polis_render::live::AttentionMark::sited`: false means the
+/// ring draws `salience::ALARM_UNSITED`'s accuracy circle and says *somewhere in
+/// here* rather than claiming a district on no evidence.
+fn decision_position(
+    base: &BaseMap,
+    snapshot: &WorldSnapshot,
+    thread: &ThreadId,
+    at: Option<&LogicalPath>,
+) -> (Option<Pos2>, bool) {
+    if let Some(p) = mark_position(base, snapshot, thread, at) {
+        return (Some(p), true);
+    }
+    (base.geometry.position_of(&LogicalPath::root()), false)
 }
 
 /// The standing pin PRD §11.2 asks for: a mast and a head above the subject, so
@@ -916,7 +1299,51 @@ fn scaffold(painter: &egui::Painter, ring: &[Pos2], ink: palette::Ink) {
     }
 }
 
+/// The most monuments named at each tier, widest zoom first.
+///
+/// PRD §8 says monuments are *"always labelled at every zoom"* and it is right:
+/// they are the orientation layer, and a map you cannot orient on is not a map.
+/// It does **not** say all of them at once — `.take(24)` was reading it that
+/// way, and twenty-four forced labels are a wall of type at the zoom where the
+/// districts underneath them are three pixels wide. The list is already ranked
+/// by inbound imports, so taking a prefix takes the best ones.
+const MONUMENTS_PER_TIER: [usize; 3] = [8, 14, 18];
+
+/// The deepest district named at each tier.
+///
+/// The wayfinding skeleton coarsens as you pull back: package names at city
+/// zoom, one level in at district zoom, two at building zoom. Without this the
+/// only zoom rule was the size gate below, which on a large repository lets
+/// forty names through at once — `utils` and `lib` and `config` repeated in
+/// every package, which is the definition of a name that does not locate you.
+const DISTRICT_DEPTH_PER_TIER: [usize; 3] = [1, 2, 3];
+
+/// The narrowest a building may be, on screen, and still carry its own name.
+///
+/// The district rule (44 px) one level down. A name wider than the thing it
+/// names is not a label, it is a line of text lying across the map — and at
+/// `ZoomTier::Building`'s wide end that is what several dozen of them were.
+const NAMEABLE_BUILDING_PX: f32 = 30.0;
+
 /// Every label on the map, in PRD §8's priority order.
+///
+/// # Order is the whole algorithm
+///
+/// [`LabelPlacer`] is greedy and now carries a per-frame budget, so **the order
+/// these are offered in decides what the operator reads**. It is:
+///
+/// 1. monuments and threads waiting on a human — [`Priority::Anchor`], outside
+///    the budget, because §8 makes one the orientation layer and §11.2 makes
+///    the other the reason the product exists;
+/// 2. districts, largest on screen first — the wayfinding skeleton, and the
+///    largest are the ones that locate you;
+/// 3. files, most recently touched first — *"what is being worked on"*, which
+///    is the only reason a file name is on an ambient map at all.
+///
+/// Before this the file loop iterated `buildings` in path order and offered
+/// **every file any thread had ever touched**, which on the operator's live
+/// session was several hundred names competing alphabetically. What survived
+/// was whatever started with `a`.
 #[allow(clippy::too_many_arguments)]
 fn draw_labels(
     painter: &egui::Painter,
@@ -929,13 +1356,24 @@ fn draw_labels(
     scale: f32,
 ) {
     let vis = camera.visible_map_rect();
+    let rank = match tier {
+        ZoomTier::City => 0,
+        ZoomTier::District => 1,
+        ZoomTier::Building => 2,
+    };
 
     // 1. Monuments. PRD §8: "always labelled at every zoom". Priority::Anchor,
-    //    so they are placed before anything else and never dropped.
-    for (path, at, _) in base.geometry.monuments.iter().take(24) {
-        if !vis.contains(*at) {
-            continue;
-        }
+    //    so they are placed before anything else and never dropped. Filtered to
+    //    the viewport *before* the count is taken — taking first meant a camera
+    //    that had paned away from the top-ranked monuments got no anchors at
+    //    all, which is the opposite of what the rule is for.
+    for (path, at, _) in base
+        .geometry
+        .monuments
+        .iter()
+        .filter(|m| vis.contains(m.1))
+        .take(MONUMENTS_PER_TIER[rank])
+    {
         let name = path.file_name().unwrap_or_else(|| path.as_str());
         label(
             painter,
@@ -948,21 +1386,41 @@ fn draw_labels(
         );
     }
 
-    // 2. Districts — the rest of the wayfinding skeleton.
-    for (path, shape) in &base.geometry.districts {
-        if !vis.intersects(shape.bounds) || path.is_root() {
+    // 2. Threads waiting on a human get a name on the map, because that is what
+    //    the product is for (PRD §1, §11.2). Before the districts, not after:
+    //    they are anchors, and an anchor that arrives late has to shove an
+    //    already-placed label aside to take its place.
+    for thread in snapshot.waiting() {
+        let Some(centre) = thread.territory.centre_of_mass else {
             continue;
-        }
-        // At City tier only the top-level packages are named: a `src` inside
-        // every crate is six identical words over a map whose whole job at this
-        // zoom is telling the packages apart.
-        if tier == ZoomTier::City && path.depth() > 1 {
-            continue;
-        }
-        // A district smaller than its own label is noise at this zoom.
-        if shape.diameter() * scale < 44.0 {
-            continue;
-        }
+        };
+        label(
+            painter,
+            placer,
+            camera.to_screen(base.to_map(centre)) - Vec2::new(0.0, 26.0),
+            &shorten(&thread_label(thread), MAP_TITLE_CHARS),
+            FontId::proportional(12.0),
+            palette::monument_label(),
+            Priority::Anchor,
+        );
+    }
+
+    // 3. Districts — the rest of the wayfinding skeleton, largest first.
+    let mut districts: Vec<(f32, &LogicalPath, &MapShape)> = base
+        .geometry
+        .districts
+        .iter()
+        .filter(|(path, shape)| {
+            vis.intersects(shape.bounds)
+                && !path.is_root()
+                && path.depth() <= DISTRICT_DEPTH_PER_TIER[rank]
+                // A district smaller than its own label is noise at this zoom.
+                && shape.diameter() * scale >= 44.0
+        })
+        .map(|(path, shape)| (shape.diameter(), path, shape))
+        .collect();
+    districts.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    for (_, path, shape) in districts {
         let name = path.file_name().unwrap_or_else(|| path.as_str());
         label(
             painter,
@@ -975,50 +1433,72 @@ fn draw_labels(
         );
     }
 
-    // 3. Threads waiting on a human get a name on the map, because that is what
-    //    the product is for (PRD §1, §11.2).
-    for thread in snapshot.waiting() {
-        let Some(centre) = thread.territory.centre_of_mass else {
-            continue;
-        };
+    // 4. Files. Only at the tier where a building can carry a name, only where
+    //    the building is wide enough to carry it, and **most recently touched
+    //    first** — the map names what is happening now, and the budget stops it
+    //    before it names the whole session's history.
+    if tier != ZoomTier::Building {
+        return;
+    }
+    let mut files: Vec<(Option<Instant>, &LogicalPath, &MapShape)> = base
+        .geometry
+        .buildings
+        .iter()
+        .filter(|(path, shape)| {
+            vis.intersects(shape.bounds)
+                && (shape.diameter() * scale >= NAMEABLE_BUILDING_PX
+                    // The one the operator is pointing at or has selected is an
+                    // answer to a question and is never too small to name.
+                    || state.selected.as_ref() == Some(*path)
+                    || state.hovered.as_ref() == Some(*path))
+        })
+        .filter_map(|(path, shape)| {
+            let picked =
+                state.selected.as_ref() == Some(path) || state.hovered.as_ref() == Some(path);
+            let touched = snapshot.file(path).and_then(|f| f.last_touched);
+            (picked || touched.is_some()).then(|| {
+                // A picked building sorts above every touched one, whenever it
+                // was last written to.
+                (picked.then_some(snapshot.at).or(touched), path, shape)
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    for (_, path, shape) in files {
+        if placer.remaining() == 0 {
+            break;
+        }
+        let name = path.file_name().unwrap_or_else(|| path.as_str());
         label(
             painter,
             placer,
-            camera.to_screen(base.to_map(centre)) - Vec2::new(0.0, 26.0),
-            &thread_label(thread),
-            FontId::proportional(12.0),
-            palette::monument_label(),
-            Priority::Anchor,
+            camera.to_screen(shape.centre),
+            name,
+            FontId::monospace(11.0),
+            palette::file_label(),
+            Priority::Detail,
         );
     }
+}
 
-    // 4. Files. Only at the tier where a building can carry a name, and only
-    //    those that are live or selected — everything else is decluttered by
-    //    not being a candidate in the first place, which is cheaper than
-    //    placing and dropping it.
-    if tier == ZoomTier::Building {
-        for (path, shape) in &base.geometry.buildings {
-            if !vis.intersects(shape.bounds) {
-                continue;
-            }
-            let interesting = snapshot.file(path).is_some()
-                || state.selected.as_ref() == Some(path)
-                || state.hovered.as_ref() == Some(path);
-            if !interesting {
-                continue;
-            }
-            let name = path.file_name().unwrap_or_else(|| path.as_str());
-            label(
-                painter,
-                placer,
-                camera.to_screen(shape.centre),
-                name,
-                FontId::monospace(11.0),
-                palette::file_label(),
-                Priority::Detail,
-            );
-        }
+/// The most characters of a thread's title the **map** draws.
+///
+/// The rail has a column and can wrap; the map has a building. A generated
+/// title runs to whatever the session was about — *"Ultracode CSS tokens and
+/// manifest bug"* — and at 12 pt that is a 260-pixel bar of type lying across
+/// four districts, forced into place because a waiting thread is
+/// [`Priority::Anchor`]. Twenty-two characters is enough to tell four threads
+/// apart, which is all the map is being asked for; the rail has the rest.
+const MAP_TITLE_CHARS: usize = 22;
+
+/// Truncates on a character boundary, with an ellipsis when it cut.
+fn shorten(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        return text.to_owned();
     }
+    let mut out: String = text.chars().take(chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// A short, stable name for a thread.
@@ -1103,6 +1583,64 @@ pub fn legend(ui: &mut egui::Ui) {
 mod tests {
     use super::*;
     use polis_events::WorkerId;
+
+    /// PRD §12's *"shared selection and highlight state"*, in both directions.
+    ///
+    /// The rail is drawn before the map, so a single field would let the map
+    /// light a rail row and never the other way round. The swap is what makes
+    /// the two symmetrical, and this is the test that would have caught the
+    /// half-working version.
+    #[test]
+    fn a_hover_written_by_either_view_is_read_by_the_other() {
+        let a = ThreadId::of_session(polis_events::SessionId::new("a"));
+        let b = ThreadId::of_session(polis_events::SessionId::new("b"));
+        let mut state = ViewState::default();
+
+        // Nothing pointed at, nothing highlighted.
+        state.begin_frame();
+        assert_eq!(state.hovered_thread(), None);
+        assert!(!state.emphasises(&a));
+
+        // The rail writes; the next frame is when every view reads it.
+        state.hover_thread(&a);
+        state.begin_frame();
+        assert_eq!(state.hovered_thread(), Some(&a));
+        assert!(state.emphasises(&a));
+        assert!(!state.emphasises(&b));
+
+        // The map writes; the rail reads the same value on the same terms.
+        state.hover_thread(&b);
+        state.begin_frame();
+        assert_eq!(state.hovered_thread(), Some(&b));
+
+        // The pointer leaves both views: nobody writes, and the highlight
+        // clears itself rather than sticking to the last thing touched.
+        state.begin_frame();
+        assert_eq!(state.hovered_thread(), None);
+
+        // Selection outlives the pointer, which is the difference between the
+        // two and the reason they are separate fields.
+        state.selected_thread = Some(a.clone());
+        state.begin_frame();
+        assert!(state.emphasises(&a));
+        assert_eq!(state.hovered_thread(), None);
+    }
+
+    /// Following and selecting are different verbs (PRD §12): an operator can
+    /// read about one thread while the camera is bound to another.
+    #[test]
+    fn selection_and_follow_are_not_the_same_field() {
+        let a = ThreadId::of_session(polis_events::SessionId::new("a"));
+        let b = ThreadId::of_session(polis_events::SessionId::new("b"));
+        let state = ViewState {
+            follow: Some(a.clone()),
+            selected_thread: Some(b.clone()),
+            ..ViewState::default()
+        };
+        assert!(state.emphasises(&b));
+        assert!(!state.emphasises(&a));
+        assert_eq!(state.follow.as_ref(), Some(&a));
+    }
 
     #[test]
     fn a_worker_eases_toward_its_target_and_then_settles() {

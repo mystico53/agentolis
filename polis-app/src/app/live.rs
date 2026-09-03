@@ -836,16 +836,47 @@ pub fn strip(ui: &mut egui::Ui, feed: &LiveFeed, snapshot: &WorldSnapshot, now: 
 
         // The headline is the roster's when there is one — it counts sessions on
         // disk, so it is right in the first second, before a single event has
-        // arrived — and the world's thread count once events are landing.
+        // arrived — and the world's own counts once events are landing.
+        //
+        // # Why this is not `snapshot.threads.len()` any more
+        //
+        // It used to read `{threads} on the map · {live} live`, and both halves
+        // were wrong at once.
+        //
+        // *On the map* counted every thread in the world, including the ones the
+        // status rail is explicitly drawing **because they are not on the map** —
+        // PRD §6.2's *"the thread renders with no cloud — an unplaced marker in
+        // the status rail"*. Watching `qurio-toolset` with eight real sessions
+        // the strip said "7 on the map" while four of those seven rows read
+        // `unplaced`. Two panels, one frame, two answers.
+        //
+        // *Live* was [`polis_world::ThreadStatus::is_live`], which is "not
+        // done"; nothing in a transcript ends a session, so without hooks
+        // registered no thread is ever done and the number was arithmetically
+        // equal to the first one. Printing the same integer twice under two
+        // names is PRD §17's test failed twice — it cannot change a decision,
+        // and it makes the strip look like it is disagreeing with itself.
+        //
+        // The three numbers here are three different numbers, and the first two
+        // sum to the rail's own row count *by construction*, because both
+        // panels ask [`polis_world::territory::Territory::placement`].
         let drawn = snapshot.threads.len();
+        let placed = snapshot
+            .threads
+            .iter()
+            .filter(|t| t.territory.placement().is_somewhere())
+            .count();
         let headline = match (&report.roster, drawn) {
             (_, n) if n > 0 => {
-                let alive = snapshot
+                let working = snapshot
                     .threads
                     .iter()
-                    .filter(|t| t.status.is_live())
+                    .filter(|t| t.status == ThreadStatus::Working)
                     .count();
-                format!("{n} on the map · {alive} live")
+                format!(
+                    "{placed} on the map · {} unplaced · {working} working",
+                    n - placed
+                )
             }
             (Some(roster), _) => roster.headline(),
             (None, _) => "waiting for an agent…".to_owned(),
@@ -854,7 +885,15 @@ pub fn strip(ui: &mut egui::Ui, feed: &LiveFeed, snapshot: &WorldSnapshot, now: 
             palette::needs_decision().color()
         } else {
             palette::worker().color()
-        }));
+        }))
+        .on_hover_text(
+            "On the map: threads whose evidence names a place — PRD §6.2's converged district or \
+             §6.4's lobes — so they have a territory to draw. PRD §10.4's cap then decides how \
+             many of those get a cloud this frame; the status bar's `N clouds` is that number. \
+             Unplaced: the rest, which is exactly the set the rail marks `unplaced`; the two \
+             always sum to the rail's row count. Working: threads making tool calls, as opposed \
+             to waiting on you or idle.",
+        );
 
         ui.label(dim(format!(
             "{} events · last {}",

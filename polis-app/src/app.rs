@@ -1024,6 +1024,7 @@ impl PolisApp {
         // PRD §12's shared highlight is double-buffered, and this is the swap:
         // it publishes what the rail and the map said about the pointer last
         // frame, before either of them draws this one.
+        scene.view.begin_frame();
         // The dock goes in after `polis-title` and before `polis-rail`, so the
         // map keeps `available_rect_before_wrap()` and neither panel has to know
         // about the other.
@@ -1080,6 +1081,7 @@ impl PolisApp {
         let mut jump: Option<drill::Jump> = None;
         let mut panel = ui::PanelAction::default();
         let mut subject: Option<LogicalPath> = None;
+        let mut dismissed: Option<polis_events::ThreadId> = None;
         if self.overlay.rail {
             egui::Panel::right("polis-rail")
                 .default_size(370.0)
@@ -1112,9 +1114,29 @@ impl PolisApp {
                                 panel = ui::building_panel(ui, &snapshot, path);
                                 ui.separator();
                             }
-                            ui::status_rail(ui, &snapshot, &mut scene.view);
+                            dismissed = ui::status_rail(ui, &snapshot, &mut scene.view);
                         });
                 });
+        }
+        // The operator closing a thread by hand. Applied here, once the rail has
+        // released its borrow of the scene, and published straight away rather
+        // than waiting for the next pump: `publish` is rate-limited, and a `✕`
+        // whose row is still there a beat later reads as a button that missed.
+        if let Some(thread) = dismissed {
+            scene.world.dismiss_thread(&thread);
+            if scene.view.follow.as_ref() == Some(&thread) {
+                scene.view.follow = None;
+            }
+            // And the shared highlight, for the same reason: a selection that
+            // outlived its row would keep the rail and the map lit for a thread
+            // neither of them can now show.
+            if scene.view.selected_thread.as_ref() == Some(&thread) {
+                scene.view.selected_thread = None;
+            }
+            self.overlay.attention_cursor = None;
+            scene.publisher.force(&scene.world);
+            scene.snapshot = scene.reader.load();
+            ui.ctx().request_repaint();
         }
         if keys.attention {
             jump = self.overlay.next_attention(&snapshot);

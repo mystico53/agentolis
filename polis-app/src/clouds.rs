@@ -63,7 +63,7 @@
 )]
 
 use eframe::egui::{self, Color32, Rect};
-use polis_render::live::{self, CloudField, CloudKernel, CloudTween, CLOUD_CROWD, CLOUD_TONES};
+use polis_render::live::{self, CloudField, CloudKernel, CloudTween, CLOUD_CROWD};
 use polis_render::raster::Canvas;
 use polis_world::snapshot::WorldSnapshot;
 use polis_world::territory::{self, Territory};
@@ -110,6 +110,10 @@ pub struct Clouds {
     pub kernels: usize,
     /// How many territories got a cloud.
     pub shown: usize,
+    /// `polis_render::live::thread_slot` per visible territory, in the order
+    /// the kernels' `thread` field indexes — so a cloud is drawn in its own
+    /// thread's hue and matches that thread's swatch in the rail.
+    tints: Vec<u8>,
     /// Texels two or more territories both claim — PRD §6.4's contention signal,
     /// visible before a write collides.
     pub contested: usize,
@@ -142,6 +146,7 @@ impl Default for Clouds {
             settled: false,
             kernels: 0,
             shown: 0,
+            tints: Vec::new(),
             contested: 0,
             build_ms: 0.0,
         }
@@ -271,8 +276,14 @@ impl Clouds {
         dt: f32,
     ) -> Option<(&egui::TextureHandle, Rect)> {
         if self.generation != snapshot.generation || self.cap != cap {
-            self.target =
-                Self::target_field(base, snapshot, cap, &mut self.kernels, &mut self.shown);
+            self.target = Self::target_field(
+                base,
+                snapshot,
+                cap,
+                &mut self.kernels,
+                &mut self.shown,
+                &mut self.tints,
+            );
             self.generation = snapshot.generation;
             self.cap = cap;
             self.settled = false;
@@ -308,6 +319,7 @@ impl Clouds {
         cap: usize,
         kernels_out: &mut usize,
         shown_out: &mut usize,
+        tints_out: &mut Vec<u8>,
     ) -> Option<CloudField> {
         let pairs: Vec<(&polis_world::Thread, &Territory)> = snapshot
             .threads
@@ -316,6 +328,22 @@ impl Clouds {
             .collect();
         let visible = territory::visible_clouds(&pairs, cap);
         *shown_out = visible.len();
+        // Whose each cloud is. `visible_clouds` returns territories and the hue
+        // is the *thread's*, so each is matched back to the pair it came from —
+        // the rank a kernel carries is a grouping index for the field sampler
+        // and must stay one, or two threads that hash to the same hue would be
+        // summed as one territory and PRD §6.4's crowd signal would go quiet.
+        tints_out.clear();
+        for territory in &visible {
+            tints_out.push(
+                pairs
+                    .iter()
+                    .find(|(_, t)| std::ptr::eq(*t, *territory))
+                    .map_or(live::NO_TINT, |(thread, _)| {
+                        live::thread_slot(thread.id.as_str())
+                    }),
+            );
+        }
         // Where one thread's field has separated into lobes, bridge them.
         // See `bridge_lobes`.
         let mut bridges: Vec<Vec<(polis_layout::Point, f32)>> = Vec::with_capacity(visible.len());
@@ -380,7 +408,7 @@ impl Clouds {
             return;
         };
 
-        let bands = field.bands();
+        let bands = field.bands_tinted(&self.tints);
         self.contested = bands
             .crowd
             .iter()
@@ -402,10 +430,15 @@ impl Clouds {
             .0
             .iter()
             .map(|p| {
-                if CLOUD_TONES.contains(p) {
-                    Color32::from_rgb(p[0], p[1], p[2])
-                } else {
+                // Opaque where a mark landed. Keyed on the canvas's own clear
+                // value rather than on a list of tones: with a hue per thread
+                // there is no fixed list any more, and a membership test would
+                // have quietly dropped every tinted pixel — which is to say,
+                // every cloud.
+                if *p == NOTHING {
                     Color32::TRANSPARENT
+                } else {
+                    Color32::from_rgb(p[0], p[1], p[2])
                 }
             })
             .collect();

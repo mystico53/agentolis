@@ -36,13 +36,20 @@
 //!
 //! PRD §11.4: *"Colour alone is never the sole channel for any state."* So the
 //! palette is deliberately thin — the shape of a glyph carries the operation
-//! (§10.1), its position carries the subject, and colour carries only the
-//! outcome (§10.2) and the layer. Where a state matters it also has a distinct
-//! shape: a decision is a pin, contention is a link between two places, done is
-//! a ring.
+//! (§10.1), its position carries the subject, and colour carries the outcome
+//! (§10.2), the layer, and **identity**. Where a state matters it also has a
+//! distinct shape: a decision is a pin, contention is a link between two
+//! places, done is a ring.
+//!
+//! Identity is the one thing colour is allowed to be the *fast* channel for,
+//! and it is still not the only one. [`thread`] gives a thread a hue for its
+//! whole life ([`polis_render::live::THREAD_HUES`]); the rail prints its name
+//! beside the swatch, the map keeps it at its own place, and hovering either
+//! highlights the other. A reader who cannot see the hue at all loses no state
+//! — only the shortcut.
 
 use eframe::egui::Color32;
-use polis_events::Outcome;
+use polis_events::{Outcome, ThreadId};
 use polis_render::{live, plan};
 use polis_world::ThreadStatus;
 
@@ -273,6 +280,61 @@ pub fn anchor() -> Ink {
     Ink::agent(live::AGENT_ANCHOR)
 }
 
+// ---------------------------------------------------------------------------
+// Identity — one thread, one colour, everywhere it appears
+// ---------------------------------------------------------------------------
+
+/// The hue slot a thread owns, from its own id.
+///
+/// `polis_render::live::thread_slot`, so the window and the headless renderer
+/// paint the same thread the same colour — the same rule as everything else in
+/// this module, and it matters more here than anywhere: a colour that meant one
+/// thread in the window and another in a recorded GIF would be worse than no
+/// colour at all.
+pub fn thread_slot(id: &ThreadId) -> u8 {
+    live::thread_slot(id.as_str())
+}
+
+/// A thread's own colour, at the brightness of the thing being drawn.
+///
+/// `role` is a `polis_render::live` band constant — [`live::AGENT_BODY`],
+/// [`live::AGENT_TRAIL`], [`live::AGENT_TETHER`], [`live::AGENT_ANCHOR`], a
+/// [`live::CLOUD_TONES`] entry. Only its peak channel is read, so the layer
+/// budget is the role's and the hue is the thread's.
+pub fn thread_ink(slot: u8, role: [u8; 3]) -> Ink {
+    let rgb = live::thread_ink(slot, role);
+    // The band is still the role's, and the `Ink` constructor is still what
+    // enforces it — identity does not get to pick a layer.
+    if role.iter().copied().max().unwrap_or(0) <= plan::CLOUD_BAND.1 {
+        Ink::cloud(rgb)
+    } else {
+        Ink::agent(rgb)
+    }
+}
+
+/// A thread's body colour: the rail swatch, the agent, the anchor ring.
+///
+/// The brightest of the thread's inks, because this is the one that has to be
+/// matched by eye between a rectangle in the rail and a mark on the map.
+pub fn thread(slot: u8) -> Ink {
+    thread_ink(slot, live::AGENT_BODY)
+}
+
+/// A thread's trail.
+pub fn thread_trail(slot: u8) -> Ink {
+    thread_ink(slot, live::AGENT_TRAIL)
+}
+
+/// A thread's tethers.
+pub fn thread_tether(slot: u8) -> Ink {
+    thread_ink(slot, live::AGENT_TETHER)
+}
+
+/// A thread's anchor ring.
+pub fn thread_anchor(slot: u8) -> Ink {
+    thread_ink(slot, live::AGENT_ANCHOR)
+}
+
 /// The rail colour for a thread's status. Paired with a text label in the rail,
 /// so colour is never the only channel.
 pub fn status(status: ThreadStatus) -> Ink {
@@ -476,6 +538,79 @@ mod tests {
             plan::CLOUD_BAND.1,
             "black cloud",
         );
+    }
+
+    /// The window's thread colour is the renderer's thread colour, at every
+    /// role. Two visual languages here would be the worst kind: the operator
+    /// learns "the blue one is the refactor" from the window and then reads a
+    /// recorded frame in which blue is somebody else.
+    #[test]
+    fn a_threads_colour_is_the_renderers_and_not_a_second_one() {
+        for slot in 0..12u8 {
+            for role in [
+                live::AGENT_BODY,
+                live::AGENT_TRAIL,
+                live::AGENT_TETHER,
+                live::AGENT_ANCHOR,
+                live::CLOUD_TONES[0],
+                live::CLOUD_TONES[1],
+                live::CLOUD_TONES[2],
+            ] {
+                assert_eq!(
+                    channels(thread_ink(slot, role)),
+                    live::thread_ink(slot, role),
+                    "slot {slot} on role {role:?}"
+                );
+            }
+        }
+    }
+
+    /// Identity is clamped like everything else here: a thread's colour cannot
+    /// walk its layer out of the band PRD §10.3 gave it.
+    #[test]
+    fn every_thread_ink_stays_in_its_band() {
+        for slot in 0..12u8 {
+            assert_in(thread(slot), plan::AGENT_BAND.0, plan::AGENT_BAND.1, "body");
+            assert_in(
+                thread_trail(slot),
+                plan::AGENT_BAND.0,
+                plan::AGENT_BAND.1,
+                "trail",
+            );
+            assert_in(
+                thread_tether(slot),
+                plan::AGENT_BAND.0,
+                plan::AGENT_BAND.1,
+                "tether",
+            );
+            assert_in(
+                thread_anchor(slot),
+                plan::AGENT_BAND.0,
+                plan::AGENT_BAND.1,
+                "anchor",
+            );
+            for tone in live::CLOUD_TONES {
+                assert_in(
+                    thread_ink(slot, tone),
+                    plan::CLOUD_BAND.0,
+                    plan::CLOUD_BAND.1,
+                    "cloud",
+                );
+            }
+        }
+    }
+
+    /// The rail swatch and the agent body are the **same triple**, not two
+    /// colours that look alike — the match the operator is asked to make by eye
+    /// between a rectangle in the panel and a mark on the map is exact.
+    #[test]
+    fn the_rail_swatch_is_the_same_triple_as_the_agent_on_the_map() {
+        for slot in 0..12u8 {
+            assert_eq!(
+                channels(thread(slot)),
+                live::thread_ink(slot, live::AGENT_BODY)
+            );
+        }
     }
 
     /// Bands do not overlap, so a mark's layer is readable from its luminance

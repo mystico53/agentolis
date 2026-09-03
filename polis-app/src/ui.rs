@@ -330,6 +330,111 @@ pub fn status_bar(ui: &mut egui::Ui, snapshot: &WorldSnapshot, vitals: Vitals) -
     open_attention
 }
 
+/// The thread's own colour, as a rectangle at the head of its row.
+///
+/// > i'd like one thread to be one color […] matching that color also in the
+/// > rail with a rectangle and a matching hover.
+///
+/// Deliberately a **filled rectangle** and not a tinted label: a swatch is a
+/// patch of flat colour with nothing else in it, which is the only shape whose
+/// hue can be matched by eye against a cloud or an agent mark out on the map.
+/// Tinting the thread's name instead would put the hue behind antialiased
+/// glyph edges, where it composites with the panel and stops being the same
+/// colour it is on the map.
+///
+/// The colour is `palette::thread`, which is the agent band's own brightness —
+/// so this rectangle and that thread's agent body are the identical triple, and
+/// the match the operator is asked to make is exact rather than approximate.
+fn swatch(ui: &mut egui::Ui, tint: u8) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(9.0, 13.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 1.5, palette::thread(tint).color());
+}
+
+/// How many places a lobed thread names before it says "+N".
+///
+/// Two. The row already carries a status word, a title, a worker count, a call
+/// count, a failure count and a diff; a third and fourth district name past the
+/// two heaviest stops changing a decision and starts wrapping the row (PRD §17).
+const PLACES_NAMED: usize = 2;
+
+/// Where a thread is working, as one line of the rail (PRD §6.2, §6.4).
+///
+/// The rail's job here is to answer *where*, and for most of this product's life
+/// it could only answer it for a thread with a single converged ancestor. Every
+/// other thread — including an orchestrator with seventeen workers and 648 tool
+/// calls, spread over `src/components`, `src/hooks` and `tests` — read
+/// **`unplaced`**, in the same frame in which its cloud was on the map. That is
+/// the rail contradicting the map about the same thread, and it is what the
+/// operator was looking at when they said they could see no distinction between
+/// agents.
+///
+/// So the three states are drawn as three states:
+///
+/// * a claim — `in src/services`;
+/// * lobes — `in src/components, src/hooks +1`, heaviest first, with the full
+///   list and each lobe's share of the thread's weight on hover, because
+///   §6.4's lobes are *weighted* and a minor lobe should read as minor;
+/// * nowhere — `unplaced`, which is a real state and keeps §6.2's honest
+///   reason on hover: the observation count, the ancestor's depth and the mass
+///   ratio, so "why has this no cloud" has an answer and not a shrug.
+fn place_of(ui: &mut egui::Ui, thread: &polis_world::Thread) {
+    use polis_world::territory::Placement;
+
+    match thread.territory.placement() {
+        Placement::Claim(claim) => {
+            ui.label(dim(format!("in {}", claim.as_str())))
+                .on_hover_text(
+                    "PRD §6.2: the observations agree on one ancestor, so the thread has one \
+                     district and one cloud.",
+                );
+        }
+        Placement::Lobes(lobes) => {
+            let named = lobes
+                .iter()
+                .take(PLACES_NAMED)
+                .map(|l| l.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rest = lobes.len().saturating_sub(PLACES_NAMED);
+            let line = if rest == 0 {
+                format!("in {named}")
+            } else {
+                format!("in {named} +{rest}")
+            };
+            let detail = lobes
+                .iter()
+                .map(|l| format!("  {} — {:.0}% of its work", l.path.as_str(), l.mass * 100.0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ui.label(dim(line)).on_hover_text(format!(
+                "Working in {} places at once, so no single ancestor above the repository root \
+                 describes it and PRD §6.2's claim is empty. PRD §6.4 draws it as lobes joined \
+                 by a thin band — one entity, several centres.\n\n{detail}",
+                lobes.len()
+            ));
+        }
+        Placement::Nowhere => {
+            // PRD §6.2 asks for the reason, not just the absence.
+            let c = thread.territory.convergence();
+            ui.label(
+                RichText::new("unplaced")
+                    .small()
+                    .color(palette::needs_decision().color()),
+            )
+            .on_hover_text(format!(
+                "No territory yet: {} observations, ancestor depth {}, mass ratio {:.2}, and no \
+                 cluster heavy enough to be a lobe. PRD §6.2 emits at depth ≥ 2 and mass > 0.70; \
+                 PRD §6.4's lobes need {:.0}% of the weight in one place.",
+                c.observations,
+                c.depth,
+                c.mass_ratio,
+                polis_world::territory::MIN_LOBE_MASS * 100.0,
+            ));
+        }
+    }
+}
+
 /// The status rail: one row per thread (PRD §6.2, §11).
 ///
 /// A thread whose territory has not converged has **no cloud on the map** and
@@ -337,55 +442,101 @@ pub fn status_bar(ui: &mut egui::Ui, snapshot: &WorldSnapshot, vitals: Vitals) -
 ///
 /// > Until then the thread renders with no cloud — an unplaced marker in the
 /// > status rail.
-pub fn status_rail(ui: &mut egui::Ui, snapshot: &WorldSnapshot, state: &mut ViewState) {
+///
+/// Returns the thread the operator closed with `✕`, if any.
+///
+/// # Why there is a close button on a map that decays by itself
+///
+/// Every rule that takes a thread off this rail is a rule about *silence*, and
+/// silence is the only evidence a transcript can give: there is no session-end
+/// record, so a session the operator closed an hour ago and one sitting at a
+/// prompt look identical (`polis_world::World::retire_threads`). The operator is
+/// the one party who knows which, and this is the only way to say so. It is not
+/// a filter and it remembers nothing — `polis_world::World::dismiss_thread`
+/// forgets the thread outright, so the next event for that session brings the
+/// row back exactly as a first sighting would.
+pub fn status_rail(
+    ui: &mut egui::Ui,
+    snapshot: &WorldSnapshot,
+    state: &mut ViewState,
+) -> Option<ThreadId> {
     ui.label(heading("THREADS"));
     if snapshot.threads.is_empty() {
         ui.label(dim("no threads yet"));
     }
+    let mut dismissed = None;
     for thread in &snapshot.threads {
+        // A session that has made no tool call has told Polis nothing. It gets a
+        // transcript the moment it starts — a title record, a mode record — so a
+        // freshly-opened terminal, or one the operator opened and never used,
+        // arrives here as a row reading "thread 15dd6e8a · unplaced · 0 workers
+        // · 0 calls · 0 fail". The operator's report was exact: *"i currently
+        // have only one terminal open in that directory. not sure why i see
+        // those"*, and *"the ones saying idle are completely unclear what they
+        // are doing"* — which is the honest reading, because they are not doing
+        // anything.
+        //
+        // PRD §17: *"does it change a decision? If not, cut it."* A thread with
+        // no activity cannot change one, and it costs a row that a working
+        // thread needs. It is still counted in the status strip, so the map
+        // never silently forgets a session it can see.
+        if thread.tool_calls == 0 && thread.workers.is_empty() {
+            continue;
+        }
         let ink = palette::status(thread.status);
+        let tint = palette::thread_slot(&thread.id);
         let following = state.follow.as_ref() == Some(&thread.id);
-        let response = ui
-            .horizontal(|ui| {
+        let emphasised = state.emphasises(&thread.id);
+        let head = ui.horizontal(|ui| {
+            swatch(ui, tint);
+            ui.label(
+                RichText::new(status_word(thread.status))
+                    .monospace()
+                    .color(ink.color()),
+            );
+            ui.label(
+                RichText::new(thread_label(thread))
+                    .color(palette::selection().color())
+                    .strong(),
+            );
+            if following {
                 ui.label(
-                    RichText::new(status_word(thread.status))
-                        .monospace()
-                        .color(ink.color()),
+                    RichText::new("following")
+                        .small()
+                        .color(palette::hover().color()),
                 );
-                ui.label(
-                    RichText::new(thread_label(thread))
-                        .color(palette::selection().color())
-                        .strong(),
-                );
-                if following {
-                    ui.label(
-                        RichText::new("following")
-                            .small()
-                            .color(palette::hover().color()),
-                    );
-                }
-            })
-            .response;
+            }
+            // Right-aligned, and the only control on the row: a destructive
+            // action that sat next to the label would be hit by an operator
+            // reaching for "follow this one".
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let x = ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✕")
+                                    .monospace()
+                                    .color(palette::status(ThreadStatus::Idle).color()),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(
+                            "Close this thread. Nothing is remembered, so its next event                              brings it back.",
+                        );
+                    (x.clicked(), x.rect)
+                },
+            )
+            .inner
+        });
+        let (closed, close_rect) = head.inner;
+        if closed {
+            dismissed = Some(thread.id.clone());
+        }
+        let top = head.response.rect.top();
         ui.horizontal(|ui| {
             ui.add_space(10.0);
-            if let Some(claim) = &thread.territory.claim {
-                ui.label(dim(format!("in {}", claim.as_str())));
-            } else {
-                {
-                    // PRD §6.2 asks for the reason, not just the absence.
-                    let c = thread.territory.convergence();
-                    ui.label(
-                        RichText::new("unplaced")
-                            .small()
-                            .color(palette::needs_decision().color()),
-                    )
-                    .on_hover_text(format!(
-                        "No territory yet: {} observations, ancestor depth {}, mass ratio \
-                         {:.2}. PRD §6.2 emits at depth ≥ 2 and mass > 0.70.",
-                        c.observations, c.depth, c.mass_ratio
-                    ));
-                }
-            }
+            place_of(ui, thread);
             ui.label(dim(format!(
                 "{} workers · {} calls · {} fail · +{} -{}",
                 thread.workers.len(),
@@ -408,12 +559,66 @@ pub fn status_rail(ui: &mut egui::Ui, snapshot: &WorldSnapshot, state: &mut View
                 });
             }
         }
-        if response.clicked() {
+        // The **whole block** is the row, not just its header line: the place
+        // an operator's pointer lands when they mean "that thread" is as often
+        // on `in src/services · 32 workers` as on the title, and a 26-pixel
+        // target inside a 120-pixel row is a hit area that reads as broken. It
+        // is still stopped short of the `✕`, which is a different verb and a
+        // destructive one — an operator reaching for "follow this one" must not
+        // find it.
+        //
+        // `interact` rather than the `horizontal`'s own response, because a
+        // `Ui` scope senses hover only and its `clicked()` is never true:
+        // click-to-follow here did nothing at all.
+        let target = egui::Rect::from_min_max(
+            egui::Pos2::new(ui.max_rect().left(), top),
+            egui::Pos2::new(close_rect.left() - 4.0, ui.min_rect().bottom()),
+        );
+        let hit = ui.interact(
+            target,
+            ui.id().with(("thread", thread.id.as_str())),
+            egui::Sense::click(),
+        );
+        if hit.hovered() {
+            // PRD §12's shared highlight, written from the rail; the map lights
+            // that thread's marks up when it reads it.
+            state.hover_thread(&thread.id);
+        }
+        // Painted from the shared state as well as from this frame's pointer,
+        // so a row lights up identically whether the pointer is on the row or
+        // out on that thread's cloud — which is the whole of "and vice versa".
+        // Two weights, because a selection outlives the pointer and a hover
+        // does not.
+        if emphasised || hit.hovered() {
+            let selected = state.selected_thread.as_ref() == Some(&thread.id);
+            let wash = if selected { 0.14 } else { 0.09 };
+            ui.painter()
+                .rect_filled(target, 2.0, palette::thread(tint).alpha(wash));
+            // A bar down the left edge in the thread's own colour. The wash
+            // alone is a colour difference and nothing else, which a
+            // colour-blind operator and a downscaled screenshot both lose; the
+            // bar is an edge, and an edge survives both (PRD §11.4).
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    target.min,
+                    egui::Pos2::new(target.min.x + 3.0, target.max.y),
+                ),
+                0.0,
+                palette::thread(tint).alpha(if selected { 1.0 } else { 0.75 }),
+            );
+        }
+        if hit.clicked() {
+            // One click does both verbs, because on this row they are one
+            // intention: "this thread". Follow toggles — it owns the camera and
+            // an operator must be able to give it back — while the selection
+            // moves to whatever was clicked last, so the map's highlight always
+            // matches the row the operator just used.
             state.follow = if following {
                 None
             } else {
                 Some(thread.id.clone())
             };
+            state.selected_thread = Some(thread.id.clone());
         }
         ui.separator();
     }
@@ -429,6 +634,7 @@ pub fn status_rail(ui: &mut egui::Ui, snapshot: &WorldSnapshot, state: &mut View
             );
         }
     }
+    dismissed
 }
 
 /// The attention list: every live state, worst first, one click from the thing

@@ -1335,7 +1335,18 @@ fn answered(
     at: Instant,
 ) {
     if denied(raw, record) {
-        needs_decision(world, thread, DecisionSource::Rejected, at, None);
+        // A rejection is an ANSWER, not a question. `DecisionSource::Rejected`'s
+        // own contract says its evidence "arrives with the operator's answer
+        // rather than with the question" — so raising it as a pending decision
+        // tells the operator they owe a reply to something they already
+        // declined. On their live map it rendered as "WAITING ON YOU · you said
+        // no", which is a contradiction in four words, and PRD §11.2a reserves
+        // that state for a thread that is genuinely blocked on a human.
+        //
+        // Resolving instead: any decision this thread was waiting on is now
+        // settled, so the pin comes down rather than a second one going up.
+        world.resolve_decisions(thread);
+        let _ = at;
         return;
     }
     let is_tool_result = blocks(record)

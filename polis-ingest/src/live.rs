@@ -88,7 +88,7 @@ pub const WORKING_WINDOW: Duration = Duration::from_secs(45);
 /// It is not proof the session ended — nothing in the transcript is — so this is
 /// the point at which Polis stops paying to follow it, not the point at which it
 /// claims the agent went away.
-pub const LIVE_WINDOW: Duration = Duration::from_mins(30);
+pub const LIVE_WINDOW: Duration = Duration::from_mins(8);
 
 /// Most bytes of an already-running session's history read at attach time, per
 /// file.

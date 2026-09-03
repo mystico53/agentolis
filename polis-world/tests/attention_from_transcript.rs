@@ -270,9 +270,21 @@ fn a_denied_tool_call_proves_the_operator_was_asked() {
         t0,
         &serde_json::json!({ "toolDenialKind": "user-rejected" }),
     ));
-    assert_eq!(decisions(&w), vec![DecisionSource::Rejected]);
-    assert!(!DecisionSource::Rejected.onset_is_exact());
-    assert_eq!(w.threads[&thread()].status, ThreadStatus::Waiting);
+    // A denial is the ANSWER, not the question. It used to raise a pending
+    // decision, which rendered on the operator's live map as "WAITING ON YOU ·
+    // you said no" — telling them they owed a reply to something they had
+    // already declined. Their report was exact: *"this says waiting for me, but
+    // the chat says done"*. PRD §11.2a reserves that state for a thread
+    // genuinely blocked on a human, so the evidence now RESOLVES.
+    assert!(
+        decisions(&w).is_empty(),
+        "a rejection is an answer and must not raise a pending decision"
+    );
+    assert_ne!(
+        w.threads[&thread()].status,
+        ThreadStatus::Waiting,
+        "the operator already answered, so the thread is not waiting on them"
+    );
 }
 
 #[test]
@@ -292,7 +304,12 @@ fn an_interrupt_is_the_same_evidence() {
             }
         }),
     ));
-    assert_eq!(decisions(&w), vec![DecisionSource::Rejected]);
+    // Same reasoning as a denial: an interrupt is the operator acting, not the
+    // operator being asked.
+    assert!(
+        decisions(&w).is_empty(),
+        "an interrupt is the operator's own answer, not a question for them"
+    );
 }
 
 #[test]

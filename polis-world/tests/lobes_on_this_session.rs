@@ -132,3 +132,73 @@ fn a_focused_thread_still_gets_exactly_one_lobe_and_a_claim() {
     );
     assert_eq!(c.lobes.len(), 1, "and reads as one place, not many");
 }
+
+/// The operator opened `polis watch` on a repository whose three agents had
+/// gone quiet 3, 11 and 21 minutes earlier and saw an empty map, three times:
+/// *"clouds should be there immediately"*.
+///
+/// PRD §6.3's 90-second half-life leaves 25 %, 0.62 % and 0.0061 % of the field
+/// at those ages, and the last two fall under `MIN_KERNEL_WEIGHT` and are
+/// dropped. A converged territory now rests instead of vanishing.
+#[test]
+fn a_converged_territory_survives_going_quiet() {
+    let now = std::time::Instant::now();
+    let mut t = Territory::default();
+    for i in 0..12 {
+        t.observe(
+            &read("src/auth/login.rs", now + Duration::from_millis(i)),
+            1.0,
+            Some(polis_layout::Point::new(10.0, 10.0)),
+        );
+    }
+    assert!(
+        t.convergence().claim.is_some(),
+        "it converged while working"
+    );
+    let while_working: f32 = t.kernels.iter().map(|k| k.weight).sum();
+    assert!(while_working > 0.0);
+
+    // A pause inside the dormancy window — the coffee-break case, and the one
+    // the operator hit: they opened the map on a repository whose agents had
+    // just stopped and saw nothing at all.
+    t.decay(now + Duration::from_mins(5));
+
+    let resting: f32 = t.kernels.iter().map(|k| k.weight).sum();
+    assert!(
+        !t.kernels.is_empty(),
+        "the field must not be erased: an empty map is the bug"
+    );
+    assert!(
+        resting >= polis_world::territory::RESTING_WEIGHT * 0.99,
+        "a rested field has to clear CLOUD_ISO[0] or the cloud is computed and \
+         never drawn: {resting}"
+    );
+    assert!(
+        resting < while_working,
+        "and it must be fainter than a thread that is actually working: \
+         {resting} vs {while_working}"
+    );
+}
+
+/// The other half: a thread that never converged still fades away, so a stray
+/// read cannot leave a permanent smudge on the map.
+#[test]
+fn an_unconverged_scatter_still_fades() {
+    let now = std::time::Instant::now();
+    let mut t = Territory::default();
+    t.observe(
+        &read("README.md", now),
+        1.0,
+        Some(polis_layout::Point::new(1.0, 1.0)),
+    );
+    t.observe(
+        &read("docs/PRD.md", now),
+        1.0,
+        Some(polis_layout::Point::new(40.0, 40.0)),
+    );
+    t.decay(now + Duration::from_mins(21));
+    assert!(
+        t.kernels.iter().map(|k| k.weight).sum::<f32>() < polis_world::territory::RESTING_WEIGHT,
+        "nothing converged, so nothing is held up"
+    );
+}

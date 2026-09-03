@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -1821,6 +1821,87 @@ fn read_as_much_as_possible(handle: &mut File, buf: &mut [u8]) -> io::Result<usi
     Ok(filled)
 }
 
+/// Puts a live transcript record's `observed` stamp where the record was
+/// *written*, not where Polis happened to read it.
+///
+/// [`EventMeta::now`] stamps the moment of receipt, which is exactly right for a
+/// hook datagram and exactly wrong for the [`crate::live::BACKFILL_BYTES`] of
+/// history Channel D reads the instant it attaches to an already-running
+/// session. Without this, opening a window replays a session the operator closed
+/// twenty minutes ago as though it were happening now: `polis-world` stamps
+/// `last_activity` from `observed`, calls the thread **working**, and holds a
+/// rail row for a full `polis_world::THREAD_RETIRE_AFTER` — a fresh
+/// thirty-minute lease granted at attach time, however old the session really
+/// is. That is the "agents do not decay" bug, and it is one clock read.
+///
+/// # Reading a wall clock here is deliberate
+///
+/// [`WallTime::now`]'s docs reserve the system clock for the construction of a
+/// recording, because PRD §7.4 forbids one anywhere that can reach a layout.
+/// This cannot reach one: the pair is read **once, when a session is opened**,
+/// and is spent entirely on [`EventMeta::observed`], which no city, layout or
+/// geometry ever reads.
+///
+/// # A backwards step still cannot reorder the bus
+///
+/// 20% of transcript files step backwards and one observed jump was 60 seconds
+/// (ADR-0014), so byte order remains the order and the aged stamp is passed
+/// through a running maximum — the same rule [`monotonise`] applies to the
+/// recorded path, for the same reason.
+#[derive(Debug, Clone)]
+pub struct Aging {
+    mono_origin: Instant,
+    wall_origin: WallTime,
+    running: Option<Instant>,
+}
+
+impl Aging {
+    /// Pairs the two clocks. One system-clock read, once per session.
+    pub fn start() -> Self {
+        Self {
+            mono_origin: Instant::now(),
+            wall_origin: WallTime::now(),
+            running: None,
+        }
+    }
+
+    /// Where a record written at `wall` belongs on the receipt clock.
+    ///
+    /// `wall` is `None` for a record that carried no timestamp — every sidecar
+    /// record is one — and such a record keeps the stamp it arrived with, which
+    /// is the receipt time.
+    pub fn stamp(&mut self, wall: Option<WallTime>, received: Instant) -> Instant {
+        let aged = wall.map_or(received, |w| self.at(w, received));
+        let stamp = self.running.map_or(aged, |r| r.max(aged));
+        self.running = Some(stamp);
+        stamp
+    }
+
+    /// `wall` on the monotonic clock, never later than `received`: a record
+    /// cannot have been written after it was read, whatever the two clocks
+    /// disagree by, and a record appended since the session opened arrived
+    /// within one poll of being written anyway.
+    fn at(&self, wall: WallTime, received: Instant) -> Instant {
+        let behind = self
+            .wall_origin
+            .unix_millis()
+            .saturating_sub(wall.unix_millis());
+        if behind <= 0 {
+            // Written since the session was opened, or in the same millisecond
+            // it was: the record arrived within one poll of being written, so
+            // the receipt clock is already the right answer. Negative is the
+            // two clocks disagreeing, and a record cannot have been written
+            // after it was read.
+            return received;
+        }
+        let behind = Duration::from_millis(u64::try_from(behind).unwrap_or(u64::MAX));
+        // `checked_sub`, because `Instant`'s origin is the boot on Windows: a
+        // machine that has been up for less time than the session is old has
+        // nowhere further back to go, and the record keeps its receipt time.
+        self.mono_origin.checked_sub(behind).unwrap_or(received)
+    }
+}
+
 /// The mutable state shared by every file of one tailer while it emits.
 ///
 /// Bundled into one struct so [`FileTail::poll`] takes one borrow rather than
@@ -1832,6 +1913,9 @@ pub struct EmitCtx<'a> {
     /// Unknown `type` strings already reported, so a drifted session emits one
     /// control event per new type rather than one per line.
     pub reported: &'a mut BTreeSet<String>,
+    /// The session's two clocks, so backfilled history is stamped as old as it
+    /// is rather than as having just happened.
+    pub age: &'a mut Aging,
 }
 
 impl EmitCtx<'_> {
@@ -1844,9 +1928,13 @@ impl EmitCtx<'_> {
         out: &mut Vec<Event>,
     ) -> usize {
         let before = self.stats.unknown_types_seen.len();
-        let Some((event, _)) = transcript_line_parts(line, source, offset, self.stats) else {
+        let Some((mut event, wall)) = transcript_line_parts(line, source, offset, self.stats)
+        else {
             return 0;
         };
+        // History reads as history: see [`Aging`]. The record's own `timestamp`
+        // is still verbatim inside the payload for anything that wants it.
+        event.meta.observed = self.age.stamp(wall, event.meta.observed);
         if self.stats.unknown_types_seen.len() != before {
             self.report_new_drift(out);
         }
@@ -1895,6 +1983,7 @@ pub struct SessionTailer {
     tails: BTreeMap<(u8, PathBuf), FileTail>,
     stats: ParseStats,
     reported: BTreeSet<String>,
+    age: Aging,
 }
 
 impl SessionTailer {
@@ -1913,6 +2002,7 @@ impl SessionTailer {
             tails: BTreeMap::new(),
             stats: ParseStats::default(),
             reported: BTreeSet::new(),
+            age: Aging::start(),
         };
         for file in session_files(session_dir)? {
             let key = (file.rank(), file.path.clone());
@@ -1993,6 +2083,7 @@ impl SessionTailer {
         let mut ctx = EmitCtx {
             stats: &mut self.stats,
             reported: &mut self.reported,
+            age: &mut self.age,
         };
         for (key, tail) in &mut self.tails {
             match tail.poll(&mut ctx, out) {
@@ -3332,6 +3423,56 @@ mod tests {
         let mut out = Vec::new();
         let n = tailer.poll(&mut out);
         (n, out)
+    }
+
+    #[test]
+    fn backfilled_history_is_stamped_as_old_as_it_is() {
+        // The bug this exists for: Channel D reads up to `live::BACKFILL_BYTES`
+        // of an already-running session the instant it attaches, and
+        // `EventMeta::now` stamped every one of those records "now". A session
+        // the operator closed twenty minutes ago therefore arrived in
+        // `polis-world` as `working`, holding a rail row on a fresh
+        // `THREAD_RETIRE_AFTER` lease — which is the whole "agents never decay"
+        // report.
+        let mut age = Aging::start();
+        let received = Instant::now();
+        let minute_ago = WallTime::from_unix_millis(WallTime::now().unix_millis() - 60_000);
+
+        let stamped = age.stamp(Some(minute_ago), received);
+        assert!(
+            received.saturating_duration_since(stamped) >= Duration::from_secs(55),
+            "a record written a minute ago must read as a minute old, not as now"
+        );
+    }
+
+    #[test]
+    fn a_backwards_timestamp_step_still_cannot_reorder_the_bus() {
+        // 20% of transcript files step backwards and one observed jump was 60
+        // seconds (ADR-0014). Byte order is the order, so the aged stamp goes
+        // through a running maximum — exactly what `monotonise` does for the
+        // recorded path.
+        let mut age = Aging::start();
+        let received = Instant::now();
+        let now = WallTime::now().unix_millis();
+
+        let first = age.stamp(Some(WallTime::from_unix_millis(now - 60_000)), received);
+        let second = age.stamp(Some(WallTime::from_unix_millis(now - 600_000)), received);
+        assert_eq!(
+            second, first,
+            "a later record never lands before an earlier one"
+        );
+
+        let third = age.stamp(Some(WallTime::from_unix_millis(now)), received);
+        assert_eq!(third, received, "and a record written now is happening now");
+    }
+
+    #[test]
+    fn a_record_with_no_timestamp_keeps_the_receipt_clock() {
+        // Every sidecar record is timestamp-free, and there is nothing better to
+        // date one by than the moment it was read.
+        let mut age = Aging::start();
+        let received = Instant::now();
+        assert_eq!(age.stamp(None, received), received);
     }
 
     #[test]

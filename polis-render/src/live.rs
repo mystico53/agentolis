@@ -181,6 +181,12 @@ pub const CLOUD_ISO: [f64; 3] = [0.55, 1.60, 3.20];
 /// The band index meaning "outside the fringe" in a per-pixel band map.
 pub const NO_BAND: u8 = u8::MAX;
 
+/// The [`thread_slot`] meaning "nobody named an owner for this pixel", which
+/// draws in the neutral [`CLOUD_TONES`].
+///
+/// Outside [`THREAD_HUES`]'s range on purpose, so it can never be a hue.
+pub const NO_TINT: u8 = u8::MAX;
+
 /// How much the hatch spacing opens up where two or more territories overlap.
 ///
 /// Overlap is drawn as a **cross**-hatch: the primary direction plus its
@@ -266,6 +272,194 @@ pub const AGENT_ANCHOR: Rgb = [138, 146, 162];
 pub const AGENT_SCAFFOLD: Rgb = [140, 148, 112];
 
 // ---------------------------------------------------------------------------
+// Identity — which thread a mark belongs to.
+//
+// > i'd like one thread to be one color, slightly different to the others,
+// > matching that color also in the rail with a rectangle and a matching hover.
+//
+// This is a *fourth* channel next to PRD §10.1's shape, §10.2's outcome colour
+// and position, and it is the one the map did not have: nine threads drew in
+// one neutral grey, so the only way to tell whose trail crossed whose was to
+// follow it back to an anchor. See [`thread_slot`] for the identity rule and
+// [`THREAD_HUES`] for how far apart the hues are and how that was measured.
+// ---------------------------------------------------------------------------
+
+/// The identity hue ring: one entry per slot, as authored.
+///
+/// # What these numbers are
+///
+/// Twelve hues, evenly spaced around the CIELAB hue circle at a **constant**
+/// `L* = 45` and `C* = 25`, rounded to sRGB. Constant lightness is the whole
+/// design, and it is forced by PRD §10.3 rather than chosen: the base map is
+/// confined to channel 48 and layer 4 gets `97–168`, so a palette that
+/// separated its members by *brightness* would either walk out of the agent
+/// band or walk into the base map's. Every separation below is therefore hue
+/// and chroma, and the ring is authored once and re-levelled per role by
+/// [`thread_ink`] — so a trail and a cloud and a rail swatch are the same hue
+/// at three brightnesses rather than three colours that happen to look alike.
+///
+/// # Measured separation, at the luminance each role is actually drawn at
+///
+/// CIEDE2000 over all 66 pairs, computed by
+/// `thread_hues_are_far_enough_apart_at_the_luminance_they_are_drawn_at`:
+///
+/// | role | peak channel | worst pair | ΔE00 |
+/// |---|---:|---|---:|
+/// | rail swatch / agent body | 168 | slot 10 ↔ 11 | **9.80** |
+/// | anchor | 162 | 10 ↔ 11 | 9.54 |
+/// | trail | 144 | 0 ↔ 11 | 8.84 |
+/// | tether | 130 | 0 ↔ 11 | 7.99 |
+/// | cloud body | 80 | 0 ↔ 11 | 6.17 |
+/// | cloud core | 84 | 0 ↔ 11 | 5.82 |
+/// | cloud fringe | 74 | 0 ↔ 11 | **5.46** |
+///
+/// The cloud band is the worst case and cannot be otherwise: `49–84` is a
+/// twelfth of the range the agent band gets, and chroma shrinks with it. 5.46
+/// is several times the ~1.0 just-noticeable difference and is what that band
+/// physically affords; the layer that has to carry identity from across the
+/// room is the rail swatch and the agent body, at 9.8.
+///
+/// # Twelve, and what twelve costs
+///
+/// Slots are handed out by hashing, so two threads *can* land on one hue —
+/// with nine threads on screen and twelve slots that is about three of the
+/// thirty-six pairs. That is the price of [`thread_slot`]'s stability rule and
+/// it is paid on purpose: raising the ring to twenty slots would only take the
+/// expected number of distinct colours among nine threads from 6.6 to 7.4
+/// while cutting the worst pair from 9.8 to 5.4 — trading a distinction the
+/// operator can make for one they cannot. PRD §11.4 covers the collision:
+/// colour is never the only channel, and a shared hue is disambiguated by the
+/// rail's own thread name, by the row's swatch sitting next to it, and by the
+/// two threads' clouds being in different places.
+pub const THREAD_HUES: [Rgb; 12] = [
+    [147, 91, 99],  // 14°  rose
+    [144, 94, 80],  // 44°  terracotta
+    [132, 101, 67], // 74°  amber-brown
+    [113, 108, 65], // 104° olive
+    [90, 113, 74],  // 134° moss
+    [65, 117, 92],  // 164° jade
+    [39, 118, 114], // 194° teal
+    [30, 116, 133], // 224° cyan-blue
+    [56, 112, 145], // 254° steel blue
+    [90, 106, 147], // 284° indigo
+    [119, 98, 138], // 314° violet
+    [139, 92, 121], // 344° magenta
+];
+
+/// FNV-1a's 32-bit offset basis, written out (ADR-0029).
+const FNV_OFFSET: u32 = 2_166_136_261;
+/// FNV-1a's 32-bit prime.
+const FNV_PRIME: u32 = 16_777_619;
+
+/// The hue slot a thread owns, from its **own identity** and nothing else.
+///
+/// # Why a hash and not a counter
+///
+/// An index into the live thread list is free and wrong. The list is sorted and
+/// re-sorted as threads arrive, finish and are retired, so the colour of a
+/// thread the operator is watching changes when an unrelated thread starts —
+/// and the one thing this channel is for is the operator learning *"the blue
+/// one is the refactor"* inside a minute. A palette that reshuffles destroys
+/// that faster than no palette at all, because it teaches something false.
+///
+/// So the slot is a pure function of the thread's id: it is fixed before the
+/// thread's first event, it is the same in the window and in the headless
+/// renderer, it survives a restart, and no other thread's lifetime can move it.
+///
+/// FNV-1a over the id's bytes, written out rather than taken from
+/// `std::hash::DefaultHasher`, whose algorithm is explicitly not stable across
+/// Rust releases (ADR-0029) — a toolchain bump must not repaint the city.
+#[must_use]
+pub fn thread_slot(id: &str) -> u8 {
+    let mut h = FNV_OFFSET;
+    for b in id.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    (h % THREAD_HUES.len() as u32) as u8
+}
+
+/// The authored hue for a slot. Out-of-range slots wrap, so no caller can panic
+/// on an identity it did not compute itself.
+#[must_use]
+pub fn thread_hue(slot: u8) -> Rgb {
+    THREAD_HUES[slot as usize % THREAD_HUES.len()]
+}
+
+/// A thread's hue at a role's own brightness.
+///
+/// `role` is one of this module's band constants — [`AGENT_BODY`],
+/// [`AGENT_TRAIL`], [`AGENT_TETHER`], [`AGENT_ANCHOR`], a [`CLOUD_TONES`] entry
+/// — and only its **peak channel** is read. The result is the thread's hue
+/// scaled so its own peak lands there, which is exactly the rule
+/// `polis_app::palette`'s band clamp already applies: brightness is the peak
+/// channel, so re-pegging the peak moves a colour between layers without
+/// touching its hue.
+///
+/// That is what keeps one thread one colour *across* layers. Its cloud is dim
+/// because clouds are dim (PRD §10.3), not because a different colour was
+/// chosen for it, and the operator reads "same thread" off a cloud and a trail
+/// that are eleven levels apart in brightness.
+///
+/// Integer arithmetic, deliberately: this runs per mark per frame and PRD §7.4
+/// wants the same bytes on every machine.
+#[must_use]
+pub fn thread_ink(slot: u8, role: Rgb) -> Rgb {
+    thread_ink_at(slot, role, IDENTITY_CHROMA)
+}
+
+/// How far a thread's non-peak channels are pulled down from its peak.
+///
+/// `0` leaves the hue as authored; `1` would drive every non-peak channel to
+/// zero. Chroma is the one identity channel that is **free** here: PRD §10.3
+/// budgets *brightness*, and [`thread_ink`] already pegs the peak channel to the
+/// role's own, so deepening the hue spends nothing the layer owns.
+///
+/// It is not cosmetic. The operator's report was *"i cant distinguish threads
+/// from eachother"* on a map whose clouds are drawn at channel 56–84, where a
+/// muted hue and a grey are nearly the same thing. Their trails and tethers had
+/// just been hidden to quiet the map, and those were carrying most of the
+/// ownership signal — so the ambient shape had to carry it instead.
+pub const IDENTITY_CHROMA: u32 = 45;
+
+/// [`thread_ink`] with an explicit chroma lift, in percent.
+#[must_use]
+pub fn thread_ink_at(slot: u8, role: Rgb, chroma: u32) -> Rgb {
+    let peak = u32::from(role.iter().copied().max().unwrap_or(0));
+    let hue = thread_hue(slot);
+    let m = u32::from(hue.iter().copied().max().unwrap_or(0)).max(1);
+    let mut out = [0u8; 3];
+    for (o, c) in out.iter_mut().zip(hue) {
+        let scaled = (u32::from(c) * peak + m / 2) / m;
+        // Deepen everything that is not the peak, so the hue reads at a
+        // brightness where a desaturated one would not. The peak is untouched,
+        // which is what keeps the band ladder — and §10.3's budget — exact.
+        let deepened = if scaled >= peak {
+            scaled
+        } else {
+            let gap = peak - scaled;
+            scaled.saturating_sub(gap * chroma / 100)
+        };
+        *o = deepened.min(peak) as u8;
+    }
+    out
+}
+
+/// A thread's three cloud iso tones (PRD §10.4), fringe → body → core.
+///
+/// The tones keep [`CLOUD_TONES`]'s brightnesses exactly — the band ladder is a
+/// contrast budget and identity does not get to spend it — and only their hue
+/// changes.
+#[must_use]
+pub fn thread_cloud_tones(slot: u8) -> [Rgb; 3] {
+    [
+        thread_ink(slot, CLOUD_TONES[0]),
+        thread_ink(slot, CLOUD_TONES[1]),
+        thread_ink(slot, CLOUD_TONES[2]),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // Layer 5 — attention. Owns the top of the range; nothing else may enter it.
 // ---------------------------------------------------------------------------
 
@@ -328,9 +522,22 @@ pub(crate) const CIRCLE: [[f64; 2]; 16] = [
 /// How many segments a tether's bow is drawn as.
 ///
 /// Eight, which is what the curve needs and what the dash divides evenly — and
-/// no more, because a tether is drawn once per worker and a thread can have
-/// dozens of them.
+/// no more, because a tether is drawn once per worker and one thread on this
+/// machine has a hundred of them.
 const TETHER_STEPS: usize = 8;
+
+/// The most tethers one thread draws, running workers first.
+///
+/// Sixteen is where a fan stops being countable. Past it the answer to *"which
+/// workers are this thread's"* is a texture rather than a list, and the exact
+/// count is in the rail anyway — see [`draw_tether`] for why the tether is now
+/// an answer to a question instead of an ambient decoration.
+///
+/// Public because two renderers draw this notation and PRD §10 allows one
+/// visual language: `polis_app::mapview` and [`crate::frame`] rank workers the
+/// same way and stop at the same number, so the window and a recorded frame
+/// show the same sixteen hands.
+pub const TETHERS_PER_THREAD: usize = 16;
 
 /// The narrowest a live stroke may be, in output pixels.
 ///
@@ -460,9 +667,12 @@ pub struct Trail {
     pub steps: Vec<TrailStep>,
     /// How long a step survives, in seconds. Ages are divided by this.
     pub ttl: f64,
+    /// Whose trail — [`thread_slot`] of the owning thread.
+    pub tint: u8,
 }
 
-/// A worker tied back to its thread, so the thread reads as one unit.
+/// A worker tied back to its thread, drawn **only for the thread the operator
+/// is asking about**. See [`draw_tether`].
 #[derive(Debug, Clone, Copy)]
 pub struct Tether {
     /// The thread's anchor.
@@ -470,18 +680,25 @@ pub struct Tether {
     /// The worker.
     pub worker: Px,
     /// Whether the worker is still running. A finished worker's tether is drawn
-    /// dimmer and thinner rather than dropped, so a thread does not appear to
-    /// shed limbs.
+    /// dimmer, thinner and dashed rather than dropped, so a thread does not
+    /// appear to shed limbs while the operator is looking straight at it.
     pub running: bool,
     /// How far, and which way, this tether bows off the straight line, in
     /// `[-1, 1]`.
     ///
     /// Workers of one thread are usually working in **one place**, so their
     /// tethers share both endpoints and stack into a single opaque ribbon that
-    /// is the loudest thing on the map and says only "this thread delegates".
-    /// Fanning them apart turns that ribbon back into a countable number of
-    /// hands, which is the thing worth knowing.
+    /// says only "this thread delegates". Fanning them apart turns that ribbon
+    /// back into a countable number of hands, which is the thing worth knowing
+    /// once the operator has asked.
     pub spread: f64,
+    /// Whose hand — [`thread_slot`] of the thread this tether belongs to.
+    ///
+    /// One thread's tethers are on screen at a time, so this no longer has to
+    /// separate one fan from another. It still has to match: the line and the
+    /// worker at the end of it and the rail's swatch are one colour, which is
+    /// how the operator confirms the line landed where they thought.
+    pub tint: u8,
 }
 
 /// A building this thread keeps coming back to (PRD §12).
@@ -532,6 +749,26 @@ pub struct Scaffold {
 
 /// One operation mark: PRD §10.1's shape and §10.2's colour, side by side and
 /// never conflated.
+///
+/// # Why a mark has no [`thread_slot`], when everything else does
+///
+/// Identity colours the thread's *continuous* things — its cloud, its trail,
+/// its tethers, its agent body — and stops at the mark. A mark is not the
+/// thread, it is one thing the thread did, and PRD §10 opens by forbidding the
+/// conflation of channels:
+///
+/// > **Shape encodes what, colour encodes how it went. Never conflate them.**
+///
+/// There is exactly one colour slot on a glyph and two candidates for it, so
+/// this is a ranking and not a preference. *"How it went"* outranks *"whose it
+/// is"*: an operator scanning the map for red is asking which work failed, and
+/// a failure repainted in its owner's hue is a failure they cannot see. Whose
+/// it is, they can already read — off the trail it sits on, the cloud it sits
+/// in, and the agent that left it, all three of which carry the hue.
+///
+/// The same reasoning keeps [`Agent::outcome`] on the agent's centre disc while
+/// its body takes the thread hue: two marks, two channels, no pixel asked to
+/// mean both.
 ///
 /// Two further fields, and neither is a third *state* channel — both are size,
 /// which is what a proportional-symbol map has always used for "how much" and
@@ -628,6 +865,12 @@ pub struct Agent {
     pub heading: [f64; 2],
     /// Whether the thread this agent belongs to is waiting on a human.
     pub waiting: bool,
+    /// Whose agent — [`thread_slot`] of the thread it belongs to.
+    ///
+    /// It colours the **body**, never the centre disc: [`Mark`] and this
+    /// struct's [`Agent::outcome`] keep PRD §10.2's channel. See
+    /// [`draw_agent`].
+    pub tint: u8,
 }
 
 /// Which of PRD §11.2's three states a mark is.
@@ -703,6 +946,16 @@ pub struct AttentionMark {
     /// has been ignored is physically bigger, which survives distance and
     /// survives greyscale.
     pub urgency: f64,
+    /// Whether [`AttentionMark::at`] is where the work actually is.
+    ///
+    /// `false` when the mark had to fall back to the civic square because the
+    /// thread has no territory and no trail the city has geometry for. PRD
+    /// §11.2a's pin stands "above the building **or district**" and an
+    /// unconverged thread has neither — but *"an agent blocked on a human"* is
+    /// the one state that must never fail to draw, so it is drawn anyway and the
+    /// notation says how sure it is. See
+    /// [`crate::salience::ALARM_UNSITED`].
+    pub sited: bool,
 }
 
 /// Everything the live layer draws in one frame: already interpolated, already
@@ -722,6 +975,16 @@ pub struct LiveFrame {
     /// Territory kernels, summed into one field: PRD §6.4's "overlap is field
     /// addition", which is also the early-warning contention signal.
     pub clouds: Vec<CloudKernel>,
+    /// [`thread_slot`] per [`CloudKernel::thread`], so a cloud is drawn in its
+    /// own thread's hue.
+    ///
+    /// A side table rather than a field on the kernel, because
+    /// `CloudKernel::thread` is a **per-frame group index** the field sampler
+    /// sorts on, and identity is not: two threads may hash to one hue and must
+    /// still be summed as two territories, or `crowd` — PRD §6.4's contention
+    /// signal — would report contested ground as one busy thread. Colour is
+    /// looked up through this table exactly once, at paint time.
+    pub cloud_tints: Vec<u8>,
     /// One trail per thread.
     pub trails: Vec<Trail>,
     /// Worker-to-thread tethers.
@@ -743,6 +1006,103 @@ pub struct LiveFrame {
     /// PRD §6.2's status rail: what has no place on the map. Chrome, drawn
     /// outside the map frame, and **never empty when something was dropped**.
     pub rail: Vec<RailRow>,
+    /// Why the map has the clouds it has — and, more usefully, why it does not
+    /// have the ones it does not. See [`CloudCensus`].
+    pub cloud: CloudCensus,
+}
+
+/// What [`polis_world::territory::select_clouds`] decided, carried onto the
+/// frame so the picture can say it out loud.
+///
+/// The selection has always returned these counts and nothing has ever read
+/// them, which is how the map arrived at *"nine threads, no clouds"* with no
+/// way to ask why. Every thread lands in exactly one of these buckets, so
+/// `shown + unplaced + dormant + capped` is the thread count, and a zero in
+/// `shown` always has a reason beside it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CloudCensus {
+    /// Threads whose territory got a cloud.
+    pub shown: usize,
+    /// Kernels those territories contributed, bridges included. Zero here with
+    /// a non-zero `shown` means the field was empty for a reason the selection
+    /// could not see — a dead weight, or a camera the territory is off.
+    pub kernels: usize,
+    /// The widest kernel this frame put on the canvas, in **output pixels**.
+    ///
+    /// The selection can hand the layer six territories and the picture still
+    /// show nothing, because PRD §6.4's bandwidth is a world-space quantity and
+    /// the camera has the last word on it. A territory two world units across
+    /// is a legible cloud at the district tier and a sub-pixel smudge fitted to
+    /// the whole city, and the difference is a factor the operator controls
+    /// with the scroll wheel. Which is why this is a *census* field and not a
+    /// debug print: `shown: 6, widest: 0.8 px` is the whole diagnosis of an
+    /// empty sky, and no other number in the system says it.
+    pub widest_px: f64,
+    /// Threads with no claim, no lobes, or no kernels: not converged.
+    pub unplaced: usize,
+    /// Converged but quiet longer than the policy's dormancy window.
+    pub dormant: usize,
+    /// Would have been drawn and lost to PRD §10.4's cap.
+    pub capped: usize,
+}
+
+impl CloudCensus {
+    /// Threads accounted for.
+    #[must_use]
+    pub fn threads(&self) -> usize {
+        self.shown + self.unplaced + self.dormant + self.capped
+    }
+
+    /// Whether anything was withheld. `false` means every thread on the map has
+    /// its cloud and the layer owes the operator no explanation.
+    #[must_use]
+    pub fn withheld(&self) -> bool {
+        self.unplaced + self.dormant + self.capped > 0
+    }
+
+    /// Whether the clouds that *were* selected are too small to draw.
+    ///
+    /// A contour needs a couple of pixels of radius before it is a stroke
+    /// rather than a dot; below this module's minimum stroke width the layer is
+    /// doing everything right and producing nothing visible.
+    #[must_use]
+    pub fn sub_pixel(&self) -> bool {
+        self.shown > 0 && self.widest_px < MIN_STROKE
+    }
+
+    /// The reason, in short phrases — one per line for a narrow panel, joined
+    /// by [`Self::reason`] for a wide one.
+    ///
+    /// The count comes first and the dominant reason next; nothing is omitted,
+    /// because a diagnostic that rounds is a diagnostic that lies. Every phrase
+    /// fits the status rail's own column width, which is what stops the fix for
+    /// one silence from becoming a line that runs off its own panel.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        let mut parts = vec![format!("{} CLOUDS", self.shown)];
+        if self.sub_pixel() {
+            parts.push(format!("{:.1} PX: ZOOM IN", self.widest_px));
+        }
+        let mut rest = [
+            (self.unplaced, "UNCONVERGED"),
+            (self.dormant, "DORMANT"),
+            (self.capped, "OVER CAP"),
+        ];
+        rest.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+        for (n, why) in rest {
+            if n > 0 {
+                parts.push(format!("{n} {why}"));
+            }
+        }
+        parts
+    }
+
+    /// The same, on one line: *"3 CLOUDS · 6 UNCONVERGED"*. For the window's
+    /// status strip, which has the width for it.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        self.lines().join(" · ")
+    }
 }
 
 /// What a [`RailRow`] is about.
@@ -759,6 +1119,15 @@ pub enum RailKind {
     /// Workers Polis cannot attach to any thread — uncertainty shown rather
     /// than guessed around.
     UnattributedWorkers,
+    /// Threads the cloud policy withheld a cloud from, and why.
+    ///
+    /// A thread can be perfectly well placed — an anchor, a trail, marks on
+    /// real buildings — and still have no cloud, because PRD §10.4's selection
+    /// dropped it. That is a different statement from [`Self::UnplacedThread`]
+    /// and it needs its own row: *"no clouds"* was a silent state, and an
+    /// operator looking at nine threads and an empty sky could not tell an
+    /// un-converged territory from a dormant one from the cap.
+    NoCloud,
 }
 
 impl RailKind {
@@ -769,6 +1138,7 @@ impl RailKind {
             Self::UnplacedThread => "NO TERRITORY",
             Self::UnplacedOps => "UNPLACED OPS",
             Self::UnattributedWorkers => "UNATTRIBUTED",
+            Self::NoCloud => "NO CLOUD",
         }
     }
 }
@@ -851,15 +1221,17 @@ pub fn draw_clouds(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
     let Some(field) = CloudField::sample(&frame.clouds, canvas.width, rows) else {
         return start.elapsed();
     };
-    paint_cloud_bands(canvas, &field.bands());
+    paint_cloud_bands(canvas, &field.bands_tinted(&frame.cloud_tints));
     start.elapsed()
 }
 
 /// Layer 3, from a field somebody else already sampled — normally a
 /// [`CloudTween`]'s.
-pub fn draw_cloud_field(canvas: &mut Canvas, field: &CloudField) -> Duration {
+///
+/// `tints` is `LiveFrame::cloud_tints`; an empty slice draws the neutral tones.
+pub fn draw_cloud_field(canvas: &mut Canvas, field: &CloudField, tints: &[u8]) -> Duration {
     let start = Instant::now();
-    paint_cloud_bands(canvas, &field.bands());
+    paint_cloud_bands(canvas, &field.bands_tinted(tints));
     start.elapsed()
 }
 
@@ -906,6 +1278,18 @@ pub struct CloudField {
     /// Fractional only because [`CloudTween`] lerps it; `sample` produces whole
     /// numbers.
     pub crowd: Vec<f32>,
+    /// Which [`CloudKernel::thread`] contributes the most density here.
+    ///
+    /// The cell's *owner*, and the only thing a per-thread cloud colour can be
+    /// keyed on: `density` is a sum over threads by construction (PRD §6.4's
+    /// field addition) and a sum has no hue. Argmax rather than a blend,
+    /// because blending two territories' hues would invent a third thread; the
+    /// place where they genuinely overlap is already drawn as contested ground
+    /// by the crossed hatch, which is a shape channel and stays one.
+    ///
+    /// Discrete, so [`CloudTween`] carries it rather than lerping it — the
+    /// midpoint between thread 2 and thread 5 is not thread 3.
+    pub owner: Vec<u16>,
 }
 
 impl CloudField {
@@ -947,6 +1331,11 @@ impl CloudField {
         let n = grid_x * grid_y;
         let mut density = vec![0.0f32; n];
         let mut crowd = vec![0.0f32; n];
+        // Who owns each cell, and by how much — the running argmax over the
+        // per-thread sums the scratch lattice already computes, so ownership
+        // costs one comparison per written cell and no second pass.
+        let mut owner = vec![0u16; n];
+        let mut owned = vec![0.0f32; n];
         // One thread's field at a time, into a scratch lattice that is zeroed
         // again over the same span it was written. Reusing one buffer is what
         // keeps the cost the sum of the kernels' areas rather than
@@ -999,6 +1388,10 @@ impl CloudField {
                         if v >= fringe {
                             crowd[c] += 1.0;
                         }
+                        if v > owned[c] {
+                            owned[c] = v;
+                            owner[c] = thread;
+                        }
                         scratch[c] = 0.0;
                     }
                 }
@@ -1015,6 +1408,7 @@ impl CloudField {
             grid_y,
             density,
             crowd,
+            owner,
         })
     }
 
@@ -1103,6 +1497,7 @@ impl CloudField {
             grid_y,
             density: vec![0.0; grid_x * grid_y],
             crowd: vec![0.0; grid_x * grid_y],
+            owner: vec![0; grid_x * grid_y],
         }
     }
 
@@ -1112,11 +1507,15 @@ impl CloudField {
     /// bilinear lookup through pixel coordinates. Cells of `to` that this field
     /// does not cover come back zero, which is the right answer: the cloud was
     /// not there.
+    ///
+    /// `owner` is a **label** and is resampled by nearest neighbour, never
+    /// bilinearly: half way between thread 2 and thread 5 is not thread 3.
     #[must_use]
-    fn resampled_onto(&self, to: &Self) -> (Vec<f32>, Vec<f32>) {
+    fn resampled_onto(&self, to: &Self) -> (Vec<f32>, Vec<f32>, Vec<u16>) {
         let n = to.grid_x * to.grid_y;
         let mut density = vec![0.0f32; n];
         let mut crowd = vec![0.0f32; n];
+        let mut owner = vec![0u16; n];
         let sx = to.width as f64 / to.grid_x as f64;
         let sy = to.height as f64 / to.grid_y as f64;
         let (msx, msy) = (
@@ -1140,14 +1539,32 @@ impl CloudField {
                 let c = gy * to.grid_x + gx;
                 density[c] = bilinear(&self.density, self.grid_x, self.grid_y, fx, fy);
                 crowd[c] = bilinear(&self.crowd, self.grid_x, self.grid_y, fx, fy);
+                let (nx, ny) = (fx.round() as usize, fy.round() as usize);
+                owner[c] =
+                    self.owner[ny.min(self.grid_y - 1) * self.grid_x + nx.min(self.grid_x - 1)];
             }
         }
-        (density, crowd)
+        (density, crowd, owner)
     }
 
     /// Thresholds the field into [`CLOUD_ISO`]'s bands, per canvas pixel.
+    ///
+    /// The clouds come out in this module's neutral [`CLOUD_TONES`]. Callers
+    /// that know whose territory is whose pass the identity table to
+    /// [`Self::bands_tinted`] instead.
     #[must_use]
     pub fn bands(&self) -> BandMap {
+        self.bands_tinted(&[])
+    }
+
+    /// [`Self::bands`], with each thread's cloud in its own hue.
+    ///
+    /// `tints` is indexed by [`CloudKernel::thread`] and holds
+    /// [`thread_slot`]s — `LiveFrame::cloud_tints`. An empty slice, or an index
+    /// past its end, falls back to the neutral tones, so a caller that has no
+    /// identity to offer gets exactly the picture it got before.
+    #[must_use]
+    pub fn bands_tinted(&self, tints: &[u8]) -> BandMap {
         let (w, h) = (self.width, self.height);
         let sx = w as f64 / self.grid_x as f64;
         let sy = h as f64 / self.grid_y as f64;
@@ -1155,6 +1572,7 @@ impl CloudField {
         let ly = (self.grid_y - 1) as f64;
         let mut cells = vec![NO_BAND; w * h];
         let mut crowd = vec![0u8; w * h];
+        let mut owner = vec![0u8; w * h];
         // One territory on the map is the ordinary case, and then the second
         // lattice is all zeroes and resampling it per pixel is pure waste.
         let contested = self
@@ -1168,6 +1586,14 @@ impl CloudField {
                 let d = bilinear(&self.density, self.grid_x, self.grid_y, fx, fy);
                 if let Some(band) = iso_band(f64::from(d)) {
                     cells[y * w + x] = band as u8;
+                    // Nearest cell, not bilinear: an owner is a label.
+                    let g = fy.round() as usize * self.grid_x + fx.round() as usize;
+                    owner[y * w + x] = self
+                        .owner
+                        .get(g)
+                        .and_then(|t| tints.get(*t as usize))
+                        .copied()
+                        .unwrap_or(NO_TINT);
                     if contested {
                         let c = bilinear(&self.crowd, self.grid_x, self.grid_y, fx, fy);
                         // Round rather than floor: the lerp between one
@@ -1186,6 +1612,7 @@ impl CloudField {
             height: h,
             cells,
             crowd,
+            tint: owner,
         }
     }
 }
@@ -1267,16 +1694,23 @@ impl CloudTween {
                 } else {
                     cur.union_with(&t)
                 };
-                let (od, oc) = cur.resampled_onto(&merged);
-                let (td, tc) = t.resampled_onto(&merged);
-                for (i, (d, c)) in merged
+                let (od, oc, oo) = cur.resampled_onto(&merged);
+                let (td, tc, to) = t.resampled_onto(&merged);
+                for (i, ((d, c), o)) in merged
                     .density
                     .iter_mut()
                     .zip(merged.crowd.iter_mut())
+                    .zip(merged.owner.iter_mut())
                     .enumerate()
                 {
                     *d = (td[i] - od[i]).mul_add(k, od[i]);
                     *c = (tc[i] - oc[i]).mul_add(k, oc[i]);
+                    // The owner is the label of whichever side has the density
+                    // here, and the target wins a tie. A cloud handing ground
+                    // over therefore changes hue at the moment the new
+                    // territory's field is the larger one, rather than
+                    // cross-fading through a colour neither thread has.
+                    *o = if td[i] >= od[i] { to[i] } else { oo[i] };
                 }
                 self.field = Some(merged);
             }
@@ -1313,6 +1747,9 @@ pub struct BandMap {
     /// How many territories reach fringe level at each pixel. `>= CLOUD_CROWD`
     /// is contested ground.
     pub crowd: Vec<u8>,
+    /// The owning thread's [`thread_slot`] per pixel, or [`NO_TINT`] where the
+    /// caller offered no identity table.
+    pub tint: Vec<u8>,
 }
 
 impl BandMap {
@@ -1320,6 +1757,17 @@ impl BandMap {
     #[must_use]
     pub fn at(&self, x: usize, y: usize) -> u8 {
         self.index(x, y).map_or(NO_BAND, |i| self.cells[i])
+    }
+
+    /// The ink for one banded pixel: the owning thread's hue at that band's
+    /// brightness, or the neutral tone where there is no owner.
+    #[must_use]
+    pub fn tone(&self, i: usize, band: u8) -> Rgb {
+        let band = CLOUD_TONES[band as usize % CLOUD_TONES.len()];
+        match self.tint.get(i).copied() {
+            Some(t) if t != NO_TINT => thread_ink(t, band),
+            _ => band,
+        }
     }
 
     /// How many territories claim a canvas pixel.
@@ -1458,7 +1906,11 @@ pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usi
                 else {
                     continue;
                 };
-                cloud_pixel(canvas, px, py, CLOUD_TONES[band as usize]);
+                // The band decides the brightness, the owner decides the hue,
+                // and neither can take the other's channel: two threads' clouds
+                // are the same three tones apart in tone and a hue apart in
+                // identity, so "core versus fringe" still reads in greyscale.
+                cloud_pixel(canvas, px, py, bands.tone(y * bands.width + x, band));
             }
         }
     }
@@ -1516,9 +1968,23 @@ pub fn draw_agents(canvas: &mut Canvas, frame: &LiveFrame, style: TrailStyle) ->
 /// Splitting contention across the first and last pass is the whole point: it
 /// is the only state that is a relation, and the relation belongs at the bottom
 /// while its terminals belong at the top.
+///
+/// # The beacons, and why §11.1 needed them
+///
+/// Between the passes sit two sets of [`crate::salience`] rings — one per
+/// pending decision, two per contention. They are the same machinery
+/// [`AttentionMark`]'s red sibling has had since M4, and they are here because
+/// the ordering §11.1 states was true of the *sort key* and false of the
+/// *picture*: measured on a live frame with a thread genuinely blocked on a
+/// human, amber held 243 px against decoration's 34 213, and the band PRD §10.3
+/// reserves for these three states had measured 0.000 % of map area in every
+/// frame ever rendered. A pin is a mark about a *building*; a ring is a mark
+/// about a *district*, and a district is what survives being seen from a chair
+/// on the other side of the room.
 pub fn draw_attention(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
     let start = Instant::now();
     let r = glyph_radius(frame.unit, frame.map_height);
+    let (decisions, contention) = crate::salience::beacons(&frame.attention, r, frame.map_height);
     for m in &frame.attention {
         if m.kind == MarkKind::Contention {
             draw_contention_link(canvas, *m, r);
@@ -1534,11 +2000,18 @@ pub fn draw_attention(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
             draw_done(canvas, *m, r);
         }
     }
+    // The primary state, region first and pin second: the ring says *this
+    // district is waiting on you* from across the room, and the pin says which
+    // building once the operator has walked over.
+    crate::salience::draw(canvas, &decisions, r);
     for m in &frame.attention {
         if m.kind == MarkKind::NeedsDecision {
             draw_pin(canvas, *m, r);
         }
     }
+    // …and contention's, over the pins, because §11.1 puts it above them and
+    // because it is the only state that claims two districts at once.
+    crate::salience::draw(canvas, &contention, r);
     for m in &frame.attention {
         if m.kind == MarkKind::Contention {
             draw_contention_ends(canvas, *m, r);
@@ -1635,6 +2108,9 @@ pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64)
         return;
     }
     let ttl = trail.ttl.max(1e-6);
+    // Whose trail. Identity is the hue; age is still the tone ramp, so a fresh
+    // trail and a stale one are the same colour at two brightnesses.
+    let ink_of = |t: f64| fade(thread_ink(trail.tint, AGENT_TRAIL), AGENT_FLOOR, t);
     let repeats = leg_repeats(&trail.steps);
     let mut path: Vec<Px> = Vec::with_capacity(BOW_CHORDS + 1);
     for (leg, pair) in trail.steps.windows(2).enumerate() {
@@ -1644,7 +2120,7 @@ pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64)
         // staler than it is.
         let age = (b.age / ttl).clamp(0.0, 1.0);
         let fresh = 1.0 - age;
-        let ink = fade(AGENT_TRAIL, AGENT_FLOOR, 0.75f64.mul_add(fresh, 0.25));
+        let ink = ink_of(0.75f64.mul_add(fresh, 0.25));
         leg_path(a.at, b.at, repeats[leg], r, &mut path);
         match style {
             TrailStyle::Fade => {
@@ -1663,7 +2139,7 @@ pub fn draw_trail(canvas: &mut Canvas, trail: &Trail, style: TrailStyle, r: f64)
     if style == TrailStyle::Timed {
         for step in &trail.steps {
             let fresh = 1.0 - (step.age / ttl).clamp(0.0, 1.0);
-            let ink = fade(AGENT_TRAIL, AGENT_FLOOR, 0.75f64.mul_add(fresh, 0.25));
+            let ink = ink_of(0.75f64.mul_add(fresh, 0.25));
             canvas.disc(
                 step.at,
                 (r * 0.16 * 0.5f64.mul_add(fresh, 0.5)).max(MIN_STROKE * 0.7),
@@ -1838,38 +2314,75 @@ fn dashed_path(canvas: &mut Canvas, points: &[Px], period: f64, duty: f64, width
 // Tethers, thrash, scaffolding
 // ---------------------------------------------------------------------------
 
-/// One tether: a bowed line from a thread's anchor to one of its workers.
+/// One tether: a bowed line from a thread's anchor to one of its workers,
+/// drawn **only for the thread the operator is asking about**.
 ///
-/// # A thread is the unit, and this is the only mark that says so
+/// # §17's test, run honestly, and what it cost the fan
 ///
-/// PRD §5 makes the thread the thing the operator thinks in, and a single
-/// session now fans out to dozens of workers scattered across the map. Without
-/// this line a fan of workers is a fan of unrelated dots, and the reading
-/// "**this** thread is doing all of that" is unavailable — the map would show
-/// activity and hide organisation.
+/// > **Test for every visual element: does it change a decision?** If not, cut
+/// > it. (PRD §17)
+///
+/// A tether says "this worker belongs to that thread". The two decisions this
+/// product exists to accelerate are *unblock* and *redirect* (PRD §1), and
+/// neither is reached by knowing which of a hundred workers belongs to which of
+/// nine threads: nobody redirects an agent because it has hands. Drawn
+/// ambiently it is one **line across the whole map** per worker — the one
+/// geometry that cannot be decluttered by position, because it is everywhere by
+/// construction. Measured on the operator's own repository, nine live threads
+/// over `qurio-toolset`, the ambient fan was the largest single consumer of the
+/// top of the contrast range while the state the product is for held 0.2 % of
+/// it.
+///
+/// So ownership moved to the channel that was already carrying it and costs no
+/// area at all: **colour**. [`thread_slot`] gives a thread one hue for its
+/// whole life, the worker's own body is drawn in it at the brightest level
+/// layer 4 has ([`AGENT_BODY`], ΔE00 9.8 between the worst pair), and the rail
+/// prints the same triple beside the thread's name and its worker count. The
+/// glance is answered without a line.
+///
+/// # The line comes back when you ask — PRD §12's fuzzy above, exact below
+///
+/// > **Fuzzy above, exact below.** Soft cloud edges are honest for the ambient
+/// > layer and useless when acting. (PRD §12)
+///
+/// Ownership has exactly that shape. The ambient reading is a hue, which is
+/// fuzzy and cheap and right for the glance; the exact reading — *these
+/// sixteen, and no others* — is a question about **one** thread, and it is
+/// asked by hovering or selecting it. Then, and only then, that thread's
+/// tethers are drawn, capped at [`TETHERS_PER_THREAD`] with the running
+/// workers first. Eight other threads' lines are never in the way of the
+/// answer, which is the part the ambient fan could not do at any brightness.
+///
+/// Callers are what enforce this: `polis_app::mapview` draws tethers for the
+/// emphasised thread only, and [`crate::frame::FrameRenderer`] emits them only
+/// for the thread [`crate::frame::FrameRenderer::tether`] names. A frame nobody
+/// is interrogating has no tethers in it.
+///
+/// # Brightness, now that it is an answer
+///
+/// It used to sit at 0.16 of the band — invisible on its own and blinding in
+/// bulk, which is the signature of a mark that was being tuned for the wrong
+/// population. One thread's sixteen lines can afford to be *read*: 0.70 of the
+/// band running, 0.34 finished. That is peak 120 and 108, under
+/// [`AGENT_TRAIL`]'s 144 and [`AGENT_BODY`]'s 168, so the thing being
+/// identified stays louder than the line identifying it, and far under
+/// [`crate::plan::ATTENTION_BAND`], which layer 5 owns alone.
 ///
 /// # Running versus finished is a **shape** difference
 ///
-/// It used to be a tone difference alone: 0.16 of the band against 0.0 of it.
-/// Both are dim greys three levels apart at the bottom of the agent band, and
-/// PRD §11.4 is explicit that peripheral vision is poor at exactly that
-/// discrimination. A finished worker's tether is now **dashed** and a running
-/// one solid, so the count of hands still on the job is legible from the
-/// silhouette, at thumbnail size, and in a colour-blind reading.
-///
-/// A finished worker's tether is dashed rather than dropped, so a thread does
-/// not appear to shed limbs the instant a subagent returns.
+/// Tone alone was three grey levels apart, and PRD §11.4 is explicit that
+/// peripheral vision is poor at exactly that discrimination. A finished
+/// worker's tether is **dashed** and a running one solid, so the count of hands
+/// still on the job is legible from the silhouette, at thumbnail size, and in a
+/// colour-blind reading. Dashed rather than dropped, so a thread does not
+/// appear to shed limbs while the operator is looking straight at it.
 pub fn draw_tether(canvas: &mut Canvas, tether: Tether, r: f64) {
-    // A tether is *structure*, not activity: it says which thread a worker
-    // belongs to and nothing about what either is doing. So it is the dimmest
-    // thing in the agent band — measured on a real frame, a tether at full tone
-    // was the brightest structure on the map and the least informative.
     let (width, tone) = if tether.running {
-        ((r * 0.09).max(MIN_STROKE * 0.75), 0.16)
+        ((r * 0.10).max(MIN_STROKE * 0.8), 0.70)
     } else {
-        ((r * 0.07).max(MIN_STROKE * 0.6), 0.08)
+        ((r * 0.07).max(MIN_STROKE * 0.6), 0.34)
     };
-    let ink = fade(AGENT_TETHER, AGENT_FLOOR, tone);
+    let ink = fade(thread_ink(tether.tint, AGENT_TETHER), AGENT_FLOOR, tone);
     // A tether bows away from the straight line so two workers on opposite
     // sides of an anchor do not draw one line through it.
     let mid = [
@@ -2008,12 +2521,20 @@ fn draw_mark(canvas: &mut Canvas, mark: Mark, r: f64) {
 }
 
 fn draw_agent(canvas: &mut Canvas, agent: Agent, r: f64) {
+    // Two marks, two channels. The **body** is the thread's hue — identity,
+    // the thing the operator tracks across the map — and the centre disc keeps
+    // PRD §10.2's outcome colour, so a failing worker is still red while it
+    // moves without the whole agent changing colour every time a tool call
+    // lands. See [`Mark`] for why the ranking goes this way and not the other.
     let ink = outcome_ink(agent.outcome);
-    let body = if agent.body == Body::Main {
-        AGENT_ANCHOR
-    } else {
-        AGENT_BODY
-    };
+    let body = thread_ink(
+        agent.tint,
+        if agent.body == Body::Main {
+            AGENT_ANCHOR
+        } else {
+            AGENT_BODY
+        },
+    );
     // The motion streak: a short tail behind a moving agent, which is the
     // cheapest possible way to make direction readable in the periphery.
     if agent.travel > 0.02 {
@@ -2417,6 +2938,243 @@ mod tests {
         c.iter().copied().max().unwrap_or(0)
     }
 
+    // -----------------------------------------------------------------------
+    // Identity: how far apart the thread hues actually are, in CIELAB
+    // -----------------------------------------------------------------------
+
+    /// sRGB -> CIELAB (D65), so the palette can be judged in a space where
+    /// distance means something.
+    ///
+    /// Written out rather than pulled in: this is the only place in the
+    /// workspace that needs a colour-appearance model, it is a dozen lines, and
+    /// the alternative is a dependency in the tree of the crate that draws every
+    /// frame.
+    fn lab(rgb: Rgb) -> [f64; 3] {
+        fn lin(c: u8) -> f64 {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.040_45 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn f(t: f64) -> f64 {
+            if t > 0.008_856 {
+                t.cbrt()
+            } else {
+                7.787f64.mul_add(t, 16.0 / 116.0)
+            }
+        }
+        let (r, g, b) = (lin(rgb[0]), lin(rgb[1]), lin(rgb[2]));
+        let x = 0.180_437_5f64.mul_add(b, 0.412_456_4f64.mul_add(r, 0.357_576_1 * g)) / 0.950_47;
+        let y = 0.072_175_0f64.mul_add(b, 0.212_672_9f64.mul_add(r, 0.715_152_2 * g));
+        let z = 0.950_304_1f64.mul_add(b, 0.019_333_9f64.mul_add(r, 0.119_192_0 * g)) / 1.088_83;
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        [
+            116.0f64.mul_add(fy, -16.0),
+            500.0 * (fx - fy),
+            200.0 * (fy - fz),
+        ]
+    }
+
+    /// CIEDE2000. The perceptual distance the palette is designed against, and
+    /// the number the module docs' table reports.
+    fn de2000(a: Rgb, b: Rgb) -> f64 {
+        let (l1, l2) = (lab(a), lab(b));
+        let (c1, c2) = (l1[1].hypot(l1[2]), l2[1].hypot(l2[2]));
+        let cb = f64::midpoint(c1, c2);
+        let g = 0.5 * (1.0 - (cb.powi(7) / (cb.powi(7) + 25f64.powi(7))).sqrt());
+        let (a1p, a2p) = ((1.0 + g) * l1[1], (1.0 + g) * l2[1]);
+        let (c1p, c2p) = (a1p.hypot(l1[2]), a2p.hypot(l2[2]));
+        let hp = |ap: f64, bp: f64| {
+            if ap == 0.0 && bp == 0.0 {
+                0.0
+            } else {
+                bp.atan2(ap).to_degrees().rem_euclid(360.0)
+            }
+        };
+        let (h1p, h2p) = (hp(a1p, l1[2]), hp(a2p, l2[2]));
+        let dlp = l2[0] - l1[0];
+        let dcp = c2p - c1p;
+        let dhp = if c1p * c2p == 0.0 {
+            0.0
+        } else if (h2p - h1p).abs() <= 180.0 {
+            h2p - h1p
+        } else if h2p > h1p {
+            h2p - h1p - 360.0
+        } else {
+            h2p - h1p + 360.0
+        };
+        let dbighp = 2.0 * (c1p * c2p).sqrt() * (dhp.to_radians() / 2.0).sin();
+        let lbp = f64::midpoint(l1[0], l2[0]);
+        let cbp = f64::midpoint(c1p, c2p);
+        let hbp = if c1p * c2p == 0.0 {
+            h1p + h2p
+        } else if (h1p - h2p).abs() <= 180.0 {
+            f64::midpoint(h1p, h2p)
+        } else if h1p + h2p < 360.0 {
+            (h1p + h2p + 360.0) / 2.0
+        } else {
+            (h1p + h2p - 360.0) / 2.0
+        };
+        let t = 0.20f64.mul_add(
+            -(4.0f64.mul_add(hbp, -63.0)).to_radians().cos(),
+            0.32f64.mul_add(
+                (3.0f64.mul_add(hbp, 6.0)).to_radians().cos(),
+                0.24f64.mul_add(
+                    (2.0 * hbp).to_radians().cos(),
+                    0.17f64.mul_add(-(hbp - 30.0).to_radians().cos(), 1.0),
+                ),
+            ),
+        );
+        let dth = 30.0 * (-(((hbp - 275.0) / 25.0).powi(2))).exp();
+        let rc = 2.0 * (cbp.powi(7) / (cbp.powi(7) + 25f64.powi(7))).sqrt();
+        let sl = 1.0 + (0.015 * (lbp - 50.0).powi(2)) / (20.0 + (lbp - 50.0).powi(2)).sqrt();
+        let sc = 0.045f64.mul_add(cbp, 1.0);
+        let sh = (0.015 * cbp).mul_add(t, 1.0);
+        let rt = -(2.0 * dth).to_radians().sin() * rc;
+        (rt * (dcp / sc) * (dbighp / sh))
+            .mul_add(
+                1.0,
+                (dbighp / sh).mul_add(
+                    dbighp / sh,
+                    (dlp / sl).mul_add(dlp / sl, (dcp / sc).powi(2)),
+                ),
+            )
+            .max(0.0)
+            .sqrt()
+    }
+
+    /// The worst pair of thread hues at one role's brightness.
+    fn worst_pair(role: Rgb) -> (f64, usize, usize) {
+        let inks: Vec<Rgb> = (0..THREAD_HUES.len())
+            .map(|i| thread_ink(i as u8, role))
+            .collect();
+        let mut worst = (f64::INFINITY, 0, 0);
+        for i in 0..inks.len() {
+            for j in i + 1..inks.len() {
+                let d = de2000(inks[i], inks[j]);
+                if d < worst.0 {
+                    worst = (d, i, j);
+                }
+            }
+        }
+        worst
+    }
+
+    /// The measurement PRD §11.4 and the operator's *"slightly different to the
+    /// others"* both come down to: with nine threads on screen, can two of them
+    /// be told apart **at the brightness the map actually draws them**?
+    ///
+    /// The floors are the measured values, held to the nearest tenth so a
+    /// careless edit to [`THREAD_HUES`] or to a band constant fails here rather
+    /// than in front of the operator. The agent band is where identity has to
+    /// read from across the room; the cloud band is `49-84` and physically
+    /// cannot do better than this.
+    #[test]
+    fn thread_hues_are_far_enough_apart_at_the_luminance_they_are_drawn_at() {
+        for (name, role, floor) in [
+            ("rail swatch / agent body", AGENT_BODY, 9.8),
+            ("anchor", AGENT_ANCHOR, 9.5),
+            ("trail", AGENT_TRAIL, 8.8),
+            ("tether", AGENT_TETHER, 7.9),
+            ("cloud core", CLOUD_TONES[2], 5.8),
+            ("cloud body", CLOUD_TONES[1], 6.1),
+            ("cloud fringe", CLOUD_TONES[0], 5.4),
+        ] {
+            let (d, i, j) = worst_pair(role);
+            // Printed, not only asserted: `cargo test -- --nocapture` is how the
+            // table in `THREAD_HUES`'s docs is re-measured after any change to
+            // the ring or to a band constant.
+            println!(
+                "{name:26} peak {:3}  worst dE00 {d:5.2}  slots {i}<->{j}",
+                head(role)
+            );
+            assert!(
+                d >= floor,
+                "{name}: worst pair is slots {i} and {j} at dE00 {d:.2}, under the measured \
+                 floor {floor} - {:?} against {:?}",
+                thread_ink(i as u8, role),
+                thread_ink(j as u8, role)
+            );
+        }
+    }
+
+    /// Every thread ink is inside the band of the role it was levelled to. A
+    /// palette that carries identity still may not spend PRD §10.3's contrast
+    /// budget: a thread's cloud has to stay a cloud.
+    #[test]
+    fn a_threads_colour_never_leaves_the_band_of_the_thing_it_is_drawn_on() {
+        for slot in 0..THREAD_HUES.len() as u8 {
+            for role in [AGENT_BODY, AGENT_TRAIL, AGENT_TETHER, AGENT_ANCHOR] {
+                let h = head(thread_ink(slot, role));
+                assert!(
+                    (AGENT_BAND.0..=AGENT_BAND.1).contains(&h),
+                    "slot {slot} on {role:?} came out at {h}, outside {AGENT_BAND:?}"
+                );
+            }
+            for tone in CLOUD_TONES {
+                let h = head(thread_ink(slot, tone));
+                assert!(
+                    (CLOUD_BAND.0..=CLOUD_BAND.1).contains(&h),
+                    "slot {slot} on cloud tone {tone:?} came out at {h}, outside {CLOUD_BAND:?}"
+                );
+            }
+        }
+    }
+
+    /// A role's brightness is the role's, not the thread's: every thread's body
+    /// sits at exactly one peak, so the band ladder still reads in greyscale and
+    /// no thread is quietly louder than another.
+    #[test]
+    fn identity_spends_hue_and_chroma_and_never_the_contrast_budget() {
+        for role in [AGENT_BODY, AGENT_TRAIL, AGENT_TETHER, AGENT_ANCHOR] {
+            let want = head(role);
+            for slot in 0..THREAD_HUES.len() as u8 {
+                assert_eq!(
+                    head(thread_ink(slot, role)),
+                    want,
+                    "slot {slot} moved the peak of {role:?}"
+                );
+            }
+        }
+    }
+
+    /// The whole point of hashing the id instead of indexing a list: a thread's
+    /// colour cannot move because another thread started, finished or was
+    /// retired.
+    #[test]
+    fn a_threads_hue_does_not_move_when_another_thread_comes_or_goes() {
+        let ids = [
+            "4f3a1c22-0e5b-4b8a-9d21-6c7e5f0a1b2c",
+            "9b2e77d0-1111-4aaa-8bbb-ccccddddeeee",
+            "0000aaaa-2222-4ccc-8ddd-eeeeffff0000",
+        ];
+        let first: Vec<u8> = ids.iter().map(|i| thread_slot(i)).collect();
+        // Every subset, in every order, and the answers never move - because
+        // there is no list to be in.
+        for perm in [[2usize, 0, 1], [1, 2, 0], [0, 2, 1]] {
+            for k in perm {
+                assert_eq!(thread_slot(ids[k]), first[k]);
+            }
+        }
+        assert_eq!(thread_slot(""), thread_slot(""));
+    }
+
+    /// The hash is pinned by literal values (ADR-0029): if `DefaultHasher` crept
+    /// in, or the constants were retyped, the city would repaint itself on a
+    /// toolchain bump and nothing else would notice.
+    #[test]
+    fn the_identity_hash_is_written_out_and_pinned() {
+        assert_eq!(thread_slot(""), (FNV_OFFSET % 12) as u8);
+        assert_eq!(thread_slot("a"), 4);
+        assert_eq!(thread_slot("polis"), 4);
+        assert_eq!(thread_slot("4f3a1c22-0e5b-4b8a-9d21-6c7e5f0a1b2c"), 1);
+        // Out of range wraps rather than panicking, so a stale slot from an old
+        // snapshot cannot take the window down.
+        assert_eq!(thread_hue(NO_TINT), thread_hue(NO_TINT % 12));
+    }
+
     /// PRD §10.3's allocation, asserted on the palette rather than described in
     /// a comment. A colour belongs to the band its **largest** channel is in,
     /// which is the same rule `plan` measures rendered pixels with.
@@ -2595,6 +3353,112 @@ mod tests {
         assert_eq!(rest.pixels[i..i + 3], onset.pixels[i..i + 3]);
     }
 
+    /// Two threads, two clouds, two colours — and neither of them anywhere near
+    /// the base map's band.
+    ///
+    /// The operator's first complaint was that nine threads all looked the
+    /// same. This is the layer where that is hardest to fix: PRD §10.3 gives a
+    /// cloud channels `49-84`, which is a twelfth of the range the agent band
+    /// gets, so it is also the layer where a careless fix would reach for
+    /// brightness and take the base map's contrast with it.
+    #[test]
+    fn two_threads_clouds_are_two_colours_and_neither_lifts_the_base_map() {
+        let mut c = Canvas::new(320, 200, [20, 21, 24]);
+        let mut kernels: Vec<CloudKernel> = Vec::new();
+        for (group, cx) in [(0u16, 80.0f64), (1, 240.0)] {
+            for i in 0..9 {
+                kernels.push(CloudKernel {
+                    at: [
+                        f64::from(i % 3).mul_add(20.0, cx - 20.0),
+                        f64::from(i / 3).mul_add(20.0, 80.0),
+                    ],
+                    radius: 40.0,
+                    weight: 1.0,
+                    thread: group,
+                });
+            }
+        }
+        let frame = LiveFrame {
+            unit: 30.0,
+            map_height: 200.0,
+            clouds: kernels,
+            // Slot 0 and slot 6 — opposite sides of the hue circle, which is
+            // what two threads that hash apart look like.
+            cloud_tints: vec![0, 6],
+            ..LiveFrame::default()
+        };
+        draw_clouds(&mut c, &frame);
+
+        let mut left: Vec<Rgb> = Vec::new();
+        let mut right: Vec<Rgb> = Vec::new();
+        for (i, p) in c.pixels.as_chunks::<3>().0.iter().enumerate() {
+            if p == &[20, 21, 24] {
+                continue;
+            }
+            let px = *p;
+            // Still opaque marks inside the cloud band: identity may not spend
+            // one level of PRD §10.3's budget.
+            let h = head(px);
+            assert!(
+                (CLOUD_BAND.0..=CLOUD_BAND.1).contains(&h),
+                "a tinted cloud pixel came out at {h}: {px:?}"
+            );
+            if i % 320 < 160 {
+                left.push(px);
+            } else {
+                right.push(px);
+            }
+        }
+        assert!(
+            left.len() > 200 && right.len() > 200,
+            "both clouds have to be on the canvas: {} and {} px",
+            left.len(),
+            right.len()
+        );
+        // Each side draws only its own thread's three tones, and the two sets
+        // are disjoint — which is the whole claim.
+        let want_l = thread_cloud_tones(0);
+        let want_r = thread_cloud_tones(6);
+        for px in &left {
+            assert!(want_l.contains(px), "left cloud drew {px:?}, not slot 0's");
+        }
+        for px in &right {
+            assert!(want_r.contains(px), "right cloud drew {px:?}, not slot 6's");
+        }
+        for a in want_l {
+            assert!(!want_r.contains(&a), "the two threads share a tone {a:?}");
+        }
+    }
+
+    /// Without a tint table the picture is exactly the one this module drew
+    /// before identity existed. A caller with nothing to say about whose cloud
+    /// it is gets the neutral tones, not a guess.
+    #[test]
+    fn a_cloud_with_no_identity_offered_is_the_neutral_tone_it_always_was() {
+        let kernels: Vec<CloudKernel> = (0..9)
+            .map(|i| CloudKernel {
+                at: [
+                    f64::from(i % 3).mul_add(20.0, 60.0),
+                    f64::from(i / 3).mul_add(20.0, 60.0),
+                ],
+                radius: 40.0,
+                weight: 1.0,
+                thread: 0,
+            })
+            .collect();
+        let field = CloudField::sample(&kernels, 200, 200).expect("a field");
+        let mut plain = Canvas::new(200, 200, [20, 21, 24]);
+        let mut empty = Canvas::new(200, 200, [20, 21, 24]);
+        paint_cloud_bands(&mut plain, &field.bands());
+        paint_cloud_bands(&mut empty, &field.bands_tinted(&[]));
+        assert_eq!(plain.pixels, empty.pixels);
+        for p in plain.pixels.as_chunks::<3>().0 {
+            if p != &[20, 21, 24] {
+                assert!(CLOUD_TONES.contains(&[p[0], p[1], p[2]]), "{p:?}");
+            }
+        }
+    }
+
     /// PRD §10.4, as an assertion: a cloud is contour and hatch, never a fill.
     /// The measure is the one that matters to the operator — how much of the
     /// city the cloud covered.
@@ -2711,7 +3575,11 @@ mod tests {
                 visits: 1,
             })
             .collect();
-        let trail = Trail { steps, ttl: 300.0 };
+        let trail = Trail {
+            steps,
+            ttl: 300.0,
+            tint: 0,
+        };
         let render = |style| {
             let mut c = Canvas::new(300, 300, [0, 0, 0]);
             draw_trail(&mut c, &trail, style, 9.0);
@@ -2774,7 +3642,12 @@ mod tests {
                     visits: (passes / 2 + 1) as u32,
                 })
                 .collect();
-            draw_trail(&mut c, &Trail { steps, ttl: 300.0 }, TrailStyle::Timed, r);
+            let trail = Trail {
+                steps,
+                ttl: 300.0,
+                tint: 0,
+            };
+            draw_trail(&mut c, &trail, TrailStyle::Timed, r);
             draw_thrash(
                 &mut c,
                 Thrash {
@@ -2810,7 +3683,12 @@ mod tests {
         };
         let render = |steps: Vec<TrailStep>, style| {
             let mut c = Canvas::new(300, 300, [0, 0, 0]);
-            draw_trail(&mut c, &Trail { steps, ttl: 300.0 }, style, 9.0);
+            let trail = Trail {
+                steps,
+                ttl: 300.0,
+                tint: 0,
+            };
+            draw_trail(&mut c, &trail, style, 9.0);
             c.pixels
                 .as_chunks::<3>()
                 .0
@@ -2914,6 +3792,7 @@ mod tests {
                     pulse: 0.0,
                     weight: 1.0,
                     urgency: 0.0,
+                    sited: true,
                 },
                 8.0,
             );
@@ -2956,6 +3835,7 @@ mod tests {
                     pulse: 0.0,
                     weight: 1.0,
                     urgency: 0.0,
+                    sited: true,
                 },
                 10.0,
             );
@@ -2982,6 +3862,7 @@ mod tests {
                 thread: 0,
             }],
             trails: vec![Trail {
+                tint: 0,
                 steps: (0..6)
                     .map(|i| TrailStep {
                         at: [40.0 + f64::from(i) * 30.0, 120.0],
@@ -2999,6 +3880,7 @@ mod tests {
                 0.5,
             )],
             agents: vec![Agent {
+                tint: 0,
                 at: [150.0, 150.0],
                 body: Body::Main,
                 outcome: Outcome::Done,
@@ -3014,6 +3896,7 @@ mod tests {
                 pulse: 0.3,
                 weight: 1.0,
                 urgency: 0.0,
+                sited: true,
             }],
             ..LiveFrame::default()
         };
@@ -3045,6 +3928,7 @@ mod tests {
                 thread: 0,
             }],
             trails: vec![Trail {
+                tint: 0,
                 steps: (0..8)
                     .map(|i| TrailStep {
                         at: [60.0 + f64::from(i) * 36.0, 200.0],
@@ -3055,6 +3939,7 @@ mod tests {
                 ttl: 300.0,
             }],
             tethers: vec![Tether {
+                tint: 0,
                 anchor: [200.0, 200.0],
                 worker: [300.0, 120.0],
                 running: true,
@@ -3083,6 +3968,7 @@ mod tests {
                 })
                 .collect(),
             agents: vec![Agent {
+                tint: 0,
                 at: [240.0, 200.0],
                 body: Body::Worker,
                 outcome: Outcome::Pending,
@@ -3121,6 +4007,7 @@ mod tests {
             pulse: 0.0,
             weight: 1.0,
             urgency: 0.0,
+            sited: true,
         }];
         let mut with = Canvas::new(400, 400, [20, 21, 24]);
         draw(&mut with, &frame, TrailStyle::Timed);
@@ -3144,6 +4031,7 @@ mod tests {
             let ox = f64::from(t % 8) * 170.0 + 60.0;
             let oy = f64::from(t / 8) * 260.0 + 90.0;
             frame.trails.push(Trail {
+                tint: 0,
                 steps: (0..64)
                     .map(|i| TrailStep {
                         at: [ox + f64::from(i % 8) * 18.0, oy + f64::from(i / 8) * 18.0],
@@ -3155,6 +4043,7 @@ mod tests {
             });
             for w in 0..4 {
                 frame.tethers.push(Tether {
+                    tint: 0,
                     anchor: [ox, oy],
                     worker: [ox + f64::from(w) * 30.0, oy + 60.0],
                     running: w % 2 == 0,
@@ -3171,6 +4060,7 @@ mod tests {
                 ));
             }
             frame.agents.push(Agent {
+                tint: 0,
                 at: [ox, oy],
                 body: Body::Main,
                 outcome: Outcome::Pending,
@@ -3186,6 +4076,7 @@ mod tests {
                 pulse: 0.2,
                 weight: 1.0,
                 urgency: 0.0,
+                sited: true,
             });
         }
         let mut c = Canvas::new(1400, 1400, [20, 21, 24]);
@@ -3575,6 +4466,7 @@ mod tests {
             draw_tether(
                 &mut c,
                 Tether {
+                    tint: 0,
                     anchor: [20.0, 30.0],
                     worker: [280.0, 30.0],
                     running,
@@ -3609,6 +4501,73 @@ mod tests {
         assert!(
             dashed.iter().filter(|c| **c).count() < solid.iter().filter(|c| **c).count(),
             "the dashed tether is not sparser than the solid one"
+        );
+    }
+
+    /// The tether was made **brighter** when it stopped being ambient, and the
+    /// thing that has to stay true is the ordering: the line that identifies a
+    /// worker may not outshine the worker, the trail, or anything in layer 5.
+    ///
+    /// Measured on rendered pixels rather than argued from the constants,
+    /// because `fade` and the rasteriser's coverage both sit between the two.
+    #[test]
+    fn an_asked_for_tether_reads_without_outshining_what_it_identifies() {
+        let peak_of = |f: &dyn Fn(&mut Canvas)| -> u8 {
+            let mut c = Canvas::new(300, 60, [0, 0, 0]);
+            f(&mut c);
+            c.pixels.iter().copied().max().unwrap_or(0)
+        };
+        let tether = |running: bool| {
+            move |c: &mut Canvas| {
+                draw_tether(
+                    c,
+                    Tether {
+                        tint: 0,
+                        anchor: [20.0, 30.0],
+                        worker: [280.0, 30.0],
+                        running,
+                        spread: 0.0,
+                    },
+                    12.0,
+                );
+            }
+        };
+        let running = peak_of(&tether(true));
+        let finished = peak_of(&tether(false));
+        let body = peak_of(&|c: &mut Canvas| {
+            draw_agent(
+                c,
+                Agent {
+                    tint: 0,
+                    at: [150.0, 30.0],
+                    body: Body::Worker,
+                    outcome: Outcome::Pending,
+                    travel: 0.0,
+                    heading: [1.0, 0.0],
+                    waiting: false,
+                },
+                12.0,
+            );
+        });
+        println!("tether running {running}, finished {finished}; worker body {body}");
+        for (name, v) in [("running", running), ("finished", finished)] {
+            assert!(
+                (AGENT_BAND.0..=AGENT_BAND.1).contains(&v),
+                "a {name} tether peaked at {v}, outside the agent band {AGENT_BAND:?}"
+            );
+        }
+        assert!(
+            finished < running,
+            "a finished worker's tether ({finished}) is not quieter than a running one ({running})"
+        );
+        assert!(
+            running < head(AGENT_TRAIL),
+            "a tether ({running}) is not quieter than a trail ({})",
+            head(AGENT_TRAIL)
+        );
+        assert!(
+            running < body,
+            "the line ({running}) outshines the worker it identifies ({body})"
         );
     }
 }

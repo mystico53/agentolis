@@ -996,11 +996,25 @@ pub struct CloudSummary {
 impl CloudSummary {
     /// Summarises a territory, or `None` when it has no cloud.
     ///
-    /// Until a territory converges there is nothing to overlap (PRD §6.2), and
-    /// that is a property of the evidence rather than of the geometry — so it is
-    /// checked here, once, rather than in every pairing.
+    /// Until a territory is placed there is nothing to overlap (PRD §6.2, §6.4),
+    /// and that is a property of the evidence rather than of the geometry — so
+    /// it is checked here, once, rather than in every pairing.
+    ///
+    /// The test is [`Territory::placement`], not the claim field, and the
+    /// difference is the whole signal. PRD §11.3 is about *"two orchestrators
+    /// claiming the same district"*, and an orchestrator is exactly the thread
+    /// §6.2's single-ancestor gate rejects: its work is spread, so its trimmed
+    /// ancestor collapses to the root and it has lobes instead of a claim. A
+    /// claim-only test therefore made the early warning blind to the one kind
+    /// of thread it was written about. Measured live on `qurio-toolset` with
+    /// eight real sessions: five territories drawn, 106 000 of the cloud
+    /// layer's 219 000 banded texels claimed by two or more of them — the map
+    /// cross-hatching contested ground the overlap list could not name a pair
+    /// for, because two of those five had lobes and no claim.
+    ///
+    /// [`Territory::placement`]: crate::territory::Territory::placement
     pub fn of(t: &crate::territory::Territory) -> Option<Self> {
-        if t.claim.is_none() || t.kernels.is_empty() {
+        if !t.placement().is_somewhere() || t.kernels.is_empty() {
             return None;
         }
         let mut kernels = t.kernels.clone();
@@ -1571,6 +1585,58 @@ mod tests {
             CloudSummary::of(&wide).unwrap().kernels.len(),
             OVERLAP_KERNELS
         );
+    }
+
+    /// PRD §11.3 is about *"two orchestrators claiming the same district"*, and
+    /// an orchestrator is precisely the thread PRD §6.2's single-ancestor gate
+    /// rejects — its work is spread, so its trimmed ancestor is the repository
+    /// root and it has PRD §6.4's lobes instead of a claim. A `claim.is_none()`
+    /// filter therefore excluded the early warning's own subject.
+    #[test]
+    fn an_orchestrator_with_lobes_and_no_claim_still_has_a_cloud_to_overlap() {
+        use crate::territory::Territory;
+        use crate::{Observation, PathScope};
+        use polis_events::ToolKind;
+        use polis_layout::Point;
+
+        let now = Instant::now();
+        let mut spread = Territory::for_extent(1000.0);
+        // Interleaved: PRD §6.3 contracts slowly, so a thread that works in one
+        // directory before it fans out keeps that first claim. A real
+        // orchestrator's workers report from everywhere at once.
+        let places = ["src/components/a.jsx", "src/hooks/b.js", "tests/c.test.js"];
+        for k in 0..12 {
+            for (i, path) in places.iter().enumerate() {
+                #[allow(clippy::cast_precision_loss)] // a test's kernel scatter
+                let x = (k * 3 + i) as f32 * 0.1;
+                spread.observe(
+                    &Observation {
+                        thread: thread("orchestrator"),
+                        worker: None,
+                        scope: PathScope::File,
+                        path: lp(path),
+                        tool: ToolKind::Read,
+                        at: now,
+                        weight: None,
+                    },
+                    1.0,
+                    Some(Point::new(x, 0.0)),
+                );
+            }
+        }
+        assert!(
+            spread.claim.is_none(),
+            "the fixture must be the case §6.2 cannot name: {:?}",
+            spread.claim
+        );
+        assert!(!spread.lobes.is_empty(), "but §6.4 can");
+        assert!(
+            CloudSummary::of(&spread).is_some(),
+            "a lobed thread has a cloud, so it has something to overlap"
+        );
+        let same = territory_overlap(&spread, &spread)
+            .expect("and the early warning can therefore see it at all");
+        assert!((same - 1.0).abs() < 1e-3, "same cloud is 1.0: {same}");
     }
 
     #[test]

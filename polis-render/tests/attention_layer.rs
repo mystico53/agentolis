@@ -67,6 +67,9 @@ fn panel(kind: MarkKind, urgency: f64, pulse: f64) -> Canvas {
         pulse,
         weight: 1.0,
         urgency,
+        // The comparison is between the four states, so every panel is drawn
+        // where the work is. `salience`'s own tests cover the fallback.
+        sited: true,
     };
     let frame = LiveFrame {
         unit: UNIT,
@@ -323,6 +326,7 @@ fn the_attention_layer_is_cheap_even_when_everything_is_on_fire() {
             pulse: 0.3,
             weight: 1.0,
             urgency: 1.0,
+            sited: true,
         });
     }
     live::draw_attention(&mut canvas, &frame);

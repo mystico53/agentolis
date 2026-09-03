@@ -86,7 +86,7 @@ use polis_layout::{CityLayout, Point};
 use polis_world::attention::{Attention, AttentionKind};
 use polis_world::place;
 use polis_world::snapshot::WorldSnapshot;
-use polis_world::territory;
+use polis_world::territory::{self, Placement};
 use polis_world::{Thread, ThreadStatus};
 
 use crate::live::{
@@ -131,16 +131,12 @@ const MARKS_PER_THREAD: usize = 48;
 
 /// The most tethers drawn for one thread, running workers first.
 ///
-/// PRD §10.4 caps clouds — *"Forty threads means forty systems and the map
-/// vanishes under haze"* — and the same argument applies with more force to
-/// tethers, because a tether is a **line across the whole map** rather than a
-/// blob in one place. Measured on a real session: 58 workers on one thread drew
-/// 58 near-parallel lines converging on one point, which was the brightest
-/// structure in the frame and said nothing except "this thread delegates".
-///
-/// Sixteen keeps "this is one unit with several hands" legible. The count is in
-/// the caption for the rest.
-const TETHERS_PER_THREAD: usize = 16;
+/// The notation's own constant, so the window and a recorded frame stop at the
+/// same sixteen hands. Capping was never enough on its own — see
+/// [`live::draw_tether`] for why the fan is now drawn for one interrogated
+/// thread rather than for all of them, and [`FrameRenderer::tether`] for how a
+/// headless frame names that thread.
+const TETHERS_PER_THREAD: usize = live::TETHERS_PER_THREAD;
 
 /// The most scaffolds drawn, tallest first.
 ///
@@ -250,6 +246,8 @@ struct RailBuilder {
     /// Threads with no position at all — no converged territory, no placeable
     /// step. PRD §6.2's literal case.
     threads: Vec<String>,
+    /// PRD §10.4's selection, as counts. See [`live::CloudCensus`].
+    cloud: live::CloudCensus,
 }
 
 impl RailBuilder {
@@ -297,6 +295,25 @@ impl RailBuilder {
                 kind: live::RailKind::UnattributedWorkers,
                 label: "no parent link".to_owned(),
                 count: u32::try_from(unattributed).unwrap_or(u32::MAX),
+                failed: 0,
+            });
+        }
+        // One row per reason a thread has no cloud, so an empty sky is never a
+        // silent state. `select_clouds` has always returned these three counts;
+        // until now nothing read them, and the map above this rail could show
+        // nine threads and no clouds with no way to ask why.
+        for (count, why) in [
+            (self.cloud.unplaced, "not converged"),
+            (self.cloud.dormant, "dormant"),
+            (self.cloud.capped, "over the cloud cap"),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            rows.push(live::RailRow {
+                kind: live::RailKind::NoCloud,
+                label: why.to_owned(),
+                count: u32::try_from(count).unwrap_or(u32::MAX),
                 failed: 0,
             });
         }
@@ -370,6 +387,12 @@ const RAIL_MIN: usize = 130;
 /// neither can ever be clipped.
 const RAIL_COLUMNS: f64 = 15.0;
 
+/// Lines of running totals the rail draws along its bottom edge.
+///
+/// Named because two places need it: the footer that draws them, and the row
+/// list that has to stop before it reaches them.
+const RAIL_FOOTER_LINES: usize = 4;
+
 /// An agent's identity across frames: a thread, and a worker inside it.
 type AgentKey = (ThreadId, Option<WorkerId>);
 
@@ -419,6 +442,21 @@ pub struct FrameRenderer {
     /// [`LiveFrame`] because it is animation state, and a `LiveFrame` has to
     /// stay a pure description of one moment.
     cloud_tween: live::CloudTween,
+    /// PRD §10.4's selection on the last frame built. See
+    /// [`FrameRenderer::cloud_census`].
+    cloud: live::CloudCensus,
+    /// `LiveFrame::cloud_tints` from the last frame built, kept because the
+    /// tween is painted from `render` and the identities were resolved in
+    /// `build`.
+    cloud_tints: Vec<u8>,
+    /// The one thread whose workers are tethered back to it, if any.
+    ///
+    /// `None` — the default, and what every recording and every measurement
+    /// uses — draws no tethers at all. See [`live::draw_tether`]: ownership is
+    /// carried ambiently by the thread's colour, and the line is the *exact*
+    /// answer to a question about one thread. A headless frame has no pointer,
+    /// so nobody is asking unless a caller says who.
+    tethered: Option<ThreadId>,
     label: String,
     timings: LiveTimings,
     frames: u64,
@@ -461,6 +499,9 @@ impl FrameRenderer {
             motion: BTreeMap::new(),
             rise: BTreeMap::new(),
             cloud_tween: live::CloudTween::default(),
+            cloud: live::CloudCensus::default(),
+            cloud_tints: Vec::new(),
+            tethered: None,
             label: String::new(),
             timings: LiveTimings::default(),
             frames: 0,
@@ -501,11 +542,49 @@ impl FrameRenderer {
         self.label = label.into();
     }
 
+    /// Names the one thread whose workers are tethered back to it, or `None`
+    /// for the ambient map, which is the default.
+    ///
+    /// This is the headless equivalent of hovering a thread in the window
+    /// (`polis_app::mapview`), and it exists so a recording *about* delegation
+    /// can still show a fan. It is deliberately one thread and not a set: PRD
+    /// §12's *"fuzzy above, exact below"* is about a question the operator
+    /// asked, and they ask it about one thread at a time.
+    ///
+    /// See [`live::draw_tether`] for the measurement that moved ownership off
+    /// the line and onto the thread's colour.
+    pub fn tether(&mut self, thread: Option<ThreadId>) {
+        self.tethered = thread;
+    }
+
     /// What the live layer cost on the last frame. PRD §13.1 budgets layers 4
     /// and 5 at under 4 ms; [`LiveTimings::budgeted`] is that number.
     #[must_use]
     pub fn timings(&self) -> LiveTimings {
         self.timings
+    }
+
+    /// The tweened cloud field this renderer drew on its last frame, or `None`
+    /// when it drew no cloud.
+    ///
+    /// Exposed for the measurement harness, and it is the only honest way to
+    /// build one: a harness that samples its own field from its own kernels is
+    /// measuring its own arithmetic, and
+    /// `polis-render/tests/cloud_measure.rs` did exactly that — with PRD
+    /// §6.2's convergence gate lifted — for as long as no real session could
+    /// pass the gate. The number that matters is what came out of *this*
+    /// tween, after this renderer's camera, this renderer's cap and this
+    /// renderer's selection.
+    #[must_use]
+    pub fn cloud_field(&self) -> Option<&live::CloudField> {
+        self.cloud_tween.field()
+    }
+
+    /// Why the last frame has the clouds it has — and why it does not have the
+    /// others (PRD §10.4). See [`live::CloudCensus`].
+    #[must_use]
+    pub fn cloud_census(&self) -> live::CloudCensus {
+        self.cloud
     }
 
     /// Re-points the camera and re-renders the base map.
@@ -598,6 +677,18 @@ impl FrameRenderer {
         // one busy thread from two threads on one file and only the second is
         // news — see [`CloudKernel::thread`].
         for (rank, territory) in selection.visible.iter().enumerate() {
+            // The rank is a per-frame group index the field sampler sorts on;
+            // the tint beside it is the thread's own identity. Matched back by
+            // pointer because `select_clouds` hands out territories and the
+            // hue is the *thread's* — the pairs it chose from are right here.
+            frame.cloud_tints.push(
+                pairs
+                    .iter()
+                    .find(|(_, t)| std::ptr::eq(*t, *territory))
+                    .map_or(live::NO_TINT, |(thread, _)| {
+                        live::thread_slot(thread.id.as_str())
+                    }),
+            );
             for k in &territory.kernels {
                 if k.weight <= 0.0 {
                     continue;
@@ -624,10 +715,32 @@ impl FrameRenderer {
         let map_px = self.opts.pixels;
         let target = live::CloudField::sample(&frame.clouds, map_px, map_px);
         self.cloud_tween.advance(target, dt, live::CLOUD_TWEEN_RATE);
+        // What the selection decided, carried out of `build` rather than
+        // dropped on the floor. `select_clouds` has returned these counts since
+        // it was written and nothing read them, which is exactly how the map
+        // reached "nine threads, no clouds" with no way to ask why.
+        frame.cloud = live::CloudCensus {
+            shown: selection.visible.len(),
+            kernels: frame.clouds.len(),
+            widest_px: frame.clouds.iter().map(|k| k.radius).fold(0.0f64, f64::max),
+            unplaced: selection.unplaced,
+            dormant: selection.dormant,
+            capped: selection.capped,
+        };
+        self.cloud = frame.cloud;
+        self.cloud_tints.clone_from(&frame.cloud_tints);
 
         let mut anchors: BTreeMap<ThreadId, Px> = BTreeMap::new();
-        let mut rail = RailBuilder::default();
+        let mut rail = RailBuilder {
+            cloud: frame.cloud,
+            ..RailBuilder::default()
+        };
         for thread in &snap.threads {
+            // One thread, one hue, everywhere it appears (PRD §11.4, and the
+            // operator's own words: *"i'd like one thread to be one color"*).
+            // Derived from the thread's own id, so it is fixed before the
+            // thread's first event and no other thread's arrival can move it.
+            let tint = live::thread_slot(thread.id.as_str());
             let anchor = thread_anchor(thread, layout, &view);
             if let Some(a) = anchor {
                 anchors.insert(thread.id.clone(), a);
@@ -654,6 +767,7 @@ impl FrameRenderer {
                 frame.trails.push(Trail {
                     steps,
                     ttl: polis_world::TRAIL_TTL.as_secs_f64(),
+                    tint,
                 });
             }
 
@@ -796,11 +910,14 @@ impl FrameRenderer {
                     travel: 1.0 - m.t,
                     heading: m.heading(),
                     waiting,
+                    tint,
                 });
             }
             // Running workers first, then the most recently active: a tether
             // is a claim about *now*, and a finished worker's is the first to
-            // go when there is not room for all of them.
+            // go when there is not room for all of them. The same order the
+            // window ranks by, so both stop at the same sixteen.
+            let tethered = self.tethered.as_ref() == Some(&thread.id);
             let mut ranked: Vec<&polis_world::Worker> = thread.workers.iter().collect();
             ranked.sort_by(|a, b| {
                 b.running
@@ -818,7 +935,7 @@ impl FrameRenderer {
                 let key = (thread.id.clone(), Some(worker.id.clone()));
                 let m = self.step_motion(key, p, dt);
                 let at = m.at();
-                if let Some(a) = anchor {
+                if let Some(a) = anchor.filter(|_| tethered) {
                     if rank < TETHERS_PER_THREAD {
                         // Fan the bundle: rank 0 bows one way, the last bows the
                         // other, and the count becomes readable.
@@ -829,6 +946,7 @@ impl FrameRenderer {
                             worker: at,
                             running: worker.running,
                             spread,
+                            tint,
                         });
                     }
                 }
@@ -846,6 +964,7 @@ impl FrameRenderer {
                         travel: 1.0 - m.t,
                         heading: m.heading(),
                         waiting: waiting && worker.running,
+                        tint,
                     });
                 }
             }
@@ -953,7 +1072,7 @@ impl FrameRenderer {
         }
 
         let clouds = self.cloud_tween.field().map_or(Duration::ZERO, |field| {
-            live::draw_cloud_field(&mut self.scratch, field)
+            live::draw_cloud_field(&mut self.scratch, field, &self.cloud_tints)
         });
         // Layer 3t: the type goes back on top of the clouds (PRD §10.3). The
         // indices are into the *map*, so they are re-strided onto the canvas.
@@ -976,7 +1095,7 @@ impl FrameRenderer {
             self.draw_caption(snap);
         }
         if self.rail_width > 0 {
-            self.draw_rail(&frame.rail, snap);
+            self.draw_rail(&frame.rail, frame.cloud, snap);
         }
     }
 
@@ -1002,7 +1121,12 @@ impl FrameRenderer {
     /// except for the failure count, which is drawn in [`live::AGENT_FAILED`]
     /// (top channel 168, the agent band's ceiling) and paired with the failed
     /// operation's own glyph, so it is never a colour-only signal (PRD §11.4).
-    fn draw_rail(&mut self, rows: &[live::RailRow], snap: &WorldSnapshot) {
+    fn draw_rail(
+        &mut self,
+        rows: &[live::RailRow],
+        cloud: live::CloudCensus,
+        snap: &WorldSnapshot,
+    ) {
         let x0 = self.opts.pixels as f64;
         let w = self.rail_width as f64;
         let h = (self.opts.pixels + self.caption_height) as f64;
@@ -1030,7 +1154,15 @@ impl FrameRenderer {
         // since the session started. They are different numbers and the rail
         // says which is which, because "0 unplaced now" and "18 unplaced ever"
         // are both true and only one of them is actionable.
-        let head = if rows.is_empty() {
+        // "All placed" is a statement about **placement**, so a `NoCloud` row —
+        // which is about the cloud policy and not about a thing with nowhere to
+        // go — must not turn it into "NOW 0 UNPLACED". The two lines answer
+        // different questions and the cloud line below answers the second one.
+        let placement_rows = rows
+            .iter()
+            .filter(|r| r.kind != live::RailKind::NoCloud)
+            .count();
+        let head = if placement_rows == 0 {
             "NOW: ALL PLACED".to_owned()
         } else if failed > 0 {
             format!("NOW {ops}, {failed} FAIL")
@@ -1048,11 +1180,29 @@ impl FrameRenderer {
                 CAPTION_TEXT
             },
         );
+        // The cloud lines. They are on the rail rather than in the caption
+        // because the rail is the panel that exists to say what the map is
+        // *not* showing, and "0 clouds" is the loudest thing this layer can
+        // fail to say. Printed even when every thread has a cloud, so the
+        // operator reads a number rather than inferring one from an empty sky —
+        // and one phrase per line, because the rail is fifteen characters wide
+        // and a diagnostic that runs off its own panel is another silence.
+        for phrase in cloud.lines() {
+            y += line;
+            self.scratch
+                .text(x0 + pad, y, &phrase, size * 0.85, CAPTION_TEXT);
+        }
         y += line * 1.35;
 
+        // The rows stop above the footer, not above the panel. The footer is
+        // four lines of running totals drawn from the bottom up, so a rail with
+        // a long list used to run its last row straight through them — reachable
+        // before, and more reachable now that the cloud lines push the list
+        // down. Two numbers overprinted are worse than one number missing.
+        let floor = h - pad - line * (RAIL_FOOTER_LINES as f64 + 0.5);
         let r = (size * 5.0 * 0.42).max(2.0);
         for row in rows {
-            if y + line * 2.0 > h - pad {
+            if y + line * 2.0 > floor {
                 break;
             }
             // The glyph is the row's own operation shape when there is one to
@@ -1070,6 +1220,7 @@ impl FrameRenderer {
                     live::RailKind::UnplacedThread => polis_events::Glyph::HollowCircle,
                     live::RailKind::UnplacedOps => polis_events::Glyph::FilledTriangle,
                     live::RailKind::UnattributedWorkers => polis_events::Glyph::Delegate,
+                    live::RailKind::NoCloud => polis_events::Glyph::ConcentricCircles,
                 },
                 ink,
             );
@@ -1105,7 +1256,8 @@ impl FrameRenderer {
             format!("RAILED {}", census.rail),
             format!("FAILED {}", snap.health.ops_failed.total()),
         ];
-        let mut y = h - pad - line * foot.len() as f64;
+        debug_assert_eq!(foot.len(), RAIL_FOOTER_LINES);
+        let mut y = h - pad - line * RAIL_FOOTER_LINES as f64;
         for text in foot {
             self.scratch
                 .text(x0 + pad, y, &text, size * 0.85, CAPTION_DIM);
@@ -1298,10 +1450,22 @@ fn attention_mark(
     let urgency = f64::from(mark.urgency(now));
     match &mark.kind {
         AttentionKind::NeedsDecision { thread, at, .. } => {
-            let p = at
+            let sited = at
                 .as_ref()
                 .and_then(|path| place(layout, path, view))
-                .or_else(|| anchors.get(thread).copied())?;
+                .or_else(|| anchors.get(thread).copied())
+                .or_else(|| {
+                    // The thread's own inferred scope, when it has one the
+                    // kernels could not express — PRD §6.4's lobes and §6.2's
+                    // claim both name a directory, and a directory has a
+                    // district even when the density field is empty.
+                    scope_of(threads, thread).and_then(|path| place(layout, &path, view))
+                });
+            let (p, sited) = match sited {
+                Some(p) => (p, true),
+                // Nowhere. And "nowhere" is not an answer for this one state.
+                None => (civic_square(layout, view)?, false),
+            };
             Some(AttentionMark {
                 kind: MarkKind::NeedsDecision,
                 at: p,
@@ -1310,6 +1474,7 @@ fn attention_mark(
                 pulse,
                 weight,
                 urgency,
+                sited,
             })
         }
         AttentionKind::Done { thread, verified } => {
@@ -1326,6 +1491,7 @@ fn attention_mark(
                 pulse,
                 weight,
                 urgency,
+                sited: true,
             })
         }
         AttentionKind::Contention(c) => {
@@ -1358,9 +1524,54 @@ fn attention_mark(
                 pulse,
                 weight,
                 urgency,
+                sited: true,
             })
         }
     }
+}
+
+/// The directory a thread's territory names, when the density field alone
+/// could not place it.
+///
+/// PRD §6.2's converged ancestor, else PRD §6.4's heaviest lobe. Reads
+/// [`polis_world::territory::Territory::placement`] rather than testing
+/// `claim.is_some()`, which is the bug that put *"unplaced"* beside a thread
+/// with 483 calls: a caller that tests the claim has quietly decided §6.4's
+/// shape is unplaced.
+fn scope_of(threads: &[Thread], id: &ThreadId) -> Option<LogicalPath> {
+    let thread = threads.iter().find(|t| &t.id == id)?;
+    match thread.territory.placement() {
+        Placement::Claim(path) => Some(path.clone()),
+        Placement::Lobes(lobes) => lobes.first().map(|l| l.path.clone()),
+        Placement::Nowhere => None,
+    }
+}
+
+/// PRD §8's civic square — the repository root, as a place of last resort.
+///
+/// # Why the root is a location here and nowhere else
+///
+/// `polis_world::place` is emphatic that it is not: a `cwd` resolving to the
+/// repository root demotes rather than drawing there, because *"it names the
+/// whole city, and drawing there puts every shell call the session ever ran on
+/// one pixel at the centre of the map"* — 6 804 of 10 030 operations in one
+/// recorded session. That argument is about **volume**, and it is right about
+/// operations.
+///
+/// A pending decision is not an operation. There is at most one per thread per
+/// source, the world caps threads outright, and
+/// [`crate::salience::rings`] folds every one that lands here into a *single*
+/// ring whose count says how many — so the failure mode the rule exists to
+/// prevent cannot occur. What can occur, and did, is the opposite one: PRD
+/// §11.2a's *"this is the primary state; it is what the product is for"*
+/// silently dropped because the thread it belongs to has not converged yet. In
+/// the operator's own screenshot all three `WAITING ON YOU` rows belonged to
+/// threads the rail called unplaced.
+///
+/// So it draws, at the civic square, with [`AttentionMark::sited`] false — and
+/// the ring says *somewhere in here* rather than pretending to know.
+fn civic_square(layout: &CityLayout, view: &View) -> Option<Px> {
+    place(layout, &LogicalPath::root(), view)
 }
 
 /// Half the footprint's width in pixels, for a scaffold that matches its
@@ -1522,6 +1733,64 @@ mod tests {
             share < 0.10,
             "the live layer inked {:.1}% of the map; the city is gone under it",
             share * 100.0
+        );
+    }
+
+    /// A headless frame has no pointer, so nobody is asking, so there are no
+    /// tethers in it — and a caller that says who *is* asking gets that one
+    /// thread's, capped.
+    ///
+    /// The renderer half of the rule `polis_app::mapview` enforces in the
+    /// window. Both halves matter: the recordings and every measurement in
+    /// `polis-render/tests` come through this path, and a fan that survived
+    /// here would go on being the loudest object in the artifacts even after
+    /// the live map lost it. See [`live::draw_tether`].
+    #[test]
+    fn a_frame_nobody_is_interrogating_has_no_tethers() {
+        let c = small_city();
+        let opts = FrameOptions {
+            pixels: 420,
+            supersample: 1,
+            caption: false,
+            rail: false,
+            ..FrameOptions::default()
+        };
+        let mut r = FrameRenderer::new(&c, opts);
+        let world = populated(&c);
+        let (_, reader) = snapshot::from_world(&world);
+        let snap = reader.load();
+
+        let ambient = r.build_frame(&snap, Duration::ZERO);
+        assert!(
+            ambient.tethers.is_empty(),
+            "an ambient frame drew {} tethers",
+            ambient.tethers.len()
+        );
+        let workers: usize = snap.threads.iter().map(|t| t.workers.len()).sum();
+        assert!(workers > 0, "the fixture has no workers to tether");
+
+        let who = snap.threads.first().expect("a thread").id.clone();
+        r.tether(Some(who.clone()));
+        let asked = r.build_frame(&snap, Duration::ZERO);
+        let want = snap
+            .thread(&who)
+            .expect("the thread")
+            .workers
+            .iter()
+            .filter(|w| w.focus.is_some())
+            .count()
+            .min(TETHERS_PER_THREAD);
+        assert_eq!(
+            asked.tethers.len(),
+            want,
+            "asking about one thread drew {} tethers, not {want}",
+            asked.tethers.len()
+        );
+
+        r.tether(None);
+        assert!(
+            r.build_frame(&snap, Duration::ZERO).tethers.is_empty(),
+            "the fan did not go away when the question did"
         );
     }
 
@@ -1810,22 +2079,65 @@ mod tests {
         assert!(inked > 200, "the chrome drew {inked} px");
     }
 
-    /// A mark with an unresolvable position is dropped, not stacked at `[0, 0]`
-    /// — including through the attention path, which has its own fallbacks.
+    /// A `done` mark with an unresolvable position is dropped, not stacked at
+    /// `[0, 0]` — and a **pending decision** is not, because that is the one
+    /// state the map is not allowed to lose.
+    ///
+    /// The asymmetry is the fix. In the operator's screenshot all three
+    /// `WAITING ON YOU` rows belonged to threads the rail called unplaced, so
+    /// under the old rule the primary state was dropped exactly when it
+    /// mattered. It now stands at the civic square with
+    /// [`AttentionMark::sited`] false, which draws
+    /// [`crate::salience::ALARM_UNSITED`]'s accuracy ring — *somewhere in
+    /// here* — rather than claiming a district it has no evidence for.
     #[test]
-    fn an_attention_mark_with_no_position_is_dropped() {
+    fn a_pending_decision_is_never_dropped_and_a_done_with_no_place_still_is() {
         let c = small_city();
         let view = View::fit([0.0, 0.0], [10.0, 10.0], 100, 100, 2.0);
-        let mark = Attention::new(
+        let ghost = ThreadId::of_session(SessionId::new("ghost"));
+        let decision = Attention::new(
             AttentionKind::NeedsDecision {
-                thread: ThreadId::of_session(SessionId::new("ghost")),
+                thread: ghost.clone(),
                 at: Some(lp("nowhere/at/all.rs")),
                 source: polis_world::attention::DecisionSource::PermissionRequest,
             },
             Instant::now(),
         );
+        let drawn = attention_mark(
+            &decision,
+            &BTreeMap::new(),
+            &[],
+            &c.layout,
+            &view,
+            Instant::now(),
+        )
+        .expect("an agent blocked on a human is always drawn");
+        assert_eq!(drawn.kind, MarkKind::NeedsDecision);
+        assert!(
+            !drawn.sited,
+            "the scope is not known and the mark must say so"
+        );
+        assert_eq!(
+            drawn.at,
+            view.at(c
+                .layout
+                .districts
+                .get(&LogicalPath::root())
+                .expect("a civic square")
+                .centre),
+            "an unplaced decision stands at the civic square"
+        );
+
+        // `done` costs nothing (PRD §11.1) and has no claim on the last resort.
+        let done = Attention::new(
+            AttentionKind::Done {
+                thread: ghost,
+                verified: false,
+            },
+            Instant::now(),
+        );
         assert!(attention_mark(
-            &mark,
+            &done,
             &BTreeMap::new(),
             &[],
             &c.layout,
@@ -2039,6 +2351,69 @@ mod tests {
         let canvas = r.render(&snap, Duration::from_millis(16));
         let (w, h) = (canvas.width, canvas.height);
         assert!(w > map, "the rail has no column to draw in");
+        let inked = (0..h)
+            .flat_map(|y| (map..w).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let o = (y * w + x) * 3;
+                [canvas.pixels[o], canvas.pixels[o + 1], canvas.pixels[o + 2]] != CAPTION_PLATE
+            })
+            .count();
+        assert!(inked > 100, "the status rail drew {inked} px");
+    }
+
+    /// "No clouds" is never a silent state.
+    ///
+    /// The operator's report was *"no clouds no distinctions between agents"* on
+    /// a map with nine live threads, and nothing anywhere in the product could
+    /// answer *why*. [`territory::select_clouds`] had returned
+    /// `unplaced`/`dormant`/`capped` since it was written and no caller read
+    /// them, so an empty sky and a map with every cloud on it produced the same
+    /// picture and the same words.
+    ///
+    /// This is the test that keeps that fixed: a thread whose territory has not
+    /// converged has to reach [`live::CloudCensus`], the status rail, and
+    /// pixels.
+    #[test]
+    fn a_thread_with_no_cloud_says_why() {
+        let c = small_city();
+        let mut r = FrameRenderer::new(&c, FrameOptions::default());
+        let world = shelling(&c);
+        let (_, reader) = snapshot::from_world(&world);
+        let snap = reader.load();
+        let frame = r.build(&snap, 0.016);
+        assert_eq!(
+            frame.cloud.threads(),
+            snap.threads.len(),
+            "every thread has to land in exactly one bucket of the census: {:?}",
+            frame.cloud
+        );
+        // A shell-only session touches no path, so its territory has neither a
+        // claim nor a lobe: PRD §6.2's un-converged case, and the one the
+        // operator was looking at.
+        assert!(
+            frame.cloud.unplaced > 0 && frame.cloud.shown == 0,
+            "expected an un-converged territory: {:?}",
+            frame.cloud
+        );
+        let row = frame
+            .rail
+            .iter()
+            .find(|row| row.kind == live::RailKind::NoCloud)
+            .expect("the rail has to say why the sky is empty");
+        assert_eq!(
+            usize::try_from(row.count).unwrap_or(usize::MAX),
+            frame.cloud.unplaced
+        );
+        assert!(
+            frame.cloud.reason().contains("UNCONVERGED"),
+            "the reason has to name itself: {}",
+            frame.cloud.reason()
+        );
+        // And it reaches pixels. A diagnostic that exists only in a struct is
+        // the same silence in a different place.
+        let map = r.map_pixels();
+        let canvas = r.render(&snap, Duration::from_millis(16));
+        let (w, h) = (canvas.width, canvas.height);
         let inked = (0..h)
             .flat_map(|y| (map..w).map(move |x| (x, y)))
             .filter(|(x, y)| {
@@ -2570,6 +2945,7 @@ mod tests {
         .collect();
         let n = walk.len();
         frame.trails.push(Trail {
+            tint: 0,
             steps: walk
                 .iter()
                 .enumerate()
@@ -2587,17 +2963,22 @@ mod tests {
             age: 0.1,
         });
 
-        // 5. A thread with eight workers: the tether fan.
+        // 5. A thread with eight workers: the tether fan, as it looks when the
+        //    operator has asked for it. On the live map this is drawn for the
+        //    one interrogated thread and for no other (`live::draw_tether`);
+        //    here it is the notation being shown, so it is built by hand.
         let anchor = pick(0.30, 0.72);
         for k in 0..8 {
             let worker = pick(0.14 + f64::from(k) * 0.035, 0.86);
             frame.tethers.push(live::Tether {
+                tint: 0,
                 anchor,
                 worker,
                 running: k % 4 != 3,
                 spread: (f64::from(k) / 7.0).mul_add(2.0, -1.0),
             });
             frame.agents.push(Agent {
+                tint: 0,
                 at: worker,
                 body: Body::Worker,
                 outcome: match k % 3 {
@@ -2611,6 +2992,7 @@ mod tests {
             });
         }
         frame.agents.push(Agent {
+            tint: 0,
             at: anchor,
             body: Body::Main,
             outcome: Outcome::Pending,
@@ -2664,6 +3046,7 @@ mod tests {
             pulse: 0.0,
             weight: 1.0,
             urgency: 0.0,
+            sited: true,
         });
         frame.attention.push(AttentionMark {
             kind: MarkKind::DoneVerified,
@@ -2673,6 +3056,7 @@ mod tests {
             pulse: 0.0,
             weight: 1.0,
             urgency: 0.0,
+            sited: true,
         });
         frame.attention.push(AttentionMark {
             kind: MarkKind::DoneUnverified,
@@ -2682,6 +3066,7 @@ mod tests {
             pulse: 0.0,
             weight: 1.0,
             urgency: 0.0,
+            sited: true,
         });
         frame.attention.push(AttentionMark {
             kind: MarkKind::Contention,
@@ -2691,6 +3076,7 @@ mod tests {
             pulse: 0.0,
             weight: 1.0,
             urgency: 0.0,
+            sited: true,
         });
 
         for (name, style) in [("timed", TrailStyle::Timed), ("fade", TrailStyle::Fade)] {

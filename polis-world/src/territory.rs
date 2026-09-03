@@ -46,6 +46,17 @@ use crate::Observation;
 /// > is removed abruptly.
 pub const DECAY_HALF_LIFE: Duration = Duration::from_secs(90);
 
+/// The total kernel weight a **converged** territory never decays below.
+///
+/// [`crate::territory::Territory::rest`] explains why this exists. The value is
+/// set against `polis_render::live::CLOUD_ISO`, whose outermost band is `0.55`:
+/// a rested field has to clear that or the cloud is computed and never drawn,
+/// which is the failure this constant was added to fix. It is deliberately close
+/// to it — a resting territory should be the faintest cloud on the map, because
+/// "this is where that agent was working" is worth less than "this is where one
+/// is working now".
+pub const RESTING_WEIGHT: f32 = 0.9;
+
 /// Consecutive outside observations required before the centre of mass may move
 /// districts (PRD §6.3).
 ///
@@ -372,6 +383,10 @@ impl Territory {
         for k in &mut self.kernels {
             k.weight *= factor;
         }
+        // Before the retain, not after: at 21 minutes idle every kernel is under
+        // MIN_KERNEL_WEIGHT, so a lift applied afterwards would have an empty
+        // list to lift.
+        self.rest();
         self.kernels.retain(|k| k.weight >= MIN_KERNEL_WEIGHT);
         for e in &mut self.evidence {
             e.weight *= factor;
@@ -380,12 +395,43 @@ impl Territory {
         if self.evidence.is_empty() {
             // Nothing is left to claim. The thread returns to an unplaced
             // marker rather than keeping a stale district forever.
+            //
+            // The lobes go with it. They are refreshed only in `refresh_claim`,
+            // which runs on an *observation* — so a thread that stops working
+            // never refreshes them again, and a lobe left standing here would
+            // make [`Territory::placement`] answer "somewhere" for ever, on
+            // evidence that has entirely decayed. `claim` has always been
+            // cleared here for exactly that reason; before lobes existed it was
+            // the whole of the answer.
             self.claim = None;
+            self.lobes.clear();
             self.centre_of_mass = None;
             self.drift_trace.clear();
             self.outside_streak = 0;
         } else {
             self.refresh_centre_of_mass(now);
+        }
+    }
+
+    /// **Where this thread is working, if anywhere** — the one question every
+    /// surface has to ask, and the one place it may be answered.
+    ///
+    /// PRD §6.2 emits a single converged ancestor; PRD §6.4 says a thread that
+    /// delegates has *"two lobes and a thin connecting band"* instead. Both are
+    /// placed. Reaching for [`Territory::claim`] directly asks only the first
+    /// question and silently answers "nowhere" to the second, which is how a
+    /// thread with 17 workers and 648 real tool calls came to read **unplaced**
+    /// in the status rail while its cloud was on the map — the rail and the map
+    /// disagreeing about the same thread, in the same frame.
+    ///
+    /// So the field is never read outside this module. Everything that means
+    /// *"does this thread have somewhere"* goes through here, and the enum makes
+    /// the lobed case impossible to forget: there is no `bool` to get backwards.
+    pub fn placement(&self) -> Placement<'_> {
+        match (&self.claim, self.lobes.as_slice()) {
+            (Some(claim), _) => Placement::Claim(claim),
+            (None, []) => Placement::Nowhere,
+            (None, lobes) => Placement::Lobes(lobes),
         }
     }
 
@@ -395,6 +441,10 @@ impl Territory {
     /// > observations agree […] Sometimes that is two observations, sometimes
     /// > twelve. Until then the thread renders with no cloud — an unplaced
     /// > marker in the status rail.
+    ///
+    /// Strictly §6.2's *single ancestor* test, and therefore **not** the
+    /// question "is this thread placed": an orchestrator has lobes and no
+    /// converged ancestor. Use [`Territory::placement`] for that.
     pub fn has_converged(&self) -> bool {
         self.converged_claim().is_some()
     }
@@ -542,6 +592,56 @@ impl Territory {
         });
         lobes.truncate(MAX_LOBES);
         lobes
+    }
+
+    /// Holds a converged territory at a visible resting level once its work
+    /// stops, instead of letting it fade to nothing.
+    ///
+    /// PRD §6.3's decay is right while a fleet is running: *"Contract slowly.
+    /// Kernel weights decay with a half-life of 90 s."* But it is applied from
+    /// each observation's own timestamp, so it also governs what an operator
+    /// sees the moment they **open** the map — and there, it deletes the answer.
+    ///
+    /// Measured on the operator's own machine: three real sessions, idle for 3,
+    /// 11 and 21 minutes, retain 25 %, 0.62 % and 0.0061 % of their weight. The
+    /// second and third fall under [`MIN_KERNEL_WEIGHT`] and are dropped
+    /// outright. So `polis watch` opened on a repository whose agents had just
+    /// been working showed an empty map, and the operator's report was exactly
+    /// that: *"clouds should be there immediately"*, three times.
+    ///
+    /// A territory that has converged has *earned* a shape, and that shape is
+    /// still the truth about where the thread was working. So decay stops at
+    /// [`RESTING_WEIGHT`]: the field keeps its form, rescaled — never
+    /// redistributed, so a lobe cannot grow relative to another while nothing is
+    /// happening — and stays faint but drawable.
+    ///
+    /// Nothing here keeps a dead thread alive. PRD §10.4's cap still drops a
+    /// territory once `quiet_for` passes its dormancy window, which is the
+    /// mechanism §10.4 actually names for letting *"dormant territories
+    /// dissipate entirely"*. This only stops the field vanishing in the ninety
+    /// seconds before that decision is due.
+    fn rest(&mut self) {
+        // Dormancy still wins. PRD §10.4: "let dormant territories dissipate
+        // entirely" — resting holds a field through the pause between two
+        // bursts of work, not forever. Past DORMANT_AFTER the thread is no
+        // longer drawn at all, so holding its field up would only cost memory
+        // and lie to `quiet_for`.
+        if self.quiet_for().is_some_and(|q| q > DORMANT_AFTER) {
+            return;
+        }
+        if self.claim.is_none() && self.lobes.is_empty() {
+            // Never converged: an unfinished scatter still fades away, which is
+            // what stops a stray read leaving a permanent smudge on the map.
+            return;
+        }
+        let total: f32 = self.kernels.iter().map(|k| k.weight).sum();
+        if total <= 0.0 || total >= RESTING_WEIGHT {
+            return;
+        }
+        let lift = RESTING_WEIGHT / total;
+        for k in &mut self.kernels {
+            k.weight *= lift;
+        }
     }
 
     /// The current bandwidth — the uncertainty knob (PRD §6.4).
@@ -880,6 +980,66 @@ pub struct Lobe {
     pub mass: f32,
 }
 
+/// Where a thread is working — [`Territory::placement`]'s answer.
+///
+/// Three states, not two, and the third is the one that keeps being lost. PRD
+/// §6.2 and §6.4 describe *different* placed shapes, and a caller that tests
+/// `claim.is_some()` has quietly decided that §6.4's shape is unplaced.
+///
+/// [`Placement::Nowhere`] is a real and useful state, not a failure: §6.2 says
+/// an unconverged thread *"renders with no cloud — an unplaced marker in the
+/// status rail"*, and [`Territory::convergence`] carries the honest reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Placement<'a> {
+    /// PRD §6.2's converged ancestor: one district, and the evidence agrees.
+    Claim(&'a LogicalPath),
+    /// PRD §6.4's lobes, heaviest first — several places, no single ancestor
+    /// above the root that could name them. Never empty.
+    Lobes(&'a [Lobe]),
+    /// No territory yet. The rail says so, and says why.
+    Nowhere,
+}
+
+impl<'a> Placement<'a> {
+    /// Whether this thread has anywhere at all — a cloud, a district name, a
+    /// row in the rail that can say *where* rather than *unplaced*.
+    ///
+    /// The predicate lives on the enum rather than on [`Territory`] so that
+    /// asking it forces a caller to have gone through
+    /// [`Territory::placement`] first, and so `Lobes` cannot be dropped on the
+    /// floor by a `claim.is_some()` written from memory.
+    #[must_use]
+    pub fn is_somewhere(self) -> bool {
+        !matches!(self, Self::Nowhere)
+    }
+
+    /// Every place this thread is working, heaviest first. Empty for
+    /// [`Placement::Nowhere`].
+    ///
+    /// One name for a focused thread, up to [`MAX_LOBES`] for an orchestrator.
+    /// Borrows rather than allocating: this runs once per thread per frame.
+    pub fn paths(self) -> impl Iterator<Item = &'a LogicalPath> {
+        let (claim, lobes) = match self {
+            Self::Claim(c) => (Some(c), [].as_slice()),
+            Self::Lobes(l) => (None, l),
+            Self::Nowhere => (None, [].as_slice()),
+        };
+        claim.into_iter().chain(lobes.iter().map(|l| &l.path))
+    }
+
+    /// The single district to name this thread by: its claim, else its heaviest
+    /// lobe.
+    ///
+    /// For the surfaces that genuinely need *one* path — PRD §11.3's overlap
+    /// pair, which asks whether two orchestrators are in the same district. The
+    /// heaviest lobe is the honest answer there: it is where most of the
+    /// thread's weight is, and it is the lobe a reader's eye lands on.
+    #[must_use]
+    pub fn district(self) -> Option<&'a LogicalPath> {
+        self.paths().next()
+    }
+}
+
 /// The raw drift measurement over [`DRIFT_WINDOW`] (PRD §10.4).
 ///
 /// Unthresholded on purpose: this is what a threshold gets chosen *from*.
@@ -1082,7 +1242,7 @@ pub const CLOUD_CAP: usize = 5;
 /// [`CloudSelection::dormant`]; and note that dissipating entirely is what the
 /// system already does, so a residue would have to be *added* by pinning a floor
 /// under the decay. Nothing in the measurement argues for paying that.
-pub const DORMANT_AFTER: Duration = Duration::from_secs(180);
+pub const DORMANT_AFTER: Duration = Duration::from_mins(8);
 
 /// PRD §10.4's cloud policy, in one place.
 ///
@@ -1182,9 +1342,14 @@ pub fn select_clouds<'a>(
         // A thread with lobes but no claim is the orchestrator case (PRD §6.4):
         // its workers are each somewhere nameable, but their common ancestor is
         // the root, so §6.2's single-ancestor gate rejects it. Drawing nothing
-        // there is what made a 101-worker session invisible on its own map.
-        if (territory.claim.is_none() && territory.lobes.is_empty()) || territory.kernels.is_empty()
-        {
+        // there is what made a 101-worker session invisible on its own map, so
+        // the test is [`Territory::placement`] and not the claim field.
+        //
+        // Kernels are a separate question and stay separate: placement is what
+        // the *evidence* says, kernels are whether any of it landed on ground
+        // this city has geometry for. A thread working entirely outside the
+        // checkout is placed and has nothing to splat.
+        if !territory.placement().is_somewhere() || territory.kernels.is_empty() {
             unplaced += 1;
             continue;
         }
@@ -1481,6 +1646,141 @@ mod tests {
         t.decay(t0 + DECAY_HALF_LIFE * 12);
         assert!(t.kernels.is_empty());
         assert!(t.claim.is_none(), "back to an unplaced marker");
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD §6.2 vs §6.4: "is this thread placed" is one question with two
+    // answers, and `Territory::placement` is the only place it is asked.
+    // -----------------------------------------------------------------------
+
+    /// The shape of the thread the operator was staring at: 17 workers spread
+    /// over three top-level directories, so §6.2's trimmed ancestor is the
+    /// repository root and `claim` is empty — while §6.4's lobes name every
+    /// place it is working and its cloud is on the map.
+    fn spread_orchestrator() -> Territory {
+        let mut t = Territory::for_extent(1000.0);
+        let now = Instant::now();
+        // Interleaved, because PRD §6.3's hysteresis is "expand readily,
+        // contract slowly": a thread that works in one directory first and only
+        // then fans out keeps that first claim. A real orchestrator's workers
+        // report from everywhere at once, which is the case being fixtured.
+        let places = [
+            "src/components/WorkspaceRail.jsx",
+            "src/hooks/useWindowCentering.js",
+            "tests/hooks/useDragResizeEdgePan.test.jsx",
+        ];
+        for k in 0..24u32 {
+            for (i, path) in places.iter().enumerate() {
+                // The heaviest lobe first, so `district()` has a stable answer:
+                // `components` reports on every pass, `hooks` on two in three,
+                // `tests` on one in three.
+                if k as usize % 3 < 3 - i {
+                    let slot = k * 8 + u32::try_from(i).expect("three places");
+                    t.observe(
+                        &obs(
+                            path,
+                            ToolKind::Read,
+                            now + Duration::from_millis(slot.into()),
+                        ),
+                        1.0,
+                        place(slot),
+                    );
+                }
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn a_lobed_thread_is_placed_even_though_it_has_no_claim() {
+        let t = spread_orchestrator();
+        assert!(
+            t.claim.is_none(),
+            "the fixture must be the case §6.2 cannot describe, got {:?}",
+            t.claim
+        );
+        assert!(
+            !t.lobes.is_empty(),
+            "but §6.4 must be able to describe it: {:?}",
+            t.lobes
+        );
+        assert!(
+            t.placement().is_somewhere(),
+            "a thread with lobes is placed; reading `claim` alone is what printed `unplaced` \
+             on a thread with 648 tool calls"
+        );
+        let named: Vec<&str> = t.placement().paths().map(LogicalPath::as_str).collect();
+        assert!(
+            named.contains(&"src/components") && named.contains(&"src/hooks"),
+            "the rail has to be able to say where: {named:?}"
+        );
+    }
+
+    #[test]
+    fn placement_names_the_claim_first_and_the_heaviest_lobe_otherwise() {
+        let mut focused = Territory::for_extent(1000.0);
+        let now = Instant::now();
+        focused.observe(&obs("src/auth/a.rs", ToolKind::Edit, now), 1.0, place(0));
+        focused.observe(&obs("src/auth/b.rs", ToolKind::Edit, now), 1.0, place(1));
+        assert_eq!(
+            focused.placement().district().map(LogicalPath::as_str),
+            Some("src/auth"),
+            "a converged thread is named by its claim"
+        );
+        assert_eq!(
+            focused.placement().paths().count(),
+            1,
+            "and by exactly one place, however many lobes the evidence forms"
+        );
+
+        let spread = spread_orchestrator();
+        assert_eq!(
+            spread.placement().district().map(LogicalPath::as_str),
+            Some("src/components"),
+            "an orchestrator is named by its heaviest lobe — PRD §11.3's pair needs one path"
+        );
+    }
+
+    #[test]
+    fn an_unconverged_thread_is_nowhere_and_says_why() {
+        let mut t = Territory::for_extent(1000.0);
+        let now = Instant::now();
+        t.observe(
+            &obs("src/auth/token.rs", ToolKind::Read, now),
+            1.0,
+            place(0),
+        );
+        assert_eq!(t.placement(), Placement::Nowhere);
+        assert!(!t.placement().is_somewhere());
+        assert_eq!(t.placement().paths().count(), 0);
+        assert!(
+            t.convergence().observations > 0,
+            "and §6.2's reason is still available for the rail's hover"
+        );
+    }
+
+    /// Lobes are refreshed only by an observation, so a thread that stops
+    /// working never refreshes them again. If `decay` did not clear them, a dead
+    /// territory would answer "somewhere" for ever on evidence that has entirely
+    /// gone — the rail would keep saying `in src/components` for a session that
+    /// ended an hour ago.
+    #[test]
+    fn lobes_do_not_outlive_the_evidence_that_made_them() {
+        let mut t = spread_orchestrator();
+        assert!(t.placement().is_somewhere());
+        let t0 = t.last_decay.expect("the fixture observed something");
+        t.decay(t0 + DECAY_HALF_LIFE * 12);
+        assert!(t.evidence.is_empty(), "the evidence has decayed away");
+        assert!(
+            t.lobes.is_empty(),
+            "and the lobes went with it, exactly as the claim does: {:?}",
+            t.lobes
+        );
+        assert_eq!(
+            t.placement(),
+            Placement::Nowhere,
+            "back to an unplaced marker (PRD §6.2)"
+        );
     }
 
     #[test]
