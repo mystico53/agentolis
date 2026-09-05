@@ -181,10 +181,11 @@ pub const CLOUD_ISO: [f64; 3] = [0.55, 1.60, 3.20];
 /// The band index meaning "outside the fringe" in a per-pixel band map.
 pub const NO_BAND: u8 = u8::MAX;
 
-/// The [`thread_slot`] meaning "nobody named an owner for this pixel", which
-/// draws in the neutral [`CLOUD_TONES`].
+/// The [`polis_world::Thread::tint`] meaning "nobody named an owner for this
+/// pixel", which draws in the neutral [`CLOUD_TONES`].
 ///
-/// Outside [`THREAD_HUES`]'s range on purpose, so it can never be a hue.
+/// Outside [`THREAD_HUES`]'s range on purpose, so it can never be a hue — and
+/// `polis_world`'s hue ring can never assign it, for the same reason.
 pub const NO_TINT: u8 = u8::MAX;
 
 /// How much the hatch spacing opens up where two or more territories overlap.
@@ -280,8 +281,10 @@ pub const AGENT_SCAFFOLD: Rgb = [140, 148, 112];
 // This is a *fourth* channel next to PRD §10.1's shape, §10.2's outcome colour
 // and position, and it is the one the map did not have: nine threads drew in
 // one neutral grey, so the only way to tell whose trail crossed whose was to
-// follow it back to an anchor. See [`thread_slot`] for the identity rule and
-// [`THREAD_HUES`] for how far apart the hues are and how that was measured.
+// follow it back to an anchor. The slot itself is assigned once, per thread,
+// by `polis_world::World` — see `polis_world::Thread::tint` for the exclusivity
+// rule and [`THREAD_HUES`] for how far apart the hues are and how that was
+// measured.
 // ---------------------------------------------------------------------------
 
 /// The identity hue ring: one entry per slot, as authored.
@@ -319,18 +322,34 @@ pub const AGENT_SCAFFOLD: Rgb = [140, 148, 112];
 /// physically affords; the layer that has to carry identity from across the
 /// room is the rail swatch and the agent body, at 9.8.
 ///
-/// # Twelve, and what twelve costs
+/// # Twelve, and what twelve now buys
 ///
-/// Slots are handed out by hashing, so two threads *can* land on one hue —
-/// with nine threads on screen and twelve slots that is about three of the
-/// thirty-six pairs. That is the price of [`thread_slot`]'s stability rule and
-/// it is paid on purpose: raising the ring to twenty slots would only take the
-/// expected number of distinct colours among nine threads from 6.6 to 7.4
-/// while cutting the worst pair from 9.8 to 5.4 — trading a distinction the
-/// operator can make for one they cannot. PRD §11.4 covers the collision:
-/// colour is never the only channel, and a shared hue is disambiguated by the
-/// rail's own thread name, by the row's swatch sitting next to it, and by the
-/// two threads' clouds being in different places.
+/// Twelve is the **exclusivity ceiling**, not a collision rate. Slots used to be
+/// handed out by hashing here, which meant two threads *could* land on one hue —
+/// with nine threads on screen and twelve slots, about three of the thirty-six
+/// pairs. The old text called that a price paid on purpose; the operator called
+/// it *"super bad"*, and it is not paid any more. `polis_world::World` assigns
+/// each slot to at most one thread as the thread is created and stores the
+/// answer on `polis_world::Thread::tint`, so **the first twelve threads of a
+/// world are mutually distinct**. Past twelve, colour degrades to the thread's
+/// bare `ThreadId::hue_preference` and the rail's name carries identity
+/// (PRD §11.4).
+///
+/// So the arithmetic below now argues the other way: it is the reason **not** to
+/// widen the ring. Raising it to twenty would take exclusivity from twelve
+/// threads to twenty while cutting the worst pair from 9.8 to 5.4 — into the
+/// band the cloud fringe already sits in at 5.46, which is the level that
+/// measurably needs a second channel to be read at all. Twelve mutually distinct
+/// colours an operator can tell apart across the room beat twenty they cannot,
+/// and the fallback past twelve is a rail row with a name on it rather than a
+/// map with no identity on it. That is why widening is not the answer to
+/// exhaustion; the answer is `polis_world::Health::identity_hues_exhausted`
+/// saying so.
+///
+/// PRD §11.4 still covers the fallback: colour is never the only channel, and a
+/// shared hue is disambiguated by the rail's own thread name, by the row's
+/// swatch sitting next to it, and by the two threads' clouds being in different
+/// places.
 pub const THREAD_HUES: [Rgb; 12] = [
     [147, 91, 99],  // 14°  rose
     [144, 94, 80],  // 44°  terracotta
@@ -346,38 +365,12 @@ pub const THREAD_HUES: [Rgb; 12] = [
     [139, 92, 121], // 344° magenta
 ];
 
-/// FNV-1a's 32-bit offset basis, written out (ADR-0029).
-const FNV_OFFSET: u32 = 2_166_136_261;
-/// FNV-1a's 32-bit prime.
-const FNV_PRIME: u32 = 16_777_619;
-
-/// The hue slot a thread owns, from its **own identity** and nothing else.
-///
-/// # Why a hash and not a counter
-///
-/// An index into the live thread list is free and wrong. The list is sorted and
-/// re-sorted as threads arrive, finish and are retired, so the colour of a
-/// thread the operator is watching changes when an unrelated thread starts —
-/// and the one thing this channel is for is the operator learning *"the blue
-/// one is the refactor"* inside a minute. A palette that reshuffles destroys
-/// that faster than no palette at all, because it teaches something false.
-///
-/// So the slot is a pure function of the thread's id: it is fixed before the
-/// thread's first event, it is the same in the window and in the headless
-/// renderer, it survives a restart, and no other thread's lifetime can move it.
-///
-/// FNV-1a over the id's bytes, written out rather than taken from
-/// `std::hash::DefaultHasher`, whose algorithm is explicitly not stable across
-/// Rust releases (ADR-0029) — a toolchain bump must not repaint the city.
-#[must_use]
-pub fn thread_slot(id: &str) -> u8 {
-    let mut h = FNV_OFFSET;
-    for b in id.as_bytes() {
-        h ^= u32::from(*b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    (h % THREAD_HUES.len() as u32) as u8
-}
+// The ring and the modulus the world assigns from cannot be allowed to drift
+// apart: `polis_world` hands out `polis_events::IDENTITY_SLOTS` slots and has no
+// way to see this table, so a thirteenth hue authored above would be a colour
+// that exists and is never used, and a shortened table would be an index that
+// panics — silently correct in both crates and wrong between them.
+const _: () = assert!(THREAD_HUES.len() == polis_events::IDENTITY_SLOTS as usize);
 
 /// The authored hue for a slot. Out-of-range slots wrap, so no caller can panic
 /// on an identity it did not compute itself.
@@ -667,7 +660,7 @@ pub struct Trail {
     pub steps: Vec<TrailStep>,
     /// How long a step survives, in seconds. Ages are divided by this.
     pub ttl: f64,
-    /// Whose trail — [`thread_slot`] of the owning thread.
+    /// Whose trail — [`polis_world::Thread::tint`] of the owning thread.
     pub tint: u8,
 }
 
@@ -692,7 +685,8 @@ pub struct Tether {
     /// back into a countable number of hands, which is the thing worth knowing
     /// once the operator has asked.
     pub spread: f64,
-    /// Whose hand — [`thread_slot`] of the thread this tether belongs to.
+    /// Whose hand — [`polis_world::Thread::tint`] of the thread this tether
+    /// belongs to.
     ///
     /// One thread's tethers are on screen at a time, so this no longer has to
     /// separate one fan from another. It still has to match: the line and the
@@ -750,7 +744,7 @@ pub struct Scaffold {
 /// One operation mark: PRD §10.1's shape and §10.2's colour, side by side and
 /// never conflated.
 ///
-/// # Why a mark has no [`thread_slot`], when everything else does
+/// # Why a mark has no [`polis_world::Thread::tint`], when everything else does
 ///
 /// Identity colours the thread's *continuous* things — its cloud, its trail,
 /// its tethers, its agent body — and stops at the mark. A mark is not the
@@ -865,7 +859,7 @@ pub struct Agent {
     pub heading: [f64; 2],
     /// Whether the thread this agent belongs to is waiting on a human.
     pub waiting: bool,
-    /// Whose agent — [`thread_slot`] of the thread it belongs to.
+    /// Whose agent — [`polis_world::Thread::tint`] of the thread it belongs to.
     ///
     /// It colours the **body**, never the centre disc: [`Mark`] and this
     /// struct's [`Agent::outcome`] keep PRD §10.2's channel. See
@@ -975,15 +969,15 @@ pub struct LiveFrame {
     /// Territory kernels, summed into one field: PRD §6.4's "overlap is field
     /// addition", which is also the early-warning contention signal.
     pub clouds: Vec<CloudKernel>,
-    /// [`thread_slot`] per [`CloudKernel::thread`], so a cloud is drawn in its
-    /// own thread's hue.
+    /// [`polis_world::Thread::tint`] per [`CloudKernel::thread`], so a cloud is
+    /// drawn in its own thread's hue.
     ///
     /// A side table rather than a field on the kernel, because
     /// `CloudKernel::thread` is a **per-frame group index** the field sampler
-    /// sorts on, and identity is not: two threads may hash to one hue and must
-    /// still be summed as two territories, or `crowd` — PRD §6.4's contention
-    /// signal — would report contested ground as one busy thread. Colour is
-    /// looked up through this table exactly once, at paint time.
+    /// sorts on, and identity is not: past twelve threads two of them share a
+    /// hue and must still be summed as two territories, or `crowd` — PRD §6.4's
+    /// contention signal — would report contested ground as one busy thread.
+    /// Colour is looked up through this table exactly once, at paint time.
     pub cloud_tints: Vec<u8>,
     /// One trail per thread.
     pub trails: Vec<Trail>,
@@ -1560,9 +1554,10 @@ impl CloudField {
     /// [`Self::bands`], with each thread's cloud in its own hue.
     ///
     /// `tints` is indexed by [`CloudKernel::thread`] and holds
-    /// [`thread_slot`]s — `LiveFrame::cloud_tints`. An empty slice, or an index
-    /// past its end, falls back to the neutral tones, so a caller that has no
-    /// identity to offer gets exactly the picture it got before.
+    /// [`polis_world::Thread::tint`]s — `LiveFrame::cloud_tints`. An empty
+    /// slice, or an index past its end, falls back to the neutral tones, so a
+    /// caller that has no identity to offer gets exactly the picture it got
+    /// before.
     #[must_use]
     pub fn bands_tinted(&self, tints: &[u8]) -> BandMap {
         let (w, h) = (self.width, self.height);
@@ -1747,8 +1742,8 @@ pub struct BandMap {
     /// How many territories reach fringe level at each pixel. `>= CLOUD_CROWD`
     /// is contested ground.
     pub crowd: Vec<u8>,
-    /// The owning thread's [`thread_slot`] per pixel, or [`NO_TINT`] where the
-    /// caller offered no identity table.
+    /// The owning thread's [`polis_world::Thread::tint`] per pixel, or
+    /// [`NO_TINT`] where the caller offered no identity table.
     pub tint: Vec<u8>,
 }
 
@@ -2334,9 +2329,10 @@ fn dashed_path(canvas: &mut Canvas, points: &[Px], period: f64, duty: f64, width
 /// it.
 ///
 /// So ownership moved to the channel that was already carrying it and costs no
-/// area at all: **colour**. [`thread_slot`] gives a thread one hue for its
-/// whole life, the worker's own body is drawn in it at the brightest level
-/// layer 4 has ([`AGENT_BODY`], ΔE00 9.8 between the worst pair), and the rail
+/// area at all: **colour**. [`polis_world::Thread::tint`] gives a thread one hue
+/// for its whole life, exclusive among the first twelve threads of a world. The
+/// worker's own body is drawn in it at the brightest level layer 4 has
+/// ([`AGENT_BODY`], ΔE00 9.8 between the worst pair), and the rail
 /// prints the same triple beside the thread's name and its worker count. The
 /// glance is answered without a line.
 ///
@@ -2906,18 +2902,16 @@ pub(crate) fn iso_band(v: f64) -> Option<usize> {
     }
 }
 
-/// A quartic kernel with compact support: `(1 - r²)²` inside the radius.
+/// The kernel this rasteriser splats.
 ///
-/// PRD §10.4 splats Gaussians; a Gaussian needs `exp`, and nothing in the
-/// rasteriser reaches for a transcendental (PRD §7.4). The quartic has the same
-/// bell shape, has *finite* support — which makes the splat cheaper, not dearer
-/// — and is a polynomial, so the same bytes come out on every libm.
+/// [`polis_layout::quartic`] carries the argument for the shape — PRD §7.4's
+/// no-transcendentals rule and what compact support buys. It lives in
+/// `polis-layout` because `polis_world::territory::Territory::anchor` picks the
+/// point where *this* curve is highest, and the world cannot depend on the
+/// renderer: two definitions would mean the anchor ring is the peak of one
+/// function and the contours are the bands of another.
 pub(crate) fn kernel(r2: f64) -> f64 {
-    if r2 >= 1.0 {
-        return 0.0;
-    }
-    let k = 1.0 - r2;
-    k * k
+    polis_layout::quartic(r2)
 }
 
 /// Stroke a circle of `radius` about `at`.
@@ -3140,39 +3134,19 @@ mod tests {
         }
     }
 
-    /// The whole point of hashing the id instead of indexing a list: a thread's
-    /// colour cannot move because another thread started, finished or was
-    /// retired.
+    /// A slot from outside the ring wraps rather than panicking, so a stale
+    /// tint from an old snapshot — or [`NO_TINT`] arriving where a real slot
+    /// was expected — cannot take the window down.
+    ///
+    /// The hash that produces a slot no longer lives here. It moved to
+    /// `polis_events::ThreadId::hue_preference` when the world became the owner
+    /// of the assignment, and its pinned literals moved with it
+    /// (`the_identity_hash_is_written_out_and_pinned`, in that crate). What this
+    /// module still owns is the *table*, and the table's contract is total.
     #[test]
-    fn a_threads_hue_does_not_move_when_another_thread_comes_or_goes() {
-        let ids = [
-            "4f3a1c22-0e5b-4b8a-9d21-6c7e5f0a1b2c",
-            "9b2e77d0-1111-4aaa-8bbb-ccccddddeeee",
-            "0000aaaa-2222-4ccc-8ddd-eeeeffff0000",
-        ];
-        let first: Vec<u8> = ids.iter().map(|i| thread_slot(i)).collect();
-        // Every subset, in every order, and the answers never move - because
-        // there is no list to be in.
-        for perm in [[2usize, 0, 1], [1, 2, 0], [0, 2, 1]] {
-            for k in perm {
-                assert_eq!(thread_slot(ids[k]), first[k]);
-            }
-        }
-        assert_eq!(thread_slot(""), thread_slot(""));
-    }
-
-    /// The hash is pinned by literal values (ADR-0029): if `DefaultHasher` crept
-    /// in, or the constants were retyped, the city would repaint itself on a
-    /// toolchain bump and nothing else would notice.
-    #[test]
-    fn the_identity_hash_is_written_out_and_pinned() {
-        assert_eq!(thread_slot(""), (FNV_OFFSET % 12) as u8);
-        assert_eq!(thread_slot("a"), 4);
-        assert_eq!(thread_slot("polis"), 4);
-        assert_eq!(thread_slot("4f3a1c22-0e5b-4b8a-9d21-6c7e5f0a1b2c"), 1);
-        // Out of range wraps rather than panicking, so a stale slot from an old
-        // snapshot cannot take the window down.
+    fn an_out_of_range_slot_wraps_rather_than_panicking() {
         assert_eq!(thread_hue(NO_TINT), thread_hue(NO_TINT % 12));
+        assert_eq!(thread_hue(12), thread_hue(0));
     }
 
     /// PRD §10.3's allocation, asserted on the palette rather than described in

@@ -77,10 +77,20 @@ use crate::transcript::{
 
 /// Appended to within this, and the agent is doing something *right now*.
 ///
-/// A working agent writes a record per tool call and per tool result, which on
-/// real sessions is several a second. 45 seconds is long enough to survive one
-/// slow `Bash` call or a long model turn without the light going out, and short
-/// enough that "working" means it.
+/// A working agent writes a record per tool call and per tool result, and at the
+/// median that is one every few seconds. **It is not several a second at the
+/// tail, and 45 s does not survive a slow `Bash` call** — a shell call writes
+/// nothing at all between its `tool_use` block and its `tool_result`, and on
+/// this machine's transcripts (65 652 settled calls) 3.3% of calls take longer
+/// than 60 s, the longest 1 724 s. The transcript is silent for the whole of
+/// each one.
+///
+/// The 45 s stands anyway, because **this constant does not decide what the map
+/// paints.** It labels a session in the roster, and a session that drops to
+/// [`Activity::Idle`] is still tailed until [`LIVE_WINDOW`] — nothing stops
+/// flowing, nothing is dropped. The status on the map is
+/// `polis_world::ThreadStatus`, and the in-flight call is accounted for there,
+/// by `polis_world::IN_FLIGHT_MAX`.
 pub const WORKING_WINDOW: Duration = Duration::from_secs(45);
 
 /// Quiet for longer than this, and the session is treated as history.

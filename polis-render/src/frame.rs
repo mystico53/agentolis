@@ -678,16 +678,15 @@ impl FrameRenderer {
         // news — see [`CloudKernel::thread`].
         for (rank, territory) in selection.visible.iter().enumerate() {
             // The rank is a per-frame group index the field sampler sorts on;
-            // the tint beside it is the thread's own identity. Matched back by
-            // pointer because `select_clouds` hands out territories and the
-            // hue is the *thread's* — the pairs it chose from are right here.
+            // the tint beside it is the thread's own identity, read off the
+            // thread rather than derived here. Matched back by pointer because
+            // `select_clouds` hands out territories and the hue is the
+            // *thread's* — the pairs it chose from are right here.
             frame.cloud_tints.push(
                 pairs
                     .iter()
                     .find(|(_, t)| std::ptr::eq(*t, *territory))
-                    .map_or(live::NO_TINT, |(thread, _)| {
-                        live::thread_slot(thread.id.as_str())
-                    }),
+                    .map_or(live::NO_TINT, |(thread, _)| thread.tint),
             );
             for k in &territory.kernels {
                 if k.weight <= 0.0 {
@@ -738,9 +737,11 @@ impl FrameRenderer {
         for thread in &snap.threads {
             // One thread, one hue, everywhere it appears (PRD §11.4, and the
             // operator's own words: *"i'd like one thread to be one color"*).
-            // Derived from the thread's own id, so it is fixed before the
-            // thread's first event and no other thread's arrival can move it.
-            let tint = live::thread_slot(thread.id.as_str());
+            // Assigned once by `polis_world::World` when the thread was created
+            // and read here as a field, so no other thread's arrival can move
+            // it and this renderer cannot disagree with the window about it —
+            // there is one answer and both read it.
+            let tint = thread.tint;
             let anchor = thread_anchor(thread, layout, &view);
             if let Some(a) = anchor {
                 anchors.insert(thread.id.clone(), a);
@@ -1425,11 +1426,19 @@ pub fn position_of(layout: &CityLayout, path: &LogicalPath) -> Option<Point> {
 /// > A main agent has no meaningful point location — it delegates rather than
 /// > edits. Computing a centroid of its workers is actively wrong. (PRD §6)
 ///
-/// So the territory's centre of mass comes first: it is a property of the
-/// density field rather than a mean of positions. Only when there is no
-/// territory yet does the thread fall back to its own most recent step, and a
-/// thread with neither is **unplaced** — no cloud, no anchor, and a row in the
-/// status rail, exactly as PRD §6.2 asks.
+/// So the territory comes first — but as its **mode**, not its mean. This doc
+/// used to say the centre of mass "is a property of the density field rather
+/// than a mean of positions", and it was a mean of positions: `Σ(c·w)/Σw`, which
+/// is the centroid the paragraph above rejects by name.
+/// `polis_world::territory::Territory::anchor` is the kernel centre where the
+/// field is highest, so the ring is always on work and never in the gap between
+/// two lobes. Only when there is no territory yet does the thread fall back to
+/// its own most recent step, and a thread with neither is **unplaced** — no
+/// cloud, no anchor, and a row in the status rail, exactly as PRD §6.2 asks.
+///
+/// The ladder itself lives in `polis_world::place::thread_position` and is
+/// walked from here and from `polis_app::mapview` alike, so the window and a
+/// recorded frame cannot put one thread's ring in two places.
 #[must_use]
 pub fn thread_anchor(thread: &Thread, layout: &CityLayout, view: &View) -> Option<Px> {
     place::thread_position(thread, layout).map(|p| view.at(p))

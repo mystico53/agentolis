@@ -198,26 +198,49 @@ pub fn district_for_cwd(layout: &CityLayout, cwd: &LogicalPath) -> Option<Logica
     }
 }
 
-/// Where a thread's main agent is (PRD §6): the territory's centre of mass,
-/// else the newest step of its trail that the city has geometry for.
+/// Where a thread's main agent is (PRD §6): the territory's **anchor**, else the
+/// newest step of its trail that the city has geometry for, else — only for a
+/// territory that has no kernels at all — its centre of mass.
 ///
 /// > A main agent has no meaningful point location — it delegates rather than
-/// > edits. Computing a centroid of its workers is actively wrong.
+/// > edits. Computing a centroid of its workers is actively wrong: an
+/// > orchestrator with workers in `src/auth` and `tests/` gets a centroid in the
+/// > empty gap between them, which is the one place nothing is happening.
 ///
-/// So the density field's centre of mass comes first; it is a property of the
-/// field, not a mean of positions.
+/// This function used to read `centre_of_mass` first and its doc used to say
+/// *"it is a property of the field, not a mean of positions"*. That was false:
+/// `Territory::refresh_centre_of_mass` is literally `Σ(c·w)/Σw`, so rung 1 was
+/// the centroid the sentence above rejects, and an orchestrator's ring really
+/// did land in the gap. [`crate::territory::Territory::anchor`] is the
+/// field's mode — the kernel centre where the density is highest — and *that* is
+/// a property of the field: it is always a place something was observed, and two
+/// sessions with similar work but different lobes no longer collapse onto nearly
+/// the same point the way two similar means do.
+///
+/// The mean survives as the **last** rung, and only there. It is what a
+/// territory assembled by hand — a fixture that pushes into `kernels` and sets
+/// `centre_of_mass` without ever calling `observe` — can still answer with, and
+/// dropping it would silently unplace threads in tests that are about something
+/// else entirely.
 #[must_use]
 pub fn thread_position(thread: &Thread, layout: &CityLayout) -> Option<Point> {
-    if let Some(com) = thread.territory.centre_of_mass {
-        if com.x.is_finite() && com.y.is_finite() {
-            return Some(com);
+    if let Some(anchor) = thread.territory.anchor() {
+        if anchor.x.is_finite() && anchor.y.is_finite() {
+            return Some(anchor);
         }
     }
-    thread
+    if let Some(head) = thread
         .trail
         .iter()
         .rev()
         .find_map(|(path, _)| position_in(layout, path))
+    {
+        return Some(head);
+    }
+    thread
+        .territory
+        .centre_of_mass
+        .filter(|com| com.x.is_finite() && com.y.is_finite())
 }
 
 /// Where the agent that ran an operation was **when it ran it**.
@@ -228,16 +251,27 @@ pub fn thread_position(thread: &Thread, layout: &CityLayout) -> Option<Point> {
 /// 1. the worker's focus, when a worker ran it — a subagent's shell call belongs
 ///    at the file that subagent is working on;
 /// 2. the newest step of the thread's trail that the city has geometry for;
-/// 3. the territory's centre of mass, as a last resort.
+/// 3. [`thread_position`] — the territory's anchor, and the centre of mass
+///    behind it — as a last resort.
 ///
-/// [`thread_position`] puts the centre of mass first because it is answering
-/// *"what is this agent's scope"*, and PRD §6 is emphatic that a scope is a
-/// field rather than a point. This function answers a different question —
-/// *"where did this call happen"* — and for that the field's centre is the wrong
-/// summary: it is decaying evidence from the whole session and can sit a long
-/// way from where the agent is now. Measured on `9cab97d7`, the centre of mass
-/// sat 227 city units from the median of the files the session touched, which
-/// put every rung-3 mark off the side of a camera framed on the work.
+/// [`thread_position`] puts the territory first because it is answering *"what
+/// is this agent's scope"*, and PRD §6 is emphatic that a scope is a field
+/// rather than a point. This function answers a different question — *"where did
+/// this call happen"* — and for that a summary of the whole field is the wrong
+/// answer however it is computed: it is decaying evidence from the entire
+/// session and can sit a long way from where the agent is now. Measured on
+/// `9cab97d7`, the centre of mass sat 227 city units from the median of the
+/// files the session touched, which put every rung-3 mark off the side of a
+/// camera framed on the work.
+///
+/// That measurement was taken against the mean, and rung 3 is now the *mode*, so
+/// half of the old argument has dissolved: the mode is a place work actually
+/// happened, so it can no longer be off in the empty middle. The half that
+/// remains is the half that decided this order — the mode is where the thread
+/// has been working over the last several minutes of decay, and the trail head
+/// is where it was on the call being drawn. Those are different questions and
+/// rung 2 answers this one. The 227 units were not re-measured against the
+/// anchor; nothing here depends on the number any more.
 #[must_use]
 pub fn agent_position(
     thread: &Thread,

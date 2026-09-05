@@ -285,11 +285,24 @@ fn a_frame_of_the_map_draws_every_live_layer() {
         map.buildings_drawn > 0 || map.tier == ZoomTier::City,
         "buildings must be drawn at every tier above City"
     );
-    assert!(clouds.shown >= 1, "the converged territory got no cloud");
+    // Through the census rather than through two loose fields, because the
+    // census is what the status bar prints and a green `shown >= 1` beside a bar
+    // that says `0 CLOUDS` would be the two disagreeing again.
+    let census = clouds.census(camera.scale());
     assert!(
-        clouds.kernels >= 6,
+        census.shown >= 1,
+        "the converged territory got no cloud: {}",
+        census.reason()
+    );
+    assert!(
+        census.kernels >= 6,
         "every kernel should reach the field: {}",
-        clouds.kernels
+        census.kernels
+    );
+    assert!(
+        !census.sub_pixel(),
+        "and they are wide enough to draw at the fitted camera: {}",
+        census.reason()
     );
     assert!(map.draw_ms < 200.0, "one frame took {} ms", map.draw_ms);
 }
@@ -461,5 +474,77 @@ fn the_base_map_is_reused_until_the_layout_changes() {
     assert!(
         !base.matches(&regenerated, false),
         "a new layout is a new base map"
+    );
+}
+
+/// An empty sky has to say why (PRD §6.2, §10.4).
+///
+/// `polis-render`'s headless path has asserted
+/// `frame.cloud.unplaced > 0 && frame.cloud.shown == 0` since `CloudCensus` was
+/// written; the window had no equivalent, because it called
+/// `territory::visible_clouds` — a wrapper that returns the chosen territories
+/// and drops the three counts saying what happened to everybody else. So the
+/// status bar could only ever print `0 clouds (0 kernels)`, which states the
+/// symptom twice and the cause not at all, and the operator's `i dont see any
+/// clouds` had nothing on screen to pull on.
+///
+/// The snapshot here is the shape that produces it: two threads that have made
+/// tool calls and whose evidence has not agreed on an ancestor.
+#[test]
+fn a_window_with_no_clouds_says_which_gate_took_them() {
+    let city = city();
+    let ctx = egui::Context::default();
+    let layout = Arc::new(city.layout.clone());
+    let base = BaseMap::render(&ctx, &city, &layout, false);
+
+    let now = Instant::now();
+    let mut snapshot = WorldSnapshot::empty(Arc::clone(&layout));
+    snapshot.at = now;
+    snapshot.generation = 1;
+    for n in 0..2 {
+        let session = SessionId::new(format!("s-{n}"));
+        let mut thread = Thread::new(ThreadId::of_session(session.clone()), session, now);
+        thread.status = ThreadStatus::Working;
+        thread.tool_calls = 417;
+        // A territory with no claim, no lobes and no kernels: PRD §6.2's
+        // *"unplaced marker in the status rail"*.
+        thread.territory = Territory::for_extent(layout.extent);
+        snapshot.threads.push(thread);
+    }
+
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+    let mut camera = Camera::fit(base.edge(), base.geometry.median_building_px, viewport);
+    let mut clouds = Clouds::default();
+    let mut state = ViewState::default();
+    let _ = frame(
+        &ctx,
+        &base,
+        &mut camera,
+        &mut clouds,
+        &snapshot,
+        &mut state,
+        None,
+        raw_input(viewport.size()),
+    );
+
+    let census = clouds.census(camera.scale());
+    assert_eq!(census.shown, 0, "nothing converged, so nothing is drawn");
+    assert_eq!(
+        census.unplaced, 2,
+        "and both threads are accounted for rather than lost"
+    );
+    assert_eq!(
+        census.threads(),
+        snapshot.threads.len(),
+        "every thread lands in exactly one bucket"
+    );
+    assert!(
+        census.withheld(),
+        "which is what makes the status bar print a reason at all"
+    );
+    let reason = census.reason();
+    assert!(
+        reason.contains("UNCONVERGED"),
+        "the bar has to name the gate that fired, not restate the count: {reason}"
     );
 }

@@ -40,8 +40,8 @@ use polis_events::{
 use polis_repo::{FileMeta, RepoTree};
 use polis_world::territory::{DECAY_HALF_LIFE, DRIFT_CONFIRMATIONS};
 use polis_world::{
-    ThreadStatus, WorkerAttribution, World, MARK_HOLD_MAX, MAX_THREADS, THREAD_RETIRE_AFTER,
-    UNATTRIBUTED_TTL,
+    ThreadStatus, WorkerAttribution, World, IDLE_AFTER, IN_FLIGHT_MAX, MARK_HOLD_MAX, MAX_THREADS,
+    THREAD_RETIRE_AFTER, UNATTRIBUTED_TTL,
 };
 
 // ---------------------------------------------------------------------------
@@ -1427,5 +1427,266 @@ fn the_early_warning_and_the_claim_table_hold_the_frame_at_prd_16s_load() {
     assert!(
         worst < Duration::from_millis(16),
         "one tick is {worst:?} against a 16.6 ms frame"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. A tool call in flight is work, not silence
+// ---------------------------------------------------------------------------
+//
+// The operator's report: a session running a long lint shows as IDLE, then
+// flips to working about ten seconds later. Nothing was wrong with the poll
+// interval — `Bash` writes nothing at all between its `tool_use` block and its
+// `tool_result`, so a thread running `cargo clippy --workspace` is byte-for-byte
+// as quiet as a thread whose operator walked away, and `IDLE_AFTER` took it at
+// 60 s. The ten seconds is the model's own latency after the result lands
+// (measured p75 7.6 s), which is how long it then took the next `assistant`
+// record to stamp the thread working again.
+//
+// These build events directly rather than driving files, for the same reason
+// section 4's lifecycle tests do: they are about *time* — a 60 s decay, a 10 min
+// ceiling — and a test that had to spend it would not be a test anyone runs.
+
+/// A `Bash` call issued by a main agent, and then silence until its result.
+fn bash_event(session: &str, id: &str, at: Instant) -> Event {
+    let mut meta = EventMeta::now(Channel::Transcript).with_session(SessionId::new(session));
+    meta.observed = at;
+    let body = serde_json::json!({
+        "type": "assistant",
+        "sessionId": session,
+        "cwd": REPO,
+        "gitBranch": "main",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": id,
+                "name": "Bash",
+                "input": { "command": "cargo clippy --workspace --all-targets" },
+            }],
+        },
+    });
+    Event::new(
+        meta,
+        Payload::Transcript(Box::new(TranscriptEvent {
+            kind: TranscriptRecordKind::Assistant,
+            source: TranscriptSource::Main,
+            byte_offset: 0,
+            record: body,
+        })),
+    )
+}
+
+/// The `user` record that settles one call. Not a human turn: a `tool_result`.
+fn result_event(session: &str, id: &str, at: Instant) -> Event {
+    let mut meta = EventMeta::now(Channel::Transcript).with_session(SessionId::new(session));
+    meta.observed = at;
+    let body = serde_json::json!({
+        "type": "user",
+        "sessionId": session,
+        "cwd": REPO,
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "warning: unused variable",
+            }],
+        },
+    });
+    Event::new(
+        meta,
+        Payload::Transcript(Box::new(TranscriptEvent {
+            kind: TranscriptRecordKind::User,
+            source: TranscriptSource::Main,
+            byte_offset: 0,
+            record: body,
+        })),
+    )
+}
+
+/// The same, arriving on a subagent's own transcript.
+fn worker_result_event(session: &str, worker: &str, id: &str, at: Instant) -> Event {
+    let mut meta = EventMeta::now(Channel::Transcript).with_session(SessionId::new(session));
+    meta.observed = at;
+    meta.worker = Some(WorkerId::new(worker));
+    let body = serde_json::json!({
+        "type": "user",
+        "sessionId": session,
+        "agentId": worker,
+        "isSidechain": true,
+        "cwd": REPO,
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "ok",
+            }],
+        },
+    });
+    Event::new(
+        meta,
+        Payload::Transcript(Box::new(TranscriptEvent {
+            kind: TranscriptRecordKind::User,
+            source: TranscriptSource::Subagent {
+                agent: WorkerId::new(worker),
+                workflow_run: None,
+            },
+            byte_offset: 0,
+            record: body,
+        })),
+    )
+}
+
+/// An assistant record with prose and no tool call — the cheapest way to bring a
+/// thread into the world without also putting a call in flight.
+fn text_event(session: &str, at: Instant) -> Event {
+    let mut meta = EventMeta::now(Channel::Transcript).with_session(SessionId::new(session));
+    meta.observed = at;
+    let body = serde_json::json!({
+        "type": "assistant",
+        "sessionId": session,
+        "cwd": REPO,
+        "message": {
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "running the lint" }],
+        },
+    });
+    Event::new(
+        meta,
+        Payload::Transcript(Box::new(TranscriptEvent {
+            kind: TranscriptRecordKind::Assistant,
+            source: TranscriptSource::Main,
+            byte_offset: 0,
+            record: body,
+        })),
+    )
+}
+
+#[test]
+fn a_thread_with_a_tool_call_in_flight_is_not_idle() {
+    let mut world = city_world();
+    let t0 = Instant::now();
+    let a = ThreadId::of_session(SessionId::new("a"));
+    world.apply(&bash_event("a", "toolu_lint", t0));
+    assert_eq!(world.thread(&a).unwrap().status, ThreadStatus::Working);
+
+    // Ninety seconds of nothing, which is what a lint run looks like on disk.
+    world.tick(t0 + Duration::from_secs(90));
+    assert_eq!(
+        world.thread(&a).unwrap().status,
+        ThreadStatus::Working,
+        "silence with a call in flight is the call, not the operator leaving"
+    );
+
+    // The result lands. It answers nothing, but it is the only record Channel D
+    // emits when the call ends, and the assistant record that would otherwise
+    // stamp the clock is a further p75 7.6 s away.
+    let done = t0 + Duration::from_secs(90);
+    world.apply(&result_event("a", "toolu_lint", done));
+    let thread = world.thread(&a).expect("thread a");
+    assert_eq!(thread.last_activity, done, "a result is activity");
+    assert_eq!(thread.status, ThreadStatus::Working);
+}
+
+#[test]
+fn a_lost_tool_result_cannot_pin_a_thread_working_for_ever() {
+    // The other edge of `IN_FLIGHT_MAX`: a session killed mid-call leaves an
+    // entry nothing will ever settle, and without a ceiling that one entry
+    // paints a live-looking dot for the rest of the thread's life.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    let a = ThreadId::of_session(SessionId::new("a"));
+    world.apply(&bash_event("a", "toolu_killed", t0));
+
+    world.tick(t0 + IN_FLIGHT_MAX);
+    assert_eq!(
+        world.thread(&a).unwrap().status,
+        ThreadStatus::Working,
+        "inside the ceiling the call is still credible"
+    );
+
+    world.tick(t0 + IN_FLIGHT_MAX + Duration::from_secs(1));
+    assert_eq!(
+        world.thread(&a).unwrap().status,
+        ThreadStatus::Idle,
+        "past {IN_FLIGHT_MAX:?} a call that never settled is evidence of nothing"
+    );
+}
+
+#[test]
+fn a_result_does_not_clear_a_wait() {
+    // `working` re-derives the wait from the attention layer on every call, so
+    // stamping activity from a `tool_result` cannot take a pin down. That is the
+    // invariant the whole change rests on.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    let a = ThreadId::of_session(SessionId::new("a"));
+    world.apply(&asks_event("a", t0));
+    assert_eq!(world.thread(&a).unwrap().status, ThreadStatus::Waiting);
+
+    let later = t0 + Duration::from_secs(5);
+    world.apply(&result_event("a", "toolu_unrelated", later));
+
+    let thread = world.thread(&a).expect("thread a");
+    assert_eq!(
+        thread.status,
+        ThreadStatus::Waiting,
+        "a tool coming back says nothing about whether the human replied"
+    );
+    assert_eq!(thread.last_activity, later, "but the thread is alive");
+    assert!(
+        world.attention.iter().any(|m| m.kind.is_decision_for(&a)),
+        "and the pin the operator has to act on is still standing"
+    );
+}
+
+#[test]
+fn a_subagents_result_stamps_its_parent() {
+    // A fleet of subagents returning results is a live orchestrator, whatever
+    // the main transcript is doing. `assistant` already stamps without looking
+    // at `worker`; the result path now matches it.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    let a = ThreadId::of_session(SessionId::new("a"));
+    world.apply(&edit_event("a", "src/auth/token.rs", t0));
+
+    let later = t0 + Duration::from_secs(120);
+    world.apply(&worker_result_event("a", "w-1", "toolu_w1", later));
+
+    assert_eq!(world.thread(&a).unwrap().last_activity, later);
+    world.tick(later + Duration::from_secs(1));
+    assert_eq!(
+        world.thread(&a).unwrap().status,
+        ThreadStatus::Working,
+        "the orchestrator is working because its workers are"
+    );
+}
+
+#[test]
+fn a_dismissed_threads_call_in_flight_does_not_follow_it_back() {
+    // `dismiss_thread` is explicitly not a tombstone, and `ThreadId::of_session`
+    // is the identity function on the session id — so the next event rebuilds
+    // the thread under the same id. An in-flight call left behind by the
+    // dismissal would hold that fresh thread `Working` on evidence from a thread
+    // the operator deleted.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    let a = ThreadId::of_session(SessionId::new("a"));
+    world.apply(&bash_event("a", "toolu_lint", t0));
+    world.dismiss_thread(&a);
+    assert!(world.thread(&a).is_none());
+
+    // Rebuilt by a record that puts nothing of its own in flight.
+    let back = t0 + Duration::from_secs(1);
+    world.apply(&text_event("a", back));
+    assert!(world.thread(&a).is_some(), "a dismissal is not a filter");
+
+    world.tick(back + IDLE_AFTER + Duration::from_secs(1));
+    assert_eq!(
+        world.thread(&a).unwrap().status,
+        ThreadStatus::Idle,
+        "the recreated thread owns no call, so silence means silence"
     );
 }

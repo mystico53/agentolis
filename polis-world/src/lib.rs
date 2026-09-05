@@ -112,13 +112,13 @@ pub mod verify;
 
 mod apply;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
 use polis_events::{
     AgentType, Event, Glyph, LogicalPath, Outcome, PathMapper, Payload, SessionId, ThreadId,
-    ToolKind, ToolUseId, WorkerId, WorktreeId,
+    ToolKind, ToolUseId, WorkerId, WorktreeId, IDENTITY_SLOTS,
 };
 use polis_layout::{CityLayout, Point};
 use polis_repo::corpus::{Corpus, Denylist};
@@ -179,7 +179,81 @@ pub const OPS_CAP: usize = 128;
 ///
 /// Idle is "alive but quiet", not "finished": only an explicit stop signal
 /// produces [`ThreadStatus::Done`].
+///
+/// # Silence is the test only while nothing is in flight
+///
+/// A `Bash` or `PowerShell` call writes **nothing at all** between its
+/// `tool_use` block and its `tool_result`: the transcript is append-only and the
+/// tool's whole output arrives in one record at the end. A session running
+/// `cargo clippy --workspace` is therefore byte-for-byte as quiet as a session
+/// whose operator walked away, and sixty seconds of nothing is not evidence of
+/// idleness on its own.
+///
+/// Measured over this machine's `~/.claude/projects` — 1 374 transcripts,
+/// 65 652 settled tool calls, the two tools that ask the operator excluded
+/// because those are the human's own latency ([`attention::asks_the_operator`]):
+/// the median call is 0.93 s, but **p99 is 120 s — twice this constant — and
+/// 3.27% of all calls outlive it**. That tail is not noise; it is the long
+/// build, the full test run and the dispatched subagent fleet, which is
+/// precisely the work an operator most needs to see is still running.
+///
+/// [`IN_FLIGHT_MAX`] is the other half of the test, and [`World::tick`] applies
+/// them together: a thread goes `Idle` when it has been silent for this long
+/// **and** owns no unsettled tool call — where "owns" is what the transcript
+/// channel saw, since that is the only channel that fills the table.
 pub const IDLE_AFTER: Duration = Duration::from_secs(60);
+
+/// How long an unsettled tool call still counts as work in progress.
+///
+/// [`IDLE_AFTER`] asks *"has this thread been silent?"*. This asks *"is it
+/// silent because it is waiting on something it started?"* — [`World::tick`]
+/// holds a thread [`ThreadStatus::Working`] while it owns a `tool_use` whose
+/// `tool_result` has not arrived and which started inside this window.
+///
+/// A ceiling is needed because the `tool_use` is not proof on its own. A session
+/// killed mid-`Bash`, a transcript truncated mid-turn, a `/clear` on top of a
+/// running call: each leaves a [`PendingCall`] that will never be settled, and
+/// without a ceiling that one entry paints a live-looking dot on the map for the
+/// rest of the thread's life.
+///
+/// # Where ten minutes comes from
+///
+/// Same corpus as [`IDLE_AFTER`] above. Each row is what that cap would leave
+/// unprotected — calls long enough to still flip their thread to `Idle`
+/// mid-call:
+///
+/// | cap | calls that still go Idle mid-call |
+/// |---:|---|
+/// | 2 min | 787 (1.199%) |
+/// | 3 min | 209 (0.318%) |
+/// | 5 min | 123 (0.187%) |
+/// | **10 min** | **44 (0.067%)** |
+/// | 15 min | 4 (0.006%) |
+/// | 30 min | 0 |
+///
+/// Too low and the defect returns for exactly the calls that motivated it: of
+/// the 44 machine calls past ten minutes, 28 are `Bash`, 7 are `Agent` and 6 are
+/// `TaskOutput` — long builds and orchestrated subagent fleets, never a quick
+/// read. Too high and the failure inverts: a session that died mid-call reads
+/// `Working` for however long this is, and at 30 minutes that equals
+/// [`THREAD_RETIRE_AFTER`], so the lie would run right up to the moment the
+/// thread is retired and no clock in the world would ever correct it. Ten
+/// minutes bounds the lie at a third of a thread's life while covering
+/// 99.933% of real calls.
+///
+/// **Asserted at the top end, not swept.** The knee of that table is at 15
+/// minutes, not 10 — 15 removes 40 of the remaining 44 — and 10 was chosen for
+/// the margin against [`THREAD_RETIRE_AFTER`] rather than measured against a
+/// cost. One machine, one operator, one corpus, whose longest machine call is
+/// 1 724 s. The 44 calls above the cap are still drawn `Idle` for their tail.
+///
+/// **Channel D only, and the gap is real.** The table this reads is filled in
+/// exactly one place — `apply::assistant`'s `tool_use` loop — so a deployment
+/// fed by hooks or by OTel alone gets nothing from this constant, and its long
+/// build still reads `Idle` for the whole run and corrects itself only at the
+/// completion edge. `PreToolUse` is the hook that would close it; it is not
+/// wired to `pending` today.
+pub const IN_FLIGHT_MAX: Duration = Duration::from_mins(10);
 
 /// How long a quiet thread stays in the world before [`World::tick`] retires it.
 ///
@@ -275,6 +349,144 @@ pub const MAX_THREADS: usize = 256;
 pub const AT_MENTION_WEIGHT: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
+// Identity hue — who owns which of PRD §11.4's twelve colours
+// ---------------------------------------------------------------------------
+
+/// Which of the [`IDENTITY_SLOTS`] hues have been handed out, and never to two
+/// threads at once.
+///
+/// # What this replaces, and why
+///
+/// The hue used to be `polis_render::live::thread_slot` — FNV over the id,
+/// modulo twelve, computed independently by five draw sites. Its own
+/// doc-comment accepted collisions as the price of stability, and with nine
+/// threads on screen about three of the thirty-six pairs shared a colour. The
+/// operator rejected the trade outright: *"the same color is super bad, can you
+/// make sure the colors have to be different?"*. A hash cannot promise that, at
+/// any ring size — twenty slots would still collide, and would cost more than
+/// the collision does (see `polis_render::live::THREAD_HUES`'s ΔE00 table). The
+/// only structure that *can* promise it is an owner that hands each slot out
+/// once, which is this.
+///
+/// [`ThreadId::hue_preference`] is still the first slot tried, so a world with a
+/// handful of threads paints exactly the colours it painted before.
+///
+/// # A slot is never released, and that is the determinism argument
+///
+/// A thread leaving the world does not give its colour back. Nothing here is
+/// keyed on [`World::threads`] at all: the ring records which *id* took which
+/// slot and keeps that for the life of the world, so a thread retired for
+/// silence and then heard from again gets the colour it had before.
+///
+/// That looks wasteful and it is the whole reason this is sound. Retirement is
+/// driven by [`World::tick`], and **tick cadence differs between the two
+/// renderers on the same recording**: `replay::ReplayDriver::advance` ticks once
+/// per call and the window calls it many times, so [`World::retire_threads`]
+/// fires repeatedly mid-run; `run_to_end` applies the whole schedule and ticks
+/// exactly once, so it fires at the end or not at all. Two things follow, and a
+/// ring that recycled slots would get both wrong:
+///
+/// * whether a slot is **free** when the next thread is created — so a recycling
+///   ring would hand the thirteenth thread a reused colour in the window and the
+///   bare fallback in a recorded GIF;
+/// * whether a thread is created **twice** — a session that goes quiet past
+///   [`THREAD_RETIRE_AFTER`] and then speaks again is retired and rebuilt by the
+///   window, and is not retired at all by `run_to_end`, so it reaches
+///   [`HueRing::assign`] a different number of times in the two.
+///
+/// The second is the one that is easy to miss, and remembering the owner is what
+/// answers it: a second `assign` for an id the ring has already placed is a
+/// lookup, not a claim, so it consumes nothing and returns the same slot in both
+/// drivers. `polis_app::palette` names the failure both of these produce in as
+/// many words — a colour that meant one thread in the window and another in a
+/// recorded GIF *"would be worse than no colour at all"*.
+///
+/// What is left is an assignment that depends only on the **set of distinct
+/// thread ids and the order they were first seen**, which is the event order:
+/// identical in both drivers, and identical across a [`World::reset`]-and-
+/// re-apply seek.
+///
+/// # The price, stated plainly
+///
+/// A world degrades to the bare preference after **twelve distinct threads have
+/// ever been seen in it**, not twelve concurrently. The guarantee is therefore:
+/// *the first twelve threads of a world are mutually distinct; past that, colour
+/// degrades to the bare preference and the rail's name carries identity
+/// (PRD §11.4)*. Past twelve the thirteenth thread is not merely *likely* to
+/// collide, it is **certain** to, because every slot is taken.
+///
+/// **This is reachable on the operator's own machine, and it is worth being
+/// blunt about how reachable.** Measured over their `~/.claude/projects` — 193
+/// main-session transcripts, subagent sidecars excluded because a subagent
+/// carries its parent's session id (ADR-0030) and is not a thread:
+///
+/// | question | answer |
+/// |---|---:|
+/// | peak threads live at once, counting a session live until its last record + [`THREAD_RETIRE_AFTER`] | **13** |
+/// | distinct sessions started per day, median | 15 |
+/// | days with more than twelve distinct sessions | 8 of 15 (53 %) |
+/// | hours from a Polis start to its twelfth distinct session, median | 17.0 (p10 2.4) |
+///
+/// So at this fleet's busiest moment the ring is **one slot short**, and a Polis
+/// left open overnight exhausts it by accretion in well under a day even with
+/// two threads on screen. Read that as the honest ceiling on the promise: it
+/// removes the collisions the operator actually complained about — three shared
+/// pairs among nine live threads — and does not remove them all. What it also
+/// does is make the remainder *countable*, in [`Health::identity_hues_exhausted`]
+/// and in the status bar, rather than a silent return of the reported bug. The
+/// operator's remedy is a restart, which is a [`World::reset`], which clears the
+/// ring.
+///
+/// Widening the ring is not the fix, and that is measured too: see
+/// `polis_render::live::THREAD_HUES`, whose ΔE00 table shows twenty slots taking
+/// the worst pair from 9.80 to 5.4, below what the cloud band already struggles
+/// with. The fix, if the fleet keeps growing, is a second channel on the rail
+/// row and not a thirteenth hue.
+///
+/// Both numbers above came from a script over the operator's real sessions that
+/// is **not in the tree**, so they cannot currently be re-taken from a test.
+/// Treat them the way `territory::CLOUD_CAP`'s doc asks its own numbers to be
+/// treated: one machine, one fortnight, one operator.
+///
+/// The memory is bounded at twelve ids by construction: once every slot is
+/// taken nothing more is ever recorded, so this is not a table that grows with
+/// the number of sessions the machine has ever run.
+#[derive(Debug, Default)]
+struct HueRing {
+    /// Slot → the thread that took it, ever. Never cleared except by
+    /// [`World::reset`].
+    held: [Option<ThreadId>; IDENTITY_SLOTS as usize],
+}
+
+impl HueRing {
+    /// The slot for `id` — the one it already had, or a fresh claim, or `None`
+    /// when all twelve are gone.
+    ///
+    /// The lookup walks `held` in **index** order and the probe is
+    /// `(pref + k) % IDENTITY_SLOTS` for `k` in `0..`, both fixed index walks —
+    /// never a scan of a map, so no iteration order can reach the answer
+    /// (PRD §7.4, and the `BTreeMap` rule this module opens with). The probe
+    /// starts at the thread's own preference so displacement is as local as it
+    /// can be: a thread only moves off its preferred hue when another thread is
+    /// already holding it.
+    fn assign(&mut self, id: &ThreadId) -> Option<u8> {
+        if let Some(slot) = self.held.iter().position(|h| h.as_ref() == Some(id)) {
+            #[allow(clippy::cast_possible_truncation)] // position over 12 slots
+            return Some(slot as u8);
+        }
+        let pref = id.hue_preference();
+        for k in 0..IDENTITY_SLOTS {
+            let slot = (pref + k) % IDENTITY_SLOTS;
+            if self.held[slot as usize].is_none() {
+                self.held[slot as usize] = Some(id.clone());
+                return Some(slot);
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The world
 // ---------------------------------------------------------------------------
 
@@ -337,6 +549,9 @@ pub struct World {
     layout_generation: u64,
     /// Bumped whenever [`Self::files`] changes.
     files_generation: u64,
+    /// Who owns which identity hue (PRD §11.4). Private, because the only way
+    /// to get a slot is to be created through [`World::thread_entry`].
+    hues: HueRing,
 }
 
 impl World {
@@ -383,6 +598,7 @@ impl World {
             now: Instant::now(),
             layout_generation: 0,
             files_generation: 0,
+            hues: HueRing::default(),
         }
     }
 
@@ -434,11 +650,25 @@ impl World {
 
         self.claims.expire(now);
         self.health.claim_paths_evicted = self.claims.paths_evicted();
+        // A thread that owns an unsettled `tool_use` is working, whatever the
+        // transcript says — see `IN_FLIGHT_MAX`. Read, never `retain`:
+        // dropping the stale entries here would make a late `tool_result` miss
+        // the diff and verification accounting `apply::settle` does with them,
+        // so the ceiling is applied to the *question* and the table is left
+        // alone. `pending` and `threads` are disjoint fields, so the immutable
+        // borrow coexists with `values_mut()` below without a clone.
+        let in_flight: BTreeSet<&ThreadId> = self
+            .pending
+            .values()
+            .filter(|c| now.saturating_duration_since(c.started) <= IN_FLIGHT_MAX)
+            .map(|c| &c.thread)
+            .collect();
         for thread in self.threads.values_mut() {
             thread.territory.decay(now);
             thread.fade_trail(now);
             if thread.status == ThreadStatus::Working
                 && now.saturating_duration_since(thread.last_activity) > IDLE_AFTER
+                && !in_flight.contains(&thread.id)
             {
                 thread.status = ThreadStatus::Idle;
             }
@@ -561,6 +791,21 @@ impl World {
     /// thread makes a building's drill-down list name a thread the rail cannot
     /// show. All four are cleared here, and the file walk is bounded by what the
     /// thread itself touched rather than by the size of the city.
+    ///
+    /// # In-flight calls go too, and that is not tidiness
+    ///
+    /// [`World::dismiss_thread`] is deliberately **not** a tombstone, and
+    /// `ThreadId::of_session` is the identity function on the session id — so
+    /// the next event for a dismissed session rebuilds the thread under the
+    /// *same* [`ThreadId`]. An orphaned [`PendingCall`] left behind here would
+    /// then be read by [`World::tick`] as evidence that the recreated thread has
+    /// work in flight, and would hold it [`ThreadStatus::Working`] on a call
+    /// belonging to a thread the operator deleted (see [`IN_FLIGHT_MAX`]).
+    ///
+    /// The price is that a `tool_result` arriving after the removal loses its
+    /// diff and verification accounting. It already lost it: `apply::settle`
+    /// looks the thread up in [`World::threads`] before recording anything, and
+    /// that lookup misses on a thread that is gone.
     pub fn forget_thread(&mut self, id: &ThreadId) {
         let Some(thread) = self.threads.remove(id) else {
             return;
@@ -575,6 +820,7 @@ impl World {
         self.files_generation = self.files_generation.wrapping_add(1);
         self.spawns.retain(|_, t| t != id);
         self.workflow_runs.retain(|_, t| t != id);
+        self.pending.retain(|_, c| &c.thread != id);
     }
 
     /// Drops unattributable workers that are never going to be adopted.
@@ -604,8 +850,23 @@ impl World {
     /// left it at the moment the seek started would age every re-applied event
     /// by the whole span being rewound, and the rebuilt world would arrive with
     /// its trails already faded. Replay passes its monotonic origin.
+    ///
+    /// **The hue ring is a live layer and is cleared with the rest of them.**
+    /// Be precise about what that buys, because it is not what it first looks
+    /// like: `HueRing` remembers *which id* holds each slot, so re-applying
+    /// the **same** schedule over a stale ring would find every id already
+    /// placed and hand out the same colours anyway — the backwards seek at
+    /// `replay::ReplayDriver::seek`, the only caller in the product today, is
+    /// idempotent either way. What this line prevents is a world reset onto a
+    /// **different** set of events: without it the twelve slots stay spoken for
+    /// by twelve ids that no longer exist, and the new city is painted entirely
+    /// in bare preferences with [`Health::identity_hues_exhausted`] counting
+    /// every thread in it. That is what "clears every live layer" has to mean
+    /// for this one to be true, and it is asserted by
+    /// `a_reset_world_hands_out_hues_as_a_fresh_one_does`.
     pub fn reset(&mut self, now: Instant) {
         self.now = now;
+        self.hues = HueRing::default();
         self.threads.clear();
         self.files.clear();
         self.claims = contention::ClaimTable::default();
@@ -726,11 +987,36 @@ impl World {
     // -- internals shared with `apply` -------------------------------------
 
     /// The thread for a session, created if this is the first time it is seen.
+    ///
+    /// This is also the **only** place [`Thread::tint`] is decided (PRD §11.4).
+    /// Creation is exactly the moment at which "which colours are already
+    /// spoken for" is knowable, and doing it here rather than in [`Thread::new`]
+    /// is what makes a hue exclusive rather than merely stable: see
+    /// [`HueRing`].
+    ///
+    /// Written as a `contains_key` / `insert` pair rather than
+    /// `entry().or_insert_with()` because the closure would have to borrow
+    /// `self.hues` while `self.threads` is already borrowed by the entry. The
+    /// extra lookup is on the cold path — once per session, not once per event.
     pub(crate) fn thread_entry(&mut self, session: &SessionId, at: Instant) -> &mut Thread {
         let id = ThreadId::of_session(session.clone());
-        self.threads
-            .entry(id.clone())
-            .or_insert_with(|| Thread::new(id, session.clone(), at))
+        if !self.threads.contains_key(&id) {
+            let mut thread = Thread::new(id.clone(), session.clone(), at);
+            match self.hues.assign(&id) {
+                Some(slot) => thread.tint = slot,
+                // Every hue this world has ever handed out is gone. `Thread::new`
+                // has already set the bare preference, which is what the old
+                // `thread_slot` would have returned — so the map degrades to the
+                // behaviour that was there before rather than to no colour, and
+                // the counter is what says so out loud.
+                None => {
+                    self.health.identity_hues_exhausted =
+                        self.health.identity_hues_exhausted.saturating_add(1);
+                }
+            }
+            self.threads.insert(id.clone(), thread);
+        }
+        self.threads.get_mut(&id).expect("just inserted")
     }
 
     /// Resolves a raw path from a tool input against the mapper.
@@ -848,6 +1134,14 @@ impl World {
         });
         if at.is_none() {
             self.health.unplaced_observations += 1;
+        }
+        // Counted here rather than inside `Territory::observe`, which has no
+        // `Health` to reach and is called on hand-built fixtures that are not
+        // part of any run's census. The predicate is the territory's own — it is
+        // `claim_path().is_root()` on both sides — and the pair of them is the
+        // whole of what PRD §6.1's `Bash` cwd row actually contributes.
+        if obs.claim_path().is_root() {
+            self.health.root_scoped_observations += 1;
         }
         let base = self.layout.extent;
         let Some(thread) = self.threads.get_mut(&obs.thread) else {
@@ -1073,6 +1367,25 @@ pub struct Thread {
     pub trail: VecDeque<(LogicalPath, Instant)>,
     /// Working / Waiting / Idle / Done.
     pub status: ThreadStatus,
+    /// This thread's identity hue slot, into `polis_render::live::THREAD_HUES`
+    /// (PRD §11.4).
+    ///
+    /// Assigned **once**, by `World::thread_entry`, the first time the world
+    /// sees the session, and never reassigned for the rest of the thread's
+    /// life. Read as a field by every surface that draws the thread — the map,
+    /// the rail, the cloud table, the headless frame — so there is exactly one
+    /// place the answer is computed and the window and a recorded GIF cannot
+    /// disagree about it.
+    ///
+    /// [`Thread::new`] defaults it to the thread's bare
+    /// [`ThreadId::hue_preference`], which is what a `Thread` built outside a
+    /// [`World`] gets: a fixture is not exclusive, deliberately, because
+    /// exclusivity is a property of the *set* of live threads and a fixture has
+    /// no set. Inside a world the ring overrides it.
+    ///
+    /// Never `polis_render::live::NO_TINT` (255): that value means *"nobody
+    /// named an owner for this pixel"* and no thread may ever carry it.
+    pub tint: u8,
 
     /// The same steps as [`Thread::trail`] with PRD §10.1's shape channel
     /// attached: which operation, how it went, and which worker did it.
@@ -1117,6 +1430,11 @@ pub struct Thread {
 impl Thread {
     /// A new thread, first seen at `at`.
     pub fn new(id: ThreadId, session_id: SessionId, at: Instant) -> Self {
+        // Before `id` is moved into the struct, and defaulted to the bare
+        // preference rather than left at zero: a fixture built outside a
+        // `World` still gets the colour that thread has always had, and a
+        // defaulted `0` would have made every fixture thread the same rose.
+        let tint = id.hue_preference();
         Self {
             id,
             session_id,
@@ -1125,6 +1443,7 @@ impl Thread {
             workers: Vec::new(),
             trail: VecDeque::new(),
             status: ThreadStatus::Working,
+            tint,
             ops: VecDeque::new(),
             visits: BTreeMap::new(),
             started: at,
@@ -1735,6 +2054,22 @@ pub struct Health {
     /// Observations whose path has no geometry in the current city, so they fed
     /// convergence but dropped no kernel.
     pub unplaced_observations: u64,
+    /// Observations whose claimed path is the **repository root**, so they fed
+    /// nothing at all — no evidence, no kernel, no ancestor.
+    ///
+    /// `Territory::observe` drops them for a good reason (the root is the
+    /// absorbing element of PRD §6.2's ancestor, and its district centre is the
+    /// middle of the map), and the drop is invisible: the operation still draws
+    /// its own mark and still counts in [`territory::Territory::observations`],
+    /// so nothing on any surface said that more than half the evidence stream
+    /// was being discarded. On the corpus this counter was added against it read
+    /// **11 605 of 20 246 — 57.3 %**, because a shell call's only path signal is
+    /// its `cwd` and a `cwd` at the checkout root resolves to the root.
+    ///
+    /// It is the number that makes "why has this thread no cloud" answerable
+    /// from the status bar instead of from a debugger, which is the same
+    /// argument [`Health::unplaced_observations`] beside it was added on.
+    pub root_scoped_observations: u64,
     /// `@`-mentions seen. A known blind spot in PRD §6.1 (ADR-0017); the OTel
     /// `at_mention` event carries no path, so only the transcript's `attachment`
     /// records can be turned into observations.
@@ -1826,6 +2161,24 @@ pub struct Health {
     /// to tell "the rail is short because agents finished" from "the rail is
     /// short because it ran out of room".
     pub threads_evicted: u64,
+    /// Threads created after all [`IDENTITY_SLOTS`] identity hues had been
+    /// handed out, so they fell back to their bare
+    /// [`ThreadId::hue_preference`] and are **certain** to share a colour with
+    /// an earlier thread (PRD §11.4).
+    ///
+    /// The exclusivity this counter measures the exhaustion of is the whole
+    /// point of the change that added it — the operator's report was *"the same
+    /// color is super bad"* — so the failure mode is the reported bug coming
+    /// back. It must be visible rather than inferred: non-zero means "two rows
+    /// in the rail can be the same colour again, and here is how many".
+    ///
+    /// Slots are never released, only claimed (see `HueRing` for why the
+    /// alternative breaks window/headless parity), so this counts threads past
+    /// the world's **twelfth distinct id ever**, not its twelfth concurrent. A
+    /// Polis left open across a day of short sessions reaches it with two
+    /// threads on screen. A session that goes quiet, is retired and comes back
+    /// does **not** count here: it keeps the slot it had.
+    pub identity_hues_exhausted: u64,
     /// Results that arrived after their operation had already been pushed out
     /// of [`OPS_CAP`], so the outcome had nowhere to land.
     ///
@@ -1894,6 +2247,40 @@ mod tests {
         assert_eq!(PathScope::for_tool(&ToolKind::Edit), PathScope::File);
     }
 
+    /// The ring's own arithmetic, which is private and so can only be asserted
+    /// here. The behaviour it produces through a real `World` — exclusivity,
+    /// the reset, and window/headless parity — is in
+    /// `polis-world/tests/identity_hue.rs`.
+    #[test]
+    fn the_hue_ring_walks_up_from_the_preference_and_then_gives_up() {
+        let id = |s: &str| ThreadId::of_session(SessionId::new(s));
+        let mut ring = HueRing::default();
+
+        // Two ids that want slot 4 (pinned in `polis_events::ids`). The first
+        // gets it; the second walks one slot up, never down and never to an
+        // arbitrary free slot, so displacement is as local as it can be.
+        assert_eq!(ring.assign(&id("a")), Some(4));
+        assert_eq!(ring.assign(&id("polis")), Some(5));
+        // Asking again is a lookup, not a claim: it consumes nothing, which is
+        // what makes a retired-and-rebuilt thread free.
+        assert_eq!(ring.assign(&id("a")), Some(4));
+
+        // Fill the rest, then confirm the ring says "gone" rather than
+        // over-writing somebody.
+        let mut taken: Vec<u8> = vec![4, 5];
+        for n in 0..10 {
+            let slot = ring
+                .assign(&id(&format!("filler-{n}")))
+                .expect("a free slot");
+            assert!(!taken.contains(&slot), "slot {slot} was handed out twice");
+            taken.push(slot);
+        }
+        assert_eq!(taken.len(), IDENTITY_SLOTS as usize);
+        assert_eq!(ring.assign(&id("one-too-many")), None);
+        // And the ids already in it are still answered after exhaustion.
+        assert_eq!(ring.assign(&id("polis")), Some(5));
+    }
+
     #[test]
     fn diff_precision_degrades_and_never_upgrades() {
         let mut f = FileState::default();
@@ -1934,6 +2321,67 @@ mod tests {
         w.upgrade_attribution(WorkerAttribution::RecordAgentId);
         w.upgrade_attribution(WorkerAttribution::TranscriptFile);
         assert_eq!(w.attribution, WorkerAttribution::RecordAgentId);
+    }
+
+    /// `cargo test` from the checkout root, through the world rather than
+    /// through [`territory::Territory`] alone.
+    ///
+    /// PRD §6.1's table gives `Bash` cwd a weight of 0.5, and for the common
+    /// case — shell input carries `command` and never `path`, so the cwd
+    /// fallback fires and resolves to the checkout root — that row buys exactly
+    /// nothing about *where*. It has always bought something about *whether*,
+    /// and until this change nothing collected it: the observation stepped the
+    /// trail and stamped `Thread::last_activity`, and then the territory quietly
+    /// forgot it had ever happened and told PRD §10.4's dormancy gate the thread
+    /// had stopped.
+    ///
+    /// This is the join with the idle fix in one assertion block: one call, four
+    /// consumers, and the only one that is allowed to ignore it is the ancestor.
+    #[test]
+    fn a_root_scoped_shell_call_still_proves_the_thread_is_alive() {
+        let mut world = World::for_replay(CityLayout::default());
+        let session = SessionId::new("s");
+        let at = Instant::now();
+        world.thread_entry(&session, at);
+        let id = ThreadId::of_session(session);
+
+        world.observe(&Observation {
+            thread: id.clone(),
+            worker: None,
+            path: LogicalPath::root(),
+            scope: PathScope::Directory,
+            tool: ToolKind::Bash,
+            at,
+            weight: None,
+        });
+
+        assert_eq!(
+            world.health.root_scoped_observations, 1,
+            "counted, so the drop is visible in the status bar rather than \
+             guessed at from an empty map"
+        );
+        let thread = world.threads.get(&id).expect("the thread");
+        assert!(
+            thread.territory.evidence.is_empty(),
+            "the root is the absorbing element of PRD §6.2's ancestor and says \
+             nothing about where"
+        );
+        assert_eq!(
+            thread.territory.observations, 1,
+            "but the thread did do that work"
+        );
+        assert_eq!(
+            thread.last_activity, at,
+            "and the rail's clock saw it (the idle fix's half)"
+        );
+        assert_eq!(thread.trail.len(), 1, "and PRD §12's trail stepped");
+        // The dormancy clock is the half this change adds. `quiet_for` needs
+        // `decay` to have run — `last_decay` **is** now — and `observe` runs it.
+        assert_eq!(
+            thread.territory.quiet_for(),
+            Some(Duration::ZERO),
+            "and PRD §10.4's dormancy clock saw it too"
+        );
     }
 
     #[test]

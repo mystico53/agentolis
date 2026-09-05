@@ -78,6 +78,27 @@
 //! stops producing clouds, this test fails with the reason in the line above the
 //! failure, and the fix is in `polis_world::territory`, never here.
 //!
+//! # It measures the shipped path **at its best moment**, and that is a limit
+//!
+//! Read the two claims below carefully: `shown_frames > 0` and
+//! `cloud_frames > 0`. They say the shipped selection can put a cloud on the map
+//! — not how often it does. And the frames they are evaluated over are chosen by
+//! `polis_render::pacing::plan`, which weights frames by **event mass**, so the
+//! sample lands where the work is dense by construction.
+//!
+//! The gap that costs is real and was measured while fixing the operator's
+//! *"i dont see any clouds"*: event-weighted sampling of the same sessions gives
+//! **94 %** cloud coverage where sampling the same replays on a fixed
+//! session-time grid gives **62 %**. A layer that draws a cloud in every busy
+//! minute and nothing in between is exactly what an operator watching a live map
+//! experiences as empty, and every assertion in this file stays green through it.
+//!
+//! So: green here means *the notation is right and the selection can fire*. It
+//! does not mean the map has clouds on it, and no test in this workspace
+//! currently asserts that it does — the wall-clock-sampled coverage harness that
+//! would is not written. `POLIS_FROM`/`POLIS_TO` are the nearest thing available,
+//! and the table below is what happens when the window moves.
+//!
 //! # Which window, and why the number moves
 //!
 //! With the lift gone the harness measures whatever window it is pointed at,

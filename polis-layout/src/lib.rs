@@ -444,6 +444,43 @@ impl Polygon {
 }
 
 // ---------------------------------------------------------------------------
+// The density kernel
+// ---------------------------------------------------------------------------
+
+/// A quartic kernel with compact support: `(1 - r²)²` inside the radius, zero
+/// outside it. `r2` is the **squared** distance from the kernel's centre in
+/// units of its own radius.
+///
+/// PRD §10.4 splats Gaussians; a Gaussian needs `exp`, and nothing in the
+/// rasteriser reaches for a transcendental (PRD §7.4). The quartic has the same
+/// bell shape, has *finite* support — which makes the splat cheaper, not dearer
+/// — and is a polynomial, so the same bytes come out on every libm.
+///
+/// # Why it lives here and not in `polis-render`
+///
+/// It had one definition, in `polis_render::live`, and then `polis-world`
+/// needed the same curve to answer *where is this thread's field highest* —
+/// `polis_world::territory::Territory::anchor`. `polis-world` cannot depend on
+/// `polis-render` (the arrow runs the other way), so the choice was a second
+/// definition or a shared one. A second one is the failure this module's own
+/// docs already name: *"a `Vec2::length` invented separately in `roads.rs` and
+/// `lots.rs` is how a fan-out produces two subtly different cities"*. Here, a
+/// second one would mean the world picking the peak of one curve and the
+/// rasteriser drawing the contours of another — the ring landing beside its own
+/// cloud, and nothing in either crate able to see why.
+///
+/// One full-weight kernel evaluates to exactly `1.0` at its centre, which is the
+/// unit `polis_render::live::CLOUD_ISO` is thresholded against (ADR-0020).
+#[must_use]
+pub fn quartic(r2: f64) -> f64 {
+    if r2 >= 1.0 {
+        return 0.0;
+    }
+    let k = 1.0 - r2;
+    k * k
+}
+
+// ---------------------------------------------------------------------------
 // Roads
 // ---------------------------------------------------------------------------
 
@@ -841,6 +878,30 @@ mod tests {
         assert_eq!(a / 2.0, Vec2::new(1.5, 2.0));
         assert_eq!(a + b, Vec2::new(-1.0, 7.0));
         assert_eq!(a - b, Vec2::new(7.0, 1.0));
+    }
+
+    /// The three properties every consumer of [`quartic`] relies on: it is one
+    /// at the centre (the unit `CLOUD_ISO` is thresholded in, ADR-0020), it is
+    /// exactly zero at and beyond the radius (compact support is what bounds
+    /// the splat's cost), and it never rises as the distance grows (a kernel
+    /// that did would put a field's maximum somewhere other than on a kernel).
+    #[test]
+    #[allow(clippy::float_cmp)] // an exact zero outside the radius *is* the property
+    fn the_kernel_is_one_at_the_centre_zero_at_the_edge_and_never_rises() {
+        assert!((quartic(0.0) - 1.0).abs() < 1e-12);
+        assert_eq!(
+            quartic(1.0),
+            0.0,
+            "compact support is exact, not asymptotic"
+        );
+        assert_eq!(quartic(4.0), 0.0);
+        let mut last = f64::INFINITY;
+        for i in 0..=100 {
+            let v = quartic(f64::from(i) / 100.0);
+            assert!(v <= last + 1e-12, "rose at r2 = {}", f64::from(i) / 100.0);
+            assert!((0.0..=1.0).contains(&v));
+            last = v;
+        }
     }
 
     /// A degenerate segment is a normal outcome of road growth, and a `NaN`

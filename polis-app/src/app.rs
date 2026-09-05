@@ -60,6 +60,7 @@ use anyhow::Context as _;
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, Color32, RichText};
 use polis_events::{LogicalPath, PathMapper};
+use polis_world::place;
 use polis_world::replay::{ReplayDriver, ReplaySchedule};
 use polis_world::snapshot::{self, SnapshotPublisher, SnapshotReader, WorldSnapshot};
 use polis_world::World;
@@ -1223,7 +1224,23 @@ impl PolisApp {
                                 .as_ref()
                                 .and_then(|path| base.geometry.position_of(path))
                                 .or_else(|| {
-                                    thread.territory.centre_of_mass.map(|c| base.to_map(c))
+                                    // The territory's anchor, not its mean. A
+                                    // cut is the most committing thing the
+                                    // camera does, and the mean of an
+                                    // orchestrator's lobes is the empty gap
+                                    // between them — following a thread used to
+                                    // land the viewport on the one place
+                                    // nothing was happening (PRD §6).
+                                    //
+                                    // The whole ladder, not the anchor alone:
+                                    // the ring on the map is drawn from
+                                    // `place::thread_position`, and a camera
+                                    // that walked a shorter ladder would refuse
+                                    // to cut to a thread the map is visibly
+                                    // drawing — a thread with a trail but no
+                                    // kernels reaches rung 2 and nothing else.
+                                    place::thread_position(thread, &snapshot.layout)
+                                        .map(|c| base.to_map(c))
                                 });
                             if let Some(point) = point {
                                 drill::drill_to(camera, point);
@@ -1317,7 +1334,13 @@ impl PolisApp {
             frame_p99: 0.0,
             labels: (frame.labels_placed, frame.labels_dropped),
             buildings: frame.buildings_drawn,
-            clouds: (scene.clouds.shown, scene.clouds.kernels),
+            // The camera is what turns a texel radius into an output-pixel one,
+            // and it is known here and nowhere inside the cloud layer. Zero when
+            // there is no camera — no map has been drawn, so nothing was too
+            // small to see.
+            clouds: scene
+                .clouds
+                .census(camera.as_ref().map_or(0.0, Camera::scale)),
             cold_start_ms: self
                 .first_frame_ms
                 .unwrap_or_else(|| scene.timing.total_ms()),

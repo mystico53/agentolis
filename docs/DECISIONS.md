@@ -799,8 +799,24 @@ cannot shift every later draw. Coordinates are quantised before serialisation, s
 the two-OS golden-file comparison cannot fail on a last-bit floating-point
 difference. `BTreeMap` everywhere iteration order can reach the layout.
 
+The same rule governs the **identity hue**: `ThreadId::hue_preference` is FNV-1a
+over the session id's bytes, written out in `polis-events/src/ids.rs` and pinned
+by `the_identity_hash_is_written_out_and_pinned` with literal expected values.
+
 **Consequences.** If the pinned seed test ever fails, every golden layout file in
 the repo is invalidated **on purpose** — that is the signal, not a nuisance.
+
+**Amended by ADR-0101 — the identity hue is no longer deterministic per id.**
+Anyone reading this ADR and assuming that a `ThreadId` determines its colour the
+way a `LogicalPath` determines its seed would be wrong, and it matters, because
+the hue is the one place in the product where a written-out hash stopped being
+the last word. The *preference* is still a pure function of the id and is still
+pinned by literals; the *slot actually drawn* is assigned by `polis_world::World`
+and is a function of the ordered set of distinct thread ids the world has seen.
+That is a genuine weakening of what this ADR promised, and it buys the thing the
+hash could not: two live threads are never the same colour. It is deterministic
+for a given event sequence — which is what `step`, `seek`, `run_to_end` and every
+golden test give it — rather than for a given id in isolation.
 
 ---
 
@@ -4176,3 +4192,401 @@ fixed-port bind makes them a singleton and the daemon is their natural owner, an
 until they move, a detached period records nothing — so "shut the lid for an hour
 and watch it play back on the map" is still ahead. `Mode::Work` constructs
 `Ingest` at a single call site so that stays a one-edit change.
+
+---
+
+## ADR-0099 — The drawn anchor is the field's mode; the centre of mass stays a mean
+
+**Context.** PRD §6 opens on a single sentence about where a thread's mark may
+go:
+
+> A main agent has no meaningful point location — it delegates rather than
+> edits. Computing a centroid of its workers is actively wrong: an orchestrator
+> with workers in `src/auth` and `tests/` gets a centroid in the empty gap
+> between them, which is the one place nothing is happening.
+
+`polis-world/src/territory.rs` has quoted that paragraph at the top of the file
+since it was written. `Territory::refresh_centre_of_mass` is `Σ(c·w)/Σw` — the
+centroid the paragraph rejects, by name — and **every** drawn mark read it: the
+anchor ring and the tether fan (`polis_app::mapview`), the headless
+`polis_render::frame::thread_anchor` through `place::thread_position`, the
+attention layer's `mark_position`, the on-map name of a waiting thread, and the
+follow camera's cut. The operator reported both halves of the consequence: a
+thread's ring drawn in empty space away from its own cloud, tethers fanning out
+of that empty point, and two different sessions landing on nearly the same
+anchor.
+
+The second half is the sharper one and it is arithmetic, not tuning. A mean
+keeps only a field's first moment, so it discards exactly the information that
+distinguishes two shapes. Two sessions touching the same repository from
+different directions therefore *converge* on the same mark — a session working
+`src/services` and `src/hooks` and a session working `src/components` and
+`src/pages` can share a centre exactly, and
+`two_threads_in_different_places_do_not_share_an_anchor` builds that case in four
+lines.
+
+Three consumers had already routed around the mean privately, which is the sign
+that the field was wrong rather than the callers: `place::agent_position`'s doc
+demoted it to rung 3 on a measurement (*"the centre of mass sat 227 city units
+from the median of the files the session touched, which put every rung-3 mark
+off the side of a camera framed on the work"*), `polis_app::app`'s follow camera
+put the trail head ahead of it, and `polis_app::clouds` computes a heaviest-
+cluster centroid of its own for the bridge band. None of them said why in a
+place the next person would look.
+
+**Decision.** Split the two meanings and give each its own name.
+
+`Territory::centre_of_mass` **stays exactly as it is**, and stays a mean, because
+two consumers genuinely want a first moment: `contention`'s
+`CloudSummary::centre` feeds a 4σ bounding rejection, which is a statement about
+spread, and `place::thread_position` keeps it as the last rung so a territory
+assembled by hand — kernels never pushed through `observe` — still answers.
+Its doc-comment's claim that *"the drift vector is measured against this"* was
+false and is deleted: `drift_state` and the drift trace both call the private
+`weighted_centre` over time-windowed *subsets* and never read the field.
+
+The **drawn** anchor becomes `Territory::anchor` — the kernel centre at which
+the density field is highest. Not a centroid, not a medoid, not the claim's
+district:
+
+* the claim's district centre is **absent in 42 % of samples** (18 of 43), which
+  is precisely the orchestrator case §6.4 exists for, and reinstating it would
+  put the mark back in the middle of the map for a root-scoped thread;
+* the weighted medoid is the same O(k²) and measurably worse (0.964 density at
+  p10 and 10.0 units of separation, against the mode's 1.000 and 12.3);
+* *"the most-edited file"* has no data inside `Territory` at all — `Evidence`
+  folds to the parent directory and `Kernel` carries no path.
+
+Measured across the same 43 field-bearing samples: density at the drawn point
+rises from **0.0103 to 1.000 of the field's peak at p10**, and the separation
+between the marks of a disjoint-lobe session pair rises from **5.8 to 12.3 units
+on a 352-unit city**, worst measured pair `e41f2794` against `dfa8cd66`, **2.3 →
+16.4**.
+
+**The curve is shared, not copied.** The anchor is only the right point if it is
+the argmax of *the field that is actually drawn*, so `polis_layout::quartic` now
+holds the one definition of `(1 - r²)²` and both `polis_render::live::kernel` and
+`Territory::density_at` call it. `polis-world` cannot depend on `polis-render`,
+so the alternative was a second definition — the failure `polis-layout`'s own
+module doc already names about `Vec2::length`, and here it would mean the ring
+being the peak of one function and the contours the bands of another. A Gaussian
+was rejected for the reason PRD §7.4 gives (`exp` is a transcendental and the
+rasteriser has none); the quartic is also about four times cheaper and has
+compact support.
+
+**No clock, and that is a determinism decision.** The obvious shape for an O(k²)
+recompute is a wall-clock throttle plus hysteresis. It would break window/
+headless parity (ADR-0029): `decay` runs from `World::tick`, `ReplayDriver::
+advance` ticks once per advance and `run_to_end` ticks once for a whole
+schedule, so a throttled state machine would settle on different anchors in the
+window and in a recorded GIF of the same recording. It is also unnecessary,
+because **a uniform rescale cannot move an argmax** — the decay factor and
+`rest`'s lift are both uniform, so the memo is carried through them
+arithmetically. The scan runs only when the kernel *list* changes: a push in
+`observe`, the window eviction beside it, and `decay`'s `retain` on the ticks it
+actually drops something. Ties are broken on `(density, x, y)` with
+`f32::total_cmp`, never `partial_cmp`, because equal densities are the common
+case here and not the corner one.
+
+**`ANCHOR_MARGIN = 1.25` is PRD §6.3's sentence, for the anchor.** §6.3 says
+*"the territory's centre of mass may only shift districts after N=8 consecutive
+weighted observations […] one read elsewhere moves nothing"*, and
+`DRIFT_CONFIRMATIONS` implements it for the *claim* only. Nothing implemented it
+for the drawn point, because a mean slides and never jumps; a mode does. The
+mode's median frame-to-frame jump is 0.26 bandwidths against the mean's 1.28 —
+much calmer — but its p90 is 14.68, and that p90 is the near-tie teleport and
+nothing else. The margin converts near-tie flicker into one decisive move, and
+buys a bound: the drawn point's density is never below `1 / ANCHOR_MARGIN` of
+`field_peak`, so hysteresis cannot park the ring somewhere cold.
+
+**Consequences.** One ladder, walked from one place. `polis_app::mapview` now
+calls `polis_world::place::thread_position(thread, &snapshot.layout)` for the
+ring and the tether fan rather than reading `centre_of_mass` itself — which also
+closes a parity bug that predates this change, since the headless renderer has
+always walked that ladder and the window had a shorter one, so a thread with a
+trail and no kernels got a ring in a recorded frame and none in the window. The
+attention layer's `mark_position` and the waiting thread's on-map name substitute
+only the first rung (`anchor()` falling back to `centre_of_mass`) and keep their
+`placement()` rungs, which exist for the documented reason that a thread with 483
+calls once had nowhere to put its pin.
+
+**The corpus is one operator, two repositories, 43 field-bearing samples**, with
+`Territory::lobes` as its own ground truth — a lobe set is what says two sessions
+are working in different places, and it is derived from the same evidence the
+anchor is. `ANCHOR_MARGIN` is **asserted, not swept**: 1.25 was read off the jump
+distribution above rather than chosen by sweeping the constant, and the harness
+that took those numbers is not in the tree, so they cannot currently be re-taken.
+`CLOUD_CAP`'s caveat applies here with more force, because that one at least had
+a fleet behind it.
+
+No PRD amendment: nothing in the PRD specifies the anchor mark, and this moves
+the code *toward* §6's opening paragraph rather than away from it.
+
+---
+
+## ADR-0100 — A thread proves it is alive by working, not by working *somewhere*; and what a resting cloud has to clear is a field value
+
+**Context.** The operator's report was *"i dont see any clouds"*, on a live map
+whose trails, glyphs and agent marks were all drawing correctly. Two independent
+defects produced it, and either one alone is enough.
+
+**The first is a unit error inside `polis_world::territory`.** PRD §10.4's
+dormancy gate asks how long a thread has been quiet, and `Territory::quiet_for`
+answered it from the newest entry in `Territory::evidence`. But `observe` drops
+every observation whose claim path is the repository root, because the root is
+the absorbing element of §6.2's lowest common ancestor and one live root-scoped
+entry pins `depth(A)` at 0 for as long as it lives — see PRD §6.1's amended
+`Bash` cwd row. A shell call's only path signal is its `cwd`, and a `cwd` at the
+checkout root is the common case rather than the corner one: **11 605 of 20 246
+observations, 57.3 %**, on the corpus this was measured against. So an agent in
+the middle of a build-and-test stretch produced a call a second, every one of
+which was thrown away, and after `DORMANT_AFTER` its territory read dormant while
+it was demonstrably working. `select_clouds` then dropped it, `rest` stopped
+holding its field up, and `decay`'s collapse deleted its claim and its lobes as
+soon as the *non-shell* evidence decayed out from under them.
+
+**Decision.** `Territory` carries `last_observation`, stamped by `observe`
+**before** the root drop, and `quiet_for` reads it — falling back to the evidence
+maximum, which is what keeps every hand-built cloud fixture in the workspace
+working. `World::observe` counts the drop in
+`Health::root_scoped_observations`. And `decay`'s collapse now waits for the same
+dormancy test rather than firing the moment the evidence list empties, so a
+converged claim outlives a shell-only stretch. The two halves are one object:
+under the old `quiet_for` the gated collapse could never fire at all, because an
+empty evidence list makes `quiet_for` return `None`.
+
+**The mechanism matters, and the plan for this change had it wrong.** The
+investigation attributed the disappearing cloud to the evidence collapse at
+roughly 600 s (a weight-1 entry survives about 6.6 half-lives). It is not: `rest`
+returns before doing anything past `DORMANT_AFTER`, `select_clouds` drops the
+territory on the same test, and `DORMANT_AFTER` is **480 s**. The cloud dies at
+eight minutes through the dormancy gate. The `last_observation` change is the
+whole fix; re-gating the collapse is second-order, and is here because a claim
+that outlives its own cloud is the rail and the map disagreeing again.
+
+**The second is a unit error across the crate boundary.** `RESTING_WEIGHT = 0.9`
+exists so that a converged territory that goes quiet keeps a drawable field
+instead of decaying to nothing — the operator's *"clouds should be there
+immediately"*. Its doc justified the value against
+`polis_render::live::CLOUD_ISO`, whose outermost band is `0.55`. But `CLOUD_ISO`
+thresholds the **density field** (ADR-0020: one full-weight kernel reads 1.0 at
+its own centre) and `rest` normalised the **mass**, the sum of the weights. Those
+are the same number only for a territory whose kernels sit on one point, and PRD
+§6.4's multi-lobed territory is spread by construction. Measured over 472
+selected clouds: **33 of them, 7.0 %, were computed, ranked, handed to the
+rasteriser and never painted** — mean mass 1.136, comfortably over the floor;
+mean peak 0.429, under the fringe.
+
+**Decision.** `rest` normalises `Territory::field_peak`, which is the exact
+quantity `CLOUD_ISO` is thresholded against, evaluated with the same
+`polis_layout::quartic` the rasteriser splats (ADR-0099). The value 0.9 stands,
+now as a peak, and the **1.64x headroom over the 0.55 fringe is the reason it
+works rather than an accident**: three separate losses sit between the world's
+peak and the drawn one, all on the window's side of the house —
+`polis_app::clouds` floors each drawn radius at `.max(2.0)` where
+`polis_render::frame` does not, it adds a chain of `BRIDGE_WEIGHT` kernels
+between lobes, and `CloudField::sample` reads a lattice at cell centres and
+under-reads a sharp peak by the sub-cell offset. At 0.55 exactly, any one of them
+would put the cloud back under the fringe.
+
+**No per-tick cost.** `rest` runs from `decay`, which runs for every thread on
+every `World::tick`, and a peak is an O(k²) scan bounded by `OBSERVATION_WINDOW`
+squared. It is not paid: ADR-0099 landed `field_peak` as a value memoised beside
+the anchor, and both rescales in play — decay's `factor` and `rest`'s own `lift`
+— are uniform, so the memo is carried through them by one multiply and the scan
+happens only when the kernel *list* changes.
+
+**Instrumentation, because both defects were silent.** The window called
+`territory::visible_clouds`, a wrapper that returns the chosen territories and
+drops `unplaced`, `dormant` and `capped` on the floor, so the status bar could
+only ever print `0 clouds (0 kernels)` — the symptom stated twice and the cause
+not at all. It now calls `select_clouds` directly, keeps the whole
+`CloudSelection`, and builds the `CloudCensus` the headless renderer has carried
+since it was written; the bar reads `0 CLOUDS · 4 UNCONVERGED`. `widest_px` is
+resolved in **output pixels** at the call site that knows the camera, because
+`CloudCensus::sub_pixel`'s *"ZOOM IN"* hint is a statement about the operator's
+scroll wheel while the cloud layer's own frame is a fixed texel grid. The rail's
+`unplaced` hover shows the undecayed total beside the live evidence count, so a
+thread with 417 tool calls stops reading *"0 observations"*.
+
+**Consequences.**
+
+* A thread running nothing but root-scoped shell commands is **not** dormant, and
+  its cloud stays over whatever it was last working on for as long as it keeps
+  running them. That is the honest reading — the field is stale about *where*,
+  and §6.3's decay is what already says so by letting it fade — where "dormant"
+  was a false claim that the agent had stopped.
+* `DORMANT_AFTER` becomes load-bearing for the **claim's** lifetime and not only
+  for the cloud's. Its doc-comment's sweep table was taken at 180 s, before
+  `ab844b1` moved the constant to eight minutes and left the justification
+  untouched; that table is corrected in place rather than deleted, and one of its
+  readings — *"at 600 s the gate has nothing left to catch, since the territory
+  has dissipated on its own"* — is now false, because `rest` means nothing
+  dissipates on its own any more.
+* Every resting territory is **brighter and wider** than before, since a peak
+  crosses the floor sooner than the mass it is a fraction of. `CLOUD_CAP = 5` was
+  chosen at the 1.5-mean-crowd crossover on the old brightness, so both real
+  harnesses were re-run on each side of the change, on the operator's own
+  sessions. `cloud_cap_policy`'s contested-fraction sweep is **identical to the
+  digit** at every cap — at its measurement instant every session is on its own
+  busiest minute, so nothing is resting and `rest` never fires. The cap is
+  therefore not re-baselined. What *did* move is that harness's dormancy sweep,
+  and only in the short windows: 13 → 15 territories survive 30 s, 16 → 19
+  survive 90 s, 22 → 24 survive 180 s, and 24 → 24 at 600 s and above. That is
+  `last_observation` doing exactly and only its job. `cloud_measure` moved the
+  same way and no further: 53 → 54 of 64 frames put a cloud on the map, dormant
+  0.03 → 0.02 per frame, kernels 34.6 → 35.8, worst ink share 51 % → 49 %, with
+  `disturbed_px = 0` and `under_cloud_median_shift = 0.000` unchanged. No
+  assertion in either harness was touched.
+* **A separate finding, which this change did not cause and does not fix.** The
+  fresh `cloud_cap_policy` sweep does not reproduce the cliff `CLOUD_CAP`'s doc
+  argues from: contested ink goes 27.0 % → 27.9 % from five clouds to six, not
+  37.7 % → 58.3 %, and the mean-crowd 1.5 crossing has moved from five to six.
+  The fleet changed underneath the table — PRD §6.4's lobes (`fb414aa`) place 24
+  of these forty sessions where 11 were placed before. Read strictly the sweep
+  now supports a cap of six. The cap is held at five and the disagreement is
+  written into its doc-comment, because what the operator sees is a decision and
+  not a consequence of this fix.
+* Both measurement harnesses now say in their headers that they measure the
+  shipped path **at its best moment**: `cloud_measure` samples through
+  `pacing::plan`, which weights frames by event mass, and `cloud_cap_policy`
+  aligns every session on its own peak. Event-weighted sampling gives 94 % cloud
+  coverage where wall-clock sampling gives 62 %, and that gap is why both were
+  green while the map was empty. The wall-clock-sampled coverage harness that
+  would catch it is **not written**, and the before/after numbers above should be
+  read with that limit in mind: they are measured where the clouds were already
+  working.
+
+**Deferred: shell evidence at depth 1.** `shell::MIN_EVIDENCE_DEPTH = 2` discards
+every depth-1 token, and in a repository whose directories are all one level deep
+— this one — the shell channel therefore contributes no scope whatever, which
+`shell.rs`'s own doc already anticipates. Admitting depth-1 tokens as lobe-only
+evidence would recover it, and would need a new field on `Evidence`, three
+separate exclusions in `convergence()` and a second denominator in `lobes_of`.
+The recovery was never measured and the change risks resurrecting the
+asymmetric-noise failure that gate exists for. Not done here.
+
+**No amendment to PRD §6.2, §6.3 or §10.4.** All three are obeyed; the code was
+not. PRD §6.1 **is** amended in place, because its `Bash` cwd row describes a
+contribution the implementation deliberately does not make.
+
+---
+
+## ADR-0101 — The identity hue is assigned by the world, not derived by the renderer
+
+**Context.** The operator ran two live sessions and could not tell them apart:
+*"the same color is super bad, can you make sure the colors have to be
+different?"*. `polis_render::live::thread_slot` was FNV-1a over the thread id
+modulo twelve, computed independently at five draw sites, and its own
+doc-comment accepted the collisions on purpose — *"Slots are handed out by
+hashing, so two threads can land on one hue — with nine threads on screen and
+twelve slots that is about three of the thirty-six pairs. That is the price …
+and it is paid on purpose."* The two ids `"a"` and `"polis"` both hash to slot 4,
+and `ThreadId::of_session` is the identity function on the session id, so that is
+a collision a real `World` can hold.
+
+Two alternatives were considered and rejected before this one:
+
+* **More hues.** `THREAD_HUES`'s measured ΔE00 table already prices it. Twenty
+  slots would take the expected number of distinct colours among nine threads
+  from 6.6 to 7.4 while cutting the worst pair from 9.80 to 5.4 — into the band
+  the cloud fringe already occupies at 5.46, which is the level that needs a
+  second channel to be read at all. And it only lowers the collision *rate*; it
+  does not satisfy "guaranteed distinct".
+* **Probing over the live thread list at draw time.** Neither stable nor
+  deterministic. Thread A (preference 3, first) and B (preference 3, probed to
+  4); A retires; a recomputation from the live set leaves B alone with
+  preference 3 and moves it 4 → 3 — an unrelated thread *ending* repainted B,
+  which is exactly what the hash was chosen to prevent.
+
+**Decision.** The hue slot is assigned **once, by the world, at thread
+creation**, and stored on `polis_world::Thread::tint`. Three parts:
+
+1. `polis_events::IDENTITY_SLOTS = 12` and `ThreadId::hue_preference()` move the
+   FNV hash down into the event model, beside `LogicalPath::layout_seed` and
+   under the same ADR-0029 rule. `polis-world` depends on `polis-events` and not
+   on `polis-render`, which is why the constant — the length of a colour table
+   two crates away — is declared there. A `const _: () = assert!(…)` beside
+   `THREAD_HUES` is what stops the two drifting.
+2. A private `HueRing` on `World` holds one thread per slot. `World::thread_entry`
+   claims a slot the first time a session is seen: the thread's own preference if
+   it is free, else a fixed index probe `(pref + k) % 12`, else nothing.
+3. `live::thread_slot` and `palette::thread_slot` are **deleted**, not shimmed,
+   and all five draw sites become field reads. A surviving function of that name
+   is an invitation to re-derive, and the point of the change is that there is
+   one answer.
+
+**A slot is never released.** A thread leaving the world does not give its colour
+back, and the ring remembers *which id* took each slot, so a session retired for
+silence and heard from again gets the colour it had. This is the load-bearing
+half of the decision and it is a determinism argument, not a product one.
+Retirement runs from `World::tick`, and tick cadence differs between the two
+renderers on the same recording: `ReplayDriver::advance` ticks once per call and
+the window calls it many times, so `retire_threads` fires repeatedly mid-run;
+`run_to_end` applies the whole schedule and ticks exactly once. Two things would
+otherwise become functions of the tick cadence — whether a slot is free when the
+next thread is created, and how many times a given thread is created at all — and
+the window and a recorded GIF would paint one thread two colours. That is the
+failure `polis_app::palette` named in prose: *"a colour that meant one thread in
+the window and another in a recorded GIF would be worse than no colour at all."*
+What is left depends only on the ordered set of distinct thread ids, which is the
+event order, which both drivers share.
+
+**The guarantee, stated precisely.** *The first twelve threads of a world are
+mutually distinct; past that, colour degrades to the bare preference and the
+rail's name carries identity (PRD §11.4).*
+
+**Consequences.**
+
+* A world degrades after twelve threads have **ever** been seen in it, not twelve
+  concurrently. Past twelve the thirteenth thread does not merely risk a
+  collision, it is certain to have one, because every slot is taken.
+* **THE GUARANTEE IS ALREADY ONE SLOT SHORT OF THIS OPERATOR'S OWN FLEET, AND
+  THAT IS NOT HIDDEN.** Measured over their `~/.claude/projects` — 193
+  main-session transcripts, subagent sidecars excluded because a subagent carries
+  its parent's session id (ADR-0030): peak threads live at once, counting a
+  session live until its last record plus `THREAD_RETIRE_AFTER`, is **13**. Per
+  day they start a median of 15 distinct sessions, and 8 of 15 days exceed
+  twelve. A Polis left running reaches its twelfth distinct session in a median
+  of 17 hours (p10 2.4). So this removes the collisions that were reported —
+  three shared pairs among nine live threads — and does not remove them all; at
+  the busiest moment one thread still shares. That is counted in
+  `Health::identity_hues_exhausted` and shown in the status bar as
+  `shared hues N`, so the residue is a reading rather than a re-report. The
+  operator's remedy is a restart, which is a `World::reset`, which clears the
+  ring. The measurement came from a scratchpad script, not from a test in the
+  tree, and cannot currently be re-taken.
+* If the fleet keeps growing, the fix is **not** a thirteenth hue — see the
+  rejected alternative above — it is a second channel on the rail row.
+* Widening the ring is **not** the answer to exhaustion — see the rejected
+  alternative above. `THREAD_HUES`'s doc now carries that argument in the
+  reversed direction it now runs in, and
+  `thread_hues_are_far_enough_apart_at_the_luminance_they_are_drawn_at` is what
+  fires if anyone widens it anyway.
+* The ring's memory is bounded at twelve ids by construction: once every slot is
+  taken nothing more is recorded.
+* ADR-0029 is amended in place. The hue *preference* is still per-id and still
+  pinned by literals; the hue *drawn* is now per-event-sequence. That is a real
+  weakening and it is written into that ADR rather than left for a reader to
+  discover.
+* A `Thread` built outside a `World` — every fixture in the workspace — keeps its
+  bare preference and is **not** exclusive. Deliberate: exclusivity is a property
+  of the set of live threads and a fixture has no set. No existing fixture
+  changes colour, and no golden file moves.
+
+**Known limit, untouched by this change: the GIF encoder.**
+`polis_render::gif` median-cuts every frame to a 256-entry palette, so two hues
+made exclusive here can still be **merged by the encoder** in recorded output.
+That is an independent second cause with its own fix, and post-quantisation ΔE00
+across the twelve hues was deliberately not measured here. "Guaranteed distinct"
+is a claim about the world and about what the window and the headless rasteriser
+paint; it is not yet a claim about a GIF.
+
+**Also not fixed: the places the hue is absent rather than colliding.**
+`polis-app/src/status.rs` and `polis-app/src/treeview.rs` carry no per-thread hue
+at all. If the operator's complaint is "I cannot tell two threads apart", those
+are a larger gap than the collision this ADR closes, and a separate defect.
+
+**No PRD amendment.** §11.4 (*"Colour alone is never the sole channel for any
+state"*) is unaffected — this makes colour more reliable, not sole — and §10.3
+and §10.4 constrain brightness and cloud count, not hue count.

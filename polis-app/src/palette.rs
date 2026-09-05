@@ -43,13 +43,24 @@
 //!
 //! Identity is the one thing colour is allowed to be the *fast* channel for,
 //! and it is still not the only one. [`thread`] gives a thread a hue for its
-//! whole life ([`polis_render::live::THREAD_HUES`]); the rail prints its name
-//! beside the swatch, the map keeps it at its own place, and hovering either
-//! highlights the other. A reader who cannot see the hue at all loses no state
-//! — only the shortcut.
+//! whole life ([`polis_render::live::THREAD_HUES`]), **exclusive among the
+//! first twelve threads a world has seen**; the rail prints its name beside the
+//! swatch, the map keeps it at its own place, and hovering either highlights the
+//! other. Past twelve, colour degrades to the thread's bare
+//! `polis_events::ThreadId::hue_preference` and the name is what carries
+//! identity — which is why a reader who cannot see the hue at all loses no
+//! state, only the shortcut.
+//!
+//! This module no longer derives that slot. It is assigned once by
+//! `polis_world::World` and read off `polis_world::Thread::tint`, which is how
+//! the window and the headless renderer are kept to one answer: the promise
+//! used to be a comment on two call sites computing the same hash, and it
+//! matters more here than anywhere, because a colour that meant one thread in
+//! the window and another in a recorded GIF would be worse than no colour at
+//! all. Now there is one source and nothing to keep in step.
 
 use eframe::egui::Color32;
-use polis_events::{Outcome, ThreadId};
+use polis_events::Outcome;
 use polis_render::{live, plan};
 use polis_world::ThreadStatus;
 
@@ -283,17 +294,6 @@ pub fn anchor() -> Ink {
 // ---------------------------------------------------------------------------
 // Identity — one thread, one colour, everywhere it appears
 // ---------------------------------------------------------------------------
-
-/// The hue slot a thread owns, from its own id.
-///
-/// `polis_render::live::thread_slot`, so the window and the headless renderer
-/// paint the same thread the same colour — the same rule as everything else in
-/// this module, and it matters more here than anywhere: a colour that meant one
-/// thread in the window and another in a recorded GIF would be worse than no
-/// colour at all.
-pub fn thread_slot(id: &ThreadId) -> u8 {
-    live::thread_slot(id.as_str())
-}
 
 /// A thread's own colour, at the brightness of the thing being drawn.
 ///

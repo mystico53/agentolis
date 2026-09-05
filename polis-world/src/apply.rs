@@ -48,6 +48,16 @@ use crate::{
 /// A `tool_use` whose `tool_result` never arrives — an interrupted session, a
 /// transcript cut mid-turn — would otherwise leak. 4 096 is far above any real
 /// turn's fan-out.
+///
+/// **It is no longer only a memory guard.** Since [`crate::IN_FLIGHT_MAX`], an
+/// entry in this table is the evidence that keeps a thread out of `Idle` while a
+/// long call runs, so the eviction at the cap now costs the owning thread its
+/// in-flight standing and not merely a row: past 4 096 unsettled calls the
+/// oldest thread starts reading `Idle` again mid-call, and its late
+/// `tool_result` also loses the diff accounting [`settle`] does. Both failures
+/// are silent. The number stays where it is — no real fan-out approaches it, and
+/// raising it would trade a bound nothing hits for one nothing hits — but a
+/// reader reaching for this constant should know it decides status now.
 const PENDING_CAP: usize = 4_096;
 
 /// A tool call seen starting, waiting for its result.
@@ -337,6 +347,14 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
             if let Some(t) = world.threads.get_mut(&thread_id) {
                 t.failures = t.failures.saturating_add(1);
             }
+            // A failure is a *completion*: the tool ran and came back. It is
+            // exactly as much proof that the thread is alive as the success
+            // above, which stamps `working` on its last line — and it is the
+            // authoritative edge Channel B has for the end of a call that took
+            // minutes to fail. Without this a hook deployment drew a thread
+            // `Idle` for the whole of a failing build and then, on the next
+            // record, working again (`crate::IDLE_AFTER`).
+            working(world, &thread_id, at);
         }
         EventKind::PermissionRequest => {
             needs_decision(
@@ -1187,6 +1205,14 @@ pub(crate) fn control(world: &mut World, event: &ControlEvent) {
 /// the wait, because a thread parked on a permission prompt can still be
 /// emitting telemetry; and resolving the mark is enough to end it, because the
 /// mark *is* the wait.
+///
+/// The caller that proves that first clause is [`answered`]'s `tool_result` arm.
+/// An orchestrator blocked on a question can have a dozen subagents returning
+/// results a second, every one of them arriving here — and every one of them
+/// re-deriving the wait from the attention layer rather than overwriting it, so
+/// the thread stays [`ThreadStatus::Waiting`] while its clock advances. That is
+/// what lets that arm stamp activity without also calling
+/// [`World::resolve_decisions`].
 fn working(world: &mut World, thread: &ThreadId, at: Instant) {
     let blocked = world
         .attention
@@ -1326,6 +1352,32 @@ fn turn_boundary(
 /// Anything else that is a genuine human turn — not injected (`isMeta`), not a
 /// tool result, not a subagent's — is the answer to whatever the thread was
 /// waiting for.
+///
+/// # A `tool_result` is not an answer, but it *is* activity
+///
+/// Two different questions, and this function used to conflate them by returning
+/// without touching the clock at all. A `tool_result` is the **only** record
+/// Channel D emits when a long `Bash` call ends, and the gap between it and the
+/// assistant record that follows is the model's own latency: measured over
+/// 59 334 result→assistant pairs in this machine's transcripts, median 3.8 s,
+/// p75 7.6 s, but **p99 69 s**, so on better than one turn in a hundred a thread
+/// went [`crate::ThreadStatus::Idle`] while the model was mid-thought.
+///
+/// So the arm stamps [`working`] and returns *without*
+/// [`World::resolve_decisions`]. The omission is the point: a tool coming back
+/// says nothing about whether the human replied, so a result must never take a
+/// pin down. `working` re-derives the wait from the attention layer on every
+/// call, which is what makes stamping safe — a thread parked on a decision is
+/// re-stamped [`crate::ThreadStatus::Waiting`], not `Working`.
+///
+/// It stamps regardless of `worker`, matching [`assistant`], which calls
+/// `working` before it looks at one. **That moves the lifetime clocks, and
+/// deliberately**: `working` sets `last_activity`, which
+/// [`World::retire_threads`] and [`crate::MARK_HOLD_MAX`] read, so a thread
+/// waiting on a decision whose subagents keep returning results now lives in the
+/// world longer than it did. That is the honest reading — it *is* alive — and
+/// the alternative, a clock only a main agent's own records advance, retires a
+/// live orchestrator out from under a working fleet.
 fn answered(
     world: &mut World,
     thread: &ThreadId,
@@ -1352,7 +1404,13 @@ fn answered(
     let is_tool_result = blocks(record)
         .iter()
         .any(|b| b.kind.as_deref() == Some("tool_result"));
-    if is_tool_result || worker.is_some() || record.is_meta == Some(true) {
+    if is_tool_result {
+        // Not the operator's answer — but proof the thread was alive at `at`.
+        // See the section above for why this deliberately does not resolve.
+        working(world, thread, at);
+        return;
+    }
+    if worker.is_some() || record.is_meta == Some(true) {
         return;
     }
     world.resolve_decisions(thread);

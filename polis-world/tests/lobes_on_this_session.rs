@@ -155,23 +155,32 @@ fn a_converged_territory_survives_going_quiet() {
         t.convergence().claim.is_some(),
         "it converged while working"
     );
-    let while_working: f32 = t.kernels.iter().map(|k| k.weight).sum();
+    // The **peak**, not the mass. `polis_render::live::CLOUD_ISO` thresholds the
+    // density field (ADR-0020: one full-weight kernel reads 1.0 at its centre),
+    // so the peak is the number that has to clear the fringe and the number
+    // `Territory::rest` normalises. This fixture puts every kernel on one point,
+    // where the two happen to be equal; reading `field_peak` anyway is what
+    // stops the assertion quietly measuring the wrong thing if somebody ever
+    // spreads the fixture out.
+    let while_working = t.field_peak();
     assert!(while_working > 0.0);
 
     // A pause inside the dormancy window — the coffee-break case, and the one
     // the operator hit: they opened the map on a repository whose agents had
-    // just stopped and saw nothing at all.
-    t.decay(now + Duration::from_mins(5));
+    // just stopped and saw nothing at all. Long enough that PRD §6.3's half-life
+    // has taken the field under the floor, which is when `rest` has anything to
+    // do at all, and still inside `DORMANT_AFTER`.
+    t.decay(now + Duration::from_secs(450));
 
-    let resting: f32 = t.kernels.iter().map(|k| k.weight).sum();
+    let resting = t.field_peak();
     assert!(
         !t.kernels.is_empty(),
         "the field must not be erased: an empty map is the bug"
     );
     assert!(
         resting >= polis_world::territory::RESTING_WEIGHT * 0.99,
-        "a rested field has to clear CLOUD_ISO[0] or the cloud is computed and \
-         never drawn: {resting}"
+        "a rested field's peak has to clear CLOUD_ISO[0] or the cloud is \
+         computed and never drawn: {resting}"
     );
     assert!(
         resting < while_working,
@@ -198,7 +207,7 @@ fn an_unconverged_scatter_still_fades() {
     );
     t.decay(now + Duration::from_mins(21));
     assert!(
-        t.kernels.iter().map(|k| k.weight).sum::<f32>() < polis_world::territory::RESTING_WEIGHT,
+        t.field_peak() < polis_world::territory::RESTING_WEIGHT,
         "nothing converged, so nothing is held up"
     );
 }

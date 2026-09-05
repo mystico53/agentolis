@@ -60,7 +60,9 @@ pub use event::{
     OtelEvent, OtelMetric, Payload, Temporality, ToolCall, TranscriptEvent, TranscriptRecordKind,
     TranscriptSource, OTEL_EVENT_NAMES, OTEL_SPAN_NAMES, PII_ATTRIBUTES, REFUSED_EVENT_NAMES,
 };
-pub use ids::{AgentType, PromptId, SessionId, ThreadId, ToolUseId, WorkerId, WorktreeId};
+pub use ids::{
+    AgentType, PromptId, SessionId, ThreadId, ToolUseId, WorkerId, WorktreeId, IDENTITY_SLOTS,
+};
 pub use kind::EventKind;
 pub use path::{LogicalPath, PathMapper, PathParseError};
 pub use record::{

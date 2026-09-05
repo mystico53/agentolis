@@ -63,10 +63,10 @@
 )]
 
 use eframe::egui::{self, Color32, Rect};
-use polis_render::live::{self, CloudField, CloudKernel, CloudTween, CLOUD_CROWD};
+use polis_render::live::{self, CloudCensus, CloudField, CloudKernel, CloudTween, CLOUD_CROWD};
 use polis_render::raster::Canvas;
 use polis_world::snapshot::WorldSnapshot;
-use polis_world::territory::{self, Territory};
+use polis_world::territory::{self, CloudPolicy, Territory};
 
 use crate::basemap::{BaseMap, BASE_MAP_PIXELS};
 
@@ -106,12 +106,28 @@ pub struct Clouds {
     tween: CloudTween,
     /// Whether the tween has arrived and the texture can be left alone.
     settled: bool,
-    /// How many kernels went in, for the status bar.
-    pub kernels: usize,
-    /// How many territories got a cloud.
-    pub shown: usize,
-    /// `polis_render::live::thread_slot` per visible territory, in the order
-    /// the kernels' `thread` field indexes — so a cloud is drawn in its own
+    /// What [`polis_world::territory::select_clouds`] decided, less the one
+    /// field this module cannot fill — see [`Clouds::census`].
+    ///
+    /// The window used to call `visible_clouds`, a wrapper that returns the
+    /// chosen territories and drops `unplaced`, `dormant` and `capped` on the
+    /// floor. So the status bar could say `0 clouds (0 kernels)` and had no way
+    /// to say *why*, which is how the operator arrived at a map with no clouds
+    /// and no thread to pull. The headless renderer has carried these counts
+    /// since `CloudCensus` was written; this is the window's half.
+    census: CloudCensus,
+    /// The widest kernel in the target field, in **texels**.
+    ///
+    /// [`CloudCensus::widest_px`] wants output pixels, because
+    /// [`CloudCensus::sub_pixel`] compares it against a minimum stroke width in
+    /// output pixels. This module builds kernels in the fixed texel frame and
+    /// has never seen the camera, so the conversion is deferred to
+    /// [`Clouds::census`], where the caller has one. Converting here would make
+    /// the *"ZOOM IN"* hint a statement about a texture the operator cannot
+    /// zoom.
+    widest_texels: f64,
+    /// `polis_world::Thread::tint` per visible territory, in the order the
+    /// kernels' `thread` field indexes — so a cloud is drawn in its own
     /// thread's hue and matches that thread's swatch in the rail.
     tints: Vec<u8>,
     /// Texels two or more territories both claim — PRD §6.4's contention signal,
@@ -124,8 +140,7 @@ pub struct Clouds {
 impl std::fmt::Debug for Clouds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Clouds")
-            .field("kernels", &self.kernels)
-            .field("shown", &self.shown)
+            .field("census", &self.census)
             .field("contested", &self.contested)
             .field("generation", &self.generation)
             .field("settled", &self.settled)
@@ -144,8 +159,8 @@ impl Default for Clouds {
             target: None,
             tween: CloudTween::default(),
             settled: false,
-            kernels: 0,
-            shown: 0,
+            census: CloudCensus::default(),
+            widest_texels: 0.0,
             tints: Vec::new(),
             contested: 0,
             build_ms: 0.0,
@@ -260,7 +275,8 @@ impl Clouds {
     ///
     /// `cap` is PRD §10.4's cloud cap: *"Forty threads means forty systems and
     /// the map vanishes under haze."* Which territories survive it is
-    /// [`polis_world::territory::visible_clouds`]'s decision, not this module's.
+    /// [`polis_world::territory::select_clouds`]'s decision, not this module's;
+    /// what it decided about the ones it withheld is [`Clouds::census`].
     ///
     /// `dt` is **presentation** seconds. The tween is an animation, so it runs
     /// on the clock the viewer experiences and not on the world's — the same
@@ -280,8 +296,8 @@ impl Clouds {
                 base,
                 snapshot,
                 cap,
-                &mut self.kernels,
-                &mut self.shown,
+                &mut self.census,
+                &mut self.widest_texels,
                 &mut self.tints,
             );
             self.generation = snapshot.generation;
@@ -312,13 +328,33 @@ impl Clouds {
         self.settled = false;
     }
 
+    /// What the layer decided and why, for the status bar.
+    ///
+    /// `screen_px_per_map_px` is [`crate::camera::Camera::scale`]. It is asked
+    /// for rather than remembered because [`CloudCensus::widest_px`] is in
+    /// **output** pixels — [`CloudCensus::sub_pixel`] tests it against a minimum
+    /// stroke width, and `shown: 6, widest: 0.8 px` is the whole diagnosis of an
+    /// empty sky — while this module's own frame is the fixed texel grid that
+    /// exists precisely so the tween never has to be re-registered when the
+    /// camera moves. One texel is 1.5625 base-map pixels for the life of the
+    /// city, and a base-map pixel is a fraction of a screen pixel or several of
+    /// them, depending entirely on the scroll wheel.
+    #[must_use]
+    pub fn census(&self, screen_px_per_map_px: f32) -> CloudCensus {
+        let map_px_per_texel = BASE_MAP_PIXELS as f64 / TEXELS as f64;
+        CloudCensus {
+            widest_px: self.widest_texels * map_px_per_texel * f64::from(screen_px_per_map_px),
+            ..self.census
+        }
+    }
+
     /// The visible territories' kernels, in texel coordinates.
     fn target_field(
         base: &BaseMap,
         snapshot: &WorldSnapshot,
         cap: usize,
-        kernels_out: &mut usize,
-        shown_out: &mut usize,
+        census_out: &mut CloudCensus,
+        widest_out: &mut f64,
         tints_out: &mut Vec<u8>,
     ) -> Option<CloudField> {
         let pairs: Vec<(&polis_world::Thread, &Territory)> = snapshot
@@ -326,22 +362,33 @@ impl Clouds {
             .iter()
             .map(|thread| (thread, &thread.territory))
             .collect();
-        let visible = territory::visible_clouds(&pairs, cap);
-        *shown_out = visible.len();
-        // Whose each cloud is. `visible_clouds` returns territories and the hue
+        // `select_clouds` rather than `visible_clouds`: the same decision by the
+        // same function — `visible_clouds` is a wrapper around it — but the
+        // wrapper throws away the three counts that say why a thread got no
+        // cloud, and throwing them away is what left the window unable to
+        // explain an empty sky. The attention list goes with it, which the
+        // wrapper also dropped: PRD §10.4 ranks *"threads with an active
+        // attention state"* first, so without it the window's cap and the
+        // headless renderer's could pick a different five out of the same world.
+        let selection = territory::select_clouds(
+            &pairs,
+            &snapshot.attention,
+            CloudPolicy::default().with_cap(cap),
+        );
+        let visible = selection.visible;
+        // Whose each cloud is. `select_clouds` returns territories and the hue
         // is the *thread's*, so each is matched back to the pair it came from —
         // the rank a kernel carries is a grouping index for the field sampler
-        // and must stay one, or two threads that hash to the same hue would be
-        // summed as one territory and PRD §6.4's crowd signal would go quiet.
+        // and must stay one, or two threads sharing a hue (which past twelve
+        // threads they will) would be summed as one territory and PRD §6.4's
+        // crowd signal would go quiet.
         tints_out.clear();
         for territory in &visible {
             tints_out.push(
                 pairs
                     .iter()
                     .find(|(_, t)| std::ptr::eq(*t, *territory))
-                    .map_or(live::NO_TINT, |(thread, _)| {
-                        live::thread_slot(thread.id.as_str())
-                    }),
+                    .map_or(live::NO_TINT, |(thread, _)| thread.tint),
             );
         }
         // Where one thread's field has separated into lobes, bridge them.
@@ -389,7 +436,16 @@ impl Clouds {
                 });
             }
         }
-        *kernels_out = kernels.len();
+        *widest_out = kernels.iter().map(|k| k.radius).fold(0.0f64, f64::max);
+        *census_out = CloudCensus {
+            shown: visible.len(),
+            kernels: kernels.len(),
+            // Filled in by `Clouds::census`, where the camera is known.
+            widest_px: 0.0,
+            unplaced: selection.unplaced,
+            dormant: selection.dormant,
+            capped: selection.capped,
+        };
         CloudField::sample(&kernels, TEXELS, TEXELS)
     }
 

@@ -860,6 +860,22 @@ pub fn strip(ui: &mut egui::Ui, feed: &LiveFeed, snapshot: &WorldSnapshot, now: 
         // The three numbers here are three different numbers, and the first two
         // sum to the rail's own row count *by construction*, because both
         // panels ask [`polis_world::territory::Territory::placement`].
+        //
+        // # Which question this asks, and which one the status bar asks
+        //
+        // `placed` is `placement().is_somewhere()` and nothing else. The status
+        // bar's cloud census counts the same threads through
+        // [`polis_world::territory::select_clouds`], which applies **two more
+        // gates** on top of placement: a territory with no kernels (placed by
+        // its evidence, but working entirely outside this checkout, so there is
+        // nothing to splat) and a territory quiet past PRD §10.4's dormancy
+        // window. Both land in the census's `UNCONVERGED` and `DORMANT`
+        // buckets. So `placed` here is an upper bound on `shown + capped` there,
+        // and the difference is not a disagreement: this line answers *"does
+        // Polis know where this thread is"* and that one answers *"is there a
+        // cloud on the map for it"*. Deliberately not sourced from the same
+        // `CloudSelection`, because the rail's `unplaced` rows are keyed on
+        // `placement()` and this line is what makes the two sum.
         let drawn = snapshot.threads.len();
         let placed = snapshot
             .threads
@@ -888,8 +904,10 @@ pub fn strip(ui: &mut egui::Ui, feed: &LiveFeed, snapshot: &WorldSnapshot, now: 
         }))
         .on_hover_text(
             "On the map: threads whose evidence names a place — PRD §6.2's converged district or \
-             §6.4's lobes — so they have a territory to draw. PRD §10.4's cap then decides how \
-             many of those get a cloud this frame; the status bar's `N clouds` is that number. \
+             §6.4's lobes — so they have a territory to draw. Two further gates then decide how \
+             many of those get a cloud this frame: a territory with nothing inside this checkout \
+             has no kernels to splat, one quiet past PRD §10.4's dormancy window dissipates, and \
+             the cap takes the rest. The status bar's cloud line names whichever of those fired. \
              Unplaced: the rest, which is exactly the set the rail marks `unplaced`; the two \
              always sum to the rail's row count. Working: threads making tool calls, as opposed \
              to waiting on you or idle.",

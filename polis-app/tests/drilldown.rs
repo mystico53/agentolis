@@ -103,6 +103,18 @@ fn snapshot() -> WorldSnapshot {
 
     let mut second = Thread::new(beta.clone(), beta_session, now - Duration::from_secs(300));
     second.title = Some("beta".to_owned());
+    // `Thread::new` leaves the bare `ThreadId::hue_preference`, and a fixture
+    // built outside a `World` is not exclusive — exclusivity is a property of
+    // the set of live threads and there is no set here. `"s-alpha"` and
+    // `"s-beta"` both prefer slot 3, so without this the two threads this test
+    // asks the operator to tell apart would be drawn the same colour: the
+    // reported defect, reproduced inside its own fixture. Inside a `World` the
+    // hue ring does this; here it is said by hand.
+    assert_eq!(
+        first.tint, second.tint,
+        "the two ids stopped colliding; this line can go"
+    );
+    second.tint = (first.tint + 1) % polis_events::IDENTITY_SLOTS;
     second.status = ThreadStatus::Done;
     second.ops.push_back(op(
         &lp(CONTESTED),

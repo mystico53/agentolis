@@ -129,6 +129,31 @@ id_newtype!(
     "agent type"
 );
 
+/// How many identity hue slots the product has (PRD §11.4).
+///
+/// This is the length of `polis_render::live::THREAD_HUES`, a table of colours
+/// that lives two crates away — and it is declared *here*, in the event model,
+/// because the slot a thread gets is now decided by `polis_world::World` when
+/// the thread is created, and `polis_world` cannot see `polis_render`. A
+/// `const _: () = assert!(THREAD_HUES.len() == IDENTITY_SLOTS as usize)` beside
+/// the table is what keeps the two from drifting; without it a thirteenth hue
+/// would be authored and never handed out, silently.
+///
+/// Twelve is the *exclusivity ceiling*, not a collision rate: a world hands the
+/// first twelve threads it ever sees twelve different slots, and the thirteenth
+/// falls back to its bare [`ThreadId::hue_preference`], which is guaranteed to
+/// collide. Twelve rather than twenty because the separation between hues is
+/// what the operator actually reads and it is already at its floor —
+/// `THREAD_HUES`'s own ΔE00 table measures the cloud fringe's worst pair at
+/// 5.46, and twenty slots would take the rail swatch's worst pair from 9.80 to
+/// 5.4. See that constant for the arithmetic.
+pub const IDENTITY_SLOTS: u8 = 12;
+
+/// FNV-1a's 32-bit offset basis, written out (ADR-0029).
+const FNV_OFFSET: u32 = 2_166_136_261;
+/// FNV-1a's 32-bit prime.
+const FNV_PRIME: u32 = 16_777_619;
+
 /// A thread: a main agent plus its worker subtree (PRD §3).
 ///
 /// The unit the operator thinks in, and the key of `World::threads` in PRD §5.
@@ -155,6 +180,54 @@ impl ThreadId {
     #[inline]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// The hue slot this thread *prefers*, from its own identity and nothing
+    /// else (PRD §11.4).
+    ///
+    /// # A preference, not the answer
+    ///
+    /// This used to be the whole rule, under the name `thread_slot`, and the
+    /// operator rejected it: *"the same color is super bad, can you make sure
+    /// the colors have to be different?"*. A hash over twelve slots collides —
+    /// with nine threads on screen, about three of the thirty-six pairs — and
+    /// the old doc accepted that on purpose. What actually decides a thread's
+    /// hue now is `polis_world::World`, which hands out each slot to at most one
+    /// thread and records the answer on `Thread::tint`; this function is only
+    /// the first slot that assignment tries.
+    ///
+    /// # Why a hash is still the right first preference
+    ///
+    /// An index into the live thread list is free and wrong. The list is sorted
+    /// and re-sorted as threads arrive, finish and are retired, so the colour of
+    /// a thread the operator is watching would change when an unrelated thread
+    /// started — and the one thing this channel is for is the operator learning
+    /// *"the blue one is the refactor"* inside a minute. A palette that
+    /// reshuffles destroys that faster than no palette at all, because it
+    /// teaches something false. Seeding the assignment from the id keeps the
+    /// common case — a world with a handful of threads — at exactly the colours
+    /// it had before this rule existed, and keeps two unrelated worlds showing
+    /// one session the same colour.
+    ///
+    /// FNV-1a over the id's bytes, written out rather than taken from
+    /// [`std::hash::DefaultHasher`], whose algorithm is explicitly not stable
+    /// across Rust releases (ADR-0029) — a toolchain bump must not repaint the
+    /// city. Pinned by literal expected values in this module's tests, the same
+    /// way [`crate::LogicalPath::layout_seed`] is.
+    ///
+    /// Not case-folded, unlike `layout_seed`. A session id is an opaque token
+    /// from another program, not a path this repository owns two spellings of.
+    #[must_use]
+    pub fn hue_preference(&self) -> u8 {
+        let mut h = FNV_OFFSET;
+        for b in self.as_str().as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        #[allow(clippy::cast_possible_truncation)] // modulo IDENTITY_SLOTS = 12
+        {
+            (h % u32::from(IDENTITY_SLOTS)) as u8
+        }
     }
 }
 
@@ -233,6 +306,45 @@ mod tests {
     fn empty_ids_are_representable_because_channels_send_them() {
         assert!(SessionId::new("").is_empty());
         assert!(!SessionId::new("x").is_empty());
+    }
+
+    /// The hue preference is pinned by literal values (ADR-0029): if
+    /// `DefaultHasher` crept in, or the constants were retyped, every city on
+    /// every machine would repaint itself on a toolchain bump and nothing else
+    /// would notice. Moved here from `polis_render::live::thread_slot` when the
+    /// hash became the world's input rather than the renderer's output; the
+    /// literals are unchanged, so no existing world changes colour.
+    #[test]
+    fn the_identity_hash_is_written_out_and_pinned() {
+        let pref = |s: &str| ThreadId::of_session(SessionId::new(s)).hue_preference();
+        #[allow(clippy::cast_possible_truncation)] // modulo IDENTITY_SLOTS = 12
+        let empty = (FNV_OFFSET % u32::from(IDENTITY_SLOTS)) as u8;
+        assert_eq!(pref(""), empty);
+        assert_eq!(pref("a"), 4);
+        // The collision the operator reported, reproduced from two ids a real
+        // `World` can hold at once: both want slot 4 and only one may have it.
+        assert_eq!(pref("polis"), 4);
+        assert_eq!(pref("4f3a1c22-0e5b-4b8a-9d21-6c7e5f0a1b2c"), 1);
+        assert!(pref("9b2e77d0-1111-4aaa-8bbb-ccccddddeeee") < IDENTITY_SLOTS);
+    }
+
+    /// The preference is a pure function of the id and of nothing else — no
+    /// list to be in, no clock, no other thread. That is what makes it a sound
+    /// *seed* for an assignment that does depend on other threads.
+    #[test]
+    fn a_threads_hue_preference_depends_on_no_other_thread() {
+        let ids = [
+            "4f3a1c22-0e5b-4b8a-9d21-6c7e5f0a1b2c",
+            "9b2e77d0-1111-4aaa-8bbb-ccccddddeeee",
+            "0000aaaa-2222-4ccc-8ddd-eeeeffff0000",
+        ];
+        let pref = |s: &str| ThreadId::of_session(SessionId::new(s)).hue_preference();
+        let first: Vec<u8> = ids.iter().map(|i| pref(i)).collect();
+        for perm in [[2usize, 0, 1], [1, 2, 0], [0, 2, 1]] {
+            for k in perm {
+                assert_eq!(pref(ids[k]), first[k], "the preference moved");
+            }
+        }
     }
 
     #[test]

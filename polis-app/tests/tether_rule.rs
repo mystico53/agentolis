@@ -11,7 +11,7 @@
 //! tether says "this worker belongs to that thread", and nobody unblocks or
 //! redirects an agent because it has hands.
 //!
-//! Ownership is carried instead by `polis_render::live::thread_slot`'s colour,
+//! Ownership is carried instead by `polis_world::Thread::tint`'s colour,
 //! which costs no area, and the line is kept for PRD §12's *"exact below"*: the
 //! operator asks about **one** thread, by pointing at it, selecting it or
 //! following it, and gets that thread's tethers and nobody else's.

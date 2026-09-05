@@ -13,6 +13,14 @@
 //! (which is exactly the contention signal), and hysteresis is temporal
 //! smoothing on the kernel weights.
 //!
+//! The paragraph above is the whole specification for **where a thread's mark
+//! goes**, and for a long time this module contradicted it: every drawn mark
+//! read [`Territory::centre_of_mass`], which is a weighted arithmetic mean, and
+//! a mean of `src/auth` and `tests/` is the empty gap. [`Territory::anchor`] is
+//! the field's *mode* — the kernel centre where the density is highest — and it
+//! is what honours the sentence now. The mean stays, under its own name, for the
+//! two consumers that want a first moment.
+//!
 //! # What is here and what is M4
 //!
 //! This module maintains the **evidence**: weighted, decaying kernels, the
@@ -31,6 +39,19 @@
 //! gate is a guard for skewed weights and for small `n`, where the trim count
 //! rounds to zero and `A` is the untrimmed ancestor. Keeping both means retuning
 //! [`TRIM_FRACTION`] cannot silently disable the check.
+//!
+//! How rarely the mass gate binds is worth knowing before anyone tunes it: the
+//! investigation behind [`RESTING_WEIGHT`]'s current unit found
+//! [`Convergence::mass_ratio`] reading **1.000 for every converged thread in
+//! every session it sampled**. The mechanism is [`Territory::observe`]'s root
+//! drop — the only class of evidence that routinely falls outside the trimmed
+//! ancestor is a shell call scoped to the repository root, and those never reach
+//! the evidence list at all. What is left outside is a genuinely stray read, and
+//! a stray read is light, so the trim usually takes it before the ratio sees it.
+//! That number was **not re-taken for this change** and the harness that took it
+//! is not in the tree; it is recorded because a reader who tunes
+//! [`CONVERGENCE_MASS`] expecting it to bite will be tuning a gate that cannot
+//! fire.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -46,15 +67,41 @@ use crate::Observation;
 /// > is removed abruptly.
 pub const DECAY_HALF_LIFE: Duration = Duration::from_secs(90);
 
-/// The total kernel weight a **converged** territory never decays below.
+/// The **field peak** a converged territory never decays below.
 ///
-/// [`crate::territory::Territory::rest`] explains why this exists. The value is
-/// set against `polis_render::live::CLOUD_ISO`, whose outermost band is `0.55`:
-/// a rested field has to clear that or the cloud is computed and never drawn,
-/// which is the failure this constant was added to fix. It is deliberately close
-/// to it — a resting territory should be the faintest cloud on the map, because
-/// "this is where that agent was working" is worth less than "this is where one
-/// is working now".
+/// `Territory::rest` explains why a floor exists at all. This doc is about the
+/// *unit*, because the unit was wrong and that is what made the constant miss.
+///
+/// `polis_render::live::CLOUD_ISO` thresholds the **density field**, in the units
+/// ADR-0020 fixes: one full-weight kernel reads `1.0` at its own centre
+/// ([`polis_layout::quartic`]), and the outermost band is `0.55`. So the quantity
+/// that has to clear the fringe is [`Territory::field_peak`]. For most of this
+/// constant's life `rest` normalised the **mass** instead — `Σw`, a different
+/// number and always the larger one — and this doc argued for the value in that
+/// unit, which is a comparison of a sum of weights against a field value.
+///
+/// On a tight territory the two coincide: one kernel's peak *is* its weight. On
+/// a spread one they do not, and PRD §6.4's multi-lobed territory is spread by
+/// construction. Measured during the investigation behind this change, over 472
+/// clouds that [`select_clouds`] actually selected: **33 of them — 7.0 % — were
+/// computed, ranked, handed to the rasteriser and never painted**, at a mean mass
+/// of 1.136 (comfortably over this floor) and a mean peak of 0.429 (under the
+/// fringe). That harness is not in the tree and the numbers were not re-taken
+/// here.
+///
+/// **0.9 as a peak is 1.64× the 0.55 fringe, and that headroom is the reason the
+/// floor works rather than an accident.** Three things shrink the peak between
+/// here and the pixel, and all three are on the window's side of the house:
+/// `polis_app::clouds` floors each drawn radius at `.max(2.0)` where
+/// `polis_render::frame` does not, it adds a chain of low-weight bridge kernels
+/// between lobes, and `polis_render::live::CloudField::sample` reads a lattice at
+/// cell centres and therefore under-reads a sharp peak by the sub-cell offset.
+/// Set this at 0.55 exactly and any one of those losses puts the cloud back under
+/// the fringe. Set it far above and a territory nobody has touched for seven
+/// minutes is drawn as brightly as the thread working right now, which inverts
+/// PRD §10.3's *"spend the rest on layers 4–5"*: a resting territory should be the
+/// faintest cloud on the map, because "this is where that agent was working" is
+/// worth less than "this is where one is working now".
 pub const RESTING_WEIGHT: f32 = 0.9;
 
 /// Consecutive outside observations required before the centre of mass may move
@@ -224,6 +271,43 @@ pub const DRIFT_COHERENCE: f32 = 0.6;
 /// [`Territory::bandwidth`] makes.
 pub const DRIFT_MIN_RECENT: f32 = 2.0;
 
+/// How much better a rival kernel must be before the **drawn anchor** moves to
+/// it (PRD §6.3).
+///
+/// > **Move only on sustained evidence**: the territory's centre of mass may
+/// > only shift districts after `N=8` consecutive weighted observations fall
+/// > outside the current claim. One read elsewhere moves nothing.
+///
+/// [`DRIFT_CONFIRMATIONS`] implements that sentence for the *claim*. Nothing
+/// implemented it for the point the thread's ring is drawn at, and until now
+/// nothing had to: that point was [`Territory::centre_of_mass`], an arithmetic
+/// mean, and a mean has no ties to break — it slides and never jumps. A mode
+/// does. Two lobes of nearly equal density swap the argmax on one observation
+/// and the ring teleports across the city and back. Measured over the sessions
+/// this change was investigated on, the mode's median frame-to-frame jump is
+/// 0.26 bandwidths against the mean's 1.28 — much calmer — but its **p90 is
+/// 14.68**, and that p90 is the near-tie teleport and nothing else.
+///
+/// So the held anchor keeps the ring until a different kernel's density beats
+/// the held point's *current* density by this factor. At 1.0 the margin does
+/// nothing and the p90 comes back. Set far above it and the ring sticks where
+/// the thread started while the field has plainly moved on, which is PRD §6's
+/// opening failure in its other form — a mark in the one place nothing is
+/// happening.
+///
+/// The margin also buys a bound worth stating on its own, because it is what
+/// stops hysteresis parking the ring somewhere cold: the drawn anchor's density
+/// is never below `1 / ANCHOR_MARGIN` of [`Territory::field_peak`] — 80 % of the
+/// peak at this value — and `the_anchor_holds_through_a_near_tie` asserts it.
+///
+/// **Asserted, not swept.** 1.25 is "clearly more than a tie, clearly less than
+/// a move" read off the jump distribution above; no sweep of *this constant*
+/// against a corpus was run, and the harness that took those numbers is not in
+/// the tree, so they cannot currently be re-taken. [`CLOUD_CAP`]'s caveat
+/// applies here with more force, because that one at least had a fleet behind
+/// it.
+pub const ANCHOR_MARGIN: f32 = 1.25;
+
 /// Weight below which a kernel stops contributing and is dropped.
 const MIN_KERNEL_WEIGHT: f32 = 0.01;
 
@@ -242,8 +326,25 @@ pub struct Territory {
     /// because their common ancestor is the root. Before this existed such a
     /// thread drew nothing at all, which is the one case §6.4 was written for.
     pub lobes: Vec<Lobe>,
-    /// Weighted centre of the whole live field. The drift vector is measured
-    /// against this.
+    /// Weighted arithmetic mean of the live field — literally `Σ(c·w)/Σw`.
+    ///
+    /// **Not where this thread's mark is drawn.** That is [`Territory::anchor`],
+    /// and the difference is the paragraph this module opens with: an
+    /// orchestrator with kernels in `src/auth` and in `tests/` has its mean in
+    /// the empty gap between them, *"which is the one place nothing is
+    /// happening"*. Every drawn mark read this field until the anchor existed.
+    ///
+    /// Two consumers genuinely want a mean and keep it. `contention`'s
+    /// `CloudSummary::centre` feeds a 4σ bounding rejection, which is a
+    /// statement about the field's *spread* and therefore needs its first
+    /// moment. And [`crate::place::thread_position`] keeps it as the last rung,
+    /// because a territory assembled by hand — kernels never pushed through
+    /// [`Territory::observe`] — has nothing else to answer with.
+    ///
+    /// The drift vector is **not** measured against this, despite what this doc
+    /// used to say: [`Territory::drift_state`] and the drift trace both call the
+    /// private `weighted_centre` over time-windowed *subsets* of the kernels and
+    /// never read this field at all.
     pub centre_of_mass: Option<Point>,
     /// Consecutive observations that fell outside the current claim.
     pub outside_streak: u32,
@@ -260,8 +361,56 @@ pub struct Territory {
     /// Total observations ever made, undecayed. The denominator an operator
     /// reads as "how much does Polis actually know about this thread".
     pub observations: u64,
+    /// How many times the anchor scan has run.
+    ///
+    /// Public for the same reason [`Territory::drift_samples`] is: the cost of
+    /// this territory is O(k²) per scan and the only property worth asserting is
+    /// *what triggers a scan*. A uniform rescale of every kernel — PRD §6.3's
+    /// decay, and `Territory::rest`'s lift — cannot move an argmax, so a tick
+    /// must not bump this.
+    /// `the_anchor_scan_is_bounded_by_the_kernel_list_and_not_by_ticks` asserts
+    /// exactly that, and it is the whole reason there is no clock in
+    /// `Territory::refresh_anchor`.
+    pub anchor_recomputes: u64,
     /// When [`Territory::decay`] last ran.
     last_decay: Option<Instant>,
+    /// When [`Territory::observe`] last accepted an observation — **including**
+    /// one whose claim path is the repository root, which contributes no
+    /// evidence at all.
+    ///
+    /// The clock [`Territory::quiet_for`] reads, and it is deliberately not the
+    /// evidence's own newest timestamp. The two answer different questions: the
+    /// evidence says *where* this thread is working, and PRD §10.4's dormancy
+    /// gate asks *whether* it still is. An agent that spends ten minutes on
+    /// `cargo build && cargo test` from the checkout root produces observations
+    /// that are pure liveness and pure noise about location — 57 % of them on
+    /// the measured corpus — and keyed off the evidence such a thread reads
+    /// dormant after [`DORMANT_AFTER`] while it is demonstrably working. Its
+    /// cloud then vanishes mid-build, which is the operator's *"i dont see any
+    /// clouds"*.
+    ///
+    /// `None` for a territory assembled by hand, which is why
+    /// [`Territory::quiet_for`] still falls back to the evidence.
+    last_observation: Option<Instant>,
+    /// The memoised anchor: the kernel centre the field is highest at, with
+    /// [`ANCHOR_MARGIN`]'s hysteresis already applied.
+    anchor: Option<Point>,
+    /// The field's value at the best kernel centre, memoised alongside
+    /// [`Territory::anchor`] because one scan produces both and
+    /// `Territory::rest` needs the peak on every tick.
+    anchor_peak: f32,
+    /// `kernels.len()` as of the last scan.
+    ///
+    /// The memo's freshness key, and it exists for a specific failure: every
+    /// hand-built fixture in this workspace pushes straight into the public
+    /// [`Territory::kernels`] and never calls [`Territory::observe`], so a memo
+    /// maintained only from `observe` would be `None` for all of them and
+    /// [`Territory::anchor`] would silently answer with the mean. A length
+    /// mismatch means "somebody changed the kernels behind our back"; the
+    /// accessors then scan on demand rather than lie. It does not catch a
+    /// mutation that leaves the length alone, and nothing outside this module
+    /// does one.
+    anchor_kernels: usize,
     /// Trace of the recent-work offset from the centre of mass, subsampled at
     /// [`DRIFT_SAMPLE_INTERVAL`] and windowed to [`DRIFT_WINDOW`]. Feeds
     /// [`Drift::coherence`] and nothing else.
@@ -300,6 +449,13 @@ impl Territory {
         }
         self.decay(obs.at);
         self.observations = self.observations.saturating_add(1);
+        // Stamped **above** the root drop below, and that placement is the whole
+        // of the dormancy fix. Everything that reaches this line is an
+        // observation `crate::World::observe` also stepped the trail for and
+        // stamped `Thread::last_activity` with; a territory that answered
+        // "quiet for nine minutes" while those were arriving would be
+        // contradicting the rail in the same frame.
+        self.last_observation = Some(obs.at);
 
         let claim_path = obs.claim_path();
         // The repository root is the absorbing element of PRD §6.2's ancestor:
@@ -321,8 +477,17 @@ impl Territory {
         // the same evidence.
         //
         // Nothing else is taken away: the operation still draws its own mark,
-        // still steps the trail, and still counts in `observations`. It just
-        // says nothing about *where*.
+        // still steps the trail, still counts in `observations`, and — since
+        // this change — has already refreshed `last_observation` above, so it
+        // counts as *liveness* for PRD §10.4's dormancy even though it counts
+        // for nothing in the ancestor. `crate::World::observe` also counts it in
+        // `crate::Health::root_scoped_observations`, which read 11 605 of 20 246
+        // observations (57.3 %) on the measured corpus and is the single number
+        // that would have made the missing-clouds defect self-diagnosing.
+        //
+        // So "it just says nothing about *where*" is finally the whole of what
+        // is taken away, rather than an aspiration: before this change the drop
+        // also silently told the dormancy gate the thread had stopped.
         if claim_path.is_root() {
             return;
         }
@@ -362,6 +527,13 @@ impl Territory {
 
         self.refresh_claim();
         self.refresh_centre_of_mass(obs.at);
+        if at.is_some() {
+            // The kernel list changed — pushed, and possibly evicted at the
+            // window — so the argmax may have. An observation with no geometry
+            // is evidence about scope and touches no kernel, so it cannot move a
+            // point in city space and does not pay for a scan.
+            self.refresh_anchor();
+        }
     }
 
     /// Decays kernel weights toward `now` (PRD §6.3).
@@ -383,18 +555,49 @@ impl Territory {
         for k in &mut self.kernels {
             k.weight *= factor;
         }
+        // A uniform rescale moves the peak's value and not its place, so the
+        // memo is carried through it arithmetically rather than rescanned. This
+        // is the whole reason `refresh_anchor` needs no clock.
+        self.anchor_peak *= factor;
         // Before the retain, not after: at 21 minutes idle every kernel is under
         // MIN_KERNEL_WEIGHT, so a lift applied afterwards would have an empty
         // list to lift.
         self.rest();
+        let kernels_before = self.kernels.len();
         self.kernels.retain(|k| k.weight >= MIN_KERNEL_WEIGHT);
+        if self.kernels.len() != kernels_before {
+            // Dropping kernels is the one thing decay does that is *not*
+            // uniform, so it is the one thing here that can move the anchor.
+            self.refresh_anchor();
+        }
         for e in &mut self.evidence {
             e.weight *= factor;
         }
         self.evidence.retain(|e| e.weight >= MIN_KERNEL_WEIGHT);
-        if self.evidence.is_empty() {
-            // Nothing is left to claim. The thread returns to an unplaced
-            // marker rather than keeping a stale district forever.
+        // Two conditions, and the second one is new.
+        //
+        // Evidence empty is not on its own proof that a thread has finished. A
+        // weight-1 entry survives about 6.6 half-lives before it falls under
+        // `MIN_KERNEL_WEIGHT`, so this list empties after roughly ten minutes of
+        // *nothing that carries usable scope* — and a stretch of `cargo build`,
+        // `cargo test`, `git status` from the checkout root is exactly that: the
+        // observations arrive, `observe` drops every one of them at the root
+        // check, and the non-shell evidence decays out from under a claim
+        // nothing is refreshing. The thread is working the whole time. Before
+        // this change its claim, its lobes and its cloud were deleted anyway.
+        //
+        // So the collapse also waits for PRD §10.4's own test for a thread that
+        // has actually stopped — [`Territory::quiet_for`] past [`DORMANT_AFTER`]
+        // — which is the same gate `select_clouds` and `Territory::rest`
+        // apply, and which now reads `last_observation` and therefore sees the
+        // shell calls. Until then the claim stands and `rest` holds the field up
+        // underneath it. This cannot invent scope: a territory that never
+        // converged has no claim and no lobes to keep, `rest` returns early for
+        // it, and it still fades to nothing.
+        if self.evidence.is_empty() && self.quiet_for().is_some_and(|q| q > DORMANT_AFTER) {
+            // Nothing is left to claim, and nothing is coming. The thread
+            // returns to an unplaced marker rather than keeping a stale district
+            // forever.
             //
             // The lobes go with it. They are refreshed only in `refresh_claim`,
             // which runs on an *observation* — so a thread that stops working
@@ -406,6 +609,22 @@ impl Territory {
             self.claim = None;
             self.lobes.clear();
             self.centre_of_mass = None;
+            // The anchor goes with the mean, and for the same reason: this is
+            // the branch that returns the thread to an unplaced marker, and a
+            // ring drawn over a territory `select_clouds` has already dropped
+            // would be the rail and the map disagreeing again. `anchor_peak` is
+            // *not* cleared: kernels can outlive the evidence — `rest` holds
+            // them up while the evidence keeps decaying — and the peak of the
+            // kernels that are still here is still a true statement about them.
+            self.anchor = None;
+            // Pin the memo shut alongside it. `anchor()` recomputes whenever
+            // `anchor_kernels` disagrees with the kernel list, so clearing the
+            // point without clearing the count would make this branch answer
+            // `None` or `Some` according to whether the `retain` above happened
+            // to drop anything — which is to say, according to which tick it
+            // ran on. That is exactly the cadence dependence `refresh_anchor`
+            // was written to keep out (ADR-0029).
+            self.anchor_kernels = self.kernels.len();
             self.drift_trace.clear();
             self.outside_streak = 0;
         } else {
@@ -433,6 +652,186 @@ impl Territory {
             (None, []) => Placement::Nowhere,
             (None, lobes) => Placement::Lobes(lobes),
         }
+    }
+
+    /// The density field's value at `p`, in the units
+    /// `polis_render::live::CLOUD_ISO` is thresholded against — one full-weight
+    /// kernel reads 1.0 at its own centre (ADR-0020).
+    ///
+    /// The same curve the rasteriser splats, from the same function
+    /// ([`polis_layout::quartic`]), because the whole point of
+    /// [`Territory::anchor`] is that it is the argmax of *the field that is
+    /// actually drawn* rather than of a lookalike. A kernel with a
+    /// non-positive radius is skipped: it has no support, and dividing by it
+    /// would put a `NaN` into an ordering that decides where a mark goes.
+    ///
+    /// Summed in `f64` and returned as `f32`. The extra width is not for
+    /// precision, it is so the world and the rasteriser call one function; the
+    /// field is `f32` everywhere it is read.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // f64 only to share one kernel with the rasteriser
+    pub fn density_at(&self, p: Point) -> f32 {
+        let mut sum = 0.0f64;
+        for k in &self.kernels {
+            if k.radius <= 0.0 {
+                continue;
+            }
+            let dx = f64::from(k.centre.x - p.x);
+            let dy = f64::from(k.centre.y - p.y);
+            let r = f64::from(k.radius);
+            sum += f64::from(k.weight) * polis_layout::quartic(dx.mul_add(dx, dy * dy) / (r * r));
+        }
+        sum as f32
+    }
+
+    /// The highest value the field reaches, evaluated at kernel centres.
+    ///
+    /// A **lower bound** on the true continuous peak, and deliberately so. The
+    /// maximum of a sum of overlapping compact kernels need not sit on any
+    /// kernel centre — two kernels a bandwidth apart peak between them — so the
+    /// exact answer needs a search over the plane, and this is the cheap
+    /// estimator that is honest about being one. It is also, exactly, the
+    /// quantity [`Territory::anchor`] is chosen by: the anchor has to be a real
+    /// observed position, so the search space *is* the kernel centres.
+    ///
+    /// `polis_render::live::CloudField::peak` is a different lower bound — the
+    /// maximum over a rasterisation lattice, which under-reads a sharp peak by
+    /// the sub-cell offset — so neither bounds the other and the two are not
+    /// interchangeable.
+    ///
+    /// Memoised: this is read on every tick and computing it costs a full O(k²)
+    /// scan.
+    #[must_use]
+    pub fn field_peak(&self) -> f32 {
+        if self.anchor_kernels == self.kernels.len() {
+            return self.anchor_peak;
+        }
+        self.scan_peak().map_or(0.0, |(_, d)| d)
+    }
+
+    /// **Where this thread's mark is drawn**: the kernel centre at which the
+    /// density field is highest.
+    ///
+    /// > A main agent has no meaningful point location — it delegates rather
+    /// > than edits. Computing a centroid of its workers is actively wrong: an
+    /// > orchestrator with workers in `src/auth` and `tests/` gets a centroid in
+    /// > the empty gap between them, which is the one place nothing is
+    /// > happening. (PRD §6)
+    ///
+    /// Always a position something was actually observed at, never an average of
+    /// two of them. That is the difference from [`Territory::centre_of_mass`],
+    /// and it is the difference between a ring on the work and a ring in the
+    /// gap.
+    ///
+    /// [`ANCHOR_MARGIN`]'s hysteresis means this is not strictly the argmax at
+    /// every instant — it is the held point until a rival clears it by the
+    /// margin — which bounds the drawn density at `1 / ANCHOR_MARGIN` of
+    /// [`Territory::field_peak`] rather than pinning it to the peak. That is the
+    /// trade PRD §6.3 asks for: *"one read elsewhere moves nothing"*.
+    ///
+    /// `None` when there are no kernels — a thread working entirely outside the
+    /// checkout, or one that has not been placed yet — and `None` again once
+    /// [`Territory::decay`] has taken the last of the evidence, which is the
+    /// branch that returns the thread to an unplaced marker. Kernels can
+    /// outlive the evidence that made them (`rest` holds them up), so the
+    /// second case is not the first: a territory with kernels and no claim
+    /// answers `None` here on purpose, because a ring drawn over a territory
+    /// [`select_clouds`] has already dropped is the rail and the map
+    /// disagreeing.
+    #[must_use]
+    pub fn anchor(&self) -> Option<Point> {
+        if self.anchor_kernels == self.kernels.len() {
+            return self.anchor;
+        }
+        self.scan_peak().map(|(c, _)| c)
+    }
+
+    /// The kernel centre where the field is highest, and the value there.
+    ///
+    /// O(k²), bounded by [`OBSERVATION_WINDOW`]² = 16 384 polynomial
+    /// evaluations, and run only when the kernel list actually changes — see
+    /// [`Territory::refresh_anchor`].
+    ///
+    /// Ties are broken on `(density, x, y)` with [`f32::total_cmp`] and never
+    /// with `partial_cmp`: two observations of the same building carry equal
+    /// density by construction, so the tie is the common case rather than the
+    /// corner one, and ADR-0029 makes a `HashMap`-flavoured answer to *"which of
+    /// these equal things"* a defect and not a nuisance.
+    fn scan_peak(&self) -> Option<(Point, f32)> {
+        let mut best: Option<(Point, f32)> = None;
+        for k in &self.kernels {
+            let density = self.density_at(k.centre);
+            let take = match best {
+                None => true,
+                Some((at, seen)) => {
+                    density
+                        .total_cmp(&seen)
+                        .then_with(|| at.x.total_cmp(&k.centre.x))
+                        .then_with(|| at.y.total_cmp(&k.centre.y))
+                        == std::cmp::Ordering::Greater
+                }
+            };
+            if take {
+                best = Some((k.centre, density));
+            }
+        }
+        best
+    }
+
+    /// Recomputes [`Territory::anchor`] and [`Territory::field_peak`] in one
+    /// scan, applying [`ANCHOR_MARGIN`].
+    ///
+    /// # There is no clock here, and that is the point
+    ///
+    /// The obvious shape for something this expensive is a wall-clock throttle —
+    /// recompute at most once per [`DRIFT_SAMPLE_INTERVAL`], the way the drift
+    /// trace is subsampled. It would be a determinism bug (PRD §7.4, ADR-0029).
+    /// `decay` runs from `World::tick`, and the two renderers tick differently:
+    /// the window's `ReplayDriver::advance` ticks once per advance, the headless
+    /// `run_to_end` applies a whole schedule and ticks once. A throttle plus
+    /// hysteresis is a state machine over the *sequence of comparisons*, so the
+    /// same recording would settle on different anchors in the window and in a
+    /// recorded GIF.
+    ///
+    /// It is also unnecessary, because **decay cannot move the anchor**. Both
+    /// things `decay` does to the weights are uniform — one `factor` across
+    /// every kernel, and `Territory::rest`'s single `lift` — so every density
+    /// scales by the same number and both the argmax and the margin's ratio test
+    /// are invariant. Only a change to the kernel *list* can move it: a push in
+    /// [`Territory::observe`], the window eviction beside it, and the `retain`
+    /// in `decay` on the ticks it actually drops something. Those are the three
+    /// call sites, and the anchor is a pure function of the current kernel list
+    /// at each of them.
+    ///
+    /// The cost that leaves is one O(k²) scan per observation that lands on
+    /// city ground. A full scan at [`OBSERVATION_WINDOW`] = 128 kernels is
+    /// 16 384 quartic evaluations and measures **20.0 µs** in `--release` on the
+    /// operator's machine (2 000 scans of a saturated territory, 40.1 ms), so
+    /// PRD §13.1's 500 events/sec sustained budget costs 10 ms of each second —
+    /// 1 % of one core, across the whole fleet, because that budget is the
+    /// fleet's and not each thread's. If it ever stops being affordable the
+    /// bound to add is a count of observations, never a clock.
+    fn refresh_anchor(&mut self) {
+        self.anchor_kernels = self.kernels.len();
+        self.anchor_recomputes = self.anchor_recomputes.saturating_add(1);
+        let Some((candidate, peak)) = self.scan_peak() else {
+            self.anchor = None;
+            self.anchor_peak = 0.0;
+            return;
+        };
+        self.anchor_peak = peak;
+        if let Some(held) = self.anchor {
+            let held_density = self.density_at(held);
+            if held_density > 0.0 && peak <= held_density * ANCHOR_MARGIN {
+                // PRD §6.3: one read elsewhere moves nothing. The held point may
+                // no longer be a live kernel centre — its kernel can have
+                // decayed out from under it — and that is still the right answer
+                // while its neighbours keep the field high there. Once they do
+                // not, this test fails on its own and the ring moves.
+                return;
+            }
+        }
+        self.anchor = Some(candidate);
     }
 
     /// Whether the observations **agree** yet (PRD §6.2).
@@ -615,11 +1014,41 @@ impl Territory {
     /// redistributed, so a lobe cannot grow relative to another while nothing is
     /// happening — and stays faint but drawable.
     ///
+    /// # What is normalised, and why it is not the mass
+    ///
+    /// The lift is chosen so that [`Territory::field_peak`] lands on
+    /// [`RESTING_WEIGHT`]. It used to be chosen so that `Σw` did, and those are
+    /// only the same number for a territory whose kernels sit on one point.
+    /// `polis_render::live::CLOUD_ISO` is thresholded against the field, so a
+    /// spread territory normalised by mass rests with a peak well under the
+    /// fringe and is drawn as nothing at all: 7.0 % of selected clouds, at a mean
+    /// peak of 0.429. [`RESTING_WEIGHT`]'s doc carries the measurement.
+    ///
+    /// # Why this is affordable at 2 Hz
+    ///
+    /// This runs from [`Territory::decay`], which runs for every thread on every
+    /// `crate::World::tick` — 2 Hz at `crate::LIVE_TICK`, times PRD §16's
+    /// hundred threads. A peak is an O(k²) scan at `k <= OBSERVATION_WINDOW`, and
+    /// paying that here unconditionally would be 16 384 polynomial evaluations
+    /// per thread per tick. It is not paid: [`Territory::field_peak`] is memoised
+    /// beside [`Territory::anchor`], and both of the rescales in play — decay's
+    /// `factor` and this function's own `lift` — are *uniform*, so the memo is
+    /// carried through them by one multiply. The scan happens only when the
+    /// kernel **list** changes. A territory assembled by hand — kernels pushed
+    /// straight into the public [`Territory::kernels`] and
+    /// [`Territory::observe`] never called — has a stale memo by construction
+    /// and does pay a scan on every tick it is decayed; every such territory in
+    /// this workspace is a fixture with a handful of kernels, and nothing in the
+    /// live path builds one.
+    ///
+    /// # Dormancy still wins
+    ///
     /// Nothing here keeps a dead thread alive. PRD §10.4's cap still drops a
-    /// territory once `quiet_for` passes its dormancy window, which is the
-    /// mechanism §10.4 actually names for letting *"dormant territories
-    /// dissipate entirely"*. This only stops the field vanishing in the ninety
-    /// seconds before that decision is due.
+    /// territory once [`Territory::quiet_for`] passes its dormancy window, which
+    /// is the mechanism §10.4 actually names for letting *"dormant territories
+    /// dissipate entirely"*, and the early return below applies the same gate so
+    /// that the field is genuinely gone by the time the cap stops asking. This
+    /// only stops the field vanishing in the minutes before that decision is due.
     fn rest(&mut self) {
         // Dormancy still wins. PRD §10.4: "let dormant territories dissipate
         // entirely" — resting holds a field through the pause between two
@@ -634,14 +1063,19 @@ impl Territory {
             // what stops a stray read leaving a permanent smudge on the map.
             return;
         }
-        let total: f32 = self.kernels.iter().map(|k| k.weight).sum();
-        if total <= 0.0 || total >= RESTING_WEIGHT {
+        let peak = self.field_peak();
+        if peak <= 0.0 || peak >= RESTING_WEIGHT {
             return;
         }
-        let lift = RESTING_WEIGHT / total;
+        let lift = RESTING_WEIGHT / peak;
         for k in &mut self.kernels {
             k.weight *= lift;
         }
+        // Uniform, like the decay factor above it: every density scales by
+        // exactly `lift`, so the peak lands on RESTING_WEIGHT by construction
+        // and the mode does not move at all. Updating the memo rather than
+        // invalidating it is what keeps the next tick's `field_peak` free.
+        self.anchor_peak *= lift;
     }
 
     /// The current bandwidth — the uncertainty knob (PRD §6.4).
@@ -700,8 +1134,10 @@ impl Territory {
     /// been made is not a redirect signal, and PRD §10.4 asks for one that is
     /// visible *"while it is happening"*.
     ///
-    /// So the vector runs from the field's own centre of mass to the centre of
-    /// the **last [`DRIFT_WINDOW`] of work**. That fires on the first minute of
+    /// So the vector runs from the weighted centre of the field's *established*
+    /// kernels to the centre of the **last [`DRIFT_WINDOW`] of work** — not from
+    /// [`Territory::centre_of_mass`], see the next paragraph. That fires on the
+    /// first minute of
     /// work in a new place, before decay has moved anything, and it clears
     /// itself: once the field catches up, the two centres coincide again and the
     /// mark goes out. It is the same two ingredients the PRD names — the centre
@@ -794,12 +1230,17 @@ impl Territory {
     ///   Thrash is not a scope change.
     /// * Enough recent evidence to mean anything: [`DRIFT_MIN_RECENT`].
     ///
-    /// The mark runs from the field's centre of mass to the centre of the last
-    /// minute's work, and it is drawn at the **far** end. The centre of mass is
-    /// where the thread has been; the recent centre is where it is going. That
-    /// is the whole point of the signal, and it is why no extrapolation is
-    /// needed to place the mark — the leading edge is a measured position, not a
-    /// projected one.
+    /// The mark runs from the weighted centre of the kernels **older** than
+    /// [`DRIFT_WINDOW`] to the weighted centre of the ones inside it, and it is
+    /// drawn at the **far** end. Neither end is [`Territory::centre_of_mass`] —
+    /// that is a mean over the *whole* field, and including the recent kernels
+    /// in their own baseline is exactly the dilution `drift_state` explains it
+    /// avoids. Nor is either end [`Territory::anchor`]: this signal is about a
+    /// centre moving, so it wants first moments at both ends, and putting a mode
+    /// at the tail would make the mark jump a district at a time. The tail is
+    /// where the thread has been; the tip is where it is going. That is why no
+    /// extrapolation is needed to place the mark — the leading edge is a
+    /// measured position, not a projected one.
     pub fn drift_mark(&self) -> Option<DriftMark> {
         let drift = self.drift_state()?;
         if drift.recent_n < DRIFT_MIN_RECENT {
@@ -835,15 +1276,42 @@ impl Territory {
         self.drift_trace.len()
     }
 
-    /// How long since the newest live observation (PRD §10.4's dormancy).
+    /// How long since this thread last did **anything** (PRD §10.4's dormancy).
     ///
     /// No `now` argument on purpose. [`Territory::decay`] runs from
     /// `World::tick` every tick, so `last_decay` **is** now, and a policy that
     /// took its own clock could disagree with the field it is judging. `None`
     /// before the first observation.
+    ///
+    /// # Anything, not any *evidence*
+    ///
+    /// This used to measure from the newest entry in [`Territory::evidence`],
+    /// and that made three separate consumers — `Territory::rest`,
+    /// [`Territory::decay`]'s collapse and [`select_clouds`]'s dormancy gate —
+    /// answer *"has this thread stopped?"* with a fact about *where it was
+    /// working*. A shell call scoped to the repository root leaves no evidence
+    /// (see [`Territory::observe`]) and 57 % of real observations are exactly
+    /// that, so an agent in the middle of a build-and-test stretch went quiet on
+    /// this clock while it was making a call a second, lost its cloud at
+    /// [`DORMANT_AFTER`], and got it back only when it next touched a file.
+    ///
+    /// So it reads `last_observation`, which every accepted observation stamps
+    /// before the root drop. The consequence to state plainly: a thread that has
+    /// been running `cargo test` from the root for twenty minutes and nothing
+    /// else is **not** dormant here, and its cloud stays over whatever it was
+    /// last working on. That is the honest reading — the field is stale about
+    /// *where*, and PRD §6.3's decay is the thing that already says so by
+    /// letting it fade — where "dormant" would have been a false claim that the
+    /// agent had stopped.
+    ///
+    /// The evidence maximum survives as a fallback for a [`Territory`] whose
+    /// kernels and evidence were assembled by hand, which is every cloud fixture
+    /// in this workspace and none of the live path.
     pub fn quiet_for(&self) -> Option<Duration> {
         let now = self.last_decay?;
-        let newest = self.evidence.iter().map(|e| e.at).max()?;
+        let newest = self
+            .last_observation
+            .or_else(|| self.evidence.iter().map(|e| e.at).max())?;
         Some(now.saturating_duration_since(newest))
     }
 
@@ -1207,6 +1675,42 @@ pub fn decay_factor(dt: Duration) -> f32 {
 ///
 /// One fleet, one moment, one repository. Re-run the harness before trusting it
 /// on a different shape of work.
+///
+/// # Re-run, and the cliff is not there any more
+///
+/// `Territory::rest`'s move from normalising the field's mass to normalising
+/// its peak was expected to brighten and widen every resting territory, so the
+/// harness above was re-run on both sides of that change — same forty sessions,
+/// same alignment, same instant, `cargo test -p polis-render --release --test
+/// cloud_cap_policy -- --ignored --nocapture`:
+///
+/// | cap | clouds | cloud ink | contested ink | mean crowd |
+/// |---|---|---|---|---|
+/// | 2 | 2 | 1.31 % | 29.9 % | 1.27 |
+/// | 4 | 4 | 2.14 % | 34.8 % | 1.41 |
+/// | **5** | 5 | 2.99 % | **27.0 %** | **1.39** |
+/// | 6 | 6 | 3.21 % | 27.9 % | **1.54** |
+/// | 10 | 10 | 3.44 % | 41.5 % | 1.99 |
+/// | 24 | 24 | 4.66 % | 44.6 % | 3.10 |
+///
+/// **Two findings, and only the second is about this cap.**
+///
+/// The first: every number in that column is *identical* before and after the
+/// `rest` change, to the digit. At this harness's measurement instant — each
+/// session aligned on its own busiest minute — nothing is resting, so `rest`
+/// never fires and cannot move the ink. What did move is the dormancy sweep, and
+/// only there; see [`DORMANT_AFTER`]. So **this cap is not re-baselined by that
+/// change**, and 5 stands on the argument above.
+///
+/// The second is that the argument above no longer describes the fleet. There is
+/// no 37.7 % → 58.3 % cliff between five and six; contested ink is 27.0 % → 27.9
+/// %, and the mean-crowd 1.5 crossing has moved from five to **six**. The fleet
+/// itself changed underneath the table — PRD §6.4's lobes (`fb414aa`) mean 24 of
+/// these threads are placed where 11 were, so the same forty sessions now put
+/// more, smaller territories on the map. Read strictly, this sweep would support
+/// a cap of six. That is a decision about what the operator sees and not a
+/// consequence of the clouds fix, so the cap is held at five and the
+/// disagreement is written down rather than acted on.
 pub const CLOUD_CAP: usize = 5;
 
 /// How long a converged territory may sit untouched before it dissipates
@@ -1214,12 +1718,27 @@ pub const CLOUD_CAP: usize = 5;
 ///
 /// > let dormant territories dissipate entirely
 ///
-/// Two [`DECAY_HALF_LIFE`]s, which takes a territory's evidence to a quarter —
-/// the point at which its bands have collapsed to a fringe and it is
-/// contributing haze rather than location.
+/// Deliberately equal to `polis_ingest::live::LIVE_WINDOW`, which is also eight
+/// minutes: `ab844b1` moved this constant to match it *"so a thread on the map
+/// has a cloud and one too old to have a cloud is not listed"*. A territory that
+/// dissipated earlier would take the cloud off a session the ingest side is
+/// still tailing.
 ///
-/// Swept on the same forty-session fleet as [`CLOUD_CAP`], with the cap lifted
-/// so the window is the only thing acting:
+/// # This is now the claim's lifetime, not just the cloud's
+///
+/// It used to gate one thing — whether [`select_clouds`] drew a territory this
+/// frame — while [`Territory::claim`] and [`Territory::lobes`] were deleted on a
+/// separate schedule, whenever the evidence list happened to empty. That
+/// schedule was wrong (see [`Territory::decay`]), so the collapse now waits for
+/// this window too. Three consumers key on it: `select_clouds`,
+/// `Territory::rest`, and the collapse. Lengthening it keeps a stale district
+/// name in the rail for longer; shortening it takes the map away from an agent
+/// that paused to think.
+///
+/// # The sweep below is stale, and is kept because it is still the only one
+///
+/// It was taken at **180 s**, on the same forty-session fleet as [`CLOUD_CAP`],
+/// with the cap lifted so the window was the only thing acting:
 ///
 /// | window | clouds shown | dissipated | cloud ink |
 /// |---|---|---|---|
@@ -1229,19 +1748,56 @@ pub const CLOUD_CAP: usize = 5;
 /// | 600 s | 11 | 0 | 3.25 % |
 /// | none | 11 | 0 | 3.25 % |
 ///
-/// Two things fall out. The window is a **small** effect — it retires one to
-/// three territories of eleven and about 3 % of the cloud ink — because PRD
-/// §6.3's decay is already doing the work: at 600 s the gate has nothing left to
-/// catch, since a kernel's weight is under the drop floor after about ten
-/// minutes and the territory has dissipated on its own. And 30 s buys nothing
-/// over 180 s but would strip the cloud off any thread that pauses half a minute
-/// to think, which is a map that flickers.
+/// `ab844b1` moved the constant from 180 s to eight minutes and left this table
+/// describing the value it had replaced. Two of its readings survive the move
+/// and one does not:
+///
+/// * The window is a **small** effect — one to three territories of eleven, and
+///   about 3 % of the cloud ink. That still holds, and 480 s sits between the
+///   180 s and 600 s rows where the effect is smallest of all.
+/// * *"30 s buys nothing over 180 s but would strip the cloud off any thread
+///   that pauses half a minute to think"* still holds, and is the argument
+///   against every shorter value.
+/// * *"at 600 s the gate has nothing left to catch, since a kernel's weight is
+///   under the drop floor after about ten minutes and the territory has
+///   dissipated on its own"* is **no longer true**, and that is the sentence
+///   this change invalidates. `Territory::rest` pins the field's peak at
+///   [`RESTING_WEIGHT`] for as long as the thread is not dormant, so nothing
+///   dissipates on its own any more and this window is the only thing that ends
+///   a territory.
+///
+/// # Re-run, on both sides of the `last_observation` change
+///
+/// Same harness, same forty-session fleet, cap lifted so the window is the only
+/// thing acting. The rows the harness sweeps are 30/90/180/600 s; 480 s is not
+/// one of them and sits inside the flat top:
+///
+/// | window | shown before | shown after | dissipated before | dissipated after |
+/// |---|---|---|---|---|
+/// | 30 s | 13 | **15** | 11 | 9 |
+/// | 90 s | 16 | **19** | 8 | 5 |
+/// | 180 s | 22 | **24** | 2 | 0 |
+/// | 600 s | 24 | 24 | 0 | 0 |
+/// | none | 24 | 24 | 0 | 0 |
+///
+/// This is the whole of what reading `last_observation` does to a real fleet,
+/// and it is the right shape: two to three more territories survive each short
+/// window, and none survives that would not have survived at 600 s. At the value
+/// actually shipped the sweep is already flat — **nothing dissipates at 480 s on
+/// this fleet, before or after** — which is the same "small effect" the earlier
+/// table found, taken at the measurement instant this harness is honest about
+/// preferring (see its header). A fleet sampled on a wall clock rather than at
+/// its peak would have more dormant territories and more for this window to
+/// catch; that harness is not written.
+///
+/// The same conclusion in one line: the effect is real, it is small, and it is
+/// entirely in the short windows this constant is not set to.
 ///
 /// PRD §17's open question — *dissipate entirely or leave a faint residue?* — is
-/// therefore answered twice over. **Dissipate**, for the reason in
-/// [`CloudSelection::dormant`]; and note that dissipating entirely is what the
-/// system already does, so a residue would have to be *added* by pinning a floor
-/// under the decay. Nothing in the measurement argues for paying that.
+/// answered **dissipate**, for the reason in [`CloudSelection::dormant`]. Note
+/// that the answer now costs something: with `rest` holding the field up, a
+/// residue is what you get by *lengthening* this window rather than by adding a
+/// floor, so the two are one knob.
 pub const DORMANT_AFTER: Duration = Duration::from_mins(8);
 
 /// PRD §10.4's cloud policy, in one place.
@@ -1409,8 +1965,20 @@ fn cloud_rank(thread: &crate::Thread, attention: &[crate::attention::Attention])
 
 /// PRD §10.4's cap with the default policy and no attention list.
 ///
-/// Kept because most callers have neither an attention list nor an opinion about
-/// dormancy; the policy still applies, so the two paths cannot disagree.
+/// **Nothing that draws calls this any more, deliberately.** It was written for
+/// callers with neither an attention list nor an opinion about dormancy, on the
+/// argument that the policy still applies so the two paths cannot disagree.
+/// Both halves of that turned out to be wrong in the same place: it returns only
+/// [`CloudSelection::visible`] and drops `unplaced`, `dormant` and `capped` on
+/// the floor, so `polis_app::clouds` — its last real caller — could put an empty
+/// sky on the map and had nothing to say about why; and passing no attention
+/// list means the rank in PRD §10.4's *"threads with an active attention state
+/// **or** in the top N"* is missing, so the window and `polis_render::frame`
+/// could choose a different five under the cap.
+///
+/// It survives as the convenience the cap's own tests are written against.
+/// Anything that draws should call [`select_clouds`] and keep the
+/// [`CloudSelection`].
 pub fn visible_clouds<'a>(
     territories: &'a [(&'a crate::Thread, &'a Territory)],
     cap: usize,
@@ -1565,6 +2133,22 @@ mod tests {
             t.observations, 49,
             "it is still counted: the thread did do that work"
         );
+        // The third number the rail's `unplaced` hover now shows beside the
+        // other two, and the reason it has to: `Convergence::observations` is
+        // `evidence.len()`, so a thread that has made forty-nine calls reads
+        // "9 observations" here and would read "0" after ten minutes of the
+        // same. `Territory::observations` is the one the operator recognises.
+        assert_eq!(
+            t.evidence.len(),
+            9,
+            "the live evidence window is the smaller of the two numbers"
+        );
+        assert_eq!(
+            t.quiet_for(),
+            Some(Duration::ZERO),
+            "and forty root-scoped shell calls leave the thread *alive*, which \
+             is the half of them that is not thrown away"
+        );
     }
 
     #[test]
@@ -1646,6 +2230,225 @@ mod tests {
         t.decay(t0 + DECAY_HALF_LIFE * 12);
         assert!(t.kernels.is_empty());
         assert!(t.claim.is_none(), "back to an unplaced marker");
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD §10.4's dormancy is a statement about the *thread*, not about its
+    // evidence. The operator's report: *"i dont see any clouds"*, on a fleet
+    // that was building and testing.
+    // -----------------------------------------------------------------------
+
+    /// A `Bash` observation scoped to the checkout root — `cargo test` from the
+    /// repository top, which is what an agent actually spends its calls on.
+    fn root_shell(at: Instant) -> Observation {
+        Observation {
+            thread: ThreadId::of_session(SessionId::new("s")),
+            worker: None,
+            path: LogicalPath::root(),
+            scope: PathScope::Directory,
+            tool: ToolKind::Bash,
+            at,
+            weight: None,
+        }
+    }
+
+    /// The reported defect, end to end. A converged thread runs nothing but
+    /// root-scoped shell calls for twenty minutes — three times the ten it takes
+    /// its non-shell evidence to decay under [`MIN_KERNEL_WEIGHT`] — and keeps
+    /// its district and its cloud the whole way, because it never stopped
+    /// working.
+    #[test]
+    fn a_converged_territory_survives_a_shell_only_stretch() {
+        let mut t = Territory::for_extent(1000.0);
+        let t0 = Instant::now();
+        for i in 0..9 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, t0),
+                1.0,
+                place(i),
+            );
+        }
+        assert_eq!(t.claim.as_ref().map(LogicalPath::as_str), Some("src/auth"));
+
+        // Twenty minutes of build-and-test, one call every fifteen seconds, with
+        // a tick between each — which is what `World::tick` does at 2 Hz.
+        for step in 1..=80u32 {
+            let at = t0 + Duration::from_secs(u64::from(step) * 15);
+            t.observe(&root_shell(at), 1.0, place(0));
+            t.decay(at);
+        }
+
+        assert!(
+            t.evidence.is_empty(),
+            "the premise: a shell call at the root leaves no evidence, so the \
+             non-shell evidence has decayed out from under the claim"
+        );
+        assert_eq!(
+            t.claim.as_ref().map(LogicalPath::as_str),
+            Some("src/auth"),
+            "and the claim must survive it: the thread never stopped working"
+        );
+        assert!(
+            t.placement().is_somewhere(),
+            "so the rail says where instead of `unplaced`"
+        );
+        assert!(
+            !t.kernels.is_empty(),
+            "and `select_clouds` has something to splat"
+        );
+        assert!(
+            t.quiet_for().is_some_and(|q| q < DORMANT_AFTER),
+            "dormancy asks whether the thread stopped, and it did not: {:?}",
+            t.quiet_for()
+        );
+
+        // And then it does stop. Nothing at all past the dormancy window, and it
+        // goes exactly as it went before — PRD §10.4's *"let dormant territories
+        // dissipate entirely"*.
+        let last = t0 + Duration::from_mins(20);
+        t.decay(last + DORMANT_AFTER + Duration::from_secs(1));
+        t.decay(last + DECAY_HALF_LIFE * 12);
+        assert!(t.claim.is_none(), "back to an unplaced marker");
+        assert_eq!(t.placement(), Placement::Nowhere);
+        assert!(t.kernels.is_empty(), "and the field is gone, not faint");
+    }
+
+    /// The half of the fix that does the work, isolated: a root-scoped shell
+    /// call is worth nothing to the ancestor and everything to the clock.
+    #[test]
+    fn a_root_scoped_shell_call_refreshes_the_dormancy_clock_and_nothing_else() {
+        let mut t = Territory::for_extent(1000.0);
+        let t0 = Instant::now();
+        t.observe(&obs("src/auth/a.rs", ToolKind::Edit, t0), 1.0, place(0));
+        t.observe(&obs("src/auth/b.rs", ToolKind::Edit, t0), 1.0, place(1));
+        let evidence_before = t.evidence.len();
+
+        let later = t0 + DORMANT_AFTER + Duration::from_secs(60);
+        t.observe(&root_shell(later), 1.0, place(0));
+
+        assert_eq!(
+            t.evidence.len(),
+            evidence_before,
+            "it says nothing about where, so it leaves no evidence"
+        );
+        assert_eq!(t.kernels.len(), 2, "nor a kernel in the empty middle");
+        assert_eq!(t.observations, 3, "it is still counted: the work happened");
+        assert_eq!(
+            t.quiet_for(),
+            Some(Duration::ZERO),
+            "and it says everything about whether: the thread is alive now"
+        );
+    }
+
+    /// The fallback that keeps every hand-built cloud fixture in this workspace
+    /// working. None of them call [`Territory::observe`], so `last_observation`
+    /// is `None` and the evidence's own newest stamp has to answer.
+    #[test]
+    fn a_hand_built_territory_still_answers_the_dormancy_question() {
+        let t0 = Instant::now();
+        let mut t = Territory::for_extent(1000.0);
+        t.evidence.push_back(Evidence {
+            path: lp("src/auth"),
+            weight: 1.0,
+            at: t0,
+        });
+        t.claim = Some(lp("src/auth"));
+        t.kernels.push(Kernel {
+            centre: Point::new(0.0, 0.0),
+            weight: 1.0,
+            radius: 10.0,
+            at: t0,
+        });
+        assert_eq!(t.quiet_for(), None, "no clock has run yet");
+
+        t.decay(t0);
+        t.decay(t0 + DORMANT_AFTER.saturating_sub(Duration::from_secs(1)));
+        assert!(
+            t.quiet_for().is_some_and(|q| q < DORMANT_AFTER),
+            "the evidence's own stamp answers"
+        );
+        assert!(t.claim.is_some(), "so the claim stands");
+    }
+
+    /// `Territory::rest` normalises the field's **peak**, because
+    /// `polis_render::live::CLOUD_ISO[0] = 0.55` thresholds the field and not the
+    /// mass. Expressed here without the render dependency: the number is the one
+    /// ADR-0020 fixes, and a spread field is where the two diverge.
+    #[test]
+    fn a_rested_field_reaches_the_fringe() {
+        /// `polis_render::live::CLOUD_ISO[0]`, in ADR-0020's units — one
+        /// full-weight kernel reads 1.0 at its own centre.
+        const FRINGE: f32 = 0.55;
+
+        let t0 = Instant::now();
+        let mut t = Territory::for_extent(1000.0);
+        // Two well-separated lobes, six observations each: PRD §6.4's shape, and
+        // the one whose mass is several times its peak.
+        for i in 0..6u32 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, t0),
+                1.0,
+                Some(Point::new(0.0, 0.0)),
+            );
+            t.observe(
+                &obs(&format!("tests/unit/f{i}.rs"), ToolKind::Edit, t0),
+                1.0,
+                Some(Point::new(900.0, 900.0)),
+            );
+        }
+        assert!(t.placement().is_somewhere(), "it has lobes to hold");
+
+        // Seven and a half minutes quiet. Inside [`DORMANT_AFTER`] — eight — so
+        // `rest` still acts, and long enough that PRD §6.3's half-life has taken
+        // the field under the floor, which is when `rest` has anything to do at
+        // all. The window between those two is narrow for a heavily evidenced
+        // territory, and normalising the peak rather than the mass is what
+        // widens it: a peak crosses the floor sooner than the mass it is a
+        // fraction of.
+        t.decay(t0 + Duration::from_secs(450));
+        let peak = t.field_peak();
+        let mass = t.mass();
+        assert!(
+            (peak - RESTING_WEIGHT).abs() < 1e-3,
+            "the peak is what is normalised: {peak}"
+        );
+        assert!(
+            peak >= FRINGE,
+            "or the cloud is computed, selected and never painted: {peak}"
+        );
+        assert!(
+            mass > peak * 1.5,
+            "and the mass is the number that used to be normalised — several \
+             times the peak on any spread field, which is why it was the wrong \
+             one: mass {mass}, peak {peak}"
+        );
+    }
+
+    /// The other end of the trade. Normalising the peak brightens a resting
+    /// field; it must not brighten it past a thread that is actually working, or
+    /// PRD §10.3's *"spend the rest on layers 4–5"* is inverted.
+    #[test]
+    fn a_resting_field_is_fainter_than_a_working_one() {
+        let t0 = Instant::now();
+        let mut t = Territory::for_extent(1000.0);
+        for i in 0..8 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, t0),
+                1.0,
+                place(i),
+            );
+        }
+        let working = t.field_peak();
+        t.decay(t0 + Duration::from_secs(450));
+        let resting = t.field_peak();
+        assert!(
+            resting < working,
+            "resting {resting} must be fainter than working {working}"
+        );
+        assert!(
+            (resting - RESTING_WEIGHT).abs() < 1e-3,
+            "and it must still clear the fringe: {resting}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2162,5 +2965,314 @@ mod tests {
         blank.territory = Territory::for_extent(1000.0);
         let pairs = [(&blank, &blank.territory)];
         assert!(visible_clouds(&pairs, 4).is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // The drawn anchor (PRD §6)
+    //
+    // > Computing a centroid of its workers is actively wrong: an orchestrator
+    // > with workers in `src/auth` and `tests/` gets a centroid in the empty gap
+    // > between them, which is the one place nothing is happening.
+    //
+    // This module has opened on that sentence since it was written, and
+    // `refresh_centre_of_mass` was a centroid the whole time. These are the
+    // tests that would have caught it the day the doc was written.
+    // ---------------------------------------------------------------------
+
+    #[allow(clippy::unnecessary_wraps)] // every call site passes an `Option<Point>`
+    fn spot(x: f32, y: f32) -> Option<Point> {
+        Some(Point::new(x, y))
+    }
+
+    #[allow(clippy::cast_precision_loss)] // small test indices
+    fn step(i: usize, gap: f32) -> f32 {
+        i as f32 * gap
+    }
+
+    /// PRD §6's opening paragraph, as an assertion.
+    #[test]
+    fn the_anchor_is_never_in_the_gap_between_two_lobes() {
+        let mut t = Territory::for_extent(1000.0);
+        let now = Instant::now();
+        // Six edits in `src/auth`, tightly clustered.
+        for i in 0..6 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, now),
+                1.0,
+                spot(step(i, 4.0), 0.0),
+            );
+        }
+        // Four in `tests/unit`, four hundred units away — well past any
+        // bandwidth this territory can reach for.
+        for i in 0..4 {
+            t.observe(
+                &obs(&format!("tests/unit/g{i}.rs"), ToolKind::Edit, now),
+                1.0,
+                spot(400.0 + step(i, 4.0), 0.0),
+            );
+        }
+
+        let com = t.centre_of_mass.expect("a field");
+        let anchor = t.anchor().expect("a field has an anchor");
+
+        assert!(
+            (100.0..300.0).contains(&com.x),
+            "the mean is in the gap, which is the defect: {com:?}"
+        );
+        assert!(
+            t.kernels.iter().any(|k| k.centre == anchor),
+            "the anchor is always a place something was observed: {anchor:?}"
+        );
+        assert!(
+            anchor.x < 100.0,
+            "and it is the heavier lobe, not the lighter one: {anchor:?}"
+        );
+
+        let peak = t.field_peak();
+        assert!(
+            t.density_at(anchor) >= 0.5 * peak,
+            "the ring sits where the field is, not merely on some kernel: {} of {peak}",
+            t.density_at(anchor)
+        );
+        assert!(
+            t.density_at(com) < 0.05 * peak,
+            "and the point it used to sit at carries {} of a {peak} field",
+            t.density_at(com)
+        );
+    }
+
+    /// The operator's report, reduced to its arithmetic: two sessions working in
+    /// entirely different places had their marks land on nearly the same point,
+    /// because a mean throws away everything except the first moment and two
+    /// different shapes can share one.
+    #[test]
+    fn two_threads_in_different_places_do_not_share_an_anchor() {
+        let now = Instant::now();
+        let build = |places: [(f32, f32); 2], dirs: [&str; 2]| {
+            let mut t = Territory::for_extent(1000.0);
+            for (n, (dir, at)) in dirs.iter().zip(places.iter()).enumerate() {
+                for i in 0..5 {
+                    t.observe(
+                        &obs(&format!("{dir}/f{n}{i}.rs"), ToolKind::Edit, now),
+                        1.0,
+                        spot(at.0 + step(i, 3.0), at.1),
+                    );
+                }
+            }
+            t
+        };
+        // One thread works east–west across the city, the other north–south.
+        // Nothing either touches is within 250 units of anything the other does.
+        let a = build([(0.0, 0.0), (400.0, 0.0)], ["src/services", "src/hooks"]);
+        let b = build(
+            [(200.0, -200.0), (200.0, 200.0)],
+            ["src/components", "src/pages"],
+        );
+
+        let means_apart = a
+            .centre_of_mass
+            .expect("a field")
+            .distance(b.centre_of_mass.expect("a field"));
+        let anchors_apart = a
+            .anchor()
+            .expect("a field")
+            .distance(b.anchor().expect("a field"));
+
+        assert!(
+            means_apart < 10.0,
+            "the two means land on top of each other — that is the report: {means_apart}"
+        );
+        assert!(
+            anchors_apart > 20.0 * means_apart.max(1.0),
+            "and the two anchors do not: {anchors_apart} against {means_apart}"
+        );
+    }
+
+    /// ADR-0029. Equal densities are the *common* case here — several
+    /// observations of the same building carry the same weight at the same
+    /// place — so the tie break has to be a total order and not `partial_cmp`.
+    #[test]
+    fn the_anchor_is_deterministic_under_ties() {
+        let now = Instant::now();
+        let build = || {
+            let mut t = Territory::for_extent(1000.0);
+            for (i, at) in [(0.0, 0.0), (300.0, 0.0), (0.0, 300.0)].iter().enumerate() {
+                t.observe(
+                    &obs(&format!("src/tie/f{i}.rs"), ToolKind::Edit, now),
+                    1.0,
+                    spot(at.0, at.1),
+                );
+            }
+            t
+        };
+        let first = build().anchor().expect("a field");
+        for _ in 0..8 {
+            assert_eq!(
+                build().anchor().expect("a field"),
+                first,
+                "three kernels of exactly equal density must resolve the same way every run"
+            );
+        }
+        // Lowest x, then lowest y — a rule, not an accident of iteration order.
+        assert_eq!(first, Point::new(0.0, 0.0));
+    }
+
+    /// The trap a stored anchor sets: a memo maintained only from `observe` is
+    /// `None` for every hand-built fixture in this workspace, because they all
+    /// push straight into the public `kernels`. `anchor()` would then quietly
+    /// fall back to the mean and every test written against it would pass while
+    /// proving nothing.
+    #[test]
+    fn a_hand_built_territory_still_answers_with_its_mode() {
+        let now = Instant::now();
+        let mut t = Territory::for_extent(1000.0);
+        for x in [0.0f32, 6.0, 12.0, 400.0] {
+            t.kernels.push(Kernel {
+                centre: Point::new(x, 0.0),
+                weight: 1.0,
+                radius: 40.0,
+                at: now,
+            });
+        }
+        t.centre_of_mass = Some(Point::new(104.5, 0.0));
+        assert_eq!(t.anchor_recomputes, 0, "nothing observed, nothing scanned");
+        let anchor = t
+            .anchor()
+            .expect("kernels pushed by hand still have a mode");
+        assert_eq!(
+            anchor,
+            Point::new(6.0, 0.0),
+            "the middle of the tight three, not the hand-set mean"
+        );
+        assert!(
+            t.field_peak() > 2.0,
+            "and the peak is computed on demand too: {}",
+            t.field_peak()
+        );
+    }
+
+    /// PRD §6.3, for the anchor. Two lobes whose densities cross by less than
+    /// [`ANCHOR_MARGIN`] must not swap the ring; a decisive overtake must.
+    #[test]
+    fn the_anchor_holds_through_a_near_tie() {
+        let now = Instant::now();
+        let mut t = Territory::for_extent(1000.0);
+        for i in 0..8 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, now),
+                1.0,
+                spot(step(i, 2.0), 0.0),
+            );
+        }
+        let held = t.anchor().expect("a field");
+        assert!(held.x < 20.0, "the first lobe has the ring: {held:?}");
+
+        // Nine of them somewhere else: heavier than nothing, and still inside
+        // the margin. The ring does not move.
+        for i in 0..9 {
+            t.observe(
+                &obs(&format!("tests/unit/g{i}.rs"), ToolKind::Edit, now),
+                1.0,
+                spot(500.0 + step(i, 2.0), 0.0),
+            );
+        }
+        assert_eq!(
+            t.anchor().expect("a field"),
+            held,
+            "a near tie is not sustained evidence — one read elsewhere moves nothing"
+        );
+        assert!(
+            t.density_at(held) >= t.field_peak() / ANCHOR_MARGIN,
+            "and the bound the margin buys still holds: {} against {}",
+            t.density_at(held),
+            t.field_peak()
+        );
+
+        // Decisively heavier. It moves, and it moves all the way.
+        for i in 9..40 {
+            t.observe(
+                &obs(&format!("tests/unit/g{i}.rs"), ToolKind::Edit, now),
+                1.0,
+                spot(500.0 + step(i, 2.0), 0.0),
+            );
+        }
+        let moved = t.anchor().expect("a field");
+        assert!(
+            moved.x > 400.0,
+            "a decisive overtake moves the ring: {moved:?}"
+        );
+    }
+
+    /// What keeps the O(k²) honest against PRD §13.1, and the reason
+    /// `refresh_anchor` takes no clock: a uniform rescale cannot move an argmax,
+    /// so a tick must not pay for a scan.
+    #[test]
+    fn the_anchor_scan_is_bounded_by_the_kernel_list_and_not_by_ticks() {
+        let mut t = Territory::for_extent(1000.0);
+        let mut at = Instant::now();
+        for i in 0..5_000u32 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, at),
+                1.0,
+                place(i % 32),
+            );
+            at += Duration::from_millis(2);
+        }
+        assert!(
+            t.anchor_recomputes <= t.observations,
+            "one scan per observation that lands on ground, and never more: {} for {}",
+            t.anchor_recomputes,
+            t.observations
+        );
+
+        // A thousand ticks that only decay. Nothing crosses MIN_KERNEL_WEIGHT
+        // over one second, so no kernel leaves the list and no scan is due.
+        let scans = t.anchor_recomputes;
+        let held = t.anchor().expect("a field");
+        let peak_before = t.field_peak();
+        for _ in 0..1_000 {
+            at += Duration::from_millis(1);
+            t.decay(at);
+        }
+        assert_eq!(
+            t.anchor_recomputes, scans,
+            "a tick that only decays cannot move the anchor, so it must not scan for one"
+        );
+        assert_eq!(t.anchor().expect("a field"), held, "and it did not move");
+        assert!(
+            t.field_peak() < peak_before && t.field_peak() > peak_before * 0.9,
+            "the peak still followed the decay down: {peak_before} -> {}",
+            t.field_peak()
+        );
+    }
+
+    /// `field_peak` is the peak of the *kernel field*, so it has to track the
+    /// two uniform rescales `decay` applies — the half-life factor and
+    /// `Territory::rest`'s lift — without a rescan, or `rest` would read a
+    /// stale number on every tick.
+    #[test]
+    fn the_memoised_peak_agrees_with_a_fresh_scan_after_decay_and_rest() {
+        let t0 = Instant::now();
+        let mut t = Territory::for_extent(1000.0);
+        for i in 0..8 {
+            t.observe(
+                &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, t0),
+                1.0,
+                place(i),
+            );
+        }
+        for n in 1..=12u32 {
+            t.decay(t0 + DECAY_HALF_LIFE * n);
+            let fresh = t
+                .kernels
+                .iter()
+                .map(|k| t.density_at(k.centre))
+                .fold(0.0f32, f32::max);
+            let memo = t.field_peak();
+            assert!(
+                (memo - fresh).abs() <= fresh.abs().mul_add(1e-3, 1e-6),
+                "half-life {n}: memo {memo}, fresh {fresh}"
+            );
+        }
     }
 }

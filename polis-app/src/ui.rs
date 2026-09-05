@@ -33,6 +33,7 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, RichText};
 use polis_events::{LogicalPath, ThreadId};
 use polis_render::camera::ZoomTier;
+use polis_render::live::CloudCensus;
 use polis_world::attention::AttentionKind;
 use polis_world::replay::{Interest, ReplayProgress};
 use polis_world::snapshot::WorldSnapshot;
@@ -161,8 +162,12 @@ pub struct Vitals {
     pub labels: (usize, usize),
     /// Buildings drawn as vectors.
     pub buildings: usize,
-    /// Clouds shown and kernels splatted.
-    pub clouds: (usize, usize),
+    /// What the cloud layer drew, and what it withheld.
+    ///
+    /// The whole struct rather than `(shown, kernels)`, because the pair could
+    /// only ever say `0 clouds (0 kernels)` and the operator's question is the
+    /// next one.
+    pub clouds: CloudCensus,
     /// Cold start, process to first frame.
     pub cold_start_ms: f64,
 }
@@ -301,6 +306,49 @@ pub fn status_bar(ui: &mut egui::Ui, snapshot: &WorldSnapshot, vitals: Vitals) -
                 );
         }
 
+        // Beside `off-repo paths` because it is the same kind of admission —
+        // evidence the map received and did not use — and because the two of
+        // them together are the whole answer to *"why has this thread no
+        // cloud"*. A shell call's only path signal is its `cwd`, and a `cwd` at
+        // the checkout root is the absorbing element of PRD §6.2's ancestor, so
+        // it is counted and then dropped. Without this line the drop is
+        // invisible: the operation still draws its mark and still counts in the
+        // thread's own total, so more than half the evidence stream can go
+        // nowhere with nothing on any surface saying so.
+        if health.root_scoped_observations > 0 {
+            ui.label(dim(format!(
+                "root-scoped {}",
+                health.root_scoped_observations
+            )))
+            .on_hover_text(
+                "Observations whose only path was the checkout root — mostly \
+                 shell calls run from the top of the tree. The whole city is not \
+                 a location (PRD §6.2), so they feed no territory and drop no \
+                 kernel. A session that is nearly all root-scoped will not \
+                 converge, and will have no cloud.",
+            );
+        }
+
+        // The one counter here that is about the notation rather than the
+        // channels, and it is here for the same reason the others are: the
+        // operator's report was *"the same color is super bad"*, and past twelve
+        // threads two rows share a hue again. Without this line that is a
+        // regression the operator has to re-report; with it, it is a reading.
+        if health.identity_hues_exhausted > 0 {
+            ui.label(dim(format!(
+                "shared hues {}",
+                health.identity_hues_exhausted
+            )))
+            .on_hover_text(
+                "There are twelve identity hues (PRD §11.4) and this world has \
+                 seen more than twelve threads, so this many of them fell back \
+                 to a colour some thread has already held. A slot is never \
+                 recycled, so the twelve may include threads long since retired \
+                 — the rows on screen right now can still all be distinct. The \
+                 rail's name is what tells them apart until Polis is restarted.",
+            );
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let over = vitals.frame_p99 > 16.6;
             ui.label(
@@ -317,14 +365,28 @@ pub fn status_bar(ui: &mut egui::Ui, snapshot: &WorldSnapshot, vitals: Vitals) -
             )
             .on_hover_text("median / p99 over the last 240 frames. PRD §13.1 budget: 16.6 ms.");
             ui.label(dim(format!("cold start {:.0} ms", vitals.cold_start_ms)));
+            // `CloudCensus::reason` and not `{shown} clouds`. The bar used to
+            // read `0 clouds (0 kernels)`, which states the symptom twice and
+            // the cause not at all; `0 CLOUDS · 4 UNCONVERGED` names the gate
+            // that fired, in `polis_world::territory::select_clouds`'s own
+            // vocabulary, and `6 CLOUDS · 0.8 PX: ZOOM IN` names the one gate
+            // that is not in `polis-world` at all.
+            let clouds = if vitals.clouds.withheld() || vitals.clouds.sub_pixel() {
+                vitals.clouds.reason()
+            } else {
+                format!("{} clouds", vitals.clouds.shown)
+            };
             ui.label(dim(format!(
-                "labels {}+{} dropped · {} buildings · {} clouds ({} kernels)",
-                vitals.labels.0,
-                vitals.labels.1,
-                vitals.buildings,
-                vitals.clouds.0,
-                vitals.clouds.1
-            )));
+                "labels {}+{} dropped · {} buildings · {clouds} · {} kernels",
+                vitals.labels.0, vitals.labels.1, vitals.buildings, vitals.clouds.kernels,
+            )))
+            .on_hover_text(
+                "Every thread lands in exactly one bucket, so the counts sum to the rail's row \
+                 count. UNCONVERGED: PRD §6.2's evidence does not agree yet, or it agrees about \
+                 ground this city has no geometry for. DORMANT: quiet past PRD §10.4's window. \
+                 OVER CAP: ranked out by the cloud cap. ZOOM IN: the clouds were drawn and are \
+                 narrower than a stroke at this camera — the one reason that is not the world's.",
+            );
         });
     });
     open_attention
@@ -416,6 +478,16 @@ fn place_of(ui: &mut egui::Ui, thread: &polis_world::Thread) {
         }
         Placement::Nowhere => {
             // PRD §6.2 asks for the reason, not just the absence.
+            //
+            // Three counts, not one. `Convergence::observations` is
+            // `evidence.len()` — the *live, undecayed-out, non-root* window that
+            // PRD §6.2's gates actually run over — and printing it alone said
+            // "No territory yet: 0 observations" about a thread that had made
+            // 417 tool calls, which reads as a broken ingest rather than as a
+            // thread whose evidence has decayed. `Territory::observations` is
+            // the undecayed total the operator recognises, and the gap between
+            // the two is the answer: a large total with an empty window is a
+            // thread whose work says nothing about where.
             let c = thread.territory.convergence();
             ui.label(
                 RichText::new("unplaced")
@@ -423,10 +495,14 @@ fn place_of(ui: &mut egui::Ui, thread: &polis_world::Thread) {
                     .color(palette::needs_decision().color()),
             )
             .on_hover_text(format!(
-                "No territory yet: {} observations, ancestor depth {}, mass ratio {:.2}, and no \
-                 cluster heavy enough to be a lobe. PRD §6.2 emits at depth ≥ 2 and mass > 0.70; \
-                 PRD §6.4's lobes need {:.0}% of the weight in one place.",
-                c.observations,
+                "No territory yet. {} tool calls seen in all, of which {} are still live \
+                 evidence; PRD §6.3 decays the rest with a 90 s half-life, and a shell call at \
+                 the checkout root never becomes evidence at all. Of that live window: ancestor \
+                 depth {}, mass ratio {:.2}, and no cluster heavy enough to be a lobe. PRD §6.2 \
+                 emits at depth ≥ 2 and mass > 0.70; PRD §6.4's lobes need {:.0}% of the weight \
+                 in one place.",
+                thread.territory.observations,
+                thread.territory.evidence.len(),
                 c.depth,
                 c.mass_ratio,
                 polis_world::territory::MIN_LOBE_MASS * 100.0,
@@ -484,7 +560,7 @@ pub fn status_rail(
             continue;
         }
         let ink = palette::status(thread.status);
-        let tint = palette::thread_slot(&thread.id);
+        let tint = thread.tint;
         let following = state.follow.as_ref() == Some(&thread.id);
         let emphasised = state.emphasises(&thread.id);
         let head = ui.horizontal(|ui| {

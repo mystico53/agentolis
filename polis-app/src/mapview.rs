@@ -625,7 +625,9 @@ fn draw_agents(
     };
 
     for thread in &snapshot.threads {
-        let tint = palette::thread_slot(&thread.id);
+        // Assigned once by the world (PRD §11.4); never re-derived here, so
+        // the map and a recorded frame read one answer.
+        let tint = thread.tint;
         // Emphasis is **weight**, never a different colour: a highlighted
         // thread has to stay the colour the rail says it is, or the one thing
         // the swatch promises stops being true at exactly the moment the
@@ -711,9 +713,14 @@ fn draw_agents(
         // question about one thread, so it is drawn only for the thread the
         // operator is pointing at, has selected or is following.
         // `polis_render::live::draw_tether` carries the measurement.
-        let anchor = thread
-            .territory
-            .centre_of_mass
+        // One ladder, walked from one place. `polis_render::frame::thread_anchor`
+        // has always gone through `place::thread_position`; the window read
+        // `centre_of_mass` and stopped, so a thread with a trail and no kernels
+        // got a ring in a recorded GIF and none in the window — the same frame,
+        // two answers. `WorldSnapshot::layout` is the `CityLayout` that makes
+        // the shared ladder callable here, and `base.to_map` is the only thing
+        // this side adds.
+        let anchor = polis_world::place::thread_position(thread, &snapshot.layout)
             .map(|p| camera.to_screen(base.to_map(p)));
         let tethered = state.interrogates(&thread.id);
         // The renderer's rank, so the window and a recorded frame stop at the
@@ -757,7 +764,8 @@ fn draw_agents(
             consider(at, r + 4.0, &thread.id);
         }
 
-        // The thread's own mark, at its territory's centre of mass.
+        // The thread's own mark, at its territory's anchor — the kernel centre
+        // its density field is highest at, never the mean of two lobes.
         if let Some(anchor) = anchor {
             // Two rings, two channels. The outer one is the thread's identity
             // and never changes; the inner dot is `status`, which does. Before
@@ -1187,10 +1195,18 @@ pub fn mark_position(
         }
     }
     let thread = snapshot.thread(thread)?;
-    if let Some(centre) = thread.territory.centre_of_mass {
+    // The anchor, with the mean behind it. Only the *first* rung changes here:
+    // the ladder below is load-bearing and is not being replaced, and
+    // `centre_of_mass` is kept as the immediate fallback so a territory built by
+    // hand — kernels never pushed through `observe` — answers exactly as it did.
+    if let Some(centre) = thread
+        .territory
+        .anchor()
+        .or(thread.territory.centre_of_mass)
+    {
         return Some(base.to_map(centre));
     }
-    // PRD §6.4's lobes, and §6.2's claim. Reading `centre_of_mass` alone and
+    // PRD §6.4's lobes, and §6.2's claim. Reading the field's summary alone and
     // stopping was the window's half of the same bug the rail had: a caller
     // that tests one shape of a placed territory has quietly decided the other
     // shape is unplaced, which is how a thread with 483 calls came to have
@@ -1391,7 +1407,16 @@ fn draw_labels(
     //    they are anchors, and an anchor that arrives late has to shove an
     //    already-placed label aside to take its place.
     for thread in snapshot.waiting() {
-        let Some(centre) = thread.territory.centre_of_mass else {
+        // Substituted, not extended: `anchor()` is `Some` exactly when there are
+        // kernels and `centre_of_mass` is `Some` exactly when they carry weight,
+        // so the same set of waiting threads gets a name as before. What changes
+        // is where the name goes — over the work rather than over the gap
+        // between two lobes, which is where a name is least readable.
+        let Some(centre) = thread
+            .territory
+            .anchor()
+            .or(thread.territory.centre_of_mass)
+        else {
             continue;
         };
         label(

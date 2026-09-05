@@ -127,7 +127,9 @@ impl WorldSnapshot {
     }
 
     /// Threads with a converged territory, paired with it, ready for
-    /// [`crate::territory::visible_clouds`].
+    /// [`crate::territory::select_clouds`] — which is what both renderers call,
+    /// because the counts it returns for the threads it *withholds* are what
+    /// lets an empty sky say why.
     pub fn territories(&self) -> Vec<(&Thread, &crate::territory::Territory)> {
         self.threads.iter().map(|t| (t, &t.territory)).collect()
     }

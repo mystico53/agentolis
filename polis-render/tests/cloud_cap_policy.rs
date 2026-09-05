@@ -22,6 +22,22 @@
 //! ```text
 //! cargo test -p polis-render --release --test cloud_cap_policy -- --ignored --nocapture
 //! ```
+//!
+//! # It tunes the cap **at the fleet's busiest moment**, deliberately
+//!
+//! [`build_fleet`] aligns every session on its own `pacing::plan` peak and
+//! measures there, and its own doc says why: a fleet sampled anywhere else is
+//! mostly dead air and the cap has nothing to decide. That is right for tuning a
+//! *cap* — a cap only ever binds when many territories are live at once — and it
+//! is worth saying out loud that it is therefore a measurement of the best case
+//! and not of a typical minute. On a fixed session-time grid the same replays put
+//! a cloud on the map 62 % of the time against 94 % under event-weighted
+//! sampling, and nothing in this file would notice the difference.
+//!
+//! So a green run here says *the cap is set at the right crossover when the
+//! crossover happens*. It does not say the map has five clouds on it most of the
+//! time. See `cloud_measure.rs`'s header for the same caveat on the other
+//! harness.
 
 // A measurement harness: counts, ratios, and one linear script per measurement.
 #![allow(
