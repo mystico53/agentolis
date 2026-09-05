@@ -408,6 +408,92 @@ fn an_unattributable_worker_does_not_stay_for_ever() {
     assert_eq!(world.health.unattributed_workers, 0);
 }
 
+#[test]
+fn a_journal_read_out_of_a_session_directory_needs_no_parent_workflow_call() {
+    // The operator's report: twelve rows of "workflow run has no parent
+    // `Workflow` call yet", for a fleet whose parent call was sitting in the
+    // transcript the whole time. Live tailing opens an existing file at its end
+    // (`ProjectsTailer` via `start_discovering`), so a Polis started after the
+    // `Workflow` call never reads the one record carrying the run id — and
+    // route 3 is the only link 503 of 643 subagents have, so every agent of
+    // that run parked for ever.
+    //
+    // The evidence was never actually missing. The journal is read out of
+    // `<project>/<session-id>/subagents/workflows/wf_<run>/`, so the owning
+    // session is a parent directory of the file, and `polis_ingest` now says so
+    // on the envelope. No `workflow_result` is applied anywhere in this test.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    world.apply(&edit_event("a", "src/auth/token.rs", t0));
+    // A second thread exists, so "the only thread there is" cannot be the
+    // reason the worker lands where it does.
+    world.apply(&edit_event("b", "src/render/frame.rs", t0));
+
+    world.apply(&journal_event_in_session(
+        "wf-run-3",
+        "agent-in-a",
+        "a",
+        t0 + Duration::from_secs(1),
+    ));
+
+    assert!(
+        world.unattributed.is_empty(),
+        "the session directory is a parent link, so nothing is parked"
+    );
+    let a = world
+        .thread(&ThreadId::of_session(SessionId::new("a")))
+        .expect("thread a");
+    let placed = a
+        .worker(&WorkerId::new("agent-in-a"))
+        .expect("the journal's own directory places it");
+    assert_eq!(
+        placed.attribution,
+        WorkerAttribution::TranscriptFile,
+        "the file's path, not a record field — reliable in practice, weaker in \
+         principle, and `strength` must keep it from overwriting a real match"
+    );
+    assert_eq!(placed.workflow_run.as_deref(), Some("wf-run-3"));
+    let b = world
+        .thread(&ThreadId::of_session(SessionId::new("b")))
+        .expect("thread b");
+    assert!(
+        b.worker(&WorkerId::new("agent-in-a")).is_none(),
+        "the other thread must not collect it"
+    );
+    assert_eq!(world.health.unattributed_workers, 0);
+}
+
+#[test]
+fn a_session_that_is_not_in_the_world_does_not_invent_a_thread() {
+    // The fallback reads a session id off a path, and a path is not proof that
+    // the session exists. Placing a worker under a thread the world has never
+    // seen would be the guess PRD §5 forbids, so the rung is gated on the
+    // thread already being there and the worker parks instead.
+    let mut world = city_world();
+    let t0 = Instant::now();
+    world.apply(&journal_event_in_session(
+        "wf-run-4",
+        "agent-nowhere",
+        "never-seen",
+        t0,
+    ));
+    assert_eq!(world.unattributed.len(), 1);
+    assert!(
+        world
+            .thread(&ThreadId::of_session(SessionId::new("never-seen")))
+            .is_none(),
+        "no thread is conjured out of a directory name"
+    );
+}
+
+/// A journal line as `polis_ingest` now delivers it: the record still names only
+/// the worker and the run, and the session comes off the file's own path.
+fn journal_event_in_session(run: &str, worker: &str, session: &str, at: Instant) -> Event {
+    let mut event = journal_event(run, worker, at);
+    event.meta = event.meta.with_session(SessionId::new(session));
+    event
+}
+
 /// A `journal.jsonl` `started` line — a worker named by a run, and nothing else.
 fn journal_event(run: &str, worker: &str, at: Instant) -> Event {
     let mut meta = EventMeta::now(Channel::Transcript);

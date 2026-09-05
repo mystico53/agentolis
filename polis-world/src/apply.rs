@@ -573,7 +573,7 @@ pub(crate) fn transcript(world: &mut World, meta: &EventMeta, event: &Transcript
             attachment(world, &thread_id, worker.as_ref(), &record, at);
         }
         TranscriptRecordKind::Started | TranscriptRecordKind::Result => {
-            journal(world, event, at);
+            journal(world, meta, event, at);
         }
         TranscriptRecordKind::System => world.health.events_ignored += 1,
         TranscriptRecordKind::Unknown => {
@@ -1102,7 +1102,7 @@ fn sidecar(
 
 /// Applies a `journal.jsonl` line — the cheapest liveness signal a workflow
 /// fleet has.
-fn journal(world: &mut World, event: &TranscriptEvent, at: Instant) {
+fn journal(world: &mut World, meta: &EventMeta, event: &TranscriptEvent, at: Instant) {
     let TranscriptSource::WorkflowJournal { run } = &event.source else {
         world.health.events_ignored += 1;
         return;
@@ -1112,25 +1112,54 @@ fn journal(world: &mut World, event: &TranscriptEvent, at: Instant) {
         return;
     };
     let worker = WorkerId::new(agent);
-    // The run table first, then the worker's own transcript. The journal is read
-    // last — it has no timestamps to sort by — so by the time it arrives the
-    // subagent's file has usually already placed it.
-    let Some(thread) = world
+    // Three rungs, strongest first. The run table is the parent `Workflow`
+    // call's own word. The worker's own transcript is the subagent's, and it
+    // usually wins the race: the journal is read last, because it has no
+    // timestamps to sort by, so by the time it arrives the subagent's file has
+    // normally already placed it.
+    //
+    // Rung 3 is the journal file's own directory. `polis_ingest` fills
+    // `meta.session` from the path when the record does not name one, and a
+    // journal record never does — so for a workflow agent this is the session
+    // whose `subagents/workflows/wf_<run>/` the line was read out of.
+    //
+    // It is last because it is the weakest of the three: the run table is the
+    // parent `Workflow` call's own word, and the worker's transcript is the
+    // subagent's. But it is the only rung that survives the common failure —
+    // live tailing opens an existing file at its end, so a Polis started after
+    // the `Workflow` call never reads the one record that carries the run id,
+    // and before this every agent of that run parked for ever on evidence that
+    // was still sitting in the directory name. Attribution is
+    // `WorkerAttribution::TranscriptFile`, which is exactly what it is: the
+    // file's path rather than a record field, reliable in practice and weaker
+    // in principle, and `strength` keeps it from overwriting a real match.
+    let placed = world
         .workflow_runs
         .get(run)
         .cloned()
-        .or_else(|| thread_of_worker(world, &worker))
-    else {
-        // The parent `Workflow` call has not been seen and no transcript has
-        // placed the worker. It is real and its thread is not knowable yet, so
-        // it is parked rather than guessed — and adopted later, by run id, once
-        // the parent call turns up.
+        .map(|t| (t, WorkerAttribution::WorkflowRun))
+        .or_else(|| thread_of_worker(world, &worker).map(|t| (t, WorkerAttribution::RecordAgentId)))
+        .or_else(|| {
+            meta.session
+                .as_ref()
+                .map(|s| ThreadId::of_session(s.clone()))
+                .filter(|t| world.threads.contains_key(t))
+                .map(|t| (t, WorkerAttribution::TranscriptFile))
+        });
+    let Some((thread, how)) = placed else {
+        // All three rungs missed: no parent `Workflow` call, no transcript for
+        // the worker, and no session on the record — which now means the
+        // journal was read from somewhere other than a session directory, since
+        // `polis_ingest::transcript::attribute_to_file` fills the session in
+        // from the path for every line that came out of one. It is real and its
+        // thread is not knowable, so it is parked rather than guessed, and
+        // adopted later by run id if the parent call ever turns up.
         park_unattributed(
             world,
             &worker,
             Some(AgentType::new("workflow-subagent")),
             at,
-            "workflow run has no parent `Workflow` call yet",
+            "workflow run has no parent `Workflow` call and no session on the record",
             Some(run),
         );
         return;
@@ -1141,7 +1170,7 @@ fn journal(world: &mut World, event: &TranscriptEvent, at: Instant) {
         &worker,
         Some(AgentType::new("workflow-subagent")),
         at,
-        WorkerAttribution::WorkflowRun,
+        how,
     );
     let finished = event.kind == TranscriptRecordKind::Result;
     if let Some(w) = world

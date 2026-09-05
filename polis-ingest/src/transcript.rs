@@ -902,6 +902,36 @@ fn meta_for(record: &Record, source: &TranscriptSource) -> EventMeta {
     meta
 }
 
+/// Says whose session a record belongs to when the record itself does not.
+///
+/// A `journal.jsonl` line is `{"type","key","agentId"}` and nothing else — no
+/// `sessionId`, no `toolUseId`, no `parentAgentId` — so [`meta_for`] leaves
+/// [`EventMeta::session`] empty for every one of them. The file's own directory
+/// is the only remaining statement of whose run it is, and it is a true one:
+/// `session_files` reads the journal out of
+/// `<project>/<session-id>/subagents/workflows/wf_<run>/`, so the owning session
+/// is a parent directory of the path the line was read from.
+///
+/// This is the same fallback [`meta_for`] already applies to the *worker* id one
+/// field above — *the file's own path is the fallback* — extended to the session
+/// for the one record type that carries neither.
+///
+/// It matters because it is the difference between a workflow fleet that is
+/// attributed and one that is not. Route 3 (the `wf_<runId>` directory matched
+/// against the parent `Workflow` call) is the only link 503 of 643 subagent
+/// transcripts have, and that parent call is a single record in the main
+/// transcript: live tailing opens existing files at their end
+/// ([`ProjectsTailer`] via `start_discovering`), so a Polis started after the
+/// `Workflow` call will never read it, and every agent of that run parks
+/// unattributed for ever with no second chance. The directory is still there.
+///
+/// Never an override: a record that named its own session keeps it.
+fn attribute_to_file(event: &mut Event, file: &TranscriptFile) {
+    if event.meta.session.is_none() {
+        event.meta.session = Some(file.session.clone());
+    }
+}
+
 /// Parses one JSONL line into a bus event and its display timestamp.
 ///
 /// `byte_offset` is the record's order (ADR-0014); the record's own `timestamp`
@@ -1796,7 +1826,7 @@ impl FileTail {
         let mut emitted = 0usize;
         for (offset, line) in lines_with_offsets(complete) {
             let text = String::from_utf8_lossy(line);
-            emitted += ctx.emit(&text, &self.file.source, base + offset, out);
+            emitted += ctx.emit(&text, &self.file, base + offset, out);
         }
         self.file.consumed = base + last_newline as u64 + 1;
         Ok(emitted)
@@ -1923,15 +1953,16 @@ impl EmitCtx<'_> {
     fn emit(
         &mut self,
         line: &str,
-        source: &TranscriptSource,
+        file: &TranscriptFile,
         offset: u64,
         out: &mut Vec<Event>,
     ) -> usize {
         let before = self.stats.unknown_types_seen.len();
-        let Some((mut event, wall)) = transcript_line_parts(line, source, offset, self.stats)
+        let Some((mut event, wall)) = transcript_line_parts(line, &file.source, offset, self.stats)
         else {
             return 0;
         };
+        attribute_to_file(&mut event, file);
         // History reads as history: see [`Aging`]. The record's own `timestamp`
         // is still verbatim inside the payload for anything that wants it.
         event.meta.observed = self.age.stamp(wall, event.meta.observed);
@@ -2304,8 +2335,11 @@ fn read_files(files: Vec<TranscriptFile>, mapper: &PathMapper) -> io::Result<Rep
         };
         for (offset, line) in lines_with_offsets(&bytes) {
             let text = String::from_utf8_lossy(line);
-            if let Some(parts) = transcript_line_parts(&text, &file.source, offset, &mut stats) {
-                parsed.push(parts);
+            if let Some((mut event, wall)) =
+                transcript_line_parts(&text, &file.source, offset, &mut stats)
+            {
+                attribute_to_file(&mut event, file);
+                parsed.push((event, wall));
             }
         }
     }
@@ -3239,6 +3273,80 @@ mod tests {
             TranscriptSource::WorkflowJournal {
                 run: "run_2026".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn a_journal_line_carries_the_session_of_the_directory_it_was_read_from() {
+        // A journal record is `{type, key, agentId}` — no `sessionId`, so
+        // `meta_for` leaves the session empty and the world has nothing to
+        // attribute the agent to but the parent `Workflow` call, which live
+        // tailing has usually already skipped past. The path still knows.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let sid = "sess";
+        write(&project.join("sess.jsonl"), "{\"type\":\"mode\"}\n");
+        let line = "{\"type\":\"started\",\"key\":\"v2:aa\",\"agentId\":\"a1234\"}\n";
+        write(
+            &project
+                .join(sid)
+                .join("subagents")
+                .join("workflows")
+                .join("wf_run_2026")
+                .join("journal.jsonl"),
+            line,
+        );
+        let files = session_files(&project.join(sid)).unwrap();
+        let journal = files
+            .iter()
+            .find(|f| matches!(f.source, TranscriptSource::WorkflowJournal { .. }))
+            .expect("the journal");
+
+        let mut stats = ParseStats::default();
+        let (mut event, _) =
+            transcript_line_parts(line.trim_end(), &journal.source, 0, &mut stats).expect("parsed");
+        assert!(
+            event.meta.session.is_none(),
+            "the record itself names no session — that is the whole problem"
+        );
+        attribute_to_file(&mut event, journal);
+        assert_eq!(
+            event.meta.session,
+            Some(SessionId::new(sid)),
+            "so the directory it was read out of says it instead"
+        );
+    }
+
+    #[test]
+    fn a_record_that_names_its_own_session_is_never_overridden_by_the_path() {
+        // The fallback is a fallback. A subagent transcript carries the parent's
+        // `sessionId`, and that is a stronger statement than the directory —
+        // for a worktree or a moved sidecar the two can disagree.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        write(&project.join("outer.jsonl"), "{\"type\":\"mode\"}\n");
+        let line = "{\"type\":\"assistant\",\"sessionId\":\"inner\",\"message\":{\"content\":[]}}";
+        write(
+            &project
+                .join("outer")
+                .join("subagents")
+                .join("agent-a1234.jsonl"),
+            "{\"type\":\"mode\"}\n",
+        );
+        let files = session_files(&project.join("outer")).unwrap();
+        let sub = files
+            .iter()
+            .find(|f| matches!(f.source, TranscriptSource::Subagent { .. }))
+            .expect("the subagent file");
+
+        let mut stats = ParseStats::default();
+        let (mut event, _) =
+            transcript_line_parts(line, &sub.source, 0, &mut stats).expect("parsed");
+        attribute_to_file(&mut event, sub);
+        assert_eq!(
+            event.meta.session,
+            Some(SessionId::new("inner")),
+            "the record's own word wins"
         );
     }
 

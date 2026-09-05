@@ -381,6 +381,29 @@ Workflow subagents (503 of 643) have neither `toolUseId` nor `parentAgentId`;
 they link structurally via `wf_<runId>` matched against the parent `Workflow`
 call's `toolUseResult.runId` (40/40 on disk, 0 orphans either way).
 
+**Amended: "0 orphans either way" is a statement about reading a session from
+disk, and it does not survive live tailing.** The run id is matched against a
+*single record* in the main transcript, and `start_discovering` follows existing
+files from their end — so a Polis started after the `Workflow` call never reads
+the record the whole route depends on, and every agent of that run parks
+unattributed for ever, with no second chance: nothing re-reads the parent.
+Observed on a live fleet as twelve rows of *"workflow run has no parent
+`Workflow` call yet"* whose parent call was in the transcript the entire time.
+Route 3 is also the one route with no fallback — an `Agent` spawn is recoverable
+because the subagent's own transcript carries the parent's `sessionId`, and a
+journal record carries no `sessionId` at all.
+
+So there is a fourth rung, and it needs no record: the journal is read out of
+`<munged-cwd>/<session-id>/subagents/workflows/wf_<runId>/`, so the **owning
+session is a parent directory of the file**.
+`polis_ingest::transcript::attribute_to_file` puts it on the envelope whenever
+the record itself names no session, and `polis_world::apply::journal` takes it
+after the run table and the worker's own transcript have both missed. It is
+attributed `WorkerAttribution::TranscriptFile` — the path rather than a record
+field — so `strength` keeps it from ever overwriting a real match, and it is
+gated on the thread already existing, because a directory name is not proof that
+a session does.
+
 **Consequences.** A parser that assumes every line has a `uuid` breaks on a
 quarter of the corpus. A parser that follows `parentUuid` alone renders a
 compacted session as two unrelated trees. A parser that assumes a root exists
