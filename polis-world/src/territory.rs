@@ -308,6 +308,45 @@ pub const DRIFT_MIN_RECENT: f32 = 2.0;
 /// it.
 pub const ANCHOR_MARGIN: f32 = 1.25;
 
+/// Relaxation time constant for the point the map draws the ring at.
+///
+/// # Why a glide and not more hysteresis
+///
+/// [`ANCHOR_MARGIN`] stops the *target* thrashing between two lobes of nearly
+/// equal density. It cannot stop the target moving when the field genuinely
+/// changes, and when it does move it moves in one frame — the ring teleports.
+/// Measured by replaying sessions `4bbcee1c` and `4bed007c` through this world
+/// and sampling once per second of session time, the anchor was **stationary on
+/// 134 of 148 and on 351 of 373 samples** and then stepped the whole way at
+/// once. Both halves of that are wrong: a map that is frozen 90 % of the time
+/// and teleports the rest is not showing a thread moving, it is showing a thread
+/// blinking between two places.
+///
+/// The answer is not to damp the argmax harder — that is the same state machine
+/// with a longer fuse. It is to stop drawing the argmax. The mode stays the
+/// *target*, with all of [`ANCHOR_MARGIN`]'s reasoning intact, and the drawn
+/// point relaxes toward it. A near-tie flip then costs a slow glide rather than
+/// a jump, and a real relocation reads as the thread travelling.
+///
+/// # Eight seconds, because a session is not eight seconds
+///
+/// A session runs ten minutes and up, so the ring can afford to take the better
+/// part of a minute to arrive: 63 % of the way at one time constant, 95 % at
+/// three. On any one glance that is a few seconds of drift, which is the point.
+///
+/// # This is exponential on purpose, and that is a determinism property
+///
+/// `refresh_anchor`'s docs reject a wall-clock throttle because a state machine
+/// over a *sequence of comparisons* settles differently under the window's 2 Hz
+/// tick and the headless renderer's one-tick-per-schedule (PRD §7.4, ADR-0029).
+/// An exponential relaxation has no such hazard: `exp(-a/τ)·exp(-b/τ)` is
+/// exactly `exp(-(a+b)/τ)`, so relaxing once over `dt` and relaxing twice over
+/// `dt/2` reach the same point to float precision. Composing under subdivision
+/// is the whole reason this is a decay and not a linear step, and
+/// `the_drawn_anchor_glides_the_same_way_however_finely_it_is_ticked` asserts
+/// it.
+pub const ANCHOR_GLIDE: Duration = Duration::from_secs(8);
+
 /// Weight below which a kernel stops contributing and is dropped.
 const MIN_KERNEL_WEIGHT: f32 = 0.01;
 
@@ -411,6 +450,14 @@ pub struct Territory {
     /// mutation that leaves the length alone, and nothing outside this module
     /// does one.
     anchor_kernels: usize,
+    /// Where the map actually draws the ring, gliding toward
+    /// [`Territory::anchor`] rather than snapping to it.
+    ///
+    /// See [`ANCHOR_GLIDE`]. `None` until the first [`Territory::decay`] after
+    /// the territory has an anchor at all, at which point it *snaps* — a thread
+    /// appearing for the first time should not sail in from wherever the last
+    /// one was.
+    drawn_anchor: Option<Point>,
     /// Trace of the recent-work offset from the centre of mass, subsampled at
     /// [`DRIFT_SAMPLE_INTERVAL`] and windowed to [`DRIFT_WINDOW`]. Feeds
     /// [`Drift::coherence`] and nothing else.
@@ -630,6 +677,54 @@ impl Territory {
         } else {
             self.refresh_centre_of_mass(now);
         }
+        // Last, so it eases toward whatever the rest of this tick settled on —
+        // including `None`, above, which takes the ring off the map rather than
+        // gliding it to nowhere.
+        self.glide_anchor(dt);
+    }
+
+    /// Eases [`Territory::drawn_anchor`] toward [`Territory::anchor`] over
+    /// [`ANCHOR_GLIDE`].
+    ///
+    /// Snaps on the first frame the territory has an anchor at all, and drops
+    /// the drawn point the moment the target does: a ring that outlived its
+    /// territory would be the rail and the map disagreeing, which is the failure
+    /// the collapse branch above exists to avoid.
+    fn glide_anchor(&mut self, dt: Duration) {
+        let Some(target) = self.anchor() else {
+            self.drawn_anchor = None;
+            return;
+        };
+        let Some(drawn) = self.drawn_anchor else {
+            self.drawn_anchor = Some(target);
+            return;
+        };
+        // `1 - exp(-dt/τ)`, which composes exactly under subdivision — see
+        // [`ANCHOR_GLIDE`] for why that is the load-bearing property and not an
+        // implementation detail.
+        let t = 1.0 - (-dt.as_secs_f32() / ANCHOR_GLIDE.as_secs_f32()).exp();
+        self.drawn_anchor = Some(Point::new(
+            (target.x - drawn.x).mul_add(t, drawn.x),
+            (target.y - drawn.y).mul_add(t, drawn.y),
+        ));
+    }
+
+    /// **Where the map draws this thread's ring** — [`Territory::anchor`],
+    /// gliding.
+    ///
+    /// Every *decision* still reads [`Territory::anchor`]: which district a
+    /// thread claims, whether a cloud is selected, how PRD §6.3's drift is
+    /// measured. This is only the drawn point, and it exists so that the one
+    /// moment the mode legitimately moves is a thread travelling rather than a
+    /// thread blinking. See [`ANCHOR_GLIDE`].
+    ///
+    /// `None` before the first [`Territory::decay`], and for a territory built
+    /// by hand that has never been decayed — both of which fall back to
+    /// [`Territory::anchor`] at the one call site that matters,
+    /// `crate::place::thread_position`.
+    #[must_use]
+    pub fn drawn_anchor(&self) -> Option<Point> {
+        self.drawn_anchor
     }
 
     /// **Where this thread is working, if anywhere** — the one question every
@@ -3148,6 +3243,79 @@ mod tests {
             t.field_peak() > 2.0,
             "and the peak is computed on demand too: {}",
             t.field_peak()
+        );
+    }
+
+    /// [`ANCHOR_GLIDE`]'s load-bearing property: the drawn ring reaches the
+    /// same place however finely the world is ticked.
+    ///
+    /// This is what lets the position channel move continuously without
+    /// re-introducing the cadence dependence `refresh_anchor` was written to
+    /// keep out (PRD §7.4, ADR-0029). The window ticks at 2 Hz, the headless
+    /// renderer once per schedule; an exponential relaxation composes exactly
+    /// under subdivision, so both settle identically. A linear step would not.
+    #[test]
+    fn the_drawn_anchor_glides_the_same_way_however_finely_it_is_ticked() {
+        // Two lobes far apart. The second decisively overtakes the first, so
+        // the target moves once and the drawn point has somewhere to travel.
+        let build = || {
+            let now = Instant::now();
+            let mut t = Territory::for_extent(1000.0);
+            for i in 0..8 {
+                t.observe(
+                    &obs(&format!("src/auth/f{i}.rs"), ToolKind::Edit, now),
+                    1.0,
+                    spot(step(i, 2.0), 0.0),
+                );
+            }
+            t.decay(now); // seeds `last_decay`, snaps the drawn anchor
+            t.decay(now + Duration::from_millis(1));
+            for i in 0..40 {
+                t.observe(
+                    &obs(&format!("tests/unit/g{i}.rs"), ToolKind::Edit, now),
+                    1.0,
+                    spot(500.0 + step(i, 2.0), 0.0),
+                );
+            }
+            (t, now)
+        };
+
+        let (mut coarse, t0) = build();
+        let start = coarse.drawn_anchor().expect("a drawn anchor");
+        let target = coarse.anchor().expect("a target");
+        assert!(
+            (target.x - start.x).abs() > 100.0,
+            "the target must actually have moved for this test to mean anything:              {start:?} -> {target:?}"
+        );
+
+        // One coarse tick of eight seconds...
+        coarse.decay(t0 + Duration::from_secs(8));
+        let after_coarse = coarse.drawn_anchor().expect("a drawn anchor");
+
+        // ...against eighty fine ticks of a tenth of a second each.
+        let (mut fine, _) = build();
+        for i in 1..=80 {
+            fine.decay(t0 + Duration::from_millis(100 * i));
+        }
+        let after_fine = fine.drawn_anchor().expect("a drawn anchor");
+
+        assert!(
+            (after_coarse.x - after_fine.x).abs() < 0.5
+                && (after_coarse.y - after_fine.y).abs() < 0.5,
+            "one 8 s tick and eighty 0.1 s ticks must agree: {after_coarse:?} vs {after_fine:?}"
+        );
+
+        // And it is a glide, not a snap: one time constant is about 63% of the
+        // way, so the ring is still a long way from the target it is chasing.
+        let travelled = (after_coarse.x - start.x).abs();
+        let distance = (target.x - start.x).abs();
+        assert!(
+            travelled < distance * 0.8,
+            "after one time constant the ring must still be short of the target:              travelled {travelled} of {distance}"
+        );
+        assert!(
+            travelled > distance * 0.4,
+            "and it must have moved: travelled {travelled} of {distance}"
         );
     }
 

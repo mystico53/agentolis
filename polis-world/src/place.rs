@@ -224,7 +224,17 @@ pub fn district_for_cwd(layout: &CityLayout, cwd: &LogicalPath) -> Option<Logica
 /// else entirely.
 #[must_use]
 pub fn thread_position(thread: &Thread, layout: &CityLayout) -> Option<Point> {
-    if let Some(anchor) = thread.territory.anchor() {
+    // The *drawn* anchor, which is the mode gliding rather than the mode
+    // jumping — see `territory::ANCHOR_GLIDE`. Every decision still reads
+    // `Territory::anchor`; this is the position channel, and the position
+    // channel is the one that has to move continuously. The plain anchor is the
+    // fallback for a territory that has never been decayed, which is every
+    // hand-built fixture.
+    if let Some(anchor) = thread
+        .territory
+        .drawn_anchor()
+        .or_else(|| thread.territory.anchor())
+    {
         if anchor.x.is_finite() && anchor.y.is_finite() {
             return Some(anchor);
         }
@@ -281,6 +291,15 @@ pub fn agent_position(
     if let Some(focus) = worker
         .and_then(|id| thread.worker(id))
         .and_then(|w| w.focus.as_ref())
+        // A focus of the repository root is not a location, for exactly the
+        // reason [`district_for_cwd`] refuses one: it names the whole city, so
+        // every worker whose last located call was root-scoped lands on the
+        // same pixel at the centre of the map. Measured on session `4bbcee1c`,
+        // three of six *running* workers shared one point that way — and 340 of
+        // that session's observations were root-scoped, so it is the common
+        // case rather than the corner one. Falling through to the trail head
+        // below says less and says it truthfully.
+        .filter(|focus| !focus.is_root())
     {
         if let Some(p) = position_in(layout, focus) {
             return Some(p);

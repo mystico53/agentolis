@@ -255,7 +255,41 @@ pub const AGENT_PENDING: Rgb = [132, 140, 156];
 /// An operation that succeeded — PRD §10.2's teal.
 pub const AGENT_DONE: Rgb = [96, 168, 150];
 /// An operation that failed, was rejected, or was aborted — PRD §10.2's red.
-pub const AGENT_FAILED: Rgb = [168, 98, 92];
+///
+/// # Why this is a deep red and not a muted one
+///
+/// It used to be `[168, 98, 92]`, and that colour was a thirteenth point on
+/// [`THREAD_HUES`]. Measured: `L* 49.3, C* 31.8, h 29.6°`, against an identity
+/// ring authored at `L* 45, C* 25` and spaced every 30° — so it sat almost
+/// exactly halfway between slot 0 (rose, 12°) and slot 1 (terracotta, 41°), at
+/// the same lightness and the same chroma. At [`AGENT_BODY`] the collision was
+/// direct: slot 0 draws as `#A84C59` and failure drew as `#A8625C`.
+///
+/// The consequence was not subtle. A session whose id hashes to slot 0 or 1 —
+/// **two of twelve, so one session in six** — painted its every cloud contour,
+/// hatch stroke, worker mark and anchor ring in a colour that means *failure*
+/// everywhere else on the map. The operator ran a clean build, looked at a map
+/// with an empty attention layer, and saw it drowning in red.
+///
+/// PRD §10 opens by forbidding exactly this: shape says what, colour says how it
+/// went. Identity had quietly taken a bite out of the outcome channel.
+///
+/// # The axis that was free
+///
+/// Rotating the ring cannot fix it: twelve hues at 30° always put a slot within
+/// 15° of any given angle. Brightening cannot either — the peak channel is
+/// already at [`crate::plan::AGENT_BAND`]'s ceiling of 168.
+///
+/// Chroma is free, for the reason [`IDENTITY_CHROMA`] gives: §10.3 budgets
+/// *brightness*, brightness is the peak channel, and deepening the non-peak
+/// channels spends nothing the layer owns. So failure keeps its hue (29.8°,
+/// unmoved) and its peak (168, unmoved) and goes deep — `C* 31.8 → 62.5`, well
+/// outside anything the identity ring reaches after its own 45 % lift. Vivid is
+/// the right register anyway: identity is ambient and outcome is a signal.
+///
+/// Worst pair against any identity slot at any role is asserted by
+/// `no_identity_hue_may_be_mistaken_for_an_outcome_or_an_attention_state`.
+pub const AGENT_FAILED: Rgb = [168, 30, 40];
 /// The tether tying a worker to its thread (PRD §5: the thread is the unit the
 /// operator thinks in).
 pub const AGENT_TETHER: Rgb = [100, 110, 130];
@@ -3092,6 +3126,80 @@ mod tests {
                 thread_ink(j as u8, role)
             );
         }
+    }
+
+    /// PRD §10's opening rule, as an assertion: **an identity may never be
+    /// mistaken for a state the operator has to act on.**
+    ///
+    /// [`THREAD_HUES`] carried a measured separation table against *itself* and
+    /// none at all against the bands it shares the map with. So [`AGENT_FAILED`]
+    /// was free to drift to `L* 49.3, C* 31.8, h 29.6°` — halfway between slot 0
+    /// (rose) and slot 1 (terracotta), at their own lightness and chroma. Two of
+    /// twelve slots, so **one session in six**, painted every cloud contour,
+    /// worker mark and anchor ring in the colour that means *failure*. The
+    /// operator ran a clean build, looked at a map whose attention layer was
+    /// empty, and saw it drowning in red. This is the test that was missing.
+    ///
+    /// # Two floors, because the two kinds of ink are not the same kind of thing
+    ///
+    /// The inks that say **act on this** — a failed call, a contention, a
+    /// pending decision — earn their meaning by being rare. An ambient layer in
+    /// their colour destroys that, and the ambient layer is exactly what
+    /// identity is: a cloud covers a district, a glyph covers eight pixels. So
+    /// identity is held a full [`THREAD_HUES`] ring-width away from them: 9.8 is
+    /// that ring's own tightest pair at the rail swatch, and a thread may not be
+    /// closer to a *state* than the two closest threads are to each other.
+    ///
+    /// The inks that say **this is fine** — succeeded, pending — are what the
+    /// map is mostly made of by design, and a territory that happens to resemble
+    /// them cries no wolf. They get the cloud fringe's floor of 5.4, which is
+    /// this codebase's own standard for "two marks side by side are still two
+    /// marks". Slot 6's teal sits at 7.09 from [`AGENT_DONE`]'s teal and is
+    /// allowed to: the alternative was desaturating success until it drifted
+    /// toward [`AGENT_PENDING`]'s neutral, which weakens a signal to buy a
+    /// symmetry the map does not need.
+    #[test]
+    fn no_identity_hue_may_be_mistaken_for_a_state_the_operator_must_act_on() {
+        /// The ring's own tightest pair at the rail swatch.
+        const ACT: f64 = 9.8;
+        /// The cloud fringe's floor — distinguishable, and no more is claimed.
+        const AMBIENT: f64 = 5.4;
+        let states = [
+            ("AGENT_FAILED", AGENT_FAILED, ACT),
+            ("ATTN_CONTENTION", ATTN_CONTENTION, ACT),
+            ("ATTN_DECISION", ATTN_DECISION, ACT),
+            ("AGENT_DONE", AGENT_DONE, AMBIENT),
+            ("AGENT_PENDING", AGENT_PENDING, AMBIENT),
+            ("ATTN_DONE", ATTN_DONE, AMBIENT),
+        ];
+        let mut worst_act = (f64::INFINITY, "", 0usize, "");
+        for (role_name, role) in [
+            ("agent body", AGENT_BODY),
+            ("anchor", AGENT_ANCHOR),
+            ("trail", AGENT_TRAIL),
+            ("tether", AGENT_TETHER),
+        ] {
+            for slot in 0..THREAD_HUES.len() {
+                let ink = thread_ink(slot as u8, role);
+                for (state_name, state, floor) in states {
+                    let d = de2000(ink, state);
+                    if floor == ACT && d < worst_act.0 {
+                        worst_act = (d, state_name, slot, role_name);
+                    }
+                    assert!(
+                        d >= floor,
+                        "slot {slot} on the {role_name} is {ink:?}, dE00 {d:.2} from                          {state_name} {state:?}, under its floor of {floor}. An identity that                          reads as a state is PRD §10's opening failure: a clean session looks                          like a broken one."
+                    );
+                }
+            }
+        }
+        // Printed so the margin is re-measurable after any change to the ring,
+        // to a state ink, or to `IDENTITY_CHROMA`. Before `AGENT_FAILED` was
+        // deepened this read 8.18.
+        println!(
+            "closest identity/act-on-this pair: slot {} on the {} vs {} at dE00 {:.2}",
+            worst_act.2, worst_act.3, worst_act.1, worst_act.0
+        );
     }
 
     /// Every thread ink is inside the band of the role it was levelled to. A

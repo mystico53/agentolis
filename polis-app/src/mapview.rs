@@ -66,6 +66,46 @@ use crate::palette;
 /// `polis_world::OPS_CAP` anyway.
 const MARKS_SCANNED: usize = 48;
 
+/// How long one call's ripple takes to open and fade.
+///
+/// Slow, because the alternative is a strobe: at several calls a second — which
+/// a working agent sustains — a fast ripple reads as flicker and a slow one
+/// reads as texture. Nearly three seconds means a burst overlaps into weather
+/// rather than into noise.
+pub const RAIN_LIFE: Duration = Duration::from_millis(2800);
+
+/// How far a ripple reaches, in screen pixels.
+///
+/// Small enough that a ring never crosses the territory it landed in, so the
+/// silhouette stays the thing that says *where* and the rain only says *now*.
+const RAIN_REACH: f32 = 21.0;
+
+/// How many written-file rings one thread may put on the map.
+///
+/// A contrast budget rather than a truncation: past this the rings stop being a
+/// set the eye can take in and start being the cobweb PRD §12's trail rule
+/// already removed once. The count itself is never lost — it is
+/// `Thread::visits` and the rail reads it.
+const WRITE_RINGS_PER_THREAD: usize = 24;
+
+/// One stack of operation marks that landed on the same pixel with the same
+/// shape and the same outcome.
+///
+/// Rungs 2 and 3 of `polis_world::place`'s chain produce these by
+/// construction — every shell call in a district lands on the district's one
+/// point, and every pathless call of one agent lands on the agent — so without
+/// merging, a single point carries forty coincident glyphs and reads as one.
+/// `polis_render::frame` aggregates the same way, by the same key.
+struct MarkStack {
+    at: Pos2,
+    glyph: Glyph,
+    outcome: polis_events::Outcome,
+    /// The freshest member's fade: a stack still being added to is not cold.
+    fade: f32,
+    /// `polis_world::place::OpSite::scale` — how certain the position is.
+    scale: f32,
+}
+
 /// A building touched more recently than this is under construction, and gets
 /// PRD §8's scaffolding overlay: *"Temporary-looking overlay on the building.
 /// Should read as impermanent."*
@@ -682,27 +722,171 @@ fn draw_agents(
             );
         }
 
-        // --- Operation glyphs: shape says what, colour says how it went -----
-        if tier != ZoomTier::City {
-            let radius = if tier == ZoomTier::Building { 6.0 } else { 3.6 };
-            for op in thread.ops.iter().rev().take(48) {
-                let Some(path) = &op.path else { continue };
+        // --- Every file this thread has written, for as long as it lives ----
+        //
+        // A read leaves nothing behind and a write does, so a written file
+        // keeps a small ring at its building in the thread's own hue until the
+        // session ends. One glance then answers "what has this agent actually
+        // changed" without opening anything — the question the operator asks
+        // before they interrupt.
+        //
+        // `Thread::visits` is the right source and the only one that survives:
+        // `Thread::ops` is capped at `OPS_CAP` = 128 and a long session writes
+        // more than that, while `VisitStats` is per thread, per path, and its
+        // own docs promise it is "never truncated by `TRAIL_CAP`". So this is a
+        // read of state the world already keeps, not a second record of it.
+        //
+        // Deliberately *not* the transient rain below: a ripple is an event and
+        // this is a memory, so they are different marks — a ring is static, thin
+        // and unfilled, a ripple grows and dies.
+        {
+            let ink = palette::thread(tint);
+            let r = match tier {
+                ZoomTier::Building => 4.6,
+                ZoomTier::District => 3.2,
+                ZoomTier::City => 2.2,
+            };
+            // The cap is a contrast budget, not a silent truncation: a thread
+            // that has written more than this has said what it needed to, and
+            // the rail carries the count. Ordered by path so which rings survive
+            // is stable frame to frame rather than a `BTreeMap` iteration
+            // accident that flickers (ADR-0029).
+            let mut drawn = 0usize;
+            for (path, stats) in &thread.visits {
+                if stats.writes == 0 {
+                    continue;
+                }
+                if drawn >= WRITE_RINGS_PER_THREAD {
+                    break;
+                }
                 let Some(map) = base.geometry.position_of(path) else {
                     continue;
                 };
+                drawn += 1;
+                painter.circle_stroke(
+                    camera.to_screen(map),
+                    r,
+                    Stroke::new(1.2 + lift * 0.6, ink.alpha(0.7)),
+                );
+            }
+        }
+
+        // --- Operation marks: shape says what, colour says how it went ------
+        //
+        // **Every operation gets a place.** `polis_world::place::site_of` is
+        // the whole fallback chain — the op's own path, else a shell call's
+        // working directory as a district, else wherever the acting agent is —
+        // and only its fourth rung, a thread with no position at all, leaves
+        // the map for the status rail.
+        //
+        // This used to ask for `op.path` and give up. That is not a small
+        // omission: measured by replaying sessions `4bbcee1c` and `4bed007c`
+        // through this world, **1 035 of 1 230 operations (84 %) resolved on
+        // rung 3** and drew nothing, because `Bash`, `PowerShell`, `Task` and
+        // `TodoWrite` name no file. Worse, failures are almost all pathless —
+        // **22 of 23 failed calls drew no red mark at all** — which is the
+        // exact hole `place`'s module docs were written to close. It was closed
+        // on `polis_render::frame`'s side only, so a recorded GIF of one frame
+        // showed strictly more than the live window did. One ladder, walked
+        // from both ends.
+        if tier != ZoomTier::City {
+            let radius = if tier == ZoomTier::Building { 6.0 } else { 3.6 };
+            // Rungs 2 and 3 stack by construction: every pathless call of one
+            // agent lands on that agent. So marks sharing a pixel, a glyph and
+            // an outcome are merged and drawn once rather than overplotted
+            // forty deep — which is `place`'s own rule that a successful
+            // operation is de-emphasised by aggregating it, never by
+            // recolouring or reshaping it.
+            let mut stacks: BTreeMap<(i32, i32, u8, u8), MarkStack> = BTreeMap::new();
+            for op in thread.ops.iter().rev().take(MARKS_SCANNED) {
                 let age = now.saturating_duration_since(op.at).as_secs_f32();
                 let fade = 1.0 - (age / ttl).clamp(0.0, 1.0);
                 if fade <= 0.05 {
                     continue;
                 }
+                let site = polis_world::place::site_of(op, thread, &snapshot.layout);
+                let Some(point) = site.point() else { continue };
+                let at = camera.to_screen(base.to_map(point));
+                let key = (
+                    at.x.round() as i32,
+                    at.y.round() as i32,
+                    op.glyph as u8,
+                    op.outcome as u8,
+                );
+                let entry = stacks.entry(key).or_insert(MarkStack {
+                    at,
+                    glyph: op.glyph,
+                    outcome: op.outcome,
+                    fade,
+                    // The position channel carrying its own uncertainty: a mark
+                    // placed at a building is full size, one placed at a
+                    // district is coarser, one placed at the agent coarser
+                    // still. It is never the outcome channel — PRD §10 opens by
+                    // forbidding that conflation.
+                    scale: site.scale() as f32,
+                });
+                // A stack ages with its freshest member: one still being added
+                // to has not gone cold.
+                entry.fade = entry.fade.max(fade);
+            }
+            for m in stacks.values() {
                 draw_glyph(
                     painter,
-                    camera.to_screen(map),
-                    radius,
-                    op.glyph,
-                    palette::outcome(op.outcome).aged(fade),
+                    m.at,
+                    radius * m.scale,
+                    m.glyph,
+                    palette::outcome(m.outcome).aged(m.fade),
                 );
             }
+        }
+
+        // --- Rain: one ripple per call, on the pond it landed in ------------
+        //
+        // The map's answer to *is anything happening right now*, and it is the
+        // only channel that fires on **every** call rather than only the ones
+        // that name a file. A `cargo check` is a drop, so is an `rg`, so is a
+        // subagent spawn — and a failing `cargo test` is a red one, which is how
+        // a failure that carries no path finally reads as a failure.
+        //
+        // Small and slow on purpose: the ripple opens over `RAIN_LIFE` and never
+        // gets wide enough to cross the territory it is in, so a hard rain reads
+        // as texture rather than as strobing. The rate is legible without
+        // counting anything — heavy rain and light rain look different from
+        // across the room.
+        //
+        // No calls, no rain. A thread blocked on the operator makes none, so its
+        // cloud goes still, and stillness among raining neighbours is itself the
+        // signal. The amber pin still carries the state; rain is not asked to.
+        for op in thread.ops.iter().rev() {
+            let age = now.saturating_duration_since(op.at);
+            // `ops` is newest-last, so the first one out of the window ends it.
+            if age >= RAIN_LIFE {
+                break;
+            }
+            let Some(point) = polis_world::place::site_of(op, thread, &snapshot.layout).point()
+            else {
+                continue;
+            };
+            let at = camera.to_screen(base.to_map(point));
+            let p = age.as_secs_f32() / RAIN_LIFE.as_secs_f32();
+            // Opens quickly, then eases — a ring on water, not a pulse.
+            let r = RAIN_REACH * (1.0 - (1.0 - p).powf(1.9));
+            let alpha = (1.0 - p).powf(1.7);
+            let failed = op.outcome == polis_events::Outcome::Failed;
+            let ink = if failed {
+                palette::outcome(polis_events::Outcome::Failed)
+            } else {
+                palette::thread(tint)
+            };
+            painter.circle_stroke(
+                at,
+                r.max(0.6),
+                Stroke::new(
+                    if failed { 1.7 } else { 1.15 },
+                    ink.alpha(alpha * if failed { 0.9 } else { 0.55 }),
+                ),
+            );
+            animating = true;
         }
 
         // --- Workers, and the tethers only the asked-about thread gets ------
@@ -734,10 +918,21 @@ fn draw_agents(
         });
         let fan = live::TETHERS_PER_THREAD.min(ranked.len()).max(2) - 1;
         for (rank, worker) in ranked.iter().enumerate() {
-            let Some(focus) = &worker.focus else { continue };
-            let Some(map) = base.geometry.position_of(focus) else {
+            // The same ladder again, not the raw `focus` field: a worker whose
+            // last located call named no file has no focus at all, and asking
+            // for one and giving up drew nothing for it. Measured over session
+            // `4bbcee1c`, that was 167 of 469 worker-frames — a third of the
+            // running subagents invisible, on the plate the operator opens
+            // precisely to see how many are running.
+            // `place::agent_position` falls through focus → trail head →
+            // thread position, so a worker that has done anything at all has
+            // somewhere honest to stand.
+            let Some(point) =
+                polis_world::place::agent_position(thread, Some(&worker.id), &snapshot.layout)
+            else {
                 continue;
             };
+            let map = base.to_map(point);
             let (eased, moving) = state.motion.ease(&worker.id, map);
             animating |= moving;
             let at = camera.to_screen(eased);
@@ -941,15 +1136,19 @@ fn draw_alarms(
             if op.outcome != polis_events::Outcome::Failed {
                 continue;
             }
-            let Some(path) = &op.path else { continue };
-            let Some(map) = base.geometry.position_of(path) else {
-                continue;
-            };
             let age = now.saturating_duration_since(op.at).as_secs_f32() / ttl;
             if age >= 1.0 {
                 continue;
             }
-            let at = camera.to_screen(map);
+            // The same ladder as the operation marks above, and it matters most
+            // here: a failing `cargo test` names no file, so gating the alarm
+            // layer on `op.path` meant 22 of the 23 failures measured across
+            // two real sessions raised no ring. A failing session rendered
+            // identically to a clean one, which is the failure `place`'s module
+            // docs open by naming.
+            let site = polis_world::place::site_of(op, thread, &snapshot.layout);
+            let Some(point) = site.point() else { continue };
+            let at = camera.to_screen(base.to_map(point));
             marks.push(live::Mark::single(
                 [f64::from(at.x), f64::from(at.y)],
                 op.glyph,
