@@ -145,7 +145,7 @@ use std::time::{Duration, Instant};
 use polis_events::PathMapper;
 use polis_render::frame::{FrameOptions, FrameRenderer};
 use polis_render::live::{
-    self, BandMap, CloudField, CloudKernel, CloudTween, CLOUD_CROWD, CLOUD_TONES, NO_BAND,
+    self, BandMap, CloudField, CloudKernel, CloudTween, CLOUD_TONES, NO_BAND,
 };
 use polis_render::plan::Focus;
 use polis_render::plan::BASE_MAP_CEILING;
@@ -659,6 +659,19 @@ fn measure_clouds_on_real_threads() {
         // over the same frame drawn without it. The field is *not* re-sampled
         // here — `cloud_field` is the tween's own output — so the mask is the
         // one the product put on the screen.
+        //
+        // Painted as a **stack**, which is the shipped notation: one banded,
+        // contoured and hatched layer per territory, over each other. Measuring
+        // the summed single map instead would measure a picture the product
+        // stopped drawing, and would miss the one thing worth measuring about a
+        // stack — that `N` layers over one place still do not fog the city
+        // under them.
+        //
+        // With no tints, so every layer comes out in the neutral `CLOUD_TONES`
+        // and `measure`'s mask can stay exact tone equality. The geometry is
+        // identical either way: `stack` keys the hue on the tint and the axis on
+        // the tint's slot, falling back to the layer's rank, so an untinted
+        // stack is the shipped stack in greyscale.
         let mut with = bare.clone();
         let started = Instant::now();
         let mut contested = 0usize;
@@ -666,15 +679,10 @@ fn measure_clouds_on_real_threads() {
         let mut peak = 0.0f32;
         if let Some(field) = shipped.cloud_field() {
             peak = field.peak();
-            let bands = field.bands();
-            contested = bands
-                .crowd
-                .iter()
-                .zip(bands.cells.iter())
-                .filter(|(c, b)| **c >= CLOUD_CROWD && **b != NO_BAND)
-                .count();
-            live::paint_cloud_bands(&mut with, &bands);
-            band_map = Some(bands);
+            let stack = field.stack(&[]);
+            contested = stack.contested();
+            live::paint_cloud_stack(&mut with, &stack);
+            band_map = stack.flattened();
         }
         draw.push(started.elapsed());
 
@@ -1055,7 +1063,9 @@ fn gif_versus_window_is_a_difference_of_scale() {
         let canvas = r.render_owned(&snap, Duration::ZERO);
         let census = r.cloud_census();
         let (footprint, thickness) = r.cloud_field().map_or((0, 0.0), |field| {
-            let bands = field.bands();
+            let Some(bands) = field.stack(&[]).flattened() else {
+                return (0, 0.0);
+            };
             let mut foot = 0usize;
             let mut edge = [0usize; 3];
             let mut area = [0usize; 3];
@@ -1278,7 +1288,7 @@ fn lift_versus_shipped_side_by_side() {
             1.0 / 24.0,
             live::CLOUD_TWEEN_RATE,
         ) {
-            live::paint_cloud_bands(&mut lifted, &field.bands());
+            live::paint_cloud_stack(&mut lifted, &field.stack(&[]));
         }
         // The right panel is the shipped **field**, painted onto the same bare
         // frame at the same point in the stack as the left. Comparing the
@@ -1289,7 +1299,7 @@ fn lift_versus_shipped_side_by_side() {
         // reported below — but it is not the difference this image is about.
         let mut shipped_panel = bare.clone();
         if let Some(field) = shipped_r.cloud_field() {
-            live::paint_cloud_bands(&mut shipped_panel, &field.bands());
+            live::paint_cloud_stack(&mut shipped_panel, &field.stack(&[]));
         }
         let covered = ink(&shipped_panel).saturating_sub(ink(&shipped));
 

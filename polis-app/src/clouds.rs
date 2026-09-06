@@ -6,10 +6,10 @@
 //!
 //! This is the window's half of that layer, and it is deliberately **not** a
 //! second implementation. The field, the thresholds, the contour, the hatch, the
-//! cross-hatch on contested ground and the tween all come from
-//! [`polis_render::live`]; this module maps kernels into a fixed texel frame,
-//! hands them over, and uploads what comes back. A visual language with two
-//! definitions has none, and the previous version proved it — see below.
+//! stacking and the tween all come from [`polis_render::live`]; this module maps
+//! kernels into a fixed texel frame, hands them over, and uploads what comes
+//! back. A visual language with two definitions has none, and the previous
+//! version proved it — see below.
 //!
 //! # What was here before, and why it had to go
 //!
@@ -26,15 +26,41 @@
 //! stays readable*, and a wash makes that sentence false however low the alpha
 //! goes.
 //!
-//! What is drawn instead is what [`polis_render::live::paint_cloud_bands`]
+//! What is drawn instead is what [`polis_render::live::paint_cloud_stack`]
 //! draws: a contour stroke on each level's boundary, widest on the outermost
 //! because that silhouette is what survives being seen from across the room,
-//! plus a hatch whose spacing tightens toward the core, crossed where two
-//! territories claim the same ground. Every mark is **opaque** and every other
-//! texel is fully transparent, so the city underneath is not merely recoverable,
-//! it is untouched — measured at **zero** disturbed pixels, and a median
-//! luminance that moves by `0.000` levels, over 192 frames of six real sessions
-//! replayed side by side (`polis-render/tests/cloud_measure.rs`).
+//! plus a hatch whose spacing tightens toward the core. Every mark is **opaque**
+//! and every other texel is fully transparent, so the city underneath is not
+//! merely recoverable, it is untouched — measured at **zero** disturbed pixels,
+//! and a median luminance that moves by `0.000` levels, over 192 frames of six
+//! real sessions replayed side by side (`polis-render/tests/cloud_measure.rs`).
+//!
+//! # And the second version, which absorbed one thread into another
+//!
+//! That notation was drawn **once for the whole sky**: every territory's kernels
+//! summed into one field, thresholded once, and each texel given to whichever
+//! thread was densest there. Two consequences, both visible on the operator's
+//! own map and neither tunable:
+//!
+//! * a thread whose cloud crossed a busier one was not dimmed under it, it was
+//!   **gone** — the argmax handed every shared texel to the winner, so the map
+//!   could not say that two threads were in one place, which two, or how far
+//!   each reached;
+//! * and the band level came from the *sum*, so two fringes overlapping drew a
+//!   core belonging to neither, breaking the one sentence §10.4 asks the bands
+//!   to carry: *"that file is in the core of **this thread's** work"*.
+//!
+//! [`polis_render::live::CloudField::stack`] draws one banded, contoured and
+//! hatched layer **per territory** instead, each in its own hue and on its own
+//! hatch axis, painted over each other urgent-last. The marks are sparse, so two
+//! weaves 30° apart interleave rather than one erasing the other, and each
+//! layer's hatch opens up by how many territories share the pixel — so the
+//! second reading is paid for out of the first one's ink budget and the city
+//! underneath is as untouched as it was with one layer.
+//!
+//! Contention is still PRD §6.4's, and better told: it used to be a crossed
+//! hatch in one thread's hue saying *somebody else is here too*, and it is now
+//! two hues, two silhouettes and two stroke directions saying **who**.
 //!
 //! # Nearest, not linear, and that is not a detail
 //!
@@ -63,7 +89,7 @@
 )]
 
 use eframe::egui::{self, Color32, Rect};
-use polis_render::live::{self, CloudCensus, CloudField, CloudKernel, CloudTween, CLOUD_CROWD};
+use polis_render::live::{self, CloudCensus, CloudField, CloudKernel, CloudTween};
 use polis_render::raster::Canvas;
 use polis_world::snapshot::WorldSnapshot;
 use polis_world::territory::{self, CloudPolicy, Territory};
@@ -464,18 +490,25 @@ impl Clouds {
             return;
         };
 
-        let bands = field.bands_tinted(&self.tints);
-        self.contested = bands
-            .crowd
-            .iter()
-            .zip(bands.cells.iter())
-            .filter(|(c, b)| **c >= CLOUD_CROWD && **b != live::NO_BAND)
-            .count();
+        // One banded map per territory rather than one for the sky. See
+        // `polis_render::live::CloudField::stack`: a summed map labels each
+        // pixel with whoever is densest there, which draws a thread sharing
+        // ground with a busier one as though it were not there at all.
+        let stack = field.stack(&self.tints);
+        let Some((x0, y0, width, height)) = stack.rect() else {
+            self.texture = None;
+            self.rect = Rect::NOTHING;
+            self.contested = 0;
+            self.settled = self.target.is_none();
+            self.build_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            return;
+        };
+        self.contested = stack.contested();
 
         // The notation itself, rasterised by `polis_render::live` so the window
         // and the headless renderer cannot disagree about a single stroke.
-        let mut canvas = Canvas::new(bands.width, bands.height, NOTHING);
-        live::paint_cloud_bands_into(&mut canvas, &bands, [bands.x0, bands.y0]);
+        let mut canvas = Canvas::new(width, height, NOTHING);
+        live::paint_cloud_stack_into(&mut canvas, &stack, [x0, y0]);
 
         // Opaque where a mark landed, fully transparent everywhere else. There
         // is no intermediate alpha anywhere in this image, which is what stops
@@ -498,7 +531,7 @@ impl Clouds {
                 }
             })
             .collect();
-        let image = egui::ColorImage::new([bands.width, bands.height], pixels);
+        let image = egui::ColorImage::new([width, height], pixels);
         match &mut self.texture {
             Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
             None => {
@@ -509,10 +542,10 @@ impl Clouds {
 
         let per_texel = BASE_MAP_PIXELS as f32 / TEXELS as f32;
         self.rect = Rect::from_min_max(
-            egui::pos2(bands.x0 as f32 * per_texel, bands.y0 as f32 * per_texel),
+            egui::pos2(x0 as f32 * per_texel, y0 as f32 * per_texel),
             egui::pos2(
-                (bands.x0 + bands.width) as f32 * per_texel,
-                (bands.y0 + bands.height) as f32 * per_texel,
+                (x0 + width) as f32 * per_texel,
+                (y0 + height) as f32 * per_texel,
             ),
         );
         self.settled = match &self.target {
@@ -553,11 +586,29 @@ mod tests {
         CloudField::sample(&kernels, 400, 400).expect("a field")
     }
 
-    fn paint(field: &CloudField) -> Canvas {
-        let bands = field.bands();
-        let mut canvas = Canvas::new(bands.width, bands.height, NOTHING);
-        live::paint_cloud_bands_into(&mut canvas, &bands, [bands.x0, bands.y0]);
+    /// The shipped path: a stack, one layer per territory, on the tints given.
+    ///
+    /// The canvas is the whole field rectangle rather than the stack's own, so
+    /// two paintings of two different worlds can be compared pixel for pixel.
+    fn paint_with(field: &CloudField, tints: &[u8]) -> Canvas {
+        let stack = field.stack(tints);
+        let mut canvas = Canvas::new(field.width, field.height, NOTHING);
+        live::paint_cloud_stack_into(&mut canvas, &stack, [field.x0, field.y0]);
         canvas
+    }
+
+    fn paint(field: &CloudField) -> Canvas {
+        paint_with(field, &[])
+    }
+
+    fn inked(canvas: &Canvas) -> usize {
+        canvas
+            .pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|p| **p != NOTHING)
+            .count()
     }
 
     /// `docs/verified/gpu-stack.md` §5's central finding, on the CPU:
@@ -626,18 +677,12 @@ mod tests {
             "transparent plus at most three bands, got {}",
             distinct.len()
         );
-        let inked = canvas
-            .pixels
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .filter(|p| **p != NOTHING)
-            .count();
-        let banded = f
-            .bands()
-            .cells
-            .iter()
-            .fold(0usize, |n, b| n + usize::from(*b != live::NO_BAND));
+        let inked = inked(&canvas);
+        let banded = f.stack(&[]).flattened().map_or(0, |b| {
+            b.cells
+                .iter()
+                .fold(0usize, |n, b| n + usize::from(*b != live::NO_BAND))
+        });
         assert!(inked > 200, "the cloud drew almost nothing: {inked} px");
         assert!(
             inked * 100 / banded.max(1) <= 35,
@@ -677,18 +722,136 @@ mod tests {
             ([190.0, 200.0], 70.0, 1.0, 0),
             ([210.0, 200.0], 70.0, 1.0, 1),
         ]);
+        assert_eq!(solo.stack(&[]).contested(), 0, "one territory, no contest");
         assert!(
-            solo.bands().crowd.iter().all(|c| *c < CLOUD_CROWD),
-            "one territory was drawn as contested ground"
-        );
-        assert!(
-            pair.bands().crowd.iter().any(|c| *c >= CLOUD_CROWD),
+            pair.stack(&[]).contested() > 0,
             "two territories on one place left no contested ground"
         );
         assert_ne!(
             paint(&solo).pixels,
             paint(&pair).pixels,
             "contested ground is drawn exactly like uncontested ground"
+        );
+    }
+
+    /// The complaint this whole layer was rebuilt for: *"patterns absorb each
+    /// other"*.
+    ///
+    /// Two threads on the same ground, drawn from the same field. The old
+    /// notation summed them into one band map and gave every pixel to whoever
+    /// was denser, so the quieter territory's hue did not appear anywhere its
+    /// neighbour reached — over the overlap it was not dimmed, it was gone. The
+    /// stack draws both.
+    #[test]
+    fn a_territory_is_still_drawn_where_a_denser_one_overlaps_it() {
+        // Slot 0 is rose and slot 6 is teal — opposite ends of the hue ring, so
+        // the assertion is about presence and not about a near miss.
+        let tints = [0u8, 6u8];
+        // The second thread is much the denser of the two, which is exactly the
+        // case the argmax used to erase.
+        let f = field(&[
+            ([200.0, 200.0], 80.0, 1.0, 0),
+            ([215.0, 200.0], 80.0, 3.0, 1),
+            ([225.0, 205.0], 80.0, 3.0, 1),
+        ]);
+        let canvas = paint_with(&f, &tints);
+
+        // Whose ink is whose: a band tone put through each thread's hue.
+        let mine: HashSet<[u8; 3]> = live::CLOUD_TONES
+            .iter()
+            .map(|t| live::thread_ink(tints[0], *t))
+            .collect();
+        let theirs: HashSet<[u8; 3]> = live::CLOUD_TONES
+            .iter()
+            .map(|t| live::thread_ink(tints[1], *t))
+            .collect();
+        assert!(
+            mine.is_disjoint(&theirs),
+            "the two hues are the same ink; this test cannot see anything"
+        );
+
+        // Only the ground the *denser* thread bands, so "still drawn" means
+        // drawn underneath it and not merely drawn somewhere else on the map.
+        let stack = f.stack(&tints);
+        let over = stack
+            .layers
+            .iter()
+            .find(|l| l.tint.first() == Some(&tints[1]))
+            .expect("the denser thread has a layer");
+        let (mut quiet, mut loud) = (0usize, 0usize);
+        for y in 0..over.height {
+            for x in 0..over.width {
+                if over.cells[y * over.width + x] == live::NO_BAND {
+                    continue;
+                }
+                let (cx, cy) = (x + over.x0 - f.x0, y + over.y0 - f.y0);
+                let p = canvas.pixels.as_chunks::<3>().0[cy * canvas.width + cx];
+                quiet += usize::from(mine.contains(&p));
+                loud += usize::from(theirs.contains(&p));
+            }
+        }
+        assert!(loud > 0, "the denser thread drew nothing on its own ground");
+        assert!(
+            quiet > 100,
+            "the quieter thread put {quiet} px inside the denser one's territory: \
+             it has been absorbed again"
+        );
+    }
+
+    /// And the absorption is not paid for in fog: PRD §10.3's budget survives
+    /// the second layer, because each layer's hatch opens up by how many
+    /// territories share the pixel (`CLOUD_SHARE_SPACING`).
+    #[test]
+    fn two_layers_over_one_place_cost_about_one_layer_of_ink() {
+        let solo = field(&[
+            ([200.0, 200.0], 80.0, 1.0, 0),
+            ([215.0, 200.0], 80.0, 1.0, 0),
+        ]);
+        let pair = field(&[
+            ([200.0, 200.0], 80.0, 1.0, 0),
+            ([215.0, 200.0], 80.0, 1.0, 1),
+        ]);
+        let one = inked(&paint(&solo));
+        let two = inked(&paint(&pair));
+        assert!(one > 200 && two > 200, "{one} and {two} px is not a cloud");
+        // Two contours where there was one, and two weaves where there was one,
+        // so it is not the same number — but it is the same order, not double.
+        assert!(
+            two * 100 / one <= 175,
+            "splitting one territory into two inked {}% of what one did",
+            two * 100 / one
+        );
+    }
+
+    /// Each layer weaves on its own axis, so two overlapping territories are two
+    /// textures rather than one (`CLOUD_WEAVES`).
+    #[test]
+    fn two_threads_do_not_share_a_hatch_axis() {
+        let f = field(&[
+            ([200.0, 200.0], 80.0, 1.5, 0),
+            ([215.0, 200.0], 80.0, 1.5, 1),
+        ]);
+        let stack = f.stack(&[0, 1]);
+        assert_eq!(stack.layers.len(), 2, "one layer per territory");
+        assert_ne!(
+            stack.layers[0].weave, stack.layers[1].weave,
+            "both territories hatch along the same axis: they read as one texture"
+        );
+    }
+
+    /// The stack is painted urgent-last, so the thread `select_clouds` ranked
+    /// first is the one on top where two marks land on the same pixel.
+    #[test]
+    fn the_first_ranked_thread_is_painted_last() {
+        let f = field(&[
+            ([200.0, 200.0], 80.0, 1.5, 0),
+            ([215.0, 200.0], 80.0, 1.5, 1),
+        ]);
+        let stack = f.stack(&[0, 1]);
+        assert_eq!(
+            stack.layers.last().map(|l| l.tint[0]),
+            Some(0),
+            "rank 0 is not the last layer painted"
         );
     }
 

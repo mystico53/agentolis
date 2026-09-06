@@ -245,14 +245,6 @@ pub enum DecisionSource {
     /// are both the real ones. Measured in the operator's own corpus: seven such
     /// calls in session `29c2fc6f`, with waits from 42 s to 2 h.
     AskUser,
-    /// **Channel D.** A main agent ended its turn with no tool call and no human
-    /// has replied yet — the transcript's form of the `idle_prompt` /
-    /// `agent_needs_input` notification PRD §11.2 lists under this state.
-    ///
-    /// Also prospective and exact, and by far the most common: 62 / 38 / 6 of
-    /// them in the three recorded sessions, with median waits of 5, 13 and 27
-    /// minutes. This is the reason a replay can show the primary state at all.
-    TurnEnded,
     /// **Channel D.** A `tool_result` carrying `toolDenialKind`, or an
     /// `[Request interrupted by user]` record: proof that a permission prompt
     /// was shown *and answered*.
@@ -273,7 +265,6 @@ impl DecisionSource {
             Self::TeammateIdle => "teammate idle",
             Self::Notification => "notification",
             Self::AskUser => "asked you",
-            Self::TurnEnded => "waiting on you",
             Self::Rejected => "you said no",
         }
     }
@@ -286,7 +277,7 @@ impl DecisionSource {
     /// not one. A live session raises the first four; a replay raises the last
     /// three and nothing else.
     pub fn is_reconstructed(self) -> bool {
-        matches!(self, Self::AskUser | Self::TurnEnded | Self::Rejected)
+        matches!(self, Self::AskUser | Self::Rejected)
     }
 
     /// Whether the mark's onset is the real one.
@@ -616,7 +607,7 @@ mod tests {
             AttentionKind::NeedsDecision {
                 thread: thread(),
                 at: None,
-                source: DecisionSource::TurnEnded,
+                source: DecisionSource::AskUser,
             },
             t0,
         );

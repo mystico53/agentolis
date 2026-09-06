@@ -30,7 +30,7 @@ hash of the logical path, so the same repo produces the same city on every launc
 and every machine; spatial memory is the entire point.
 
 The spec is [`docs/PRD.md`](docs/PRD.md). Where the built system deliberately
-diverges from it — 72 recorded decisions, every one grounded in a measurement —
+diverges from it — 102 recorded decisions, every one grounded in a measurement —
 see [`docs/DECISIONS.md`](docs/DECISIONS.md). The evidence behind those decisions
 is in [`docs/verified/`](docs/verified/).
 

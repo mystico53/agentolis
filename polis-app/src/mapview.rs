@@ -1176,16 +1176,28 @@ fn draw_alarms(
             // two real sessions raised no ring. A failing session rendered
             // identically to a clean one, which is the failure `place`'s module
             // docs open by naming.
+            //
+            // Which is not the same as saying every one of them may fly a ring.
+            // A call that names no file *and* ran at the repository root has no
+            // place of its own, so rung 3 lends it the thread's — and a ring
+            // there is a claim about a district that never ran anything. It
+            // keeps its red glyph above; `salience::alarms` is what refuses it
+            // the ring, on `OpSite::sited`.
             let site = polis_world::place::site_of(op, thread, &snapshot.layout);
             let Some(point) = site.point() else { continue };
             let at = camera.to_screen(base.to_map(point));
-            marks.push(live::Mark::single(
+            // Rung 3 is carried, not dropped, because the rule about what it
+            // means belongs to `salience::alarms` and not to either rasteriser —
+            // the window and the headless renderer have to raise the same rings
+            // or the recorded frame stops being evidence about the live one.
+            let mark = live::Mark::single(
                 [f64::from(at.x), f64::from(at.y)],
                 op.glyph,
                 op.outcome,
                 f64::from(age),
                 live::pulse_at(now.saturating_duration_since(op.at).as_secs_f64()),
-            ));
+            );
+            marks.push(if site.sited() { mark } else { mark.at_agent() });
         }
     }
     if marks.is_empty() {

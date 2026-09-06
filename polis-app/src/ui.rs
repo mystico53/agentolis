@@ -575,6 +575,13 @@ pub fn status_rail(
                     .color(palette::selection().color())
                     .strong(),
             );
+            // What it is waiting *on*. The state word answers "should I go
+            // there"; this answers "why", which is the question the operator
+            // asked when a thread parked on a background `cargo test` and a
+            // thread blocked on a permission prompt read identically.
+            if let Some(why) = why_of(snapshot, thread) {
+                ui.label(RichText::new(why).small().color(ink.color()));
+            }
             if following {
                 ui.label(
                     RichText::new("following")
@@ -591,7 +598,7 @@ pub fn status_rail(
                     let x = ui
                         .add(
                             egui::Button::new(
-                                RichText::new("✕")
+                                RichText::new("x")
                                     .monospace()
                                     .color(palette::status(ThreadStatus::Idle).color()),
                             )
@@ -613,13 +620,17 @@ pub fn status_rail(
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             place_of(ui, thread);
+            // `0 workers` on a thread that never spawned any read as a broken
+            // row, and mixed a now-gauge with lifetime totals in one breath.
+            // Running-of-total when there are any, nothing at all when there are
+            // not.
+            let workers = match (thread.running_workers(), thread.workers.len()) {
+                (_, 0) => String::new(),
+                (live, total) => format!("{live}/{total} workers · "),
+            };
             ui.label(dim(format!(
-                "{} workers · {} calls · {} fail · +{} -{}",
-                thread.workers.len(),
-                thread.tool_calls,
-                thread.failures,
-                thread.lines_added,
-                thread.lines_removed
+                "{workers}{} calls · {} fail · +{} -{}",
+                thread.tool_calls, thread.failures, thread.lines_added, thread.lines_removed
             )));
         });
         if let Some((path, count)) = thread.most_revisited() {
@@ -1645,10 +1656,18 @@ pub fn explainer(ctx: &egui::Context) -> bool {
 
 fn status_word(status: ThreadStatus) -> &'static str {
     match status {
-        ThreadStatus::Waiting => "WAITING",
-        ThreadStatus::Working => "working",
-        ThreadStatus::Idle => "idle   ",
-        ThreadStatus::Done => "done   ",
+        ThreadStatus::Waiting => "WAITING    ",
+        // Upper case is a budget, and only `blocks_operator` states may spend
+        // it. `interrupted` is the exception that proves the column width: it is
+        // the longest word the rail can say, and it earns the space because
+        // "idle" for a thread the operator stopped themselves was the report
+        // that widened this enum.
+        ThreadStatus::Interrupted => "INTERRUPTED",
+        ThreadStatus::Ready => "ready      ",
+        ThreadStatus::Parked => "parked     ",
+        ThreadStatus::Working => "working    ",
+        ThreadStatus::Idle => "idle       ",
+        ThreadStatus::Done => "done       ",
     }
 }
 
@@ -1682,6 +1701,68 @@ fn trim(speed: f32) -> String {
         return format!("{}", speed.round() as i32);
     }
     format!("{speed}")
+}
+
+/// The object of the wait, for the rail's caption. `None` when the state word
+/// already says everything there is to say.
+///
+/// Ordered by what the operator would ask next. A blocked thread names the
+/// question and how long it has stood — the wait's age is the triage dimension,
+/// and 63 of 112 measured `AskUserQuestion` waits ran past five minutes, so
+/// "how long" separates a thread that just asked from one that has been ignored.
+/// A parked thread names the job holding it, because "1 shell still running" is
+/// the fact the operator was reading off their own terminal footer.
+fn why_of(snapshot: &WorldSnapshot, thread: &Thread) -> Option<String> {
+    match thread.status {
+        ThreadStatus::Waiting => {
+            let mark = snapshot
+                .attention
+                .iter()
+                .find(|m| m.kind.is_decision_for(&thread.id))?;
+            let AttentionKind::NeedsDecision { source, .. } = &mark.kind else {
+                return None;
+            };
+            Some(format!(
+                "{} · {}",
+                format::duration(mark.waited(snapshot.at)),
+                source.label()
+            ))
+        }
+        ThreadStatus::Interrupted => thread.interrupted_at.map(|at| {
+            format!(
+                "{} ago · you stopped it",
+                format::duration(snapshot.at.saturating_duration_since(at))
+            )
+        }),
+        ThreadStatus::Parked => {
+            let job = thread.background.first()?;
+            let more = thread.background.len().saturating_sub(1);
+            let label = job.label.as_deref().unwrap_or("background job");
+            Some(match more {
+                0 => format!(
+                    "{} · {}",
+                    format::duration(job.age(snapshot.at)),
+                    short(label)
+                ),
+                n => format!(
+                    "{} · {} +{n} more",
+                    format::duration(job.age(snapshot.at)),
+                    short(label)
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A command line trimmed to something a rail row can hold.
+fn short(text: &str) -> String {
+    let one = text.split('\n').next().unwrap_or(text).trim();
+    if one.chars().count() <= 32 {
+        return one.to_owned();
+    }
+    let head: String = one.chars().take(31).collect();
+    format!("{head}…")
 }
 
 /// A thread's one-line summary, shared by the rail and the transport bar.
@@ -1760,6 +1841,9 @@ mod tests {
     fn status_words_are_padded_to_one_column_width() {
         let widths: Vec<usize> = [
             ThreadStatus::Waiting,
+            ThreadStatus::Interrupted,
+            ThreadStatus::Ready,
+            ThreadStatus::Parked,
             ThreadStatus::Working,
             ThreadStatus::Idle,
             ThreadStatus::Done,

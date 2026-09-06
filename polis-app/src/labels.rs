@@ -77,7 +77,7 @@ const BUDGET_RANGE: (usize, usize) = (8, 28);
 /// One per frame. Feed it labels in descending priority; it answers with the
 /// rectangle to draw in, or `None` when the label was decluttered away — either
 /// because it collided with something already placed, or because the frame's
-/// [budget](AREA_PER_LABEL) is spent.
+/// budget (`AREA_PER_LABEL`) is spent.
 #[derive(Debug)]
 pub struct LabelPlacer {
     /// The rectangle labels must stay inside — the map viewport.
@@ -153,7 +153,7 @@ impl LabelPlacer {
     ///
     /// Two things can decluttter a label away, and they answer different
     /// questions: a collision means *"there is no room here"*, and a spent
-    /// [budget](AREA_PER_LABEL) means *"there are already enough names on this
+    /// budget (`AREA_PER_LABEL`) means *"there are already enough names on this
     /// map"*. Both count as [`Self::dropped`], because from the operator's side
     /// they are the same event — a name that is not on screen.
     pub fn place(&mut self, anchor: Pos2, size: Vec2, priority: Priority) -> Option<Rect> {

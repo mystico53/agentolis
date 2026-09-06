@@ -148,6 +148,24 @@ impl OpSite {
         }
     }
 
+    /// Whether this site is a place the **operation** named, or one borrowed
+    /// from the agent that ran it.
+    ///
+    /// Rungs 1 and 2 are the operation's own — the file it touched, the
+    /// directory it ran in. Rung 3 is not: it is wherever the thread happens to
+    /// be standing, which moves as the agent works and says nothing about what
+    /// the call did. A [`Point`] cannot carry that difference, and losing it is
+    /// how a failed `PowerShell` at the repository root came to fly a
+    /// district-scale alarm over a directory it had never opened.
+    ///
+    /// The mark is drawn either way, and [`scale`](Self::scale) is what says how
+    /// sure its position is. This is the stronger question, and only the alarm
+    /// layer asks it: *may a ring point at this?*
+    #[must_use]
+    pub fn sited(self) -> bool {
+        matches!(self, Self::Path(_) | Self::Cwd(_))
+    }
+
     /// Whether this site stacks marks on top of each other by construction.
     ///
     /// Rungs 2 and 3 are coarse: every shell call in a district lands on the

@@ -19,8 +19,9 @@
 //!
 //! # Priority, and where it stops
 //!
-//! [`Describer::describe`] tries four sources in this order and takes the first
-//! that survives [`sanitise`]:
+//! [`Neighborhoods::describe`](crate::neighborhoods::Neighborhoods::describe)
+//! tries four sources in this order and takes the first that survives
+//! [`sanitise`]:
 //!
 //! 1. **A README in the directory** — its first sentence, or its first heading
 //!    when that heading says something the directory name does not.
@@ -530,7 +531,7 @@ const BOILERPLATE_PHRASES: &[&str] = &[
 ///
 /// Two families, and they fail for the same reason: the text is real, it is
 /// where a description would be, and it is about something other than this
-/// directory. See [`PRAGMA_PREFIXES`] and [`BOILERPLATE_PHRASES`].
+/// directory. See `PRAGMA_PREFIXES` and `BOILERPLATE_PHRASES`.
 pub fn looks_like_boilerplate(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // Leading punctuation is stripped before the prefix test because the
@@ -604,7 +605,7 @@ const SECRET_NAMES: &[&str] = &[
 /// Four independent tests:
 ///
 /// * a **known key prefix** anywhere in a token;
-/// * an **assignment** to one of [`SECRET_NAMES`] with a non-empty value —
+/// * an **assignment** to one of `SECRET_NAMES` with a non-empty value —
 ///   which is why the plain word "secret" in a sentence is allowed through, and
 ///   `secret="hunter2"` is not;
 /// * a **URL with user information**, `https://user:pass@host`;
@@ -745,12 +746,13 @@ pub struct ReadmeText {
 ///
 /// Deliberately simple, and every skip is a case seen on a real repository:
 /// YAML front matter, fenced code blocks, badge rows (a paragraph that is
-/// nothing but images and links vanishes in [`strip_markup`] and is skipped as
+/// nothing but images and links vanishes in `strip_markup` and is skipped as
 /// empty), tables, and HTML blocks.
 ///
 /// The heading is kept separately from the body because it is only useful
-/// *sometimes* — see [`Describer::describe`], which uses it only when it says
-/// something the directory name does not.
+/// *sometimes* — see
+/// [`Neighborhoods::describe`](crate::neighborhoods::Neighborhoods::describe),
+/// which uses it only when it says something the directory name does not.
 pub fn read_readme(text: &str) -> ReadmeText {
     let mut out = ReadmeText::default();
     let mut lines = text.lines().peekable();
@@ -930,7 +932,7 @@ pub fn toml_description(text: &str, tables: &[&str]) -> Option<String> {
 /// The module-level documentation at the top of a source file.
 ///
 /// Uses the same four tree-sitter grammars [`crate::imports`] loads, through the
-/// same [`crate::imports::ts_language`], so the two modules can never end up on
+/// same `crate::imports::ts_language`, so the two modules can never end up on
 /// different parsers. Returns the comment's text with its syntax removed:
 ///
 /// * **Rust** — leading `//!` lines and `/*! … */` blocks, skipping any `#![…]`

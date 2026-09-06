@@ -861,13 +861,22 @@ fn settle(
     // A subagent spawn, whichever shape the result took (ADR-0013 routes 1-3).
     if let Some(sidecar) = sidecar {
         spawn_from_result(world, thread, id, sidecar, at);
+        // A job that outlives the turn that launched it. Opened here because
+        // this result is the only record that names its id.
+        open_background(world, thread, id.as_str(), sidecar, at);
     }
 
     let Some(pending) = pending else {
         return;
     };
 
-    if pending.verification && outcome != Outcome::Failed {
+    let backgrounded = sidecar.is_some_and(|s| s.get("backgroundTaskId").is_some());
+    if pending.verification && outcome != Outcome::Failed && !backgrounded {
+        // A backgrounded test run has *started*, not passed. Marking the thread
+        // verified here would let `cargo test --workspace &` clear PRD §11.2's
+        // "done, unverified" the instant it was launched — the opposite of what
+        // the operator meant by "waiting on the clean run before committing".
+        // The real verdict arrives with the `<task-notification>`.
         mark_verified(world, thread, at);
     }
 
@@ -1243,18 +1252,85 @@ pub(crate) fn control(world: &mut World, event: &ControlEvent) {
 /// what lets that arm stamp activity without also calling
 /// [`World::resolve_decisions`].
 fn working(world: &mut World, thread: &ThreadId, at: Instant) {
+    if let Some(t) = world.threads.get_mut(thread) {
+        t.last_activity = at;
+    }
+    derive(world, thread);
+}
+
+/// The main agent picked its turn back up.
+///
+/// Separate from [`working`] because `working` stamps for a **worker's** records
+/// too — deliberately, so a live orchestrator is not retired out from under a
+/// working fleet — and a subagent churning away says nothing about the main
+/// agent's turn. Calling this from `working` made a fleet of subagents clear
+/// their parent's `turn_ended`, which put a finished thread back to `Working`
+/// and then let the 60-second clock decay it to `Idle`.
+///
+/// The interrupt clears here for the same reason, and it has to clear
+/// somewhere: measured on this machine a `<task-notification>` arrives 429 ms
+/// after an interrupt and the thread carries straight on, so a sticky
+/// `Interrupted` would hold a blocking pin over visibly working work.
+fn resumed(world: &mut World, thread: &ThreadId, at: Instant) {
+    if let Some(t) = world.threads.get_mut(thread) {
+        t.turn_ended = false;
+        t.interrupted_at = None;
+        t.last_activity = at;
+    }
+    derive(world, thread);
+}
+
+/// The **only** function that assigns [`Thread::status`].
+///
+/// # Why status is derived rather than written
+///
+/// It used to be written in five places that did not agree, and the disagreement
+/// was not theoretical. Two call sites resolved a decision without re-deriving
+/// (`OtelEvent::ToolBlockedOnUserSpan`, and the interrupt branch of
+/// [`answered`]), and [`World::tick`] decays only `Working` — so a thread could
+/// sit in `Waiting` with zero live marks until it was retired half an hour
+/// later. Every state added to the enum was another way to get permanently
+/// stuck.
+///
+/// So the channels now write *ledgers* — the attention layer,
+/// [`Thread::background`], [`Thread::interrupted_at`], [`Thread::turn_ended`],
+/// `World::pending` — and this reads them in one fixed precedence:
+///
+/// 1. **`Done`** is sticky. A session that ended cannot be resurrected by a
+///    transcript record that was merely slow to arrive.
+/// 2. **`Waiting`** — a live decision mark. Somebody asked the operator a
+///    question and it has not been answered.
+/// 3. **`Interrupted`** — the operator pressed Esc and nothing has happened
+///    since.
+/// 4. **`Working`** — a tool call is in flight, or the turn has not ended.
+/// 5. **`Parked`** — the turn ended but a background job is still open. Ranks
+///    below `Working` because a thread that is *also* calling tools is working,
+///    whatever else it has running.
+/// 6. **`Ready`** — the turn ended with the ledgers empty.
+/// 7. **`Idle`** — none of the above can be shown. The honest last resort.
+fn derive(world: &mut World, thread: &ThreadId) {
     let blocked = world
         .attention
         .iter()
         .any(|m| m.kind.is_decision_for(thread));
-    if let Some(t) = world.threads.get_mut(thread) {
-        t.status = if blocked {
-            ThreadStatus::Waiting
-        } else {
-            ThreadStatus::Working
-        };
-        t.last_activity = at;
+    let in_flight = world.pending_for(thread);
+    let Some(t) = world.threads.get_mut(thread) else {
+        return;
+    };
+    if t.status == ThreadStatus::Done {
+        return;
     }
+    t.status = if blocked {
+        ThreadStatus::Waiting
+    } else if t.interrupted_at.is_some() {
+        ThreadStatus::Interrupted
+    } else if in_flight || !t.turn_ended {
+        ThreadStatus::Working
+    } else if !t.background.is_empty() {
+        ThreadStatus::Parked
+    } else {
+        ThreadStatus::Ready
+    };
 }
 
 /// Raises a "needs decision" mark and parks the thread on it.
@@ -1346,7 +1422,7 @@ fn turn_boundary(
     if !calls.is_empty() {
         if worker.is_none() {
             world.resolve_decisions(thread);
-            working(world, thread, at);
+            resumed(world, thread, at);
         }
         for name in calls {
             if crate::attention::asks_the_operator(&ToolKind::parse(name)) {
@@ -1358,13 +1434,41 @@ fn turn_boundary(
     // `stop_reason` is the only field that says "this really was the end of the
     // turn". A text-only record with no stop reason is a streamed fragment, and
     // treating it as an idle boundary makes the pin flicker on every paragraph.
-    let ended = record
+    //
+    // An allowlist rather than a match on one value, with anything unrecognised
+    // counted rather than guessed at: `max_tokens` (the answer was truncated)
+    // and `pause_turn` ("not finished, call again") are documented boundaries
+    // that do not appear in this machine's 52,528 recorded stop reasons, and a
+    // silent mismatch would read as a thread that never finished a turn.
+    let ended = match record
         .message
         .as_ref()
         .and_then(|m| m.stop_reason.as_deref())
-        == Some("end_turn");
+    {
+        Some("end_turn" | "stop_sequence") => true,
+        Some("tool_use") | None => false,
+        Some(_) => {
+            world.health.events_ignored += 1;
+            false
+        }
+    };
     if worker.is_none() && ended {
-        needs_decision(world, thread, DecisionSource::TurnEnded, at, None);
+        // NOT a decision. This line used to raise
+        // `DecisionSource::TurnEnded`, which painted the loudest state in the
+        // product — amber, uppercase, sorted first, never decaying — on the
+        // single most common thing an agent does. PRD §11.2 lists the sources of
+        // *needs decision* as `PermissionRequest`, `Elicitation` and
+        // `TeammateIdle`; a turn ending is not among them, and §11.2(b) files it
+        // under `done` instead: "a main thread going idle is news".
+        //
+        // What the boundary means now is decided by `derive` from the ledgers:
+        // `Ready` with nothing outstanding, `Parked` with a background job still
+        // open, and still `Waiting` if a real question is pending.
+        if let Some(t) = world.threads.get_mut(thread) {
+            t.turn_ended = true;
+            t.last_activity = at;
+        }
+        derive(world, thread);
     }
 }
 
@@ -1415,6 +1519,28 @@ fn answered(
     record: &ThreadedRecord,
     at: Instant,
 ) {
+    if interrupted(record) {
+        // The operator pressed Esc. This used to fall into the branch below and
+        // be thrown away — the line was literally `let _ = at;` — so the thread
+        // kept whatever status it had, went silent, and 60 seconds later the
+        // decay clock relabelled it `Idle`. That is the operator's own report:
+        // *"i just interrupted this chat, the chat says 'idle', it should say
+        // 'interrupted'"*.
+        //
+        // Both wordings land here. `[Request interrupted by user for tool use]`
+        // is 41 of this machine's 86 interrupts and 15 of those are the last
+        // record in their file; classifying it as a mere tool rejection — which
+        // its neighbouring `user-rejected` tool_result makes tempting — leaves
+        // half of all interrupts decaying into `Idle`.
+        world.resolve_decisions(thread);
+        if let Some(t) = world.threads.get_mut(thread) {
+            t.interrupted_at = Some(at);
+            t.last_activity = at;
+            t.turn_ended = true;
+        }
+        derive(world, thread);
+        return;
+    }
     if denied(raw, record) {
         // A rejection is an ANSWER, not a question. `DecisionSource::Rejected`'s
         // own contract says its evidence "arrives with the operator's answer
@@ -1427,7 +1553,7 @@ fn answered(
         // Resolving instead: any decision this thread was waiting on is now
         // settled, so the pin comes down rather than a second one going up.
         world.resolve_decisions(thread);
-        let _ = at;
+        working(world, thread, at);
         return;
     }
     let is_tool_result = blocks(record)
@@ -1442,27 +1568,160 @@ fn answered(
     if worker.is_some() || record.is_meta == Some(true) {
         return;
     }
+    // A machine waking the thread is not the operator answering it.
+    //
+    // `<task-notification>` records — a background shell reporting in, a
+    // subagent finishing — arrive as ordinary `user` records and were, until
+    // here, indistinguishable from the human typing. 218 of them in this
+    // machine's corpus were being read as "the operator replied", which took
+    // down pins nobody had answered and is the second half of the report *"then
+    // it starts again automatically and the 'waiting' disappears"*.
+    //
+    // `origin.kind` names the difference, and it is absent on ~30% of genuine
+    // human prompts, so the test is one-sided on purpose: only an explicit
+    // `task-notification` is treated as machine. Anything else — including a
+    // missing `origin` — stays the operator, which keeps today's behaviour as
+    // the fallback rather than silently withholding pins from real answers.
+    let machine_wake = record
+        .origin
+        .as_ref()
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        == Some("task-notification");
+    if machine_wake {
+        // It is activity, and it closes whatever background job just reported —
+        // but it answers nothing.
+        close_background(world, thread, raw);
+        resumed(world, thread, at);
+        return;
+    }
     world.resolve_decisions(thread);
-    working(world, thread, at);
+    resumed(world, thread, at);
+}
+
+/// Opens a background job on the `tool_result` that launched it.
+///
+/// `Bash(run_in_background: true)` answers in milliseconds and then runs for
+/// minutes, so this is the only moment Polis learns the job exists. Two shapes
+/// carry it, measured across this machine's 125 transcripts that have any:
+/// `toolUseResult.backgroundTaskId` (360 distinct ids), and the result text
+/// `Command running in background with ID: …` for the launches that predate the
+/// structured field.
+fn open_background(
+    world: &mut World,
+    thread: &ThreadId,
+    tool_use: &str,
+    sidecar: &Value,
+    at: Instant,
+) {
+    let id = sidecar
+        .get("backgroundTaskId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let text = sidecar.get("stdout").and_then(Value::as_str)?;
+            text.split_once("Command running in background with ID:")
+                .map(|(_, rest)| rest.trim().lines().next().unwrap_or("").trim().to_owned())
+                .filter(|id| !id.is_empty())
+        });
+    let Some(id) = id else { return };
+    let Some(t) = world.threads.get_mut(thread) else {
+        return;
+    };
+    if t.background.iter().any(|b| b.id == id) {
+        return;
+    }
+    t.background.push(crate::BackgroundTask {
+        id,
+        tool_use: Some(tool_use.to_owned()),
+        label: sidecar
+            .get("command")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        since: at,
+    });
+}
+
+/// Closes the background job a `<task-notification>` reports on.
+///
+/// The notification names its `<task-id>`, so the close is keyed rather than
+/// guessed. Its own payload warns that "the same task-id may notify more than
+/// once", so removing an id that is already gone is a no-op by construction.
+///
+/// A job whose notification never arrives — measured at 17 of 357, ~5% — is
+/// reaped by [`expire_background`] instead.
+fn close_background(world: &mut World, thread: &ThreadId, raw: &Value) {
+    let text = raw
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let blocks = raw.get("message")?.get("content")?.as_array()?;
+            blocks
+                .iter()
+                .find_map(|b| b.get("text").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+        });
+    let Some(text) = text else { return };
+    let Some(id) = text
+        .split_once("<task-id>")
+        .and_then(|(_, rest)| rest.split_once("</task-id>"))
+        .map(|(id, _)| id.trim().to_owned())
+    else {
+        return;
+    };
+    if let Some(t) = world.threads.get_mut(thread) {
+        t.background.retain(|b| b.id != id);
+    }
+}
+
+/// Whether a `user` record proves the operator pressed Esc.
+///
+/// # Both wordings, and why the second one is not a rejection
+///
+/// Claude Code writes one of two text blocks, and this machine's corpus splits
+/// them 45 / 41:
+///
+/// * `[Request interrupted by user]` — Esc at the prompt, mid-thought;
+/// * `[Request interrupted by user for tool use]` — Esc while a tool call was
+///   up, which is **48% of all interrupts**, and 15 of those 41 are the last
+///   record in their file.
+///
+/// The second is easy to mistake for a permission denial, because a
+/// `user-rejected` `tool_result` sits immediately before it (verified on 4 of 4
+/// sampled contexts). It is not: `toolDenialKind` is present on **0 of 41** of
+/// these records, the denial belongs to the *previous* record, and the operator
+/// who hit Esc has stopped the thread rather than answered it. Calling it a
+/// rejection leaves half of all interrupts decaying into `Idle`, which is the
+/// bug this predicate exists to close.
+///
+/// Matched on the exact stripped text rather than a prefix, so that a tool
+/// result quoting the phrase — this repository's own source does — cannot
+/// masquerade as one.
+fn interrupted(record: &ThreadedRecord) -> bool {
+    blocks(record).iter().any(|b| {
+        b.kind.as_deref() == Some("text")
+            && b.text.as_deref().is_some_and(|t| {
+                let t = t.trim();
+                t == "[Request interrupted by user]"
+                    || t == "[Request interrupted by user for tool use]"
+            })
+    })
 }
 
 /// Whether a `user` record proves the operator was asked and said no.
 ///
 /// `toolDenialKind` (`user-rejected` | `permission-rule` | `automode-blocked` |
-/// `automode-unavailable`) and `interruptedMessageId` are raw envelope fields
-/// that `ThreadedRecord` does not model, so they are read off the verbatim
-/// record — which PRD §4.4's `{ known fields } + Value` rule keeps available
-/// exactly for cases like this.
-fn denied(raw: &Value, record: &ThreadedRecord) -> bool {
-    if raw.get("toolDenialKind").is_some() || raw.get("interruptedMessageId").is_some() {
-        return true;
-    }
-    blocks(record).iter().any(|b| {
-        b.kind.as_deref() == Some("text")
-            && b.text
-                .as_deref()
-                .is_some_and(|t| t.starts_with("[Request interrupted"))
-    })
+/// `automode-unavailable`) is a raw envelope field that `ThreadedRecord` does
+/// not model, so it is read off the verbatim record — which PRD §4.4's
+/// `{ known fields } + Value` rule keeps available exactly for cases like this.
+///
+/// `interruptedMessageId` used to be read here too. It moved to
+/// [`interrupted`]: it rides on 51 of 86 interrupt records and means Esc, not a
+/// denial, so answering it as a rejection lost the state entirely.
+fn denied(raw: &Value, _record: &ThreadedRecord) -> bool {
+    raw.get("toolDenialKind").is_some()
 }
 
 /// Finishes a thread, raising PRD §11.2's `done` split by verification.

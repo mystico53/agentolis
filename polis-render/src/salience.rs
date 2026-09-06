@@ -169,7 +169,7 @@ impl AlarmKind {
     /// Whether this kind grows with [`Site::urgency`].
     ///
     /// The two states that persist do; a failed call does not, because
-    /// [`ink_weight`]'s floor is already its whole statement about time and PRD
+    /// `ink_weight`'s floor is already its whole statement about time and PRD
     /// §10.2's outcome channel has nothing to escalate — the build was broken
     /// then and it is broken now.
     #[must_use]
@@ -346,7 +346,7 @@ pub const ALARM_UNSITED: f64 = 1.72;
 /// Sparse on purpose — a ring of eleven short arcs at 34 % duty is not the same
 /// object as [`ALARM_ARCS`]' eight arcs at 72 %, and PRD §11.4 needs the two to
 /// be told apart with the colour thrown away. Realised as a **stride** over
-/// [`RING`]'s 32 vertices, so the gaps land at fixed angles and the notation
+/// `RING`'s 32 vertices, so the gaps land at fixed angles and the notation
 /// does not rotate frame to frame.
 pub const ALARM_UNSITED_TICKS: usize = 11;
 
@@ -435,7 +435,7 @@ pub struct Site {
     /// How many things this site stands for. One, unless the caller has already
     /// aggregated.
     pub count: u32,
-    /// Normalised age in `[0, 1]`, driving [`ink_weight`].
+    /// Normalised age in `[0, 1]`, driving `ink_weight`.
     pub age: f64,
     /// Arrival pulse in `[0, 1]` (PRD §11.4).
     pub pulse: f64,
@@ -447,7 +447,11 @@ pub struct Site {
 }
 
 impl Site {
-    /// A site with no escalation and a known place — what a failed call is.
+    /// A site with no escalation and a known place.
+    ///
+    /// Every failure ring is one of these, because [`alarms`] admits only marks
+    /// that already stand where their operation happened; a failure that
+    /// borrowed the agent's position never becomes a [`Site`] at all.
     #[must_use]
     pub fn new(at: Px, count: u32, age: f64, pulse: f64) -> Self {
         Self {
@@ -483,6 +487,28 @@ impl Cluster {
 
 /// Groups the failed marks of a frame into alarms.
 ///
+/// # An alarm needs a place of its own
+///
+/// Only marks that stand where their operation actually happened are eligible —
+/// [`live::Mark::sited`], which is rung 1 or 2 of
+/// `polis_world::place::site_of`. A pathless call whose working directory is the
+/// repository root resolves on rung 3, at the agent, and its position is the
+/// thread's rather than the failure's: it moves as the agent works, and the
+/// district it lands on is whichever file the thread most recently had open.
+///
+/// A red glyph there is true — the call failed, and that is where the agent was.
+/// A ring there is not: this ring is drawn at district scale, holds
+/// [`ALARM_FLOOR`] ink for the whole of `polis_world::TRAIL_TTL`, and reads as
+/// *this part of the city is broken*. Measured on session `f24c92b7`, every one
+/// of the failures in it was a shell call at the root, so every ring it flew was
+/// pointing at a district that had done nothing wrong.
+///
+/// Nothing is hidden by this. The failure keeps its mark (PRD §10.2's outcome
+/// channel), the status rail keeps its count, and a failed verification still
+/// leaves the thread unverified for PRD §11.2b to raise when it stops — which is
+/// the attention state that actually wants the operator. What is dropped is a
+/// layer-4 mark shouting in a layer-5 voice about a place it invented.
+///
 /// Deterministic: the marks are visited in a fixed order (rounded position, then
 /// glyph), so the same frame yields the same clusters on every run and every
 /// machine. Greedy single-pass assignment — a mark joins the first cluster whose
@@ -493,7 +519,7 @@ impl Cluster {
 pub fn alarms(marks: &[Mark], r: f64, map_height: f64) -> Vec<Alarm> {
     let failed: Vec<Site> = marks
         .iter()
-        .filter(|m| m.outcome == polis_events::Outcome::Failed)
+        .filter(|m| m.outcome == polis_events::Outcome::Failed && m.sited)
         .map(|m| Site::new(m.at, m.count.max(1), m.age, m.pulse))
         .collect();
     rings(&failed, AlarmKind::Failure, r, map_height)
@@ -828,6 +854,30 @@ mod tests {
         ];
         assert!(alarms(&marks, 8.0, 600.0).is_empty());
         assert_eq!(alarms(&[failed([100.0, 100.0], 0.0)], 8.0, 600.0).len(), 1);
+    }
+
+    /// The same failure, at a place it named and at a place it borrowed.
+    ///
+    /// One ring and no ring, and the mark is identical in every other respect —
+    /// so what this pins is exactly the rung and nothing else.
+    #[test]
+    fn a_failure_that_borrowed_the_agents_position_raises_no_ring() {
+        let own = failed([100.0, 100.0], 0.0);
+        assert_eq!(alarms(&[own], 8.0, 600.0).len(), 1);
+        assert!(alarms(&[own.at_agent()], 8.0, 600.0).is_empty());
+    }
+
+    /// A stack that has one real failure in it keeps its ring.
+    ///
+    /// Rung 3 lands every pathless call of one agent on one point, and that
+    /// point can round onto a building the same thread genuinely failed at.
+    /// Refusing the ring there would lose a failure that *does* have a place.
+    #[test]
+    fn one_sited_failure_is_enough_to_raise_the_ring() {
+        let borrowed = failed([100.0, 100.0], 0.0).at_agent();
+        let own = failed([104.0, 100.0], 0.0);
+        assert!(alarms(&[borrowed], 8.0, 600.0).is_empty());
+        assert_eq!(alarms(&[borrowed, own], 8.0, 600.0).len(), 1);
     }
 
     #[test]

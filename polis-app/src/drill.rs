@@ -260,10 +260,9 @@ pub struct Ranked<'a> {
     /// The file the row is about: the one the mark names, else the last file
     /// the thread touched.
     ///
-    /// The fallback is what makes the list usable at all: the most common
-    /// source of a *needs decision* on real sessions is `TurnEnded`, which names
-    /// no file, and a row with nowhere to go is a row the operator cannot act
-    /// on.
+    /// The fallback is what makes the list usable at all: `AskUser` and the
+    /// `Notification` family name no file, and a row with nowhere to go is a row
+    /// the operator cannot act on.
     pub at: Option<LogicalPath>,
     /// What to call the thread.
     pub thread: String,
@@ -574,7 +573,7 @@ mod tests {
             AttentionKind::NeedsDecision {
                 thread: id,
                 at: None,
-                source: polis_world::attention::DecisionSource::TurnEnded,
+                source: polis_world::attention::DecisionSource::AskUser,
             },
             t0,
         )];
@@ -670,7 +669,7 @@ mod tests {
         let decision = AttentionKind::NeedsDecision {
             thread: thread.clone(),
             at: None,
-            source: polis_world::attention::DecisionSource::TurnEnded,
+            source: polis_world::attention::DecisionSource::AskUser,
         };
         let unverified = AttentionKind::Done {
             thread: thread.clone(),

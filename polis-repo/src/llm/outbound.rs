@@ -122,7 +122,7 @@ pub const MAX_FIELD_CHARS: usize = 400;
 ///
 /// 1. **Strip what must never be transmitted or drawn** — every control
 ///    character and the Unicode bidi overrides and zero-width characters, using
-///    [`crate::describe::is_unsafe_char`], the same predicate the inbound
+///    `crate::describe::is_unsafe_char`, the same predicate the inbound
 ///    sanitiser uses. Whitespace runs collapse to one space.
 /// 2. **Refuse the whole field** if what remains is credential-shaped.
 ///

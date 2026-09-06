@@ -777,7 +777,7 @@ const GENERATED_MARKERS: &[&str] = &[
 ];
 
 /// How many bytes of a file [`kind_of_with_content`] reads looking for a
-/// [`GENERATED_MARKERS`] banner.
+/// `GENERATED_MARKERS` banner.
 ///
 /// A generated-file banner is in the first line or two by universal convention;
 /// 512 bytes covers a shebang, a licence line and the banner, and bounds the

@@ -305,7 +305,7 @@ impl PtyHost {
 
     /// Ends the child and waits for the thread to finish.
     ///
-    /// Bounded by [`GRACE`] plus one `taskkill`, so a caller closing twenty
+    /// Bounded by `GRACE` plus one `taskkill`, so a caller closing twenty
     /// panes is bounded too.
     pub fn shutdown(&mut self) {
         let _ = self.tasks.send(Task::Kill);

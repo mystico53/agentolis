@@ -255,6 +255,20 @@ pub const IDLE_AFTER: Duration = Duration::from_secs(60);
 /// wired to `pending` today.
 pub const IN_FLIGHT_MAX: Duration = Duration::from_mins(10);
 
+/// How long a background job may run before Polis stops believing in it.
+///
+/// About 5% of launched jobs (17 of 357 measured here) never produce the
+/// `<task-notification>` that would close them — the session was killed, the
+/// terminal closed, the shell reaped. Without a ceiling those pin a thread
+/// [`ThreadStatus::Parked`] forever, which is quieter and therefore worse than
+/// the `WAITING` it replaced.
+///
+/// Twelve hours, not the hour a reap timer would suggest, because the ceiling
+/// has to sit above real jobs rather than through them: measured
+/// launch-to-notification on this machine is p90 22 min but **p99 10.4 h**, with
+/// a longest legitimate job of 12.0 h.
+pub const BACKGROUND_MAX: Duration = Duration::from_hours(12);
+
 /// How long a quiet thread stays in the world before [`World::tick`] retires it.
 ///
 /// **Deliberately the same 30 minutes as `polis_ingest::live::LIVE_WINDOW`**,
@@ -274,7 +288,7 @@ pub const THREAD_RETIRE_AFTER: Duration = Duration::from_mins(30);
 
 /// The ceiling on how long a standing attention mark may hold a silent thread.
 ///
-/// [`World::retire_threads`] will not take a thread the operator still has to
+/// `World::retire_threads` will not take a thread the operator still has to
 /// act on, and only `Done { verified: true }` marks decay
 /// ([`attention::AttentionKind::decays`]) — so a *needs decision* Polis never
 /// saw answered, or a *done, unverified*, pinned its thread to the rail
@@ -543,6 +557,21 @@ pub struct World {
     spawns: BTreeMap<ToolUseId, ThreadId>,
     /// Whether an unrecognised `cwd` may be adopted as a worktree.
     adopt_worktrees: bool,
+    /// Whether the quiet-thread clock runs. Off for a replay.
+    ///
+    /// Retirement exists to bound a **live** world — `MAX_THREADS` pressure, and
+    /// forgetting sessions that ended hours ago. A replay has neither problem:
+    /// the driver owns the whole timeline and the operator scrubs it.
+    ///
+    /// Leaving it on made replay non-deterministic, because it makes the world a
+    /// function of the *tick schedule* rather than of the events. Seeking to the
+    /// midpoint ticks there and retires a quiet thread; the thread's next event
+    /// then rebuilds it from zero, so the same moment reached by seeking and by
+    /// playing straight through disagreed on tool counts and worker attribution.
+    /// `real_corpus`'s seek-determinism test caught it once ADR-0102 stopped
+    /// every finished turn pinning its thread for four hours and threads could
+    /// reach the clock at all.
+    retire_quiet_threads: bool,
     /// Highest `observed` seen, so `tick` has a floor even before the first one.
     now: Instant,
     /// Bumped whenever [`Self::layout`] is replaced.
@@ -595,6 +624,7 @@ impl World {
             workflow_runs: BTreeMap::new(),
             spawns: BTreeMap::new(),
             adopt_worktrees: true,
+            retire_quiet_threads: true,
             now: Instant::now(),
             layout_generation: 0,
             files_generation: 0,
@@ -609,7 +639,9 @@ impl World {
     /// record carries one, which is what makes `polis replay <transcript>` work
     /// with nothing configured.
     pub fn for_replay(layout: CityLayout) -> Self {
-        Self::new(RepoTree::default(), layout)
+        let mut world = Self::new(RepoTree::default(), layout);
+        world.retire_quiet_threads = false;
+        world
     }
 
     /// Applies one event. The only mutation path.
@@ -666,11 +698,32 @@ impl World {
         for thread in self.threads.values_mut() {
             thread.territory.decay(now);
             thread.fade_trail(now);
+            // Silence only ever demotes a thread that claimed to be *working*.
+            // `Waiting`, `Interrupted`, `Parked` and `Ready` each rest on a
+            // record that was actually seen, and a clock must not overrule
+            // evidence — a parked `cargo test` is legitimately silent for
+            // minutes (measured p90 22 min, p99 10.4 h), and an interrupt is
+            // silent until the operator types.
             if thread.status == ThreadStatus::Working
                 && now.saturating_duration_since(thread.last_activity) > IDLE_AFTER
                 && !in_flight.contains(&thread.id)
             {
                 thread.status = ThreadStatus::Idle;
+            }
+            // Reap background jobs whose notification never came — measured at
+            // 17 of 357, about 5%. Without this a thread parks forever, which is
+            // worse than the bug being fixed because `Parked` is quiet.
+            //
+            // The ceiling is elapsed time, and it is deliberately generous:
+            // launch-to-notification runs to p99 10.4 h on this machine, so a
+            // tighter clock would relabel legitimately running overnight jobs.
+            let before = thread.background.len();
+            thread.background.retain(|b| b.age(now) <= BACKGROUND_MAX);
+            if thread.background.len() != before && thread.background.is_empty() {
+                thread.status = match thread.status {
+                    ThreadStatus::Parked => ThreadStatus::Ready,
+                    other => other,
+                };
             }
         }
         self.refresh_contention(now);
@@ -679,7 +732,9 @@ impl World {
         // After the marks have been expired, never before: a thread is retired
         // only when nothing on the attention layer still points at it, so the
         // rule below reads a list that is already current.
-        self.retire_threads(now);
+        if self.retire_quiet_threads {
+            self.retire_threads(now);
+        }
         self.expire_unattributed(now);
         attention::sort(&mut self.attention);
     }
@@ -762,14 +817,14 @@ impl World {
     /// Every automatic rule here is a rule about *silence*, and silence is the
     /// only evidence a transcript can offer: there is no session-end record, so
     /// a session that ended, one that crashed and one still sitting at a prompt
-    /// are indistinguishable (see [`World::retire_threads`]). The operator is
+    /// are indistinguishable (see `World::retire_threads`). The operator is
     /// the one party who actually knows, and until this existed there was no way
     /// to tell Polis — a thread pinned by a standing mark outlived every clock
     /// the world has.
     ///
     /// **Not a tombstone.** Nothing here remembers the dismissal, so the next
     /// event for that session builds the thread again through
-    /// [`World::thread_entry`] exactly as a first sighting would. Closing an
+    /// `World::thread_entry` exactly as a first sighting would. Closing an
     /// agent that turns out to still be working costs one row for one event,
     /// which is the right price: the alternative is a filter that hides a live
     /// agent, and a map that omits work is worse than one that shows work you
@@ -919,6 +974,21 @@ impl World {
     /// where the collision would be a lie rather than the truth.
     pub fn set_adopt_worktrees(&mut self, adopt: bool) {
         self.adopt_worktrees = adopt;
+    }
+
+    /// Whether the quiet-thread clock runs.
+    ///
+    /// On for a live world, off for one built by [`World::for_replay`]. The
+    /// asymmetry is about **destructiveness**, not about replay being special:
+    /// every other time-based rule here — the `Working` decay, territory
+    /// dormancy, the trail fade — recomputes from `last_activity` and so lands
+    /// on the same answer however the clock got there. Retirement deletes a
+    /// thread outright, and a deleted thread rebuilt by its next event comes
+    /// back with its counters at zero. That makes the world a function of the
+    /// tick schedule, so a scrubber that seeks to a moment and one that plays
+    /// through to it disagree — which is a replay that lies about what happened.
+    pub fn set_retire_quiet_threads(&mut self, retire: bool) {
+        self.retire_quiet_threads = retire;
     }
 
     /// The latest instant the world has been advanced to.
@@ -1190,6 +1260,18 @@ impl World {
         self.attention.retain(|m| !m.kind.is_decision_for(thread));
     }
 
+    /// Whether a tool call this thread issued is still outstanding.
+    ///
+    /// **Deliberately not bounded by [`IN_FLIGHT_MAX`].** `apply::derive` must be
+    /// a pure function of the ledgers, or the same events replayed differently
+    /// produce different states — `real_corpus`'s seek-determinism test caught
+    /// exactly that when this read the clock. The staleness ceiling belongs to
+    /// [`World::tick`], which already applies it, and which is where every other
+    /// time-dependent demotion lives.
+    pub(crate) fn pending_for(&self, thread: &ThreadId) -> bool {
+        self.pending.values().any(|c| &c.thread == thread)
+    }
+
     /// Rebuilds the contention marks from the live claim table.
     ///
     /// Contention is a **relation**, not a property, so it cannot outlive the
@@ -1365,8 +1447,32 @@ pub struct Thread {
     /// counts the PRD is describing live in [`Thread::visits`] and are **not**
     /// lost when a step falls off the end.
     pub trail: VecDeque<(LogicalPath, Instant)>,
-    /// Working / Waiting / Idle / Done.
+    /// Working / Waiting / Interrupted / Parked / Ready / Idle / Done.
+    ///
+    /// Derived, never authored: every channel writes to the ledgers below and
+    /// then calls `apply::derive`, which is the only function that assigns this.
     pub status: ThreadStatus,
+    /// Work this thread launched that outlives the turn that launched it.
+    ///
+    /// A `run_in_background` shell hands its `tool_result` back in milliseconds
+    /// and then runs for minutes, so this ledger is the only thing that can tell
+    /// *finished* from *still going*. Non-empty at a turn boundary is what makes
+    /// a thread [`ThreadStatus::Parked`] instead of [`ThreadStatus::Ready`].
+    pub background: Vec<BackgroundTask>,
+    /// Whether the last thing this thread said was the end of a turn.
+    ///
+    /// The ledger behind `Ready` / `Parked`. Set by a `stop_reason` boundary or
+    /// a `Stop` hook, cleared by any activity, and read by `apply::derive` —
+    /// which is what stops a finished turn from being confused with a thread
+    /// that is mid-call and merely slow.
+    pub turn_ended: bool,
+    /// When the operator last pressed Esc, cleared by the thread's next activity.
+    ///
+    /// Stamped rather than written straight to `status` so that `derive` keeps
+    /// its single-writer contract, and so an interrupt cannot outlive the work
+    /// that follows it: measured on this machine, a `<task-notification>` can
+    /// arrive 429 ms after an interrupt and the thread carries on.
+    pub interrupted_at: Option<Instant>,
     /// This thread's identity hue slot, into `polis_render::live::THREAD_HUES`
     /// (PRD §11.4).
     ///
@@ -1443,6 +1549,9 @@ impl Thread {
             workers: Vec::new(),
             trail: VecDeque::new(),
             status: ThreadStatus::Working,
+            background: Vec::new(),
+            turn_ended: false,
+            interrupted_at: None,
             tint,
             ops: VecDeque::new(),
             visits: BTreeMap::new(),
@@ -1710,14 +1819,121 @@ pub struct UnattributedWorker {
     pub reason: &'static str,
 }
 
+/// One job a thread launched that outlives the turn that launched it.
+///
+/// # Why this has to exist at all
+///
+/// `Bash(run_in_background: true)` returns its `tool_result` immediately — a
+/// seven-minute `cargo test` is a 0.2-second tool call as far as every clock in
+/// this crate is concerned. The thread then ends its turn and sits silent until
+/// a `<task-notification>` wakes it. Without this ledger those minutes are
+/// indistinguishable from a finished session, which is exactly what the operator
+/// reported: *"it's waiting on the clean run before committing, not for the
+/// user"*.
+///
+/// Measured on this machine: 360 distinct `backgroundTaskId`s across 125
+/// transcripts, and `grep -rn backgroundTaskId --include=*.rs` matched **no
+/// production file** before this change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTask {
+    /// Claude Code's own `backgroundTaskId`, and the join key the closing
+    /// `<task-notification>` names.
+    pub id: String,
+    /// The `tool_use` that launched it, so the job can be traced to its call.
+    pub tool_use: Option<String>,
+    /// What it is, in the operator's words — the command line where the launch
+    /// record carried one.
+    pub label: Option<String>,
+    /// When it was launched.
+    pub since: Instant,
+}
+
+impl BackgroundTask {
+    /// How long it has been running.
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.since)
+    }
+}
+
 /// What a thread is doing (PRD §5).
+///
+/// # One state per piece of evidence
+///
+/// Each variant is reached by a distinct thing a channel can actually *prove*,
+/// which is the standard the rest of this crate holds itself to. The state that
+/// used to be missing was [`ThreadStatus::Ready`], and its absence sent every
+/// completed turn into [`ThreadStatus::Waiting`] — the loudest state in the
+/// product, fired by the most common thing an agent does.
+///
+/// | Evidence | State |
+/// |---|---|
+/// | a live `NeedsDecision` mark | `Waiting` |
+/// | a `[Request interrupted by user]` record | `Interrupted` |
+/// | tool calls arriving | `Working` |
+/// | turn ended with a background task still open | `Parked` |
+/// | `stop_reason: end_turn`, no tool call, main agent | `Ready` |
+/// | [`IDLE_AFTER`] of silence mid-turn, or a `StopFailure` | `Idle` |
+/// | a `Stop` hook | `Done` |
+///
+/// # Only two of these are the operator's move
+///
+/// [`ThreadStatus::blocks_operator`] is the bit that matters, and it is true for
+/// exactly `Waiting` and `Interrupted`. Everything else is the thread's own
+/// business, however it got there. The failure this enum was widened for was one
+/// word — `WAITING` — standing for "asked you a question", "finished", "you hit
+/// Esc" and "a background `cargo test` is still going", which are four different
+/// answers to *should I go there now*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadStatus {
     /// Actively calling tools.
     Working,
     /// Blocked on a human. This is what the product is for.
     Waiting,
-    /// Alive but quiet.
+    /// The operator pressed Esc. Nothing moves until they type.
+    ///
+    /// Distinct from [`ThreadStatus::Waiting`] because nothing was *asked* —
+    /// there is no question to answer, no pin to resolve, and the thread stopped
+    /// mid-thought rather than at a boundary. Distinct from
+    /// [`ThreadStatus::Idle`] because the transcript carries positive proof, and
+    /// reading an interrupt as silence is what produced the operator's report:
+    /// *"i just interrupted this chat, the chat says 'idle', it should say
+    /// 'interrupted'"*.
+    ///
+    /// Both wordings count. Measured over this machine's corpus: 45 records read
+    /// `[Request interrupted by user]` and 41 read `[Request interrupted by user
+    /// for tool use]` — 48% of all interrupts — and 15 of that second group are
+    /// the last record in their file. Treating the second as a mere tool
+    /// rejection leaves half of all interrupts decaying into `Idle`.
+    Interrupted,
+    /// Its turn ended, but work it started is still running and it will resume
+    /// on its own. **Not the operator's move.**
+    ///
+    /// This is the state behind *"its waiting on the clean run before
+    /// committing, not for the user"*. A `run_in_background` shell returns its
+    /// `tool_result` in milliseconds while the command runs for minutes, so the
+    /// thread looks finished to every clock Polis owns; then a
+    /// `<task-notification>` arrives and it carries on by itself. Rendering that
+    /// as `WAITING` told the operator to go somewhere nothing was needed of
+    /// them, and rendering it as `Ready` would claim the prompt is theirs when
+    /// the thread is about to take it back.
+    Parked,
+    /// Its turn ended and the prompt is the operator's.
+    ///
+    /// Not [`ThreadStatus::Waiting`]: nothing was asked, so nothing is blocked
+    /// and no wall clock is being burned. Not [`ThreadStatus::Idle`]: the
+    /// transcript carries positive proof the turn ended (`stop_reason`), rather
+    /// than mere silence. Not [`ThreadStatus::Done`]: the session is alive and
+    /// the operator's next message resumes it.
+    ///
+    /// **It does not decay.** "This thread's last turn ended and nothing has
+    /// happened since" stays true indefinitely, and ageing it into `Idle` would
+    /// re-create the complaint `Idle` already carries — *"the ones saying idle
+    /// are completely unclear what they are doing"*. Retirement clears it on the
+    /// ordinary timer, which it can now reach, because a ready thread carries no
+    /// attention mark pinning it (see [`MARK_HOLD_MAX`]).
+    Ready,
+    /// Alive but quiet, with nothing to say why: it was working and went silent
+    /// mid-turn, or its turn ended on an API error.
     Idle,
     /// Finished. Split by verification in [`attention`], because "done,
     /// unverified" is really "needs review".
@@ -1727,13 +1943,29 @@ pub enum ThreadStatus {
 impl ThreadStatus {
     /// Status-rail order: waiting first, because unblocking is the primary
     /// decision PRD §1 exists to accelerate.
+    ///
+    /// [`ThreadStatus::Ready`] outranks [`ThreadStatus::Working`] on the same
+    /// principle: the ordering is *what needs the operator, first*, and a thread
+    /// whose turn has ended needs them while a working one does not.
     pub fn rail_rank(self) -> u8 {
         match self {
             Self::Waiting => 0,
-            Self::Working => 1,
-            Self::Idle => 2,
-            Self::Done => 3,
+            Self::Interrupted => 1,
+            Self::Ready => 2,
+            Self::Parked => 3,
+            Self::Working => 4,
+            Self::Idle => 5,
+            Self::Done => 6,
         }
+    }
+
+    /// Whether the operator has to act before this thread can move.
+    ///
+    /// The one bit the rail sorts and colours by. `Parked` and `Ready` are
+    /// deliberately false: a parked thread resumes itself, and a ready one is an
+    /// invitation, not a demand.
+    pub fn blocks_operator(self) -> bool {
+        matches!(self, Self::Waiting | Self::Interrupted)
     }
 
     /// Whether the thread can still produce work.
@@ -1747,6 +1979,9 @@ impl fmt::Display for ThreadStatus {
         f.write_str(match self {
             Self::Working => "working",
             Self::Waiting => "waiting",
+            Self::Interrupted => "interrupted",
+            Self::Parked => "parked",
+            Self::Ready => "ready",
             Self::Idle => "idle",
             Self::Done => "done",
         })

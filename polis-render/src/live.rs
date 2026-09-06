@@ -107,6 +107,105 @@ pub const CLOUD_TONES: [Rgb; 3] = [[56, 64, 74], [64, 72, 80], [74, 80, 84]];
 /// that module's tests.
 pub const CLOUD_HATCH: [f64; 2] = [-0.8, 0.6];
 
+/// The hatch axes a **stack** of clouds weaves on, 30° apart, starting at
+/// [`CLOUD_HATCH`].
+///
+/// Each entry is the unit normal of one layer's stripes, so the stripes
+/// themselves run 30° apart and [`CLOUD_HATCH_SPACING`] keeps meaning output
+/// pixels. Index 3 is `[-0.6, -0.8]` — exactly perpendicular to index 0 — which
+/// is not a coincidence and not free either: six axes over 180° is the most a
+/// 1 px stroke can carry before two of them are the same texture.
+///
+/// # Why a layer needs an axis of its own at all
+///
+/// Two territories used to be composited into one band map, one hue per pixel
+/// by argmax, and the loser was simply **not drawn**: where a thread's cloud
+/// crossed a denser one it disappeared, so the operator could not see that two
+/// threads were in one place, let alone which two, or how far each reached. The
+/// notation had one axis, so even the pixels that did survive wove into the
+/// neighbouring territory's hatch and read as one texture.
+///
+/// A stack fixes both at once. Every thread's field is banded, contoured and
+/// hatched **on its own**, and the layers are painted over each other; the marks
+/// are sparse and opaque, so two weaves 30° apart interleave instead of one
+/// erasing the other. Where they overlap the operator sees two hues, two
+/// silhouettes and two directions of stroke — the contention signal PRD §6.4
+/// asks for, saying *which* two rather than only *that* two.
+///
+/// # Keyed on the thread's hue slot, not on its place in the stack
+///
+/// A layer's rank changes whenever the attention ranking does, and a weave that
+/// changed with it would set a settled cloud spinning. The hue slot is the
+/// thread's for as long as it lives, so the weave is too. Slots six apart share
+/// an axis and are half the hue ring apart — the one collision this table can
+/// produce is between the two colours hardest to confuse.
+pub const CLOUD_WEAVES: [[f64; 2]; 6] = [
+    [-0.800_000, 0.600_000],
+    [-0.992_820, 0.119_615],
+    [-0.919_653, -0.392_820],
+    [-0.600_000, -0.800_000],
+    [-0.119_615, -0.992_820],
+    [0.392_820, -0.919_653],
+];
+
+// A hatch's spacing is read in output pixels along its own axis, which is only
+// true while the axis is a unit vector. A hand-authored rotation table is
+// exactly the kind of thing that acquires a typo, and a typo here is a layer
+// whose fringe hatch is quietly 8 % tighter than every other layer's.
+const _: () = {
+    let mut i = 0;
+    while i < CLOUD_WEAVES.len() {
+        let [x, y] = CLOUD_WEAVES[i];
+        let n = x * x + y * y;
+        assert!(
+            n > 0.999_9 && n < 1.000_1,
+            "a cloud weave is not a unit axis"
+        );
+        i += 1;
+    }
+    assert!(
+        CLOUD_WEAVES[0][0] == CLOUD_HATCH[0] && CLOUD_WEAVES[0][1] == CLOUD_HATCH[1],
+        "the stack's first axis is the one axis the rest of the map is drawn across"
+    );
+};
+
+/// How far one layer's hatch opens up where territories share the ground,
+/// indexed by how many claim it.
+///
+/// Ink, not spacing, is the budget: `crate::plan` draws the line between a
+/// texture and a fog at 35 % of a region inked, and a layer lays down
+/// `width / spacing` of the ground it covers. `N` layers over one place ink `N`
+/// times what one does unless something gives, and `N` times a core band's 25 %
+/// is the fog PRD §10.3 forbids, arriving through the front door this time.
+///
+/// # Why it opens by less than the crowd
+///
+/// The arithmetic that holds the union exactly constant is to open by `N`, and
+/// that is the wrong picture. PRD §6.4 is explicit that *"two territories
+/// overlapping is just a denser region, which is exactly the contention
+/// signal"*, and a rule that spends the whole second layer on paying for the
+/// first draws the busiest ground in the city as the emptiest — the operator's
+/// eye is pulled to the quiet corners.
+///
+/// So these open by **less** than the crowd — half a step per extra claimant —
+/// and the union is allowed to rise instead of being pinned:
+///
+/// | claimants | spacing × | union, in layers of ink |
+/// |---|---|---|
+/// | 1 | 1.0 | 1.00 |
+/// | 2 | 1.4 | 1.43 |
+/// | 3 | 1.9 | 1.58 |
+/// | 4 | 2.4 | 1.67 |
+/// | 5 | 2.9 | 1.72 |
+///
+/// Shared ground therefore reads denser than plain ground, and the density
+/// stops climbing well before it closes up: five claimants — the whole of
+/// `polis_world::territory::CLOUD_CAP` standing on one pixel — costs 1.7 layers
+/// of ink and not five. Index `0` and `1` are `1.0` because nothing is shared
+/// there and a lone territory has to be drawn exactly as it always was; the last
+/// entry holds for any larger crowd.
+pub const CLOUD_SHARE_SPACING: [f64; 6] = [1.0, 1.0, 1.4, 1.9, 2.4, 2.9];
+
 /// Hatch spacing per iso band, fringe → core, in **output** pixels.
 ///
 /// Spacing is the encoding: PRD §10.4 wants the reader able to say "that file is
@@ -188,12 +287,21 @@ pub const NO_BAND: u8 = u8::MAX;
 /// `polis_world`'s hue ring can never assign it, for the same reason.
 pub const NO_TINT: u8 = u8::MAX;
 
-/// How much the hatch spacing opens up where two or more territories overlap.
+/// How much the hatch spacing opens up on the **single-map** path where two or
+/// more territories overlap.
 ///
-/// Overlap is drawn as a **cross**-hatch: the primary direction plus its
+/// There, overlap is drawn as a **cross**-hatch: the primary direction plus its
 /// perpendicular. That is the shape channel saying "two territories claim this
 /// ground", and it is deliberately not a colour or a tone, both of which are
 /// already spoken for by the band.
+///
+/// It is a **stand-in**, and only the sky-in-one-map path still needs it. What
+/// it stands in for is the second territory's own layer: a summed map has one
+/// hue per pixel and cannot draw the other thread at all, so it says *somebody
+/// else is here* with a crossing stroke in the winner's colour. A
+/// [`CloudStack`] draws that thread — the crossing is two real weaves in two
+/// hues — and sets [`BandMap::cross_contested`] to false, opening its spacing by
+/// [`CLOUD_SHARE_SPACING`] instead.
 ///
 /// The spacing has to open up or the notation defeats itself. Two directions at
 /// the core band's 6 px spacing ink 44 % of the region, and 35 % is where
@@ -822,6 +930,15 @@ pub struct Mark {
     /// Positional certainty as a factor on the glyph radius —
     /// `polis_world::OpSite::scale`. `1.0` is "this building".
     pub scale: f64,
+    /// Whether this mark stands where the operation happened, or at the agent
+    /// that ran it — `polis_world::OpSite::sited`.
+    ///
+    /// A pathless call has no place of its own, so rung 3 lends it the thread's.
+    /// Drawing the mark there is honest — that is where the agent was — and
+    /// [`Mark::scale`] already says how weak the claim is. What such a mark may
+    /// not do is raise a district-scale ring about a district that did nothing.
+    /// [`crate::salience::alarms`] is the only reader.
+    pub sited: bool,
     /// How many operations this mark stands for. `1` is a single call.
     ///
     /// Aggregation is how volume is kept off the map without losing anything:
@@ -844,8 +961,18 @@ impl Mark {
             age,
             pulse,
             scale: 1.0,
+            sited: true,
             count: 1,
         }
+    }
+
+    /// The same mark, standing at the agent that ran the operation rather than
+    /// at any place the operation itself named — rung 3 of
+    /// `polis_world::place::site_of`.
+    #[must_use]
+    pub fn at_agent(mut self) -> Self {
+        self.sited = false;
+        self
     }
 }
 
@@ -897,7 +1024,7 @@ pub struct Agent {
     ///
     /// It colours the **body**, never the centre disc: [`Mark`] and this
     /// struct's [`Agent::outcome`] keep PRD §10.2's channel. See
-    /// [`draw_agent`].
+    /// `draw_agent`.
     pub tint: u8,
 }
 
@@ -1249,7 +1376,7 @@ pub fn draw_clouds(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
     let Some(field) = CloudField::sample(&frame.clouds, canvas.width, rows) else {
         return start.elapsed();
     };
-    paint_cloud_bands(canvas, &field.bands_tinted(&frame.cloud_tints));
+    paint_cloud_stack(canvas, &field.stack(&frame.cloud_tints));
     start.elapsed()
 }
 
@@ -1259,7 +1386,7 @@ pub fn draw_clouds(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
 /// `tints` is `LiveFrame::cloud_tints`; an empty slice draws the neutral tones.
 pub fn draw_cloud_field(canvas: &mut Canvas, field: &CloudField, tints: &[u8]) -> Duration {
     let start = Instant::now();
-    paint_cloud_bands(canvas, &field.bands_tinted(tints));
+    paint_cloud_stack(canvas, &field.stack(tints));
     start.elapsed()
 }
 
@@ -1272,15 +1399,28 @@ pub fn draw_cloud_field(canvas: &mut Canvas, field: &CloudField, tints: &[u8]) -
 /// the field — the thing §13 asks to be tweened — rather than interpolating the
 /// picture of it, which would cross-fade two sets of contours into mush.
 ///
-/// # The second channel, and why it is not just more density
+/// # The layers are the field; the rest is derived from them
 ///
 /// `density` is the sum over every kernel, which is PRD §6.4's field addition
 /// and therefore already makes overlap denser. It cannot, on its own, tell
 /// **one** thread working hard in a corner from **two** threads standing on
-/// each other: both are a high number. `crowd` counts how many territories
-/// separately reach fringe level at a cell, so the second reading gets a
-/// notation of its own ([`paint_cloud_bands`] crosses the hatch) and the first
-/// does not.
+/// each other: both are a high number.
+///
+/// So the field keeps each thread's own lattice — [`CloudLayer`] — and computes
+/// `density`, `crowd` and `owner` from them ([`CloudField::derive`]). That
+/// ordering is the whole of this change:
+///
+/// * the **picture** is a stack, one banded, contoured and hatched layer per
+///   thread ([`CloudField::stack`]), so a territory is drawn where it is even
+///   when a denser one is drawn over it;
+/// * the **summed** reading is still there for everything that wants one — the
+///   tween's settle test, [`CloudField::peak`], [`CloudField::at`];
+/// * and the two cannot drift apart, because one is computed from the other.
+///
+/// Previously `density` was primary and the per-thread lattices were scratch
+/// that got zeroed; a layer that lost the argmax was therefore not merely
+/// dimmed, it was **absent**, and no amount of tuning downstream could put it
+/// back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloudField {
     /// Left edge of the covered rectangle, in canvas pixels.
@@ -1295,6 +1435,11 @@ pub struct CloudField {
     pub grid_x: usize,
     /// Lattice rows.
     pub grid_y: usize,
+    /// One lattice per territory, ascending by [`CloudKernel::thread`].
+    ///
+    /// The primary channel. Everything below is [`CloudField::derive`]'s
+    /// arithmetic over these.
+    pub layers: Vec<CloudLayer>,
     /// Summed density, row-major, `grid_x * grid_y`.
     ///
     /// Unbounded on purpose: `N` overlapping kernels sum to about `N`, and
@@ -1303,21 +1448,49 @@ pub struct CloudField {
     pub density: Vec<f32>,
     /// How many territories reach [`CLOUD_ISO`]`[0]` here, row-major.
     ///
-    /// Fractional only because [`CloudTween`] lerps it; `sample` produces whole
-    /// numbers.
+    /// Fractional only because a lerped layer can cross the fringe between two
+    /// cells' worth of resampling; `derive` itself produces whole numbers.
+    ///
+    /// This is what opens a shared layer's hatch (see [`CLOUD_SHARE_SPACING`]),
+    /// and
+    /// what the status rail counts as contested ground.
     pub crowd: Vec<f32>,
     /// Which [`CloudKernel::thread`] contributes the most density here.
     ///
-    /// The cell's *owner*, and the only thing a per-thread cloud colour can be
-    /// keyed on: `density` is a sum over threads by construction (PRD §6.4's
-    /// field addition) and a sum has no hue. Argmax rather than a blend,
-    /// because blending two territories' hues would invent a third thread; the
-    /// place where they genuinely overlap is already drawn as contested ground
-    /// by the crossed hatch, which is a shape channel and stays one.
+    /// The cell's *owner*, and what the single-map path keys a hue on: a sum
+    /// over threads has no hue, so it needs a label. Argmax rather than a
+    /// blend, because blending two territories' hues would invent a third
+    /// thread.
     ///
-    /// Discrete, so [`CloudTween`] carries it rather than lerping it — the
-    /// midpoint between thread 2 and thread 5 is not thread 3.
+    /// The **stack** does not use it — each layer knows whose it is — and that
+    /// is the point of the stack: an argmax is a choice, and this one used to
+    /// be made per pixel, silently, in favour of whoever was denser.
     pub owner: Vec<u16>,
+}
+
+/// One territory's own density on a [`CloudField`]'s lattice.
+///
+/// Kept apart from the sum so the layer can be drawn on its own. PRD §6.4 says
+/// overlap is field addition and that stays true of `CloudField::density`; what
+/// it does not say, and what the first implementation assumed, is that the
+/// *picture* has to be of the sum. A summed picture cannot answer "whose
+/// territory is this, and where does it end" anywhere two territories meet,
+/// which is precisely where the question is worth asking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudLayer {
+    /// Whose. Indexes the caller's tint table, exactly as
+    /// [`CloudKernel::thread`] does.
+    pub thread: u16,
+    /// This territory's density alone, row-major, `grid_x * grid_y`.
+    pub density: Vec<f32>,
+}
+
+impl CloudLayer {
+    /// The largest value in this layer.
+    #[must_use]
+    pub fn peak(&self) -> f32 {
+        self.density.iter().copied().fold(0.0, f32::max)
+    }
 }
 
 impl CloudField {
@@ -1357,27 +1530,24 @@ impl CloudField {
         let sx = w as f64 / grid_x as f64;
         let sy = h as f64 / grid_y as f64;
         let n = grid_x * grid_y;
-        let mut density = vec![0.0f32; n];
-        let mut crowd = vec![0.0f32; n];
-        // Who owns each cell, and by how much — the running argmax over the
-        // per-thread sums the scratch lattice already computes, so ownership
-        // costs one comparison per written cell and no second pass.
-        let mut owner = vec![0u16; n];
-        let mut owned = vec![0.0f32; n];
-        // One thread's field at a time, into a scratch lattice that is zeroed
-        // again over the same span it was written. Reusing one buffer is what
-        // keeps the cost the sum of the kernels' areas rather than
-        // `threads × lattice`.
-        let mut scratch = vec![0.0f32; n];
+        // One lattice per thread, kept rather than folded away. The buffer used
+        // to be a single scratch that was zeroed again over the span it was
+        // written, on the argument that reusing it keeps the cost the sum of the
+        // kernels' areas rather than `threads × lattice`. The cost argument
+        // still holds — the splat loop below is unchanged, and it is the loop
+        // that scales with the kernels — but what the scratch bought in bytes it
+        // spent in information, and the layer that got zeroed was a territory
+        // the map then could not draw. There are at most
+        // `polis_world::territory::CLOUD_CAP` of these.
+        let mut layers: Vec<CloudLayer> = Vec::new();
 
         let mut order: Vec<usize> = (0..kernels.len()).filter(|i| live(&kernels[*i])).collect();
         order.sort_by_key(|i| kernels[*i].thread);
-        let fringe = CLOUD_ISO[0] as f32;
 
         let mut i = 0;
         while i < order.len() {
             let thread = kernels[order[i]].thread;
-            let (mut tx0, mut ty0, mut tx1, mut ty1) = (grid_x, grid_y, 0usize, 0usize);
+            let mut scratch = vec![0.0f32; n];
             let mut j = i;
             while j < order.len() && kernels[order[j]].thread == thread {
                 let k = &kernels[order[j]];
@@ -1399,45 +1569,72 @@ impl CloudField {
                             (k.weight * kernel(dx.mul_add(dx, dy * dy))) as f32;
                     }
                 }
-                tx0 = tx0.min(gx0);
-                ty0 = ty0.min(gy0);
-                tx1 = tx1.max(gx1);
-                ty1 = ty1.max(gy1);
                 j += 1;
             }
-            for gy in ty0..ty1 {
-                for gx in tx0..tx1 {
-                    let c = gy * grid_x + gx;
-                    let v = scratch[c];
-                    if v > 0.0 {
-                        // PRD §6.4: overlap is field addition. The sum is the
-                        // density; the count is what says whose.
-                        density[c] += v;
-                        if v >= fringe {
-                            crowd[c] += 1.0;
-                        }
-                        if v > owned[c] {
-                            owned[c] = v;
-                            owner[c] = thread;
-                        }
-                        scratch[c] = 0.0;
-                    }
-                }
-            }
+            layers.push(CloudLayer {
+                thread,
+                density: scratch,
+            });
             i = j;
         }
 
-        Some(Self {
+        let mut field = Self {
             x0,
             y0,
             width: w,
             height: h,
             grid_x,
             grid_y,
-            density,
-            crowd,
-            owner,
-        })
+            layers,
+            density: Vec::new(),
+            crowd: Vec::new(),
+            owner: Vec::new(),
+        };
+        field.derive();
+        Some(field)
+    }
+
+    /// Recomputes `density`, `crowd` and `owner` from `layers`.
+    ///
+    /// Every path that changes a layer ends here, so the sum can never be a
+    /// frame out of step with the layers it is the sum of. PRD §6.4's field
+    /// addition is this function's first line.
+    ///
+    /// It is a full pass over `layers × lattice` rather than over each layer's
+    /// own span. That is a few hundred thousand adds for a capped sky and it
+    /// buys the tween the right to hand back a layer set assembled from two
+    /// differently-shaped fields without also having to track where each one
+    /// wrote.
+    pub fn derive(&mut self) {
+        let n = self.grid_x * self.grid_y;
+        let mut density = vec![0.0f32; n];
+        let mut crowd = vec![0.0f32; n];
+        let mut owner = vec![0u16; n];
+        // How much the current owner has, so ownership costs one comparison per
+        // written cell and no second pass.
+        let mut owned = vec![0.0f32; n];
+        let fringe = CLOUD_ISO[0] as f32;
+        for layer in &self.layers {
+            for (c, v) in layer.density.iter().copied().enumerate().take(n) {
+                if v <= 0.0 {
+                    continue;
+                }
+                // PRD §6.4: overlap is field addition. The sum is the density;
+                // the count is what says how many, and the layer itself says
+                // whose.
+                density[c] += v;
+                if v >= fringe {
+                    crowd[c] += 1.0;
+                }
+                if v > owned[c] {
+                    owned[c] = v;
+                    owner[c] = layer.thread;
+                }
+            }
+        }
+        self.density = density;
+        self.crowd = crowd;
+        self.owner = owner;
     }
 
     /// Whether the two fields cover the same rectangle at the same lattice
@@ -1523,27 +1720,40 @@ impl CloudField {
             height: h,
             grid_x,
             grid_y,
+            layers: Vec::new(),
             density: vec![0.0; grid_x * grid_y],
             crowd: vec![0.0; grid_x * grid_y],
             owner: vec![0; grid_x * grid_y],
         }
     }
 
-    /// Resamples this field onto `to`'s rectangle and lattice.
+    /// Resamples every one of this field's layers onto `to`'s rectangle and
+    /// lattice.
     ///
     /// Both grids live in the same canvas-pixel space, so this is a plain
     /// bilinear lookup through pixel coordinates. Cells of `to` that this field
     /// does not cover come back zero, which is the right answer: the cloud was
     /// not there.
     ///
-    /// `owner` is a **label** and is resampled by nearest neighbour, never
-    /// bilinearly: half way between thread 2 and thread 5 is not thread 3.
+    /// Only the layers are carried. `density`, `crowd` and `owner` are
+    /// [`CloudField::derive`]'s job on the far side, and re-deriving them is
+    /// strictly better than resampling them: `crowd` is a count, `owner` is a
+    /// label, and resampling either one is an interpolation of something that
+    /// does not interpolate. The tween used to do exactly that and needed a
+    /// hand-written rule — *"the target wins a tie"* — to keep a hue from
+    /// cross-fading through a thread that does not exist. Layers are densities
+    /// all the way down and lerp without a special case.
     #[must_use]
-    fn resampled_onto(&self, to: &Self) -> (Vec<f32>, Vec<f32>, Vec<u16>) {
+    fn layers_onto(&self, to: &Self) -> Vec<CloudLayer> {
         let n = to.grid_x * to.grid_y;
-        let mut density = vec![0.0f32; n];
-        let mut crowd = vec![0.0f32; n];
-        let mut owner = vec![0u16; n];
+        let mut out: Vec<CloudLayer> = self
+            .layers
+            .iter()
+            .map(|l| CloudLayer {
+                thread: l.thread,
+                density: vec![0.0f32; n],
+            })
+            .collect();
         let sx = to.width as f64 / to.grid_x as f64;
         let sy = to.height as f64 / to.grid_y as f64;
         let (msx, msy) = (
@@ -1565,14 +1775,12 @@ impl CloudField {
                 }
                 let fx = fx.clamp(0.0, (self.grid_x - 1) as f64);
                 let c = gy * to.grid_x + gx;
-                density[c] = bilinear(&self.density, self.grid_x, self.grid_y, fx, fy);
-                crowd[c] = bilinear(&self.crowd, self.grid_x, self.grid_y, fx, fy);
-                let (nx, ny) = (fx.round() as usize, fy.round() as usize);
-                owner[c] =
-                    self.owner[ny.min(self.grid_y - 1) * self.grid_x + nx.min(self.grid_x - 1)];
+                for (dst, src) in out.iter_mut().zip(self.layers.iter()) {
+                    dst.density[c] = bilinear(&src.density, self.grid_x, self.grid_y, fx, fy);
+                }
             }
         }
-        (density, crowd, owner)
+        out
     }
 
     /// Thresholds the field into [`CLOUD_ISO`]'s bands, per canvas pixel.
@@ -1642,7 +1850,211 @@ impl CloudField {
             cells,
             crowd,
             tint: owner,
+            weave: 0,
+            cross_contested: true,
         }
+    }
+
+    /// The sky as one banded map **per territory**, bottom first.
+    ///
+    /// This is what the product draws. [`Self::bands_tinted`] thresholds the
+    /// sum and labels each pixel with whoever is densest there; this thresholds
+    /// each territory's own field, so a thread that shares ground with a denser
+    /// one is still drawn — its own bands, its own contour, its own hue, on its
+    /// own hatch axis — instead of being argmaxed off the map.
+    ///
+    /// Each layer's rectangle is tight to that layer's own ground, so the stack
+    /// costs the territories' areas and not `layers × sky`.
+    ///
+    /// # The order is the paint order, and it runs urgent-last
+    ///
+    /// `layers` comes back with the **last** rank first, because a painter's
+    /// last stroke is the one that survives a collision.
+    /// `polis_world::territory::select_clouds` ranks attention first, so
+    /// reversing its order puts the thread that most wants the operator on top.
+    /// Collisions are rare — every mark here is sparse — but "rare" is not a
+    /// tie-break, and an arbitrary one would be a different picture on two
+    /// machines.
+    #[must_use]
+    pub fn stack(&self, tints: &[u8]) -> CloudStack {
+        let mut layers: Vec<BandMap> = Vec::with_capacity(self.layers.len());
+        // Bottom first: rank 0 is painted last and therefore wins a shared
+        // pixel.
+        for layer in self.layers.iter().rev() {
+            let Some((x0, y0, x1, y1)) = self.banded_bounds(&layer.density) else {
+                continue;
+            };
+            let (w, h) = (x1 - x0, y1 - y0);
+            let sx = self.width as f64 / self.grid_x as f64;
+            let sy = self.height as f64 / self.grid_y as f64;
+            let lx = (self.grid_x - 1) as f64;
+            let ly = (self.grid_y - 1) as f64;
+            let mut cells = vec![NO_BAND; w * h];
+            let mut crowd = vec![0u8; w * h];
+            let tint = tints.get(layer.thread as usize).copied().unwrap_or(NO_TINT);
+            // A caller with no identity table still gets one axis per layer, or
+            // the whole point of the stack would be lost to whoever did not pass
+            // a hue. The rank is the fallback because it is the only handle
+            // there is; see `CLOUD_WEAVES` for why the hue slot is better.
+            let weave = if tint == NO_TINT {
+                (layer.thread % CLOUD_WEAVES.len() as u16) as u8
+            } else {
+                tint % CLOUD_WEAVES.len() as u8
+            };
+            for py in 0..h {
+                let fy = ((((py + y0 - self.y0) as f64 + 0.5) / sy) - 0.5).clamp(0.0, ly);
+                for px in 0..w {
+                    let fx = ((((px + x0 - self.x0) as f64 + 0.5) / sx) - 0.5).clamp(0.0, lx);
+                    let d = bilinear(&layer.density, self.grid_x, self.grid_y, fx, fy);
+                    let Some(band) = iso_band(f64::from(d)) else {
+                        continue;
+                    };
+                    cells[py * w + px] = band as u8;
+                    // How many territories claim this pixel, including this one.
+                    // The layer hatches more openly where the number is higher,
+                    // so the stack's ink over shared ground is one layer's ink —
+                    // see `CLOUD_SHARE_SPACING`.
+                    let c = bilinear(&self.crowd, self.grid_x, self.grid_y, fx, fy);
+                    crowd[py * w + px] = c.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            layers.push(BandMap {
+                x0,
+                y0,
+                width: w,
+                height: h,
+                cells,
+                crowd,
+                tint: vec![tint; w * h],
+                weave,
+                cross_contested: false,
+            });
+        }
+        CloudStack { layers }
+    }
+
+    /// The pixel rectangle a single layer's lattice can band in, with the one
+    /// cell of margin bilinear resampling reaches across.
+    ///
+    /// A bilinear sample is a convex combination of four cells, so it cannot
+    /// exceed all four; a pixel that bands therefore has a cell at or above the
+    /// fringe within one cell of it. That is what makes cropping to these bounds
+    /// exact rather than merely close.
+    fn banded_bounds(&self, density: &[f32]) -> Option<(usize, usize, usize, usize)> {
+        let sx = self.width as f64 / self.grid_x as f64;
+        let sy = self.height as f64 / self.grid_y as f64;
+        let fringe = CLOUD_ISO[0] as f32;
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for (i, d) in density.iter().enumerate() {
+            if *d < fringe {
+                continue;
+            }
+            let (gx, gy) = (i % self.grid_x, i / self.grid_x);
+            let a = (gx as f64 - 1.0).mul_add(sx, self.x0 as f64).max(0.0) as usize;
+            let b = (gy as f64 - 1.0).mul_add(sy, self.y0 as f64).max(0.0) as usize;
+            let c = (gx as f64 + 2.0).mul_add(sx, self.x0 as f64).max(0.0) as usize;
+            let d = (gy as f64 + 2.0).mul_add(sy, self.y0 as f64).max(0.0) as usize;
+            x0 = x0.min(a.max(self.x0));
+            y0 = y0.min(b.max(self.y0));
+            x1 = x1.max(c.min(self.x0 + self.width));
+            y1 = y1.max(d.min(self.y0 + self.height));
+        }
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+    }
+}
+
+/// The sky as a stack of per-territory band maps, bottom first.
+///
+/// The layers overlap and are meant to: each is a sparse set of opaque marks,
+/// so painting one over another interleaves two weaves rather than replacing
+/// one with the other. See [`CloudField::stack`] for the order and
+/// [`CLOUD_WEAVES`] for why each layer gets its own hatch axis.
+#[derive(Debug, Clone, Default)]
+pub struct CloudStack {
+    /// Bottom first — index `0` is painted first and index `len - 1` last.
+    pub layers: Vec<BandMap>,
+}
+
+impl CloudStack {
+    /// Whether there is anything to draw.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    /// The pixel rectangle every layer fits inside, as `(x0, y0, width,
+    /// height)`.
+    #[must_use]
+    pub fn rect(&self) -> Option<(usize, usize, usize, usize)> {
+        let mut it = self.layers.iter();
+        let first = it.next()?;
+        let (mut x0, mut y0) = (first.x0, first.y0);
+        let (mut x1, mut y1) = (first.x0 + first.width, first.y0 + first.height);
+        for l in it {
+            x0 = x0.min(l.x0);
+            y0 = y0.min(l.y0);
+            x1 = x1.max(l.x0 + l.width);
+            y1 = y1.max(l.y0 + l.height);
+        }
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// The stack flattened to one band map — each pixel's deepest band, and the
+    /// hue of the topmost layer that reaches it.
+    ///
+    /// Not what is drawn, and deliberately not usable as such: the flattening
+    /// throws away exactly the thing the stack exists to keep. It is here for
+    /// the measurement harness, which has to ask "how much of the ground any
+    /// cloud covers did the layer ink" and needs one footprint to ask it of.
+    #[must_use]
+    pub fn flattened(&self) -> Option<BandMap> {
+        let (x0, y0, width, height) = self.rect()?;
+        let mut cells = vec![NO_BAND; width * height];
+        let mut crowd = vec![0u8; width * height];
+        let mut tint = vec![NO_TINT; width * height];
+        for layer in &self.layers {
+            for y in 0..layer.height {
+                for x in 0..layer.width {
+                    let src = y * layer.width + x;
+                    let band = layer.cells[src];
+                    if band == NO_BAND {
+                        continue;
+                    }
+                    let dst = (y + layer.y0 - y0) * width + (x + layer.x0 - x0);
+                    // `NO_BAND` is `u8::MAX`, so "deepest" is a minimum against
+                    // it and an unbanded pixel loses to every real band.
+                    if cells[dst] == NO_BAND || band > cells[dst] {
+                        cells[dst] = band;
+                    }
+                    crowd[dst] = crowd[dst].max(layer.crowd[src]);
+                    tint[dst] = layer.tint[src];
+                }
+            }
+        }
+        Some(BandMap {
+            x0,
+            y0,
+            width,
+            height,
+            cells,
+            crowd,
+            tint,
+            weave: 0,
+            cross_contested: false,
+        })
+    }
+
+    /// How many drawn pixels two or more territories both claim — PRD §6.4's
+    /// contention signal, as a number the status rail can say out loud.
+    #[must_use]
+    pub fn contested(&self) -> usize {
+        self.flattened().map_or(0, |f| {
+            f.crowd
+                .iter()
+                .zip(f.cells.iter())
+                .filter(|(c, b)| **c >= CLOUD_CROWD && **b != NO_BAND)
+                .count()
+        })
     }
 }
 
@@ -1656,6 +2068,15 @@ impl CloudField {
 /// exist. Lerping them handles a territory appearing, dissipating, tightening
 /// as its bandwidth falls, and drifting across the map — with one rule and no
 /// bookkeeping.
+///
+/// # Layer by layer, matched on the thread
+///
+/// The lattice is now [`CloudLayer`]s and the tween runs on each of them
+/// separately, pairing them by [`CloudLayer::thread`] and treating a layer only
+/// one side has as zero on the other. A territory appearing rises on its own
+/// without disturbing the one it is rising through; a territory dissipating
+/// falls without handing its ground to a neighbour; and the sum is re-derived
+/// afterwards, so it stays the sum of what is actually drawn.
 ///
 /// # Why not tween the picture instead
 ///
@@ -1694,20 +2115,23 @@ impl CloudTween {
             // A brand-new cloud starts at zero and rises, so a territory eases
             // in rather than popping the moment it converges (PRD §6.2).
             (None, Some(mut t)) => {
-                for (d, c) in t.density.iter_mut().zip(t.crowd.iter_mut()) {
-                    *d *= k;
-                    *c *= k;
+                for layer in &mut t.layers {
+                    for d in &mut layer.density {
+                        *d *= k;
+                    }
                 }
+                t.derive();
                 self.field = Some(t);
             }
             (Some(mut cur), None) => {
-                let mut peak = 0.0f32;
-                for (d, c) in cur.density.iter_mut().zip(cur.crowd.iter_mut()) {
-                    *d -= *d * k;
-                    *c -= *c * k;
-                    peak = peak.max(*d);
+                for layer in &mut cur.layers {
+                    for d in &mut layer.density {
+                        *d -= *d * k;
+                    }
                 }
-                self.field = (peak > CLOUD_GONE).then_some(cur);
+                cur.layers.retain(|l| l.peak() > CLOUD_GONE);
+                cur.derive();
+                self.field = (!cur.layers.is_empty()).then_some(cur);
             }
             (Some(cur), Some(t)) => {
                 // The two fields rarely share a rectangle — a territory that
@@ -1723,24 +2147,43 @@ impl CloudTween {
                 } else {
                     cur.union_with(&t)
                 };
-                let (od, oc, oo) = cur.resampled_onto(&merged);
-                let (td, tc, to) = t.resampled_onto(&merged);
-                for (i, ((d, c), o)) in merged
-                    .density
-                    .iter_mut()
-                    .zip(merged.crowd.iter_mut())
-                    .zip(merged.owner.iter_mut())
-                    .enumerate()
-                {
-                    *d = (td[i] - od[i]).mul_add(k, od[i]);
-                    *c = (tc[i] - oc[i]).mul_add(k, oc[i]);
-                    // The owner is the label of whichever side has the density
-                    // here, and the target wins a tie. A cloud handing ground
-                    // over therefore changes hue at the moment the new
-                    // territory's field is the larger one, rather than
-                    // cross-fading through a colour neither thread has.
-                    *o = if td[i] >= od[i] { to[i] } else { oo[i] };
+                let from = cur.layers_onto(&merged);
+                let to = t.layers_onto(&merged);
+                let n = merged.grid_x * merged.grid_y;
+                // The union of both sides' threads, so a territory that only one
+                // side has still has a layer to ease along. Both sides are
+                // already sorted by thread, which is what makes the union a
+                // merge rather than a search.
+                let mut threads: Vec<u16> = from
+                    .iter()
+                    .chain(to.iter())
+                    .map(|l| l.thread)
+                    .collect::<Vec<_>>();
+                threads.sort_unstable();
+                threads.dedup();
+                let mut layers = Vec::with_capacity(threads.len());
+                for thread in threads {
+                    let a = from.iter().find(|l| l.thread == thread);
+                    let b = to.iter().find(|l| l.thread == thread);
+                    let mut density = vec![0.0f32; n];
+                    for (i, d) in density.iter_mut().enumerate() {
+                        // Absent on a side is zero on that side: a territory
+                        // rises from nothing and falls back to nothing through
+                        // the same lerp as one that merely moved.
+                        let o = a.map_or(0.0, |l| l.density[i]);
+                        let n = b.map_or(0.0, |l| l.density[i]);
+                        *d = (n - o).mul_add(k, o);
+                    }
+                    let layer = CloudLayer { thread, density };
+                    // A layer under the floor cannot reach a band however the
+                    // thresholds move, and carrying it would grow the stack by
+                    // one dead sheet per territory the session ever had.
+                    if layer.peak() > CLOUD_GONE {
+                        layers.push(layer);
+                    }
                 }
+                merged.layers = layers;
+                merged.derive();
                 self.field = Some(merged);
             }
         }
@@ -1778,7 +2221,25 @@ pub struct BandMap {
     pub crowd: Vec<u8>,
     /// The owning thread's [`polis_world::Thread::tint`] per pixel, or
     /// [`NO_TINT`] where the caller offered no identity table.
+    ///
+    /// Uniform across a [`CloudStack`] layer, which is what a layer *is*: one
+    /// territory. Per pixel only on a flattened or summed map, where the owner
+    /// is an argmax and changes from pixel to pixel.
     pub tint: Vec<u8>,
+    /// Which of [`CLOUD_WEAVES`] this map's hatch runs along.
+    ///
+    /// `0` is [`CLOUD_HATCH`], the axis the rest of the map is drawn across, and
+    /// what a single un-stacked map has always used.
+    pub weave: u8,
+    /// Whether contested ground is hatched with the perpendicular stroke as
+    /// well.
+    ///
+    /// True for a map standing in for the whole sky, where the crossing is the
+    /// only way a second territory can be shown at all. False for one layer of
+    /// a [`CloudStack`], where the second territory is drawn — it is the next
+    /// layer — and its own axis does the crossing. Drawing both would be the
+    /// same news twice, at twice the ink.
+    pub cross_contested: bool,
 }
 
 impl BandMap {
@@ -1872,14 +2333,19 @@ pub fn contour_steps(bands: &BandMap) -> [isize; 3] {
     out
 }
 
-/// Paints a band map as nested contours plus a hatch that tightens toward the
-/// core, crossed where territories overlap.
+/// Paints **one** band map as nested contours plus a hatch that tightens toward
+/// the core, on [`BandMap::weave`]'s axis.
 ///
 /// Nothing here is a fill, so the base map under a cloud is not lifted — it is
 /// left alone and shows through between the strokes. The contour is found by
 /// comparing a pixel's band with its neighbours a stroke-width away, which gives
 /// a closed curve of the right thickness for free and cannot leak: a band
 /// boundary is a boundary in the array.
+///
+/// A sky is a [`CloudStack`] of these — see [`paint_cloud_stack`]. One map is
+/// one territory, or, where the caller has no identity to split by, the sum of
+/// all of them with [`BandMap::cross_contested`] standing in for the layers it
+/// does not have.
 pub fn paint_cloud_bands(canvas: &mut Canvas, bands: &BandMap) {
     paint_cloud_bands_into(canvas, bands, [0, 0]);
 }
@@ -1893,6 +2359,7 @@ pub fn paint_cloud_bands(canvas: &mut Canvas, bands: &BandMap) {
 /// a territory that is merely growing.
 pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usize; 2]) {
     let step = contour_steps(bands);
+    let axis = CLOUD_WEAVES[bands.weave as usize % CLOUD_WEAVES.len()];
     for y in 0..bands.height {
         for x in 0..bands.width {
             let band = bands.cells[y * bands.width + x];
@@ -1914,19 +2381,26 @@ pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usi
                 || neighbour(0, -s) != band;
             let cx = x + bands.x0;
             let cy = y + bands.y0;
-            let contested = bands.crowd[y * bands.width + x] >= CLOUD_CROWD;
+            let crowd = bands.crowd[y * bands.width + x];
             let hatched = !contour && {
                 let width = CLOUD_HATCH_WIDTH[band as usize];
                 let mut spacing = CLOUD_HATCH_SPACING[band as usize];
-                // One direction for one territory; two crossed for contested
-                // ground, at a spacing that keeps the *ink* about where it was
-                // so the weave reads without fogging the city under it.
-                let a = CLOUD_HATCH[0].mul_add(cx as f64, CLOUD_HATCH[1] * cy as f64);
-                if contested {
+                let a = axis[0].mul_add(cx as f64, axis[1] * cy as f64);
+                if bands.cross_contested && crowd >= CLOUD_CROWD {
+                    // One map standing in for the whole sky: the second
+                    // territory has no layer of its own, so this one draws its
+                    // direction too, at a spacing that keeps the *ink* about
+                    // where it was.
                     spacing *= CLOUD_OVERLAP_SPACING;
-                    let b = CLOUD_HATCH[1].mul_add(cx as f64, -(CLOUD_HATCH[0] * cy as f64));
+                    let b = axis[1].mul_add(cx as f64, -(axis[0] * cy as f64));
                     a.rem_euclid(spacing) < width || b.rem_euclid(spacing) < width
                 } else {
+                    // One layer of a stack: open up by how many territories
+                    // share this pixel, so shared ground reads denser than plain
+                    // ground without `N` layers fogging the city under it.
+                    // Uncontested ground has `crowd <= 1` and is untouched.
+                    spacing *=
+                        CLOUD_SHARE_SPACING[(crowd as usize).min(CLOUD_SHARE_SPACING.len() - 1)];
                     a.rem_euclid(spacing) < width
                 }
             };
@@ -1943,6 +2417,27 @@ pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usi
             }
         }
     }
+}
+
+/// Paints a whole [`CloudStack`], bottom layer first.
+///
+/// The z-order is the stack's own — see [`CloudField::stack`] — and it decides
+/// nothing but the rare pixel two layers both ink. What makes the layers legible
+/// through each other is not the ordering, it is that every mark is sparse:
+/// a hatch lays down one stroke in six at its tightest, so a layer occludes a
+/// small fraction of whatever is under it and the two weaves interleave.
+///
+/// `origin` is where the canvas's top-left sits in the stack's coordinates, as
+/// in [`paint_cloud_bands_into`].
+pub fn paint_cloud_stack_into(canvas: &mut Canvas, stack: &CloudStack, origin: [usize; 2]) {
+    for layer in &stack.layers {
+        paint_cloud_bands_into(canvas, layer, origin);
+    }
+}
+
+/// [`paint_cloud_stack_into`] onto a canvas that covers the whole map.
+pub fn paint_cloud_stack(canvas: &mut Canvas, stack: &CloudStack) {
+    paint_cloud_stack_into(canvas, stack, [0, 0]);
 }
 
 /// Layer 4 — trails, tethers, thrash rosettes, scaffolding, marks, agents.
@@ -3698,6 +4193,65 @@ mod tests {
         assert!(new > old, "timed trail: new {new} px, old {old} px");
     }
 
+    /// The two cloud notations on the same three territories, side by side, for
+    /// the eye rather than for an assertion.
+    ///
+    /// Left: the summed single map — one threshold over every thread's field,
+    /// one hue per pixel by argmax, one hatch axis. Right: the stack.
+    ///
+    /// What to look for is the ground the territories **share**. On the left it
+    /// belongs to whoever is densest and the others are not drawn there at all;
+    /// on the right each thread keeps its own contour, its own hue and its own
+    /// stroke direction through the overlap, and the weaves interleave rather
+    /// than replace one another.
+    ///
+    /// ```text
+    /// POLIS_OUT=<dir> cargo test -p polis-render --release -- --ignored --nocapture cloud_stack_sheet
+    /// ```
+    #[test]
+    #[ignore = "writes an image"]
+    fn cloud_stack_sheet() {
+        let Ok(out) = std::env::var("POLIS_OUT") else {
+            eprintln!("skipped: set POLIS_OUT to a directory");
+            return;
+        };
+        let bg: Rgb = [20, 21, 24];
+        let (w, h) = (620usize, 540usize);
+        // Three territories with real overlap and unequal weight, which is the
+        // arrangement the argmax handled worst. Drawn at district scale: the
+        // hatch spacings are in output pixels, so a sheet the size of a postage
+        // stamp compares two notations neither of which is legible.
+        let mut kernels = territory(0, [250.0, 270.0], 100.0, 76.0, 10);
+        kernels.extend(territory(1, [350.0, 315.0], 120.0, 70.0, 16));
+        kernels.extend(territory(2, [315.0, 200.0], 85.0, 64.0, 7));
+        let tints = [0u8, 5u8, 8u8];
+        let field = CloudField::sample(&kernels, w, h).expect("a field");
+
+        let mut summed = Canvas::new(w, h, bg);
+        paint_cloud_bands(&mut summed, &field.bands_tinted(&tints));
+        let mut stacked = Canvas::new(w, h, bg);
+        paint_cloud_stack(&mut stacked, &field.stack(&tints));
+
+        let mut sheet = Canvas::new(w * 2 + 12, h, [10, 10, 12]);
+        for (panel, x0) in [(&summed, 0usize), (&stacked, w + 12)] {
+            for y in 0..h {
+                for x in 0..w {
+                    let p = panel.pixels.as_chunks::<3>().0[y * w + x];
+                    let i = (y * sheet.width + x + x0) * 3;
+                    sheet.pixels[i..i + 3].copy_from_slice(&p);
+                }
+            }
+        }
+        let path = std::path::Path::new(&out).join("cloud-stack.png");
+        sheet.write_png(&path).expect("write the sheet");
+        eprintln!(
+            "wrote {} — summed {} px inked, stacked {} px",
+            path.display(),
+            inked(&summed, bg),
+            inked(&stacked, bg)
+        );
+    }
+
     /// Draws the thrashing notation at the size it is really drawn, for the eye
     /// rather than for an assertion: one, two, four and six passes over the same
     /// pair of buildings, plus the revisit rosette beside them.
@@ -4352,6 +4906,165 @@ mod tests {
         assert!(
             ib < ia * 5 / 4,
             "contested ground inked {ib} against {ia}: that is a second fill"
+        );
+    }
+
+    /// The stack is what ships, and the same relabelling test says what it
+    /// changed.
+    ///
+    /// Same kernels, same places, same weights, relabelled from one territory
+    /// into two — so the density field is identical to the bit and anything that
+    /// moves in the image is the stack and nothing else. Two claims:
+    ///
+    /// * both threads are drawn over the ground they share. The single map
+    ///   handed every shared pixel to the argmax winner, so one of these two
+    ///   counts would have been zero;
+    /// * and the second layer is not a second fill. [`CLOUD_SHARE_SPACING`]
+    ///   opens each layer's hatch by how many territories claim the pixel, which
+    ///   is what pays for it.
+    #[test]
+    fn a_stack_draws_both_territories_over_the_ground_they_share() {
+        let bg: Rgb = [20, 21, 24];
+        let mut one = territory(0, [150.0, 150.0], 40.0, 55.0, 9);
+        one.extend(territory(0, [175.0, 150.0], 40.0, 55.0, 9));
+        let mut two = one.clone();
+        for k in two.iter_mut().skip(9) {
+            k.thread = 1;
+        }
+        // Opposite ends of the hue ring, so "which thread drew this pixel" is a
+        // question the pixels can actually answer.
+        let tints = [0u8, 6u8];
+
+        let solo = CloudField::sample(&one, 300, 300).expect("a field");
+        let pair = CloudField::sample(&two, 300, 300).expect("a field");
+        assert_eq!(solo.layers.len(), 1, "one territory is one layer");
+        assert_eq!(pair.layers.len(), 2, "two territories are two layers");
+        // The sum is the same picture either way — it is summed in a different
+        // order, so it is not the same *bits*, and the bands are the level at
+        // which the claim is meant.
+        assert_eq!(
+            solo.bands().cells,
+            pair.bands().cells,
+            "relabelling moved the field itself; nothing below is measuring the stack"
+        );
+
+        let mut ca = Canvas::new(300, 300, bg);
+        let mut cb = Canvas::new(300, 300, bg);
+        paint_cloud_stack(&mut ca, &solo.stack(&tints));
+        paint_cloud_stack(&mut cb, &pair.stack(&tints));
+
+        // Who drew what: a band tone through each thread's hue.
+        let ink_of =
+            |slot: u8| -> Vec<Rgb> { CLOUD_TONES.iter().map(|t| thread_ink(slot, *t)).collect() };
+        let (mine, theirs) = (ink_of(tints[0]), ink_of(tints[1]));
+        let stack = pair.stack(&tints);
+        let shared = stack.flattened().expect("a flattened stack");
+        let (mut first, mut second) = (0usize, 0usize);
+        for y in 0..shared.height {
+            for x in 0..shared.width {
+                let i = y * shared.width + x;
+                if shared.cells[i] == NO_BAND || shared.crowd[i] < CLOUD_CROWD {
+                    continue;
+                }
+                let p = cb.pixels.as_chunks::<3>().0[(y + shared.y0) * cb.width + (x + shared.x0)];
+                first += usize::from(mine.contains(&p));
+                second += usize::from(theirs.contains(&p));
+            }
+        }
+        assert!(
+            first > 30 && second > 30,
+            "over contested ground the two threads drew {first} and {second} px: \
+             one of them has been absorbed"
+        );
+
+        let (ia, ib) = (inked(&ca, bg), inked(&cb, bg));
+        assert!(
+            ib < ia * 7 / 4,
+            "the second layer inked {ib} against {ia}: that is a second fill"
+        );
+    }
+
+    /// A layer that overlaps a denser one keeps its own **bands**, not the
+    /// sum's.
+    ///
+    /// PRD §10.4 asks the levels to say *"that file is in the core of **this
+    /// thread's** work versus at the fringe"*. Thresholding the sum answers a
+    /// different question — two fringes overlapping came out as a core that
+    /// belonged to neither thread — and the sentence quietly stopped being true
+    /// exactly where two threads met.
+    #[test]
+    fn a_layers_bands_are_its_own_and_not_the_sums() {
+        let mut kernels = territory(0, [150.0, 150.0], 30.0, 60.0, 4);
+        kernels.extend(territory(1, [160.0, 150.0], 30.0, 60.0, 4));
+        let field = CloudField::sample(&kernels, 300, 300).expect("a field");
+
+        let summed = field.bands();
+        let stack = field.stack(&[]);
+        let core_summed = count_band(&summed.cells, 2);
+        let core_stacked: usize = stack.layers.iter().map(|l| count_band(&l.cells, 2)).sum();
+        assert!(
+            core_summed > 0,
+            "the two territories do not overlap enough to make the sum's core"
+        );
+        assert!(
+            core_stacked < core_summed,
+            "the stack drew {core_stacked} core pixels against the sum's \
+             {core_summed}: it is still thresholding somebody else's evidence"
+        );
+    }
+
+    /// The tween runs per layer, so a territory arriving does not drag its
+    /// neighbour's cloud with it.
+    #[test]
+    fn the_tween_eases_one_layer_without_moving_the_other() {
+        let settled = territory(0, [100.0, 150.0], 30.0, 50.0, 8);
+        let mut both = settled.clone();
+        both.extend(territory(1, [200.0, 150.0], 30.0, 50.0, 8));
+
+        let mut tween = CloudTween::default();
+        // Long enough for the first territory to arrive on its own.
+        for _ in 0..200 {
+            tween.advance(
+                CloudField::sample(&settled, 300, 300),
+                1.0 / 60.0,
+                CLOUD_TWEEN_RATE,
+            );
+        }
+        let before = tween
+            .field()
+            .and_then(|f| f.layers.iter().find(|l| l.thread == 0))
+            .map(CloudLayer::peak)
+            .expect("the first territory arrived");
+
+        // One step toward a world that also has a second territory.
+        let field = tween
+            .advance(
+                CloudField::sample(&both, 300, 300),
+                1.0 / 60.0,
+                CLOUD_TWEEN_RATE,
+            )
+            .expect("a field");
+        assert_eq!(field.layers.len(), 2, "the new territory got no layer");
+        let after = field
+            .layers
+            .iter()
+            .find(|l| l.thread == 0)
+            .map(CloudLayer::peak)
+            .expect("the first territory still has a layer");
+        let arriving = field
+            .layers
+            .iter()
+            .find(|l| l.thread == 1)
+            .map(CloudLayer::peak)
+            .expect("the second territory has a layer");
+        assert!(
+            arriving > 0.0 && arriving < before,
+            "the arriving layer popped instead of easing in: {arriving}"
+        );
+        assert!(
+            (after - before).abs() < before * 0.02,
+            "the settled layer moved from {before} to {after} because a \
+             different thread arrived"
         );
     }
 

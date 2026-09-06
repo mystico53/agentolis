@@ -144,6 +144,28 @@ fn tool_result(tool: ToolKind, path: &LogicalPath, outcome: Outcome, at: Instant
     )
 }
 
+/// One OTel `tool_result` that names no file at all.
+///
+/// What every shell call looks like on this channel: the span carries
+/// `file_path` and never a working directory, so a `Bash` or `PowerShell` call
+/// arrives with an empty path list and lands on rung 3.
+fn pathless_result(tool: ToolKind, outcome: Outcome, at: Instant) -> Event {
+    let mut meta = EventMeta::now(Channel::Otel).with_session(SessionId::new("s"));
+    meta.observed = at;
+    meta.worker = Some(WorkerId::new("agent-1"));
+    let call = ToolCall {
+        tool,
+        tool_use_id: Some(ToolUseId::new("toolu_2")),
+        paths: Vec::new(),
+        outcome,
+        duration_ms: Some(4.0),
+    };
+    Event::new(
+        meta,
+        Payload::Otel(Box::new(OtelEvent::ToolResult(Box::new(call)))),
+    )
+}
+
 /// Forty operations across twelve buildings. `failures` of them failed, spread
 /// through the run so the newest is a few seconds old — the moment the operator
 /// is being asked to read.
@@ -375,6 +397,81 @@ fn the_alarm_does_not_swallow_the_map() {
         share < 0.20,
         "the alarm inked {:.1}% of the thumbnail; that is fog, not a signal",
         share * 100.0
+    );
+}
+
+/// A failure with no place of its own keeps its glyph and loses its ring.
+///
+/// The operator's report was blunt — *"why is this red? it shouldn't be…
+/// nothing needs my attention here"* — and the ring in question was flying over
+/// a district the session had never opened. Every failure in that session was a
+/// shell call whose working directory was the repository root, which
+/// `place::site_of` refuses as a location, so all of them resolved on rung 3 and
+/// were drawn wherever the thread happened to be standing.
+///
+/// Both halves are the claim, on one session that differs only in whether its
+/// failures name a file:
+///
+/// * the pathless run raises **no ring**, and still draws every red mark, so a
+///   failure is never silently lost — which is the defect `place`'s module docs
+///   open by naming, and this must not reintroduce it;
+/// * the same failures at buildings raise the ring exactly as before.
+#[test]
+fn a_rootless_shell_failure_draws_its_mark_but_flies_no_ring() {
+    let city = small_city();
+
+    let built = |pathless: bool| {
+        let mut world = session(&city, 0);
+        let path = city.layout.buildings.keys().next().expect("a building");
+        let mut at = Instant::now();
+        for _ in 0..3 {
+            // The only difference between the two runs. A `PowerShell` that
+            // named no file and ran at the root arrives here with no paths at
+            // all, which is rung 3.
+            let event = if pathless {
+                pathless_result(ToolKind::PowerShell, Outcome::Failed, at)
+            } else {
+                tool_result(ToolKind::PowerShell, path, Outcome::Failed, at)
+            };
+            world.apply(&event);
+            at += Duration::from_secs(1);
+        }
+        world.tick(at);
+        let mut r = FrameRenderer::new(
+            &city,
+            FrameOptions {
+                pixels: PIXELS,
+                supersample: 1,
+                caption: false,
+                rail: false,
+                ..FrameOptions::default()
+            },
+        );
+        let (_, reader) = snapshot::from_world(&world);
+        r.build_frame(&reader.load(), Duration::ZERO)
+    };
+
+    let borrowed = built(true);
+    let own = built(false);
+    let red = |f: &polis_render::live::LiveFrame| {
+        f.marks
+            .iter()
+            .filter(|m| m.outcome == Outcome::Failed)
+            .count()
+    };
+
+    assert!(
+        red(&borrowed) > 0,
+        "the failures left the map entirely; the mark is the part that must survive"
+    );
+    assert!(
+        borrowed.alarms.is_empty(),
+        "a failure standing at the agent flew {} ring(s) over a district that ran nothing",
+        borrowed.alarms.len()
+    );
+    assert!(
+        !own.alarms.is_empty(),
+        "the same failures at their own buildings raised no ring; the gate is too wide"
     );
 }
 

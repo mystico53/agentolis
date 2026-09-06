@@ -192,6 +192,9 @@ struct MarkAgg {
     age: f64,
     scale: f64,
     coarse: bool,
+    /// True once any member of the stack stands at a place its own operation
+    /// named. See `polis_world::OpSite::sited`.
+    sited: bool,
     count: u32,
 }
 
@@ -580,6 +583,19 @@ impl FrameRenderer {
         self.cloud_tween.field()
     }
 
+    /// The identity table the last frame's clouds were drawn with, indexed by
+    /// [`live::CloudKernel::thread`].
+    ///
+    /// Goes with [`Self::cloud_field`], and for the same reason: a field alone
+    /// no longer determines the picture. [`live::CloudField::stack`] takes the
+    /// tints, and they decide both each layer's hue and — through the thread's
+    /// hue slot — the axis it weaves on, so a harness that omitted them would
+    /// measure a stack this renderer never drew.
+    #[must_use]
+    pub fn cloud_tints(&self) -> &[u8] {
+        &self.cloud_tints
+    }
+
     /// Why the last frame has the clouds it has — and why it does not have the
     /// others (PRD §10.4). See [`live::CloudCensus`].
     #[must_use]
@@ -827,9 +843,17 @@ impl FrameRenderer {
                     age,
                     scale: site.scale(),
                     coarse: site.is_coarse(),
+                    sited: site.sited(),
                     count: 0,
                 });
                 entry.count = entry.count.saturating_add(1);
+                // One sited member is enough to earn the stack a ring: the
+                // agent's borrowed position and a real one can round to the same
+                // pixel, and when they do the ring has something true to point
+                // at. The weaker reading is the honest one for `Alarm::sited`,
+                // which is about *how precisely* a ring is placed; this is about
+                // whether there is a ring at all.
+                entry.sited |= site.sited();
                 // The stack ages with its freshest member: a mark that is still
                 // being added to has not gone cold.
                 entry.age = entry.age.min(age);
@@ -893,6 +917,7 @@ impl FrameRenderer {
                     age: m.age / MARK_TTL,
                     pulse: pulse(m.age),
                     scale: m.scale,
+                    sited: m.sited,
                     count: m.count,
                 });
             }

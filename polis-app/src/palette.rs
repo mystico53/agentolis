@@ -340,7 +340,20 @@ pub fn thread_anchor(slot: u8) -> Ink {
 pub fn status(status: ThreadStatus) -> Ink {
     match status {
         ThreadStatus::Waiting => Ink::agent([168, 146, 72]),
+        // The same amber family as `Waiting`, deliberately: both states are the
+        // operator's move. Dimmer, because `Ready` asks and does not block —
+        // the loud amber is reserved for a thread that is burning wall clock.
+        ThreadStatus::Ready => Ink::agent([146, 138, 96]),
+        // Also the operator's move, so also warm — but its own hue, because
+        // `WAITING` and `interrupted` ask for different things: one is a
+        // question to answer, the other is a thread the operator stopped and
+        // has to restart.
+        ThreadStatus::Interrupted => Ink::agent([172, 122, 92]),
         ThreadStatus::Working => Ink::agent([120, 150, 168]),
+        // `Working`'s steel, desaturated: a parked thread is busy, just not with
+        // anything the operator can watch. Cool on purpose — nothing here is
+        // the operator's move.
+        ThreadStatus::Parked => Ink::agent([104, 128, 140]),
         ThreadStatus::Idle => Ink::agent([112, 112, 116]),
         ThreadStatus::Done => Ink::agent([96, 152, 144]),
     }

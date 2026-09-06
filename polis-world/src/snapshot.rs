@@ -38,7 +38,7 @@ use arc_swap::ArcSwap;
 use polis_events::{LogicalPath, ThreadId};
 use polis_layout::CityLayout;
 
-use crate::{FileState, Health, Thread, ThreadStatus, UnattributedWorker, World};
+use crate::{FileState, Health, Thread, UnattributedWorker, World};
 
 /// The floor between two publishes.
 ///
@@ -121,9 +121,7 @@ impl WorldSnapshot {
     /// > **Primary decision it accelerates:** *unblock* — get to the thread that
     /// > is waiting on a human. (PRD §1)
     pub fn waiting(&self) -> impl Iterator<Item = &Thread> + '_ {
-        self.threads
-            .iter()
-            .filter(|t| t.status == ThreadStatus::Waiting)
+        self.threads.iter().filter(|t| t.status.blocks_operator())
     }
 
     /// Threads with a converged territory, paired with it, ready for

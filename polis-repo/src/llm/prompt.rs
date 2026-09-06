@@ -582,7 +582,7 @@ const STOPWORDS: &[&str] = &[
 /// The precise version of the review's complaint. Words are split on
 /// non-alphanumerics **and** on `camelCase` boundaries — `dropZoneService`
 /// becomes `drop zone service` — folded to lower case, and singularised on a
-/// trailing `s`. Then: strip stopwords and [`CATEGORY_NOUNS`] from the caption,
+/// trailing `s`. Then: strip stopwords and `CATEGORY_NOUNS` from the caption,
 /// and if nothing is left that the name does not already contain, the caption is
 /// a tautology.
 ///

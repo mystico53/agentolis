@@ -21,7 +21,7 @@
 //! | eframe's four bundled fonts | 8 of 16 — box-drawing and blocks yes, `⎿ ✻ ✽ ✢ ✓ ✗` and braille no |
 //! | plus `seguisym.ttf` | **16 of 16** |
 //!
-//! Cascadia Mono and Consolas are in [`candidates`] only as understudies for a
+//! Cascadia Mono and Consolas are in `candidates` only as understudies for a
 //! machine without Segoe UI Symbol: measured, they add **nothing** on top of it,
 //! so loading them as well would be megabytes of resident memory for no glyph.
 //!

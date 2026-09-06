@@ -215,8 +215,16 @@ fn trails_decay_and_revisit_counts_do_not() {
     assert!(!before.is_empty());
     assert!(!thread.trail.is_empty());
 
-    // An hour later, with no further events.
-    world.tick(world.now() + Duration::from_secs(3_600));
+    // Twenty minutes later, with no further events: past `TRAIL_TTL` (15 min)
+    // and `DORMANT_AFTER` (8 min), but inside `THREAD_RETIRE_AFTER` (30 min).
+    //
+    // This used to say an hour. It could, because a finished turn raised a
+    // `TurnEnded` attention mark and `retire_threads` will not retire a thread a
+    // mark points at — so every finished thread was immortal for up to
+    // `MARK_HOLD_MAX`, four hours. ADR-0102 removed that mark, so an hour of
+    // silence now retires the thread, which is the point. The window has to sit
+    // where the fade is observable and the thread is still alive.
+    world.tick(world.now() + Duration::from_mins(20));
     let thread = world.threads.values().next().expect("one thread");
     assert!(
         thread.trail.is_empty(),
@@ -234,18 +242,21 @@ fn trails_decay_and_revisit_counts_do_not() {
         "and a dormant territory dissipates entirely (PRD §10.4)"
     );
     // The fixture's last two records are `assistant` / `stop_reason: end_turn`
-    // with no tool call and no human reply after them, which is PRD §11.2's
-    // primary state — the thread is parked on a human, not merely quiet. That
-    // read used to be unavailable to a replay at all (the attention band was
-    // 0.000% of map area in every frame of every M2 recording); it now comes
-    // from `DecisionSource::TurnEnded`, and `Waiting` is what it looks like in
-    // the status rail. An hour of silence does not resolve it: §11.2 says this
-    // state "persists until resolved", and nobody has resolved it.
+    // with no tool call after them. That used to raise
+    // `DecisionSource::TurnEnded` and read as `Waiting` — "parked on a human" —
+    // which ADR-0102 established is a lie: nobody was asked anything. The turn
+    // simply ended, the ledgers are empty, and the prompt is the operator's
+    // whenever they want it.
+    //
+    // Twenty minutes of silence does not change that. `Ready` rests on a record
+    // that was actually seen, so the decay clock leaves it alone; only `Working`
+    // is demoted by silence, because only `Working` is a claim about right now.
     assert_eq!(
         thread.status,
-        ThreadStatus::Waiting,
-        "parked on a human, which outranks 'alive but quiet'"
+        ThreadStatus::Ready,
+        "a finished turn is ready, not waiting on anybody"
     );
+    assert!(!thread.status.blocks_operator());
 }
 
 #[test]

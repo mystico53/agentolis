@@ -61,6 +61,24 @@
 //! hardcoded, because a fixed three-pixel ring around a small cloud is 60 % of
 //! it — see [`crate::live::CLOUD_CONTOUR_FRACTION`].
 //!
+//! # This mirrors the **single-map** notation, and the CPU path has moved on
+//!
+//! What is described above — one threshold over the summed field, one hue per
+//! texel, one hatch axis, a crossing stroke where two territories meet — is
+//! [`crate::live::paint_cloud_bands`], and it is no longer what the product
+//! draws. The CPU path now draws a [`crate::live::CloudStack`]: one banded,
+//! contoured and hatched layer **per** territory, each on its own axis, painted
+//! over each other, because the argmax in step 3 does not dim the losing
+//! territory, it deletes it.
+//!
+//! This module is not on the shipped path — nothing outside
+//! `polis-render/tests/density_gpu.rs` constructs a [`DensityField`] — so the
+//! divergence costs nothing today. It is recorded because it is the work this
+//! pipeline needs before it can replace the CPU one: step 3's single threshold
+//! becomes one threshold-and-draw pass per territory, over the per-territory
+//! scratch step 1 already produces, and `crowd` stays exactly what it is —
+//! see [`crate::live::CLOUD_SHARE_SPACING`] for what reads it.
+//!
 //! # The kernel is `live`'s quartic, not the probe's Gaussian
 //!
 //! `docs/verified/gpu-stack.md` splats `exp(-4.5·d²) − exp(-4.5)`. This module

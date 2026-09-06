@@ -4613,3 +4613,147 @@ are a larger gap than the collision this ADR closes, and a separate defect.
 **No PRD amendment.** §11.4 (*"Colour alone is never the sole channel for any
 state"*) is unaffected — this makes colour more reliable, not sole — and §10.3
 and §10.4 constrain brightness and cloud count, not hue count.
+
+---
+
+## ADR-0102 — `WAITING` meant "the agent stopped talking", and four different stops were one word
+
+**Context.** The operator reported three separate symptoms in one sitting, and
+they turned out to be three causes wearing one label:
+
+1. *"i just interrupted this chat, the chat says 'idle', it should say
+   'interrupted'"*
+2. a session reading `1 shell still running` shown as waiting, *"but then it
+   starts again automatically and the 'waiting' disappears"*
+3. a session whose footer read `done 21:23 · 1 shell still running` also shown as
+   waiting — *"but its waiting on the clean run before committing, not for the
+   user"*
+
+**The cause.** `turn_boundary` raised `DecisionSource::TurnEnded` on every
+`stop_reason: end_turn`, which set `ThreadStatus::Waiting`. So the loudest state
+in the product — amber, uppercase, sorted first, never decaying, exempt from both
+the idle decay and LRU eviction — was fired by the most common thing an agent
+does: finishing. PRD §11.2 lists the sources of *needs decision* as
+`PermissionRequest`, `Elicitation` and `TeammateIdle`; a turn ending is not among
+them, and §11.2(b) files it under `done`: *"a main thread going idle is news"*.
+
+Three consequences followed, only the first of which was reported:
+
+* **The amber meant nothing.** A thread genuinely blocked on a permission prompt
+  was one amber row among fifty.
+* **Finished threads were immortal.** `retire_threads` will not retire a thread an
+  attention mark points at until `MARK_HOLD_MAX` — four hours. Every finished
+  turn pinned its thread for four hours. This is the pile-up behind ADR-0092.
+* **The map shouted too.** `mapview` gives every `snapshot.waiting()` thread a
+  `Priority::Anchor` title label, so the map named finished threads.
+
+**Measured, on this machine's own corpus** (1,420 transcripts, 238 sessions):
+
+| Signal | Count | Was |
+|---|---:|---|
+| `[Request interrupted by user]` | 45 | parsed, then discarded |
+| `[Request interrupted by user for tool use]` | 41 | read as a tool rejection |
+| — of those, last record in their file | 15 | decayed to `idle` |
+| distinct `backgroundTaskId` | 360 | **unmodelled — 0 Rust files matched** |
+| `<task-notification>` wakes read as the human replying | 218 | took down pins nobody answered |
+
+**Decision.** Two new states, and one structural change that matters more than
+either.
+
+`ThreadStatus` gains `Interrupted` and `Parked`, and `blocks_operator()` becomes
+the single bit the rail sorts and colours by — true for `Waiting` and
+`Interrupted`, false for `Parked` and `Ready`. `Parked` is the state complaints 2
+and 3 were asking for: the turn ended, a job it launched is still running, and it
+will resume by itself. `snapshot.waiting()` now filters on `blocks_operator()`, so
+the rail, the drill panel and the map cannot drift apart on what "needs me" means.
+
+**`Thread::status` is now derived, never authored.** It was written in five places
+that did not agree, and the disagreement was live: two sites resolved a decision
+without re-deriving status, and `tick` decays only `Working`, so a thread could
+sit in `Waiting` with zero live marks until it was retired half an hour later.
+Channels now write *ledgers* — the attention layer, `background`,
+`interrupted_at`, `turn_ended`, `pending` — and `apply::derive` reads them in one
+fixed precedence. Without this, every state added to the enum is another way to
+get permanently stuck; with it, `Done` is also sticky for the first time.
+
+**Both interrupt wordings count.** `for tool use` is 48% of all interrupts and is
+easy to misfile as a permission denial, because a `user-rejected` `tool_result`
+sits immediately before it. It is not one: `toolDenialKind` is present on **0 of
+41** of those records — the denial belongs to the previous record — and an
+operator who hit Esc has stopped the thread rather than answered it.
+
+**A backgrounded test run no longer counts as verification.** `settle` marked the
+thread verified when a `verification` command returned successfully; a
+`run_in_background` `cargo test` returns in milliseconds, so launching it cleared
+"done, unverified" instantly. Guarded on `backgroundTaskId`.
+
+**What this closes.** ADR-0092's open `TurnEnded` defect, without needing the
+`entrypoint` gate it proposed: a headless run that finishes now reads `ready` and
+retires on the ordinary timer, with no new field read.
+
+**Honest limits.**
+
+* A background job whose notification never arrives — 17 of 357, ~5% — is reaped
+  by `BACKGROUND_MAX`, twelve hours. The ceiling sits above real jobs rather than
+  through them: measured launch-to-notification is p90 22 min but **p99 10.4 h**.
+* `origin.kind` is absent on ~30% of genuine human prompts, so the machine-wake
+  test is deliberately one-sided: only an explicit `task-notification` is treated
+  as machine, and everything else stays the operator. This keeps the old
+  behaviour as the fallback rather than silently withholding pins from real
+  answers.
+* Deleting `TurnEnded` removes the source that produced 62/38/6 marks in the three
+  recorded M2 sessions. Replays will look emptier, and that is correct.
+* **Hooks are not registered on this machine at all** — `~/.claude/settings.json`
+  has no `hooks` key — so `Done`, `StopFailure` and all four authoritative
+  decision sources are unreachable and every symptom above was a Channel-D-only
+  artefact. The operator also runs `autoMode: true`, under which
+  `PermissionRequest` rarely fires and `PermissionDenied` (unregistered, refused
+  by ADR-0044 on an assumption never exercised) is what actually fires. Neither is
+  fixed here; both are named so the next round does not rediscover them.
+---
+
+## ADR-0103 — An alarm needs a place of its own; a mark does not
+
+**Context.** ADR-0091 gave PRD §10.2's failure red the area it needed to be seen
+from across the room: nearby failures cluster into one district-scale broken
+ring that holds `ALARM_FLOOR` ink for the whole of `TRAIL_TTL`. Separately,
+`place::site_of` gave every operation a position through a four-rung chain, so
+that the 69 % of failures which name no file stopped falling off the map.
+
+Composed, the two produce a claim neither of them makes alone. Rung 3 is *the
+agent's* position — the head of the thread's trail — deliberately, because "an
+agent has a place even when a particular call does not". Feeding that position to
+a ring turns it into a statement about a **district**. Observed on the operator's
+own session `f24c92b7`: a `PowerShell` env-var probe died on its own quoting,
+resolved on rung 3 because its cwd was the repository root, and flew a full
+district ring for fifteen minutes over a corner of the city the session had never
+opened. The report was *"why is this red? it shouldn't be — nothing needs my
+attention here"*, and it was right.
+
+**Decision.** A failure raises a ring only from rungs 1 and 2 — a place the
+operation itself named. `OpSite::sited` is the predicate, `live::Mark::sited`
+carries it through both rasterisers, and `salience::alarms` is the single place
+that applies it, so the window and the headless renderer cannot disagree about
+which failures shout.
+
+**What is deliberately unchanged.** The mark. Every failure still draws its red
+glyph wherever `site_of` put it, still at `OpSite::scale`'s reduced radius, still
+counted in the rail and in `PlacementCensus`. The defect `place` was written to
+close — a failing session rendering identically to a clean one — does not return,
+and `a_failing_session_and_a_clean_one_are_different_at_thumbnail_size` still
+passes unchanged, because its failures name files.
+
+**Why this is not a loss of signal.** The alarm ring is a layer-4 mark that had
+been given a layer-5 voice. The states that genuinely want the operator are PRD
+§11.2's three, and a failed verification already reaches them by a better road:
+`settle` withholds `mark_verified` on failure, so the thread stays *done,
+unverified* and raises amber when it stops. A shell command that failed while the
+agent is still working needs the agent, not the operator.
+
+**Honest limit.** A `cargo test` that fails at the repository root now raises no
+ring while the thread keeps working — only a red mark at the agent. That is the
+intended reading and it is a judgement, not a measurement: it trades a guaranteed
+alarm on the most important pathless failure for the absence of an alarm on the
+thousands of unimportant ones. If it proves wrong, the lever is a rung-3 ring
+drawn `unsited` — the survey circle in `salience::strokes` already exists and
+reads as *somewhere in here* — rather than a return to the confident ring.

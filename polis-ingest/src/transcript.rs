@@ -1876,7 +1876,7 @@ fn read_as_much_as_possible(handle: &mut File, buf: &mut [u8]) -> io::Result<usi
 ///
 /// 20% of transcript files step backwards and one observed jump was 60 seconds
 /// (ADR-0014), so byte order remains the order and the aged stamp is passed
-/// through a running maximum — the same rule [`monotonise`] applies to the
+/// through a running maximum — the same rule `monotonise` applies to the
 /// recorded path, for the same reason.
 #[derive(Debug, Clone)]
 pub struct Aging {

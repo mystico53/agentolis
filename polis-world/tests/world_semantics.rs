@@ -22,6 +22,10 @@ const REPO: &str = "C:/repo";
 
 fn world() -> World {
     let mut w = World::for_replay(CityLayout::default());
+    // These are live-world semantics, and several of them turn on the
+    // quiet-thread clock that `for_replay` leaves off (see
+    // `World::set_retire_quiet_threads`).
+    w.set_retire_quiet_threads(true);
     w.mapper_mut()
         .add_worktree(WorktreeId::PRIMARY, std::path::Path::new(REPO))
         .expect("primary root");
