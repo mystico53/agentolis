@@ -72,6 +72,17 @@ pub struct Line {
     pub detail: String,
     /// What to do about it, when there is something to do.
     pub hint: Option<String>,
+    /// How many events this channel has actually delivered, when the row is
+    /// about a channel that counts them.
+    ///
+    /// `Reach` answers *is it wired up*; this answers *is it feeding*, and the
+    /// two are not the same question. A telemetry row can sit at
+    /// [`Reach::Partial`] — bound, listening, nothing exported to it — which is
+    /// the state an operator reads as "connected" and then spends an hour
+    /// wondering why the map is quiet. The count was already in `detail`, which
+    /// only a hover reveals; a channel that has delivered nothing should say so
+    /// without being asked.
+    pub count: Option<u64>,
 }
 
 impl Line {
@@ -81,11 +92,20 @@ impl Line {
             reach,
             detail: detail.into(),
             hint: None,
+            count: None,
         }
     }
 
     fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Records what this channel has delivered. Zero is a value, not an absence:
+    /// `telemetry 0` is the whole diagnosis of a map that looks connected and
+    /// draws nothing.
+    fn with_count(mut self, count: u64) -> Self {
+        self.count = Some(count);
         self
     }
 }
@@ -125,11 +145,17 @@ impl Connectivity {
         // Order matters: the zero-setup row is first because it is the one that
         // works with nothing installed, and an operator reading top-down has to
         // learn that before they learn that hooks exist.
+        // Each row carries what its channel has actually delivered. `Reach`
+        // says whether a channel is wired up; the count says whether it is
+        // feeding, and an operator staring at a quiet map needs the second one.
+        // `inspect` deliberately leaves them `None`: it binds nothing, so it has
+        // no counters to report and must not invent zeroes that read as "dead".
         let lines = vec![
-            sessions_row(&bus, roster.as_ref()),
-            telemetry_row(&bus),
-            hooks_row(&bus, crate::setup::detect(repo).hooks_installed()),
-            files_row(&bus),
+            sessions_row(&bus, roster.as_ref()).with_count(totals.received(Channel::Transcript)),
+            telemetry_row(&bus).with_count(totals.received(Channel::Otel)),
+            hooks_row(&bus, crate::setup::detect(repo).hooks_installed())
+                .with_count(totals.received(Channel::Hook)),
+            files_row(&bus).with_count(totals.received(Channel::Fs)),
         ];
         Self {
             repo: repo.to_path_buf(),

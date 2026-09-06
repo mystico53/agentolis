@@ -511,6 +511,26 @@ pub fn duration(d: Duration) -> String {
     format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
 }
 
+/// An event count, short enough to sit inline in the status strip.
+///
+/// Exact below a thousand, because the difference between `0` and `3` is the
+/// whole diagnosis of a channel that is bound and silent. Abbreviated above it,
+/// because by then the operator is reading "a lot" and the strip has four of
+/// these to fit alongside everything else.
+pub fn count(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)] // a display string, not a computation
+    let f = n as f64;
+    if n < 1_000 {
+        format!("{n}")
+    } else if n < 100_000 {
+        format!("{:.1}k", f / 1_000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{:.1}M", f / 1_000_000.0)
+    }
+}
+
 /// A byte count as `1.2 MB`.
 pub fn bytes(n: u64) -> String {
     #[allow(clippy::cast_precision_loss)] // a display string, not a computation

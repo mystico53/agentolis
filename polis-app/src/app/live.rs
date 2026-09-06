@@ -821,6 +821,17 @@ pub fn strip(ui: &mut egui::Ui, feed: &LiveFeed, snapshot: &WorldSnapshot, now: 
                 .strong()
                 .color(palette::selection().color()),
         );
+        // Name, then what that channel has actually delivered.
+        //
+        // The name alone, coloured by `Reach`, answers "is it wired up" — and an
+        // operator reads a green `telemetry` as "telemetry is working". It is
+        // not the same claim: a channel can be bound, healthy and silent, which
+        // is precisely the state that had one asking why a connected map showed
+        // no activity. `telemetry 0` says it in two characters, without a hover.
+        //
+        // Zero is printed, never blanked, for the reason the `dropped` counter
+        // beside it is printed: "nothing arrived" and "this is not wired up"
+        // must never look the same.
         for line in &report.lines {
             ui.label(
                 RichText::new(line.name)
@@ -831,6 +842,21 @@ pub fn strip(ui: &mut egui::Ui, feed: &LiveFeed, snapshot: &WorldSnapshot, now: 
                 Some(hint) => format!("{}\n\n{hint}", line.detail),
                 None => line.detail.clone(),
             });
+            if let Some(count) = line.count {
+                ui.label(
+                    RichText::new(crate::format::count(count))
+                        .monospace()
+                        .small()
+                        .color(if count == 0 {
+                            palette::status(ThreadStatus::Idle).color()
+                        } else {
+                            reach_colour(line.reach)
+                        }),
+                )
+                .on_hover_text(format!(
+                    "{count} events on this channel since the window opened."
+                ));
+            }
         }
         ui.separator();
 
