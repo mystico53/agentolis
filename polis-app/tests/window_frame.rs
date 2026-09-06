@@ -548,3 +548,58 @@ fn a_window_with_no_clouds_says_which_gate_took_them() {
         "the bar has to name the gate that fired, not restate the count: {reason}"
     );
 }
+
+/// Rain is the only channel that fires on *every* call, so it is also the only
+/// one whose absence is invisible: a map with no rain and a map whose rain is
+/// broken look identical. This is the test that tells them apart.
+///
+/// It drives one frame with every operation fresh and one with every operation
+/// long stale, and asserts the fresh pass emits strictly more shapes and reports
+/// itself as animating. "No calls, no rain" is the intended behaviour, so the
+/// stale pass must be quiet — both halves are the claim.
+#[test]
+fn rain_falls_while_calls_are_arriving_and_stops_when_they_are_not() {
+    let city = city();
+    let ctx = egui::Context::default();
+    let layout = Arc::new(city.layout.clone());
+    let base = BaseMap::render(&ctx, &city, &layout, false);
+
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+
+    // One pass at a given operation age, everything else held identical.
+    let pass = |age: Duration| {
+        let mut snapshot = populated(&city);
+        let at = snapshot.at - age;
+        for thread in &mut snapshot.threads {
+            for op in &mut thread.ops {
+                op.at = at;
+            }
+        }
+        let mut camera = Camera::fit(base.edge(), base.geometry.median_building_px, viewport);
+        let mut clouds = Clouds::default();
+        let mut state = ViewState::default();
+        frame(
+            &ctx,
+            &base,
+            &mut camera,
+            &mut clouds,
+            &snapshot,
+            &mut state,
+            None,
+            raw_input(viewport.size()),
+        )
+    };
+
+    let (wet, wet_shapes) = pass(Duration::from_millis(200));
+    let (_dry, dry_shapes) = pass(Duration::from_secs(600));
+
+    assert!(
+        wet_shapes > dry_shapes,
+        "a frame with calls arriving drew {wet_shapes} shapes and one with none drew \
+         {dry_shapes} - rain is not reaching the canvas"
+    );
+    assert!(
+        wet.animating,
+        "rain is on screen but the frame did not ask for another, so it will freeze mid-ripple"
+    );
+}

@@ -68,17 +68,39 @@ const MARKS_SCANNED: usize = 48;
 
 /// How long one call's ripple takes to open and fade.
 ///
-/// Slow, because the alternative is a strobe: at several calls a second — which
-/// a working agent sustains — a fast ripple reads as flicker and a slow one
-/// reads as texture. Nearly three seconds means a burst overlaps into weather
-/// rather than into noise.
-pub const RAIN_LIFE: Duration = Duration::from_millis(2800);
+/// # Tuned against the rate that exists, not the one that felt right
+///
+/// This was 2.8 s, chosen so that a burst would overlap into weather rather
+/// than strobe. That reasoning was sound and the number was wrong, because it
+/// was picked against a *simulation* firing four to eight calls a second. The
+/// measured rate is nothing like that: `polis tail` on a live checkout reports
+/// **0.3 events/sec** with an agent working, and 1.4/sec on the busiest
+/// repository here.
+///
+/// A ripple's life times the arrival rate is how many are on screen at once,
+/// and at 2.8 s × 0.3/s that is **0.8** — less than one, so the operator's map
+/// was empty most of the time and briefly held a single hairline. The first
+/// report was "i still dont see any rain", which is exactly what 0.8 looks
+/// like.
+///
+/// | life | at 0.3/s | at 1.4/s |
+/// |---|---:|---:|
+/// | 2.8 s | 0.8 | 3.9 |
+/// | 6.5 s | **1.9** | **9.1** |
+///
+/// So the ripple is slow rather than brief: it opens over six and a half
+/// seconds, which keeps roughly two on a quiet map and a legible weather of
+/// them on a busy one. Slow is also what was asked for — the drop still never
+/// jumps, it expands.
+pub const RAIN_LIFE: Duration = Duration::from_millis(6500);
 
 /// How far a ripple reaches, in screen pixels.
 ///
-/// Small enough that a ring never crosses the territory it landed in, so the
-/// silhouette stays the thing that says *where* and the rain only says *now*.
-const RAIN_REACH: f32 = 21.0;
+/// Large enough to be a ring rather than a dot — a 21 px ripple on a map at
+/// building zoom is smaller than one building — and still short of crossing the
+/// territory it landed in, so the silhouette keeps saying *where* and the rain
+/// only says *now*.
+const RAIN_REACH: f32 = 34.0;
 
 /// How many written-file rings one thread may put on the map.
 ///
@@ -871,8 +893,16 @@ fn draw_agents(
             let p = age.as_secs_f32() / RAIN_LIFE.as_secs_f32();
             // Opens quickly, then eases — a ring on water, not a pulse.
             let r = RAIN_REACH * (1.0 - (1.0 - p).powf(1.9));
-            let alpha = (1.0 - p).powf(1.7);
+            // Was `^1.7`, which spent two thirds of the ripple's life under a
+            // quarter alpha — invisible for most of the time it was on screen.
+            // A gentler ramp keeps it readable until it actually goes.
+            let alpha = (1.0 - p).powf(1.2);
             let failed = op.outcome == polis_events::Outcome::Failed;
+            // A ripple lands *inside* its own thread's cloud, so it is competing
+            // with hatch in its own hue. `palette::thread` is the agent band
+            // (peak 168) against the cloud's 74–84, so it is already twice the
+            // brightness — but at the old 0.55 alpha and a 1.15 px stroke that
+            // margin was being given straight back.
             let ink = if failed {
                 palette::outcome(polis_events::Outcome::Failed)
             } else {
@@ -882,8 +912,8 @@ fn draw_agents(
                 at,
                 r.max(0.6),
                 Stroke::new(
-                    if failed { 1.7 } else { 1.15 },
-                    ink.alpha(alpha * if failed { 0.9 } else { 0.55 }),
+                    if failed { 2.2 } else { 1.7 },
+                    ink.alpha(alpha * if failed { 0.95 } else { 0.8 }),
                 ),
             );
             animating = true;
