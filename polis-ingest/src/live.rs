@@ -47,6 +47,17 @@
 //! `Idle`, which is exactly why `polis connect` remains worth doing on top of a
 //! zero-setup watch — and why the status area must say which channels are up.
 //!
+//! # The one ending a transcript *can* prove
+//!
+//! There is a single exception, and the successor is the one that reports it.
+//! `/clear` does not truncate the conversation in place: Claude Code opens a
+//! **new** transcript with a new session id and abandons the old file, and both
+//! carry the same `bridge-session.bridgeSessionId` — an id belonging to the
+//! running `claude` process rather than to the conversation. A second live
+//! session under one bridge id therefore means the first is finished, with no
+//! hook installed and no waiting for silence. See [`LiveTailer::superseded`] and
+//! ADR-0105; the measurements are in `docs/verified/jsonl-schema.md` §10.1.
+//!
 //! # Catching up without a flood
 //!
 //! A session that was already running when the window opened has history the
@@ -65,10 +76,11 @@ use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use polis_events::{Event, PathMapper, SessionId};
+use polis_events::{ControlEvent, Event, PathMapper, SessionId, WallTime};
 
 use crate::transcript::{
-    discover_project_dirs, project_dir_cwd, session_files, sessions_in, SessionTailer, StartAt,
+    discover_project_dirs, project_dir_cwd, session_files, session_head, sessions_in, SessionHead,
+    SessionTailer, StartAt, HEAD_PROBE_BYTES,
 };
 
 // ---------------------------------------------------------------------------
@@ -239,12 +251,27 @@ pub struct LiveSession {
     pub subagents: usize,
     /// Whether Polis is following this session's files right now.
     pub tailing: bool,
+    /// The session that replaced this one in the same CLI process — `/clear`.
+    ///
+    /// The only *proof* of an ending a transcript can offer, and it is proof:
+    /// the file will never be appended to again. Everything else in this struct
+    /// is an inference from silence.
+    pub superseded_by: Option<SessionId>,
     /// Whether it appeared *after* the watch started. The common case an
     /// operator actually exercises: open the map, then start an agent.
     pub started_while_watching: bool,
 }
 
 impl LiveSession {
+    /// Whether this session is still one of the agents in the room.
+    ///
+    /// [`Activity`] alone answers *has it been quiet*, and a session cleared
+    /// four seconds ago is by that measure the busiest thing on the machine.
+    /// Every count that means "agents you could talk to" goes through here.
+    pub fn is_live(&self) -> bool {
+        self.activity.is_live() && self.superseded_by.is_none()
+    }
+
     /// A one-line rendering for a terminal or a status rail.
     pub fn line(&self) -> String {
         let location = match (&self.cwd, self.fit) {
@@ -252,6 +279,12 @@ impl LiveSession {
             (Some(cwd), _) => cwd.clone(),
             (None, _) => "unknown".to_owned(),
         };
+        // "cleared" replaces the activity word rather than joining it: a
+        // conversation the operator ended four seconds ago is not "working",
+        // however recently its file grew.
+        if self.superseded_by.is_some() {
+            return format!("{}  cleared  {}", self.session, location);
+        }
         let quiet = match self.quiet_for {
             Some(d) if self.activity != Activity::Working => {
                 format!(", quiet for {}", short_duration(d))
@@ -336,24 +369,24 @@ impl Roster {
 
     /// Live sessions in the watched repository — the headline number.
     pub fn live_here(&self) -> usize {
-        self.here().filter(|s| s.activity.is_live()).count()
+        self.here().filter(|s| s.is_live()).count()
     }
 
     /// Sessions in the watched repository that are working right now.
     pub fn working_here(&self) -> usize {
         self.here()
-            .filter(|s| s.activity == Activity::Working)
+            .filter(|s| s.is_live() && s.activity == Activity::Working)
             .count()
     }
 
     /// Live sessions in some other repository.
     pub fn live_elsewhere(&self) -> usize {
-        self.elsewhere().filter(|s| s.activity.is_live()).count()
+        self.elsewhere().filter(|s| s.is_live()).count()
     }
 
     /// Live sessions whose repository is not knowable yet.
     pub fn live_resolving(&self) -> usize {
-        self.resolving().filter(|s| s.activity.is_live()).count()
+        self.resolving().filter(|s| s.is_live()).count()
     }
 
     /// Sessions being followed right now.
@@ -406,6 +439,16 @@ impl Roster {
 // The tailer
 // ---------------------------------------------------------------------------
 
+/// One head read, with the file length it was read at.
+///
+/// The length is what makes re-probing terminate: an incomplete answer is worth
+/// asking again only while the file has more to say.
+#[derive(Debug, Clone)]
+struct HeadProbe {
+    head: SessionHead,
+    bytes: u64,
+}
+
 /// What one scan learnt about a session, kept between scans.
 #[derive(Debug, Clone)]
 struct Known {
@@ -434,6 +477,27 @@ pub struct LiveTailer {
     project_cwd: BTreeMap<PathBuf, Option<String>>,
     known: BTreeMap<PathBuf, Known>,
     tails: BTreeMap<PathBuf, SessionTailer>,
+    /// What the head of each live session's transcript said about its identity.
+    ///
+    /// Read once per session and kept: the head of a transcript is immutable
+    /// once written. An empty [`SessionHead`] — the file existed but had said
+    /// nothing yet — is re-probed, because that is a session being born rather
+    /// than a session with no bridge id.
+    heads: BTreeMap<PathBuf, HeadProbe>,
+    /// Sessions a later session of the same CLI process has replaced, and the
+    /// one that replaced each.
+    ///
+    /// See the module header: this is the only ending the transcript channel can
+    /// *prove*. Entries are never removed while the session is still on disk —
+    /// nothing can un-clear a conversation.
+    superseded: BTreeMap<PathBuf, SessionId>,
+    /// Control events waiting for the next [`LiveTailer::poll`].
+    ///
+    /// A supersession is discovered during a rescan, and a rescan is not allowed
+    /// to touch the bus: the caller decides when events are drained, and every
+    /// event this channel produces must reach it through the one path that
+    /// preserves order behind the records it follows.
+    pending: Vec<Event>,
     /// Sessions that existed before the watch started, so a session that appears
     /// later can be told from one that was already there.
     preexisting: BTreeSet<PathBuf>,
@@ -454,6 +518,9 @@ impl LiveTailer {
             project_cwd: BTreeMap::new(),
             known: BTreeMap::new(),
             tails: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            superseded: BTreeMap::new(),
+            pending: Vec::new(),
             preexisting: BTreeSet::new(),
             roster: Roster::empty(projects_dir, repo),
             started: SystemTime::now(),
@@ -524,12 +591,121 @@ impl LiveTailer {
         // being reported, rather than becoming a permanent ghost in the roster.
         self.known.retain(|dir, _| seen.contains(dir));
         self.tails.retain(|dir, _| seen.contains(dir));
+        self.heads.retain(|dir, _| seen.contains(dir));
+        self.superseded.retain(|dir, _| seen.contains(dir));
         if !self.first_scan_done {
             self.preexisting = seen;
             self.first_scan_done = true;
         }
+        self.detect_supersession(now);
         self.reconcile_tails(now);
         self.publish(now);
+    }
+
+    /// Finds sessions `/clear` ended, by the one link their files share.
+    ///
+    /// Two transcripts carrying the same `bridge-session.bridgeSessionId` are
+    /// two conversations of one `claude` process, and a process holds one at a
+    /// time: measured across 262 transcripts on this machine, the id never
+    /// changes within a file (0 files) and the sessions sharing one never
+    /// overlap — eight chains, every successor's first record after its
+    /// predecessor's last. So the newest is the live one and the rest are
+    /// history, whatever their modification times say (ADR-0105).
+    ///
+    /// # Only live sessions are probed, but every live session is
+    ///
+    /// The head read is one `open` per session for the life of the watch, and
+    /// the liveness gate has already cut hundreds of sessions down to the
+    /// handful running anywhere on the machine. A dormant session is not on the
+    /// map for a clear to take off it.
+    ///
+    /// The [`Scope`] is deliberately *not* applied. A terminal that moved
+    /// between checkouts leaves the two halves of one chain in two project
+    /// directories, and the roster reports out-of-scope sessions too — so
+    /// filtering here would both miss real clears and let the "3 more in other
+    /// repositories" line count conversations that are over.
+    fn detect_supersession(&mut self, now: SystemTime) {
+        let candidates: Vec<PathBuf> = self
+            .known
+            .iter()
+            .filter(|(_, known)| activity_of(known.modified, now).is_live())
+            .map(|(dir, _)| dir.clone())
+            .collect();
+
+        let mut by_bridge: BTreeMap<String, Vec<(WallTime, PathBuf)>> = BTreeMap::new();
+        let mut incomplete: BTreeSet<String> = BTreeSet::new();
+        for dir in candidates {
+            let bytes = self.known[&dir].bytes;
+            let probe = self.probe_head(&dir, bytes);
+            let Some(bridge) = probe.head.bridge.clone() else {
+                continue;
+            };
+            match probe.head.first_record {
+                Some(first) => by_bridge.entry(bridge).or_default().push((first, dir)),
+                // A file that has written its `bridge-session` record but not yet
+                // a timestamped one — a window of a few hundred bytes. Its whole
+                // group waits: the missing value is exactly the one that says
+                // which session is the successor, and guessing it backwards
+                // would take the *new* thread off the map.
+                None => {
+                    incomplete.insert(bridge);
+                }
+            }
+        }
+
+        for (bridge, mut sessions) in by_bridge {
+            if sessions.len() < 2 || incomplete.contains(&bridge) {
+                continue;
+            }
+            // The newest first record is the live conversation. Modification
+            // times are not consulted at all: a finished session's file can
+            // still receive its last assistant flush and its `cost-state`, and
+            // 20% of transcripts contain a backwards timestamp step (ADR-0014).
+            // The first record of each file is the one comparison neither of
+            // those can move.
+            sessions.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let winner = session_id_of(&sessions[0].1);
+            for (_, dir) in &sessions[1..] {
+                if self.superseded.contains_key(dir) {
+                    continue;
+                }
+                let session = session_id_of(dir);
+                tracing::debug!(%session, by = %winner, "session cleared");
+                self.superseded.insert(dir.clone(), winner.clone());
+                self.pending
+                    .push(Event::control(ControlEvent::SessionSuperseded {
+                        session,
+                        by: winner.clone(),
+                    }));
+            }
+        }
+    }
+
+    /// One session's [`SessionHead`], read at most once per growth of the file
+    /// and never again once it is complete.
+    ///
+    /// A transcript is created empty and writes its identity records inside the
+    /// first second, so the first probe of a session being born legitimately
+    /// finds nothing; and 37 of 262 transcripts on this machine carry no
+    /// `bridge-session` record at all, which must not become a read on every
+    /// scan for as long as they live. Re-probing stops when the answer is
+    /// complete, or when the file has grown past [`HEAD_PROBE_BYTES`] — past
+    /// which the records this reads for cannot still be coming.
+    fn probe_head(&mut self, dir: &Path, bytes: u64) -> &HeadProbe {
+        let transcript = self.known[dir].transcript.clone();
+        let stale = self.heads.get(dir).is_none_or(|probe| {
+            !probe.head.is_complete() && bytes > probe.bytes && probe.bytes < HEAD_PROBE_BYTES
+        });
+        if stale {
+            self.heads.insert(
+                dir.to_path_buf(),
+                HeadProbe {
+                    head: session_head(&transcript),
+                    bytes,
+                },
+            );
+        }
+        &self.heads[dir]
     }
 
     /// Records what one `metadata` call says about one session.
@@ -565,6 +741,13 @@ impl LiveTailer {
             let cwd = self.cwd_of(&known.project_dir);
             let fit = self.scope.fit(cwd);
             let activity = activity_of(known.modified, now);
+            // A cleared session is finished, whatever its mtime says. Following
+            // it would cost a poll per tick on a file that can never grow again,
+            // and would re-deliver its backfill to a world that has already been
+            // told the thread is gone.
+            if self.superseded.contains_key(dir) {
+                continue;
+            }
             let follow = match fit {
                 Fit::Inside => activity.is_live(),
                 // A session whose repository is not yet knowable is followed
@@ -634,6 +817,7 @@ impl LiveTailer {
                     activity,
                     subagents: tail.map_or(0, |t| t.files().count().saturating_sub(1)),
                     tailing: tail.is_some(),
+                    superseded_by: self.superseded.get(dir).cloned(),
                     started_while_watching: known.started_while_watching,
                 }
             })
@@ -664,7 +848,14 @@ impl LiveTailer {
     /// how often that costs, because a rescan is `read_dir` per project
     /// directory and a poll is a `metadata` per followed file.
     pub fn poll(&mut self, out: &mut Vec<Event>) -> usize {
-        self.tails.values_mut().map(|t| t.poll(out)).sum()
+        let records: usize = self.tails.values_mut().map(|t| t.poll(out)).sum();
+        // After the records, always: a `SessionSuperseded` says a thread is over,
+        // and it must not overtake the records of the thread it is about. The
+        // tail it refers to was dropped during the rescan that raised it, so
+        // nothing can arrive behind it either.
+        let announced = self.pending.len();
+        out.append(&mut self.pending);
+        records + announced
     }
 
     /// How many sessions are being followed.
@@ -716,6 +907,16 @@ fn activity_of(modified: Option<SystemTime>, now: SystemTime) -> Activity {
     } else {
         Activity::Dormant
     }
+}
+
+/// The session id a `<project>/<session-id>` sidecar path names.
+fn session_id_of(session_dir: &Path) -> SessionId {
+    SessionId::new(
+        session_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
+    )
 }
 
 /// The later of two optional times.
@@ -1098,5 +1299,254 @@ mod tests {
         if let Ok(file) = file {
             let _ = file.set_modified(when);
         }
+    }
+
+    /// Writes a session the way Claude Code does: the `bridge-session` sidecar
+    /// first, then threaded records — which is why the bridge id is readable
+    /// before any timestamp is.
+    fn write_bridged_session(
+        project: &Path,
+        id: &str,
+        cwd: &str,
+        bridge: &str,
+        started: &str,
+    ) -> PathBuf {
+        let path = project.join(format!("{id}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"t","sessionId":"{id}"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"bridge-session","sessionId":"{id}","bridgeSessionId":"{bridge}","lastSequenceNum":0}}"#
+        )
+        .unwrap();
+        for i in 0..3 {
+            writeln!(
+                file,
+                r#"{{"type":"user","uuid":"{id}-{i}","sessionId":"{id}","cwd":{},"timestamp":"{started}","message":{{"role":"user","content":"hi"}}}}"#,
+                serde_json::to_string(cwd).unwrap()
+            )
+            .unwrap();
+        }
+        file.flush().unwrap();
+        path
+    }
+
+    /// `/clear`: the successor's own file says the previous conversation is
+    /// over, and it says so at once rather than after [`LIVE_WINDOW`].
+    #[test]
+    fn a_cleared_session_is_superseded_by_the_one_that_took_its_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let here = project(&projects, "C--work-mine");
+        write_bridged_session(
+            &here,
+            "old0",
+            "C:/work/mine",
+            "cse_one",
+            "2026-09-06T22:24:31Z",
+        );
+        write_bridged_session(
+            &here,
+            "new0",
+            "C:/work/mine",
+            "cse_one",
+            "2026-09-06T22:30:44Z",
+        );
+
+        let mut tailer = LiveTailer::open(&projects, Scope::Repo(mapper_for("C:/work/mine")));
+        let roster = tailer.roster();
+        let cleared = roster
+            .sessions
+            .iter()
+            .find(|s| s.session.as_str() == "old0")
+            .unwrap();
+        let live = roster
+            .sessions
+            .iter()
+            .find(|s| s.session.as_str() == "new0")
+            .unwrap();
+
+        assert_eq!(
+            cleared.superseded_by.as_ref().map(SessionId::as_str),
+            Some("new0"),
+            "the older session of one bridge id is the cleared one"
+        );
+        assert!(!cleared.is_live(), "a cleared session is not an agent");
+        assert!(!cleared.tailing, "and is not worth following");
+        assert!(cleared.line().contains("cleared"), "{}", cleared.line());
+        assert_eq!(live.superseded_by, None);
+        assert!(live.is_live() && live.tailing);
+        assert_eq!(
+            roster.live_here(),
+            1,
+            "one agent is in this repository, not two"
+        );
+
+        let mut out = Vec::new();
+        tailer.poll(&mut out);
+        let announced: Vec<_> = out
+            .iter()
+            .filter_map(|e| match &e.payload {
+                polis_events::Payload::Control(ControlEvent::SessionSuperseded { session, by }) => {
+                    Some((session.as_str().to_owned(), by.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            vec![("old0".to_owned(), "new0".to_owned())],
+            "the world is told once, naming both ends"
+        );
+
+        // Said once, not once per poll: the thread is already gone.
+        let mut again = Vec::new();
+        tailer.rescan();
+        tailer.poll(&mut again);
+        assert!(
+            !again.iter().any(|e| matches!(
+                &e.payload,
+                polis_events::Payload::Control(ControlEvent::SessionSuperseded { .. })
+            )),
+            "supersession is announced once"
+        );
+    }
+
+    /// Two sessions that merely ran in the same repository are two agents. The
+    /// bridge id is the whole of the evidence, and without a shared one nothing
+    /// is removed.
+    #[test]
+    fn sessions_of_different_processes_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let here = project(&projects, "C--work-mine");
+        write_bridged_session(
+            &here,
+            "aaaa",
+            "C:/work/mine",
+            "cse_one",
+            "2026-09-06T22:24:31Z",
+        );
+        write_bridged_session(
+            &here,
+            "bbbb",
+            "C:/work/mine",
+            "cse_two",
+            "2026-09-06T22:30:44Z",
+        );
+        // A third with no bridge record at all — 37 of 262 transcripts on this
+        // machine — which must be reported, never guessed about.
+        write_session(&here, "cccc", "C:/work/mine", 3);
+
+        let tailer = LiveTailer::open(&projects, Scope::Repo(mapper_for("C:/work/mine")));
+        let roster = tailer.roster();
+        assert!(roster.sessions.iter().all(|s| s.superseded_by.is_none()));
+        assert_eq!(roster.live_here(), 3);
+    }
+
+    /// A terminal that changed directory between conversations leaves the two
+    /// halves of one chain under two project directories. The clear happened all
+    /// the same, and the thread it ended is on *this* map.
+    #[test]
+    fn a_clear_is_seen_even_when_the_new_chat_is_in_another_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let here = project(&projects, "C--work-mine");
+        let there = project(&projects, "C--work-other");
+        write_bridged_session(
+            &here,
+            "old0",
+            "C:/work/mine",
+            "cse_one",
+            "2026-09-06T22:24:31Z",
+        );
+        write_bridged_session(
+            &there,
+            "new0",
+            "C:/work/other",
+            "cse_one",
+            "2026-09-06T22:30:44Z",
+        );
+
+        let tailer = LiveTailer::open(&projects, Scope::Repo(mapper_for("C:/work/mine")));
+        let roster = tailer.roster();
+        let cleared = roster.here().next().unwrap();
+        assert_eq!(cleared.session.as_str(), "old0");
+        assert_eq!(
+            cleared.superseded_by.as_ref().map(SessionId::as_str),
+            Some("new0")
+        );
+        assert_eq!(roster.live_here(), 0, "the chat in this repository is over");
+        assert_eq!(
+            roster.live_elsewhere(),
+            1,
+            "and the one that replaced it is"
+        );
+    }
+
+    /// The window between the two records the probe needs: a successor that has
+    /// written its bridge id but not yet a timestamped record must not be read
+    /// as the *older* of the pair, which would take the new thread off the map
+    /// and leave the dead one on it.
+    #[test]
+    fn nothing_is_superseded_until_both_sides_can_be_ordered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let here = project(&projects, "C--work-mine");
+        write_bridged_session(
+            &here,
+            "old0",
+            "C:/work/mine",
+            "cse_one",
+            "2026-09-06T22:24:31Z",
+        );
+        let newborn = here.join("new0.jsonl");
+        std::fs::write(
+            &newborn,
+            "{\"type\":\"bridge-session\",\"sessionId\":\"new0\",\"bridgeSessionId\":\"cse_one\"}\n",
+        )
+        .unwrap();
+
+        let mut tailer = LiveTailer::open(&projects, Scope::Repo(mapper_for("C:/work/mine")));
+        assert!(
+            tailer
+                .roster()
+                .sessions
+                .iter()
+                .all(|s| s.superseded_by.is_none()),
+            "no first record, no ordering, no removal"
+        );
+
+        // The successor's first threaded record lands; now the pair can be
+        // ordered, and the probe is repeated because the file grew.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newborn)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","uuid":"n-0","sessionId":"new0","cwd":"C:/work/mine","timestamp":"2026-09-06T22:30:44Z","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+        tailer.rescan();
+        let roster = tailer.roster();
+        let cleared = roster
+            .sessions
+            .iter()
+            .find(|s| s.session.as_str() == "old0")
+            .unwrap();
+        assert_eq!(
+            cleared.superseded_by.as_ref().map(SessionId::as_str),
+            Some("new0")
+        );
     }
 }

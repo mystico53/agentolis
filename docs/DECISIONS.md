@@ -4757,3 +4757,568 @@ alarm on the most important pathless failure for the absence of an alarm on the
 thousands of unimportant ones. If it proves wrong, the lever is a rung-3 ring
 drawn `unsited` — the survey circle in `salience::strokes` already exists and
 reads as *somewhere in here* — rather than a return to the confident ring.
+
+---
+
+## ADR-0104 — The repository is a choice the operator makes, not one the shell makes
+
+**Context.** PRD §2 says one Polis window maps one repository, and nothing here
+changes that. What changed is how the repository is chosen. Until now it was the
+process's working directory — `Cli::repo_root` falls back to
+`std::env::current_dir()` — and the only way to look at another checkout was to
+close the window, `cd`, and start again. Bare `polis` guessed between two
+answers that were both about that directory: the session picker on a first run,
+a map of the current folder afterwards.
+
+The roster already knew this was the wrong question. `polis watch` prints, in
+its own words:
+
+> Elsewhere on this machine — reported, not drawn, because one Polis window maps
+> one repository:
+> …
+> To watch one of those:  polis -C \<that repository\> watch
+
+That is Polis knowing exactly where the operator's other agents are working, and
+handing back a command line. An operator running agents in three checkouts is
+standing in at most one of them, and the answer to *which repository* is on disk
+already: every Claude Code session on the machine writes a transcript carrying
+the `cwd` it is working in.
+
+**Decision.** `polis-app/src/repos.rs` is one screen that answers *where could
+Polis be looking, and what is happening there*, and it is used in both places
+that ask: bare `polis` (and `polis home`) open it as the front door, and `o` — or
+the repository name in the title bar — opens the same screen over a running map
+and switches the watch in place.
+
+Rows come from three sources merged by checkout root: live sessions from a
+one-shot `LiveTailer` with `Scope::Everything` (the source that matters — it is
+the only one that knows an agent is working somewhere right now), the session
+index for checkouts worked in before, and a recents file Polis writes. The list
+is ordered by *where work is happening*, not by recency: the repository being
+watched, then working agents, then idle ones, then last activity.
+
+**Three things this deliberately does not do.**
+
+* **It does not draw two cities.** PRD §2 is unchanged. Switching tears one city
+  down and builds another; the window is still about one repository, and says
+  which in the title bar.
+* **It does not change what kind of window it is.** `PolisApp::live_template` is
+  `Some` exactly when the window is a watch, so a watch stays a watch and
+  `polis map` stays a map that binds no ports. Switching moves `repo_root` in
+  the options the command line already produced — ports, channel set and session
+  scope included — rather than inventing a fresh configuration.
+* **It does not switch under `polis work`.** Those agents are attached to this
+  checkout's `polis-sessiond` and would be left behind, so the button is
+  disabled and says why.
+
+**The one ordering that is not interchangeable.** A live feed holds 4317 and the
+hook port, and the next one needs both. `PolisApp::open_repo` therefore drops
+the old scene — which is what runs `OtlpReceiver::shutdown` and
+`HookListener::shutdown`, each of which *joins* its thread — **before**
+`LiveFeed::start` binds the new one, and starts the feed **before** the city is
+generated, for the reason `launch` already does: a hook datagram that arrives
+with nothing bound is gone for good. Getting this backwards produces a map that
+looks perfectly healthy with Channel A dead on it, which is precisely the
+silence PRD §15 M3 exists to eliminate.
+
+**Two smaller findings, both from writing it.**
+
+* `enter` on the third row opened the first one. egui delivers `enter` as a
+  click to whatever widget holds keyboard focus, and a list that binds `enter`
+  to its own cursor therefore has to require a *pointer* click on a row. The
+  same shape exists in `session.rs`'s picker and has not been observed there;
+  it is noted here rather than fixed blind.
+* The launcher keeps pumping the feed underneath it while it is open
+  (`pump_beneath`). Closing it shows the map as it is now rather than replaying
+  the seconds the operator spent choosing, and the drop counter stays honest:
+  a bounded bus drops its oldest event whether or not anybody was looking.
+
+**Honest limit.** The live counts come from a scan that re-reads every project
+directory every two seconds while the launcher is open. That is the same read
+`polis watch --list` does, on a background thread, and it is charged only while
+the screen is up — but on a machine with thousands of sessions it is the one
+part of this that will need a cheaper answer, and the shape of that answer is a
+`(size, mtime)` cache like the session index already has.
+
+## ADR-0105 — The dock and the map are one window, and the terminal is reachable from the map
+
+**Context.** ADR-0095 put the ptys in `polis-sessiond` and made the window a
+thin client, and it worked: `polis work` renders Claude Code in a pane, a
+force-killed window leaves its agent running, and reattaching puts the screen
+back. What it did not do is connect the two halves of the window it had built.
+
+Two gaps, and the first one is the whole feature:
+
+1. **`Mode::Work` started no ingest.** `launch` built a `LiveFeed` for
+   `Mode::Live` and for nothing else. Meanwhile `panes.rs` was already spawning
+   every agent with `polis_ingest::env::agent_env()` pointed at `127.0.0.1:4317`
+   and a `--session-id` Polis issued itself (ADR-0096). So the panes were
+   producing telemetry into a socket nobody had bound, and the city beside them
+   never moved. The one window that owned its agents was the one window that
+   could not see them.
+2. **`pane_for_session` existed and had no caller.** The `BTreeMap` lookup the
+   roadmap called *"nothing inferred, nothing timed, nothing raced"* was written,
+   tested, and dead.
+
+And underneath both, a product gap: the terminal was reachable only through
+`polis work`. An operator who ran `polis` or `polis watch` — the two commands the
+README calls the front door and the headline — got a city with no way to start an
+agent in it.
+
+**Decision.** Three edits, in the order they matter.
+
+**The work window watches.** `launch` starts `LiveFeed::start(&LiveOptions::watching(repo))`
+for `Mode::Work` as well. `watching`, not `for_repo`: it is the line that sets
+`SessionScope::ThisRepo`, which is what makes Channel D discover this
+repository's agents and publish a roster, and it is now shared by `polis watch`,
+the launcher, an in-place repository switch and the dock — four callers, one
+rule, no drift.
+
+**The correlation runs both ways, in one place.** After every panel has drawn,
+`app.rs` resolves the dock and the map against each other exactly once a frame:
+
+* **Pane → map.** `Dock::take_reveal` reports the tab the operator moved to, and
+  the frame sets `view.selected_thread` to `ThreadId::of_session` of it. Clicking
+  a tab lights that agent's cloud, its rail row and its trail.
+* **Map → pane.** A changed `selected_thread`, or an attention jump, calls
+  `Dock::focus_session`. A cloud goes amber, `a` — or its row in the rail —
+  takes you to it, and the terminal that agent is typing into is the one on
+  screen. **The map's own anchors stay hover targets, not click targets**: they
+  sit over buildings, and a click that both opened a file in the editor and
+  switched terminals would be one gesture doing two unrelated things. The two
+  routes that already *mean* "this agent" were wired instead; making an anchor
+  mean it too is a change to what a map click is, and belongs in its own ADR.
+
+*Taken* rather than read, and *changed* rather than current: without both, the
+map would re-focus a tab every frame and the operator could never look at one
+terminal while another agent's cloud was lit. An attention jump is honoured every
+time because it means *take me there*; a selection only when it moves.
+
+**A tab reads the world, not the pty.** `Dock::observe` runs once a frame against
+the same published `WorldSnapshot` the map and the rail read, and writes each
+tab's place, status and amber flag. A tab therefore says `2 polis-world/src` in
+`ThreadStatus::Working`'s colour rather than `2 claude`, and it cannot disagree
+with the cloud beside it, because there is one source and it is not the terminal.
+
+`place_label` deliberately keeps PRD §6.2's refusal to guess: a claim is written
+plainly, §6.4's lobes as the heaviest plus a count, and *nowhere* as an absence.
+A tab that invented a district for a thread the world declined to place would be
+the dock and the map contradicting each other about the same agent — which is the
+defect ADR-0099's `place_of` was written to end on the rail.
+
+**The amber flag is not merged into the bell flag.** `Tab::attention` is sticky —
+a bell happened, and it stays until it is looked at. *Waiting on you* is true
+*now*, and has to stop being true the instant the agent is unblocked, including
+when the operator answers the prompt in the pane and never touches the tab. Two
+different lifetimes, so two fields.
+
+**The dock is reachable without the subcommand.** `Ctrl+Alt+T` — the same chord
+`panes::RESERVED` already used for *new agent* — starts a dock in a window that
+has none, and the title bar carries a `+ agent` button beside the repository
+name. `polis work` is now "open with a pane already running", not "the mode that
+has terminals".
+
+**Gated on the map being live**, which is the one non-obvious line. `polis map`
+is deliberately a city with no wire into it and `polis replay` is a recording of
+the past; a pane opened on either would be an agent working beside a map that
+structurally could not draw it. Both would look like the bug this ADR exists to
+fix, so neither offers the button.
+
+**Starting the dock is deferred by one frame.** The scene is borrowed for the
+rest of the frame and `Dock::start` takes all of `self`, so the request is a
+field and the connection happens at the top of the next frame with a repaint
+already requested. That is also where the cost is: `connect_or_start` polls for
+the daemon's endpoint file every 50 ms on the UI thread. With a daemon already up
+it is a loopback connect; on the first agent of the session it is a visible
+hitch of roughly a process spawn. **Not measured**, and the honest fix if it
+bites is the load-thread pattern `spawn_load` already uses, not a shorter
+timeout.
+
+**Measured, on this machine.** Two things were observed rather than reasoned
+about.
+
+*The window runs the channels.* Same checkout, same debug binary, one after the
+other: `polis map` holds **44 threads / 151.7 MB**, `polis work` holds **51 /
+191.0**. The seven extra threads and the 39 MB are the ingest stack, and before
+this change `polis work` had neither.
+
+*The correlation key is real.* A pane was opened and the daemon reported it as
+`%1 claude ... 000032cc-0000-4001-98d2-dd6d64b3fdcc`. A prompt was driven into
+it through the daemon's own client, and Claude Code wrote
+`~/.claude/projects/C--coding-agentolis/000032cc-0000-4001-98d2-dd6d64b3fdcc.jsonl`
+— the Polis-issued id, as the filename, under this repository's project
+directory. `polis watch --list` then listed that same id as **working** in this
+checkout. That is every hop of the chain the dock and the map key on, and it
+held without hooks and with Channel A refused (another Polis already had 4317),
+which is the point of leaning on Channel D.
+
+It also shows ADR-0098's inherited-identity hazard is genuinely closed: the
+daemon was started from inside a Claude Code session and its pane still saved a
+transcript.
+
+**Not observed.** The click-through itself, in either direction — it needs a
+hand on the mouse, and nothing here fakes one. And PRD §13.1's frame budget was
+not re-measured in release with a live feed and a pane drawing at once, which is
+the one number this change could plausibly move.
+
+**What this does not close.** M7b's persisted dock width and collapsed state,
+M7c's selection and OSC 52, the `polis doctor` glyph line, and M7e. And the four
+channels still start in the *window*, not the daemon — so a detached period still
+records nothing, and *"shut the lid for an hour and watch it play back"* remains
+the thing M8 owes.
+
+---
+
+## ADR-0105 — `/clear` is the one ending a transcript can prove, and the next session is what proves it
+
+**Context.** The operator's sentence: *"when i clear a chat, that thread should
+disappear in the app"*. It did not. A cleared conversation sat on the map as a
+live cloud for eight minutes (`polis_ingest::live::LIVE_WINDOW`), stayed in the
+world for thirty (`polis_world::THREAD_RETIRE_AFTER`), and — if it had left an
+attention mark behind — for up to four hours (`MARK_HOLD_MAX`). Every one of
+those numbers is deliberate and none of them is wrong: they exist because
+`live.rs` and `retire_threads` both say, correctly, that *a session never ends on
+disk*. `docs/verified/jsonl-schema.md` enumerates the record types and none of
+them closes a session, so a session that ended, one that crashed and one sitting
+at a prompt are indistinguishable, and Polis waits rather than inventing
+evidence.
+
+`/clear` is the exception, and it was being missed because the proof is not in
+the file anyone was looking at. Claude Code does not truncate the conversation in
+place: it **abandons the transcript and opens a new one**, with a new session id,
+whose first user record is `<command-name>/clear</command-name>`. The dead file
+simply stops. What links the two is `bridge-session.bridgeSessionId` — an id
+belonging to the running `claude` process rather than to the conversation.
+
+**The measurement** (2026-09-06, 263 transcripts under `~/.claude/projects`, one
+unreadable for the `MAX_PATH` reason in jsonl-schema §1.3; the table is
+§10.1):
+
+* 225 of 262 files carry a `bridge-session` record; the id **never changes**
+  within a file (0 files).
+* 114 distinct bridge ids; 48 of them cover more than one session; 107 sessions
+  are the successor of another under one id, in chains up to 9 long.
+* **106 of those 107 open with `/clear`** (the odd one out opens with
+  `/design`).
+* **0 of 107** have the predecessor writing after the successor's first record.
+
+So the sessions of one bridge id are a strict, non-overlapping sequence: a second
+live session under an id means the first one is over, will never be appended to
+again, and cannot be returned to by the operator either.
+
+**Decision.** `LiveTailer::detect_supersession` groups the *live, in-scope*
+sessions by bridge id, keeps the one with the newest first record, and calls
+every other one superseded: it stops being tailed, the roster reports it
+`cleared` rather than `working`, and one `ControlEvent::SessionSuperseded`
+reaches the world, where `World::supersede_thread` removes the thread. End to
+end that is one rescan — two seconds — instead of eight minutes.
+
+**Removed, not marked done.** `EventKind::SessionEnd` finishes a thread and
+leaves it on the rail carrying its attention mark, because *"this agent stopped
+and its work is unverified"* is a queue item (PRD §11.2). A cleared conversation
+is not a queue item: there is no thread to go back to, and a *done, unverified*
+mark would pin a row naming a chat the operator deliberately threw away for
+`MARK_HOLD_MAX`. The city does not lose the work — building height is
+uncommitted diff, a fact about the disk and not about the chat.
+
+**Three things this gets right only because they were measured.**
+
+* **Ordering is by first record, never by mtime.** A finished session's file can
+  still grow — the last assistant flush, a `cost-state` written at exit — and
+  observed transcript timestamps step backwards in 20% of files (ADR-0014). The
+  first record of each file is the one comparison that survives both, and it is
+  what the probe reads.
+* **The bridge id is readable before any timestamp is.** `bridge-session` is
+  written among the opening sidecars, several records ahead of the first threaded
+  one. A reader that treated "no timestamp yet" as "oldest" would conclude the
+  *new* session was the one that ended and take the live thread off the map. So a
+  group whose members cannot all be ordered is left alone until the next rescan,
+  and the head probe is repeated while the file is still growing.
+* **The probe is bounded and it terminates.** At most `HEAD_PROBE_BYTES` (64 KiB
+  — the first bridge record sits at byte ≤ 392 in 224 of 225 files, the outlier
+  at 17 458), only for sessions the liveness gate already wants to follow, once
+  per session, and re-read only while the answer is incomplete *and* the file is
+  both growing and still under that bound. The 37 files that carry no bridge
+  record at all cost one read each, not one per scan.
+
+**Honest limits.**
+
+* **No bridge record, no inference.** 37 of 262 files have none, and those
+  sessions go back to leaving on silence. Nothing is guessed for them.
+* **This is an undocumented internal field.** It is not in the hooks reference
+  or any public schema, and a release could stop writing it or start sharing one
+  id across concurrent sessions. The failure mode if it did is bounded and
+  self-correcting: like `World::dismiss_thread`, supersession is **not a
+  tombstone**, so a session that speaks again rebuilds its thread on the next
+  event. A `SessionEnd` hook remains the stronger signal and `polis connect`
+  remains worth doing.
+* **It does not cover quitting.** Closing the terminal, `Ctrl-C`, or a crash
+  writes nothing and starts nothing, so those endings still wait for
+  `THREAD_RETIRE_AFTER`. `/clear` is the only one that leaves a witness.
+
+## ADR-0107 — A cloud gets a body, and the number that decides how much city it hides belongs to the operator
+
+**Context.** The operator's report was two sentences and they name two different
+failures: *"the cloud layers look a bit weird, super pixelated"*, and *"the
+clouds need an even background, they don't distinguish themselves; the labels we
+build aren't necessary, instead the rail thread should point to the cloud."*
+
+Both were earned by decisions this log already records.
+
+* **Pixelation.** `polis-app::clouds` rasterises the layer on the CPU into a
+  fixed 1 024² texel grid over the whole base map and uploads it with
+  `TextureOptions::NEAREST`. Nearest is right for a sparse opaque mark — a
+  linear filter turns a one-pixel hatch stroke into a smear at every
+  intermediate alpha, which is the wash the layer was rewritten twice to remove
+  — but it means one texel becomes a visible block as soon as the operator zooms
+  past about 1.5×.
+* **No even ground.** The layer had been reduced to contour and hatch precisely
+  *because* fills fogged the map: the first version inked two thirds of its
+  footprint, lifted 40 % of the city by more than six luminance levels, and
+  moved the median under a cloud from `L 22` to `L 45`. What that fix cost is
+  the thing the operator is now naming: a sparse weave over a city block reads
+  as texture **on** the city, not as a region of it, and a territory's
+  silhouette was carried by a contour one to three pixels wide.
+* **Two captions for one thread.** `crate::callout` put a leader and a caption
+  beside every cloud — name, state, age, call counts — in gutters down the sides
+  of the viewport. Every line of it was already in the rail, in a column with
+  room for it, and the map is the surface that is short of space.
+
+**Decision.**
+
+**A cloud gets a body, and the body is a levelling rather than a fill.**
+`live::CLOUD_BODY` is a floor tone *under* `plan::BASE_MAP_CEILING`, and
+`CLOUD_BODY_ALPHA` carries the ground toward it — a fifth at the fringe, four
+fifths at the core. The obvious body is the mark's own ink thinned, and it is
+wrong for a reason that is arithmetic and not taste: `CLOUD_TONES` runs 56–84
+against a base map confined to 48, so blending toward it *lifts* the city.
+Thinning makes the lift smaller and never absent. Levelling toward a tone below
+the ceiling collapses the region's variance instead — which is what "an even
+background" means numerically — and leaves the marks the brightest thing inside
+a cloud, which is the order §10.3 asks for.
+
+**How much of the city may disappear is the operator's setting, not a
+measurement.** `config::Look::cloud_veil` scales all three bands together, live,
+from a slider in the legend panel. Every other number in this notation was
+settled by measuring — the iso thresholds against real sessions, the hatch
+spacing against an ink budget, the identity ring by CIEDE2000 at the luminance
+each role is drawn at. This one cannot be, because it trades the city's
+legibility against the cloud's, and which one an operator wants depends on
+whether they are reading the map or watching it from across the room. At `0` the
+layer is exactly the marks-only notation, disturbance included; at `1` a core
+keeps a fifth of the contrast under it.
+
+**The captions come off the map and the rail keeps a line to the cloud.**
+`draw_cloud_callouts` and its gutter layout are gone from the map;
+`mapview::draw_thread_connectors` draws a hairline from a thread's rail card to
+the near edge of its own cloud, in that thread's hue, painted into
+`Order::Foreground` so it crosses the terminal dock rather than starting at the
+map's edge and pointing at nothing. `config::Look::connectors` chooses how many:
+`Asked` — the thread being pointed at, selected or followed — or `Always`, or
+`Off`. The model-written phrase `crate::intent` produces moved with it, onto the
+rail card's second line where the `ai-title` used to sit alone.
+
+**Two textures, not one, and this is what fixes the pixelation now.** A body
+wants a smooth filter and a mark wants a nearest one, and one image cannot have
+both. `Clouds` uploads the body `LINEAR` and the marks `NEAREST` over the same
+rectangle. The body's band steps become a one-texel ramp instead of a wall of
+blocks; the strokes stay strokes.
+
+**Consequences, including the one that is a real loss.**
+
+* The layer's standing claim — zero disturbed pixels, `0.000` levels of median
+  shift over 192 frames of six real sessions — is now a statement about
+  `veil = 0` rather than about the layer. It is still asserted, alongside what
+  the shipped veil actually does, by
+  `the_veil_levels_the_ground_under_a_cloud_and_only_when_it_is_on`: the ground
+  evens out fringe → core, no pixel is carried past the floor tone or out of the
+  base map's band, and under the fringe two ground tones stay at least half as
+  far apart as they were.
+* `live::CLOUD_VEIL` is what every headless frame renders with, so a recorded
+  session and a live window agree unless the operator has moved the slider. When
+  the number settles, it belongs in that constant.
+* The setting is remembered in `look.json` in the state directory rather than in
+  the config file, written when the operator lets go of the slider. A config
+  file is what a run was *started* with; rewriting somebody's hand-edited file to
+  record a drag is not something a slider should do.
+* `polis-app/src/callout.rs` is parked, not deleted. The leader-and-gutter
+  geometry is correct work and the map may want captions back for one state —
+  a thread blocked on a human is the candidate — and nothing in it is imported
+  today.
+* The pixelation fix is a mitigation, not the end of it. The real answer is
+  `polis-render::density`'s wgpu pipeline, which computes contour and hatch per
+  screen pixel and is written, tested and still unused by the window. Wiring it
+  in has to keep the per-territory stack — the accumulator there is one summed
+  `(density, crowd)` target, which is the argmax notation ADR-0020's successor
+  removed — so it is a real piece of work rather than a call site.
+
+## ADR-0108 — Three columns: the map, the list that selects, and the terminal it selects
+
+**Context.** ADR-0105 made the dock and the map one window, but left them
+arranged as two docks around a centre: a terminal panel on the left, the map in
+the middle, and a 370-point rail on the right carrying the thread list. That put
+the two things that talk about the same agent — the card and the cloud — at
+opposite ends of the window, with a terminal between them.
+
+Three things were wrong with the column that held the threads, and the operator
+named all three:
+
+1. **The card grew with its thread.** A header line, a place line, a revisit
+   line, and a `why it looks like this` fold, so nine threads were nine
+   different heights. The list is scanned before any single row of it is read,
+   and a ragged list cannot be scanned.
+2. **`why it looks like this` was on every card.** The right content, repeated
+   once per thread, closed by default, and pushing every card past scanning
+   height to say the same thing about notation nine times.
+3. **The terminal had its own selector.** A tab strip that answered *which agent
+   am I looking at* — the question the list and the map already answer.
+
+**Decision.** One row of three columns, left to right: **map, rail, terminal.**
+
+The map is the central panel and takes what is left. The other two are *right*
+panels, and egui gives the first one added the outer edge — so the terminal is
+added first to land on the right, and the rail second to land between it and the
+map. The rail therefore sits **against** the map, which is what the connectors
+want: a line from a cloud to its card now crosses nothing.
+
+Defaults are fractions of the window — 15 % rail, 35 % terminal, the rest map —
+taken **once** before any panel is added. Reading `available_width` per panel
+would have made the terminal 35 % of what was left rather than 35 % of the
+window. They are defaults only: egui keeps a width once it has been dragged.
+
+**The card is three fixed lines**, painted rather than assembled from widgets,
+because an exact height and a bar the *full* height of the card are both
+properties of a rectangle that has to exist before the text goes into it, and
+`Ui::horizontal` decides its height afterwards. The lines are the state word
+with a right-aligned age, the agent's own name, and where it is working — or
+what it is waiting on, when that is the more urgent of the two. Each is
+truncated with an ellipsis into the hover rather than wrapped, because wrapping
+is how a fixed height stops being fixed.
+
+**The tint bar is drawn always, not on hover.** It used to appear only under
+hover or selection, which meant the thing PRD §11.4 makes identity out of — the
+thread's own hue — was invisible until the operator was already pointing at the
+row they wanted. A cloud and its card now carry the same colour at all times, so
+the match is made by looking rather than by hunting.
+
+**One legend, three doors.** *Why it looks like this* left the cards for a
+single panel opened from the map's own corner, from the title bar, or with `h`.
+It answers for whichever thread is **selected**, and selection is already what
+binds the list, the map and the terminal together (ADR-0105), so it follows for
+free with nothing new to keep in sync. The key sheet moved into it too: `h` used
+to draw a two-column table of every keystroke *inside* the rail, which was
+survivable at 370 points and absurd at 15 % of the window. That also took
+`Overlay` back under clippy's four-bool ceiling without an `allow`, which is the
+house rule doing its job rather than a coincidence.
+
+**The terminal follows the selection.** `Dock::show_selected` points the pane at
+the selected agent; there is no second selector. Its empty state tells four
+silences apart, and the middle one is the one worth naming: an agent that is
+selected and real but **running somewhere else**, which is the ordinary case for
+a session started in another terminal. Falling back to whatever was on screen
+before would show one agent's terminal under another agent's name, which is
+worse than showing nothing.
+
+**Measured, and the number that forced a rule change.** The eighty-column floor
+was a *veto*: the dock took `minimum_width()` whatever else wanted the row. On
+this machine that is **647 points of a 907-point window** — so a fifteen percent
+rail beside it left the map **110 points wide**, which is not a map. The rule
+was written when the dock had one neighbour and it now has two.
+
+So the map's floor wins and the fraction is the default. A pane that ends up
+under eighty columns says so on its own screen (`panes::MIN_COLS`), and that
+message names the fix — widen it — with the drag handle right there. A squeezed
+map offers neither. Measured after the change, same window: map **435**, rail
+**136**, terminal **318**, against 454/136/318 asked for; the 19 points are
+panel separators.
+
+The honest consequence: on a 907-point window an eighty-column terminal and a
+360-point map cannot both exist. The window now says which one it gave up
+instead of silently destroying the other.
+
+**Connectors default to `Always`.** `Connectors::Asked` draws the line only for
+the thread already being pointed at, which answers a question the operator has
+stopped asking. Every cloud gets its line to its card, and the asked-about one
+is still drawn last and brighter so it reads as *the* answer in a window full of
+them. The line leaves whichever edge of the card faces the map, because the
+panels are draggable and neither end can be hard-coded.
+
+**What this does not close.** The rail still carries the attention list and the
+building panel above the cards, and at 15 % both are cramped — they were sized
+for a 370-point column and have not been redesigned for a 136-point one. And
+the map's own cloud anchors are still hover targets rather than click targets
+(ADR-0105), so the connector now points at a card the operator cannot click
+*from the map end*.
+
+## ADR-0109 — Asking about a thread lights its cloud, and the map draws no line for it
+
+**Context.** PRD §12 splits the map into *"fuzzy above, exact below"*: the
+ambient layer sets the scene, and a handful of marks answer the operator's own
+question about **one** thread. Two of those marks were lines, and both were
+withdrawn a step at a time under the same complaint.
+
+First the delegation fan: one tether from every worker back to its thread's
+anchor, for every thread at once, uncapped — *"super messy"* on a nine-thread
+repository, and one session on this machine has a hundred workers. So the fan
+was capped and put behind `ViewState::interrogates`. Then the trail went behind
+the same gate, after 192 points held for fifteen minutes across five threads
+came back as *"still lines everywhere!!"*.
+
+That left both lines appearing the moment the pointer crossed a row in the rail
+— which is something an operator does while *reading the list*, not while asking
+a question. The rule that replaced it is the operator's own: *"instead of these
+lines when hovering over a thread card, highlight the cloud, make it brighter."*
+
+**Decision.** The window's layer 4 draws **no trail and no tether at all**.
+Asking about a thread — pointing at its card, selecting it, or following it —
+brightens that thread's cloud instead: every tone its layer emits, contour,
+hatch and the body under them, multiplied by `clouds::LIT_GAIN` = 1.8.
+
+The card and the cloud already carry one hue (PRD §11.4), so the question a
+hover asks — *which shape on the map is this row?* — is answered by lighting
+that shape up. Nothing is drawn that the map was not already drawing, and the
+answer is about the region the thread is working in rather than about a path
+across the city.
+
+Three things this needed:
+
+1. **Identity is the layer, not the hue.** `polis_world::Thread::tint` has
+   twelve slots and then repeats, so lighting by hue lights two threads' clouds
+   on a busy world. `polis_render::live::BandMap` now carries the territory's
+   `thread` layer id — unique across threads, stable across frames — and
+   `CloudMark::layer` is what the window matches on.
+2. **One thread at a time.** `ViewState::interrogates` is true of two threads at
+   once when a pointer rests on one card while another is selected;
+   `ViewState::asked_about` names the single thread to light, and the pointer
+   wins because it is the live question.
+3. **A repaint, not a per-frame cost.** The lit thread invalidates the cloud
+   texture exactly the way the veil slider does: one rebuild when the pointer
+   arrives on a card and one when it leaves, and the layer goes back to being
+   still.
+
+Window-only, deliberately. A recorded frame has no pointer, so
+`polis_render::live` gains nothing to light and its own trail and tether
+notation is untouched — `polis_app::clouds` scales what that module emits and
+adds no stroke of its own.
+
+**Measured.** `polis-app/tests/asked_about.rs` composes the real window pass over
+a two-thread world with forty workers on one of them. Asking about a thread now
+changes the frame's shape count by **zero** (745 against 745), where the first
+rule drew 46 lines and the second a capped fan plus a trail. The cloud carries
+it instead: the sky's uploaded light goes up **43.3 %** for the larger of the two
+territories and **34.5 %** for the smaller, and `clouds::tests` holds the exact
+half of the claim — the lit layer comes out at `LIT_GAIN` and every other layer
+is identical texel for texel.
+
+**What this does not close.** The trail was PRD §12's answer to *"where has this
+thread been"*, and the window no longer has one: backtracking and thrashing are
+visible in a recorded frame and in the tree's history, not on the live map. The
+territory's drift mark is the only live redirect signal left. If that turns out
+to be a hole, the trail comes back as something that is not a permanent
+polyline — a few recent stops, or the drift arrow lengthened.
+
+And the connector is untouched: `Connectors::Always` still draws a line from
+every card to its own cloud (ADR-0108). It is an ambient link that is there
+before the operator asks, which is a different mark from the ones this decision
+removed — those appeared *because* they were asked for, and answered with a
+cobweb.

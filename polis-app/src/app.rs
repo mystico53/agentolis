@@ -73,6 +73,7 @@ use crate::config::Config;
 use crate::drill;
 use crate::mapview::{self, ViewState};
 use crate::palette;
+use crate::repos::{Choice, Launcher};
 use crate::session::Picker;
 use crate::treeview::TreeView;
 use crate::ui::{self, Overlay, View, Vitals};
@@ -89,18 +90,48 @@ const FRAME_WINDOW: usize = 240;
 /// the three that has a keystroke to bring it back, and the map is the product.
 const MAP_MIN_WIDTH: f32 = 360.0;
 
-/// What the right-hand rail takes when it is open.
-///
-/// Its real width is egui's to remember, so this is the estimate the layout
-/// decision uses — it only has to be close enough to choose between "all three
-/// fit" and "they do not".
-const RAIL_WIDTH: f32 = 370.0;
-
 /// The dock, collapsed to a rail of one chip per agent.
 ///
 /// Wide enough for a two-digit ordinal, so a waiting agent stays visible with
 /// the dock shut.
 const COLLAPSED_DOCK: f32 = 34.0;
+
+/// The agent list's share of the window, before the operator drags it.
+///
+/// Fifteen percent is narrow on purpose: the list is for *scanning* — which
+/// agents exist, which one is amber — and the two columns beside it are for
+/// reading. Every card truncates to fit it (see `ui::CARD_LINES`), and the
+/// operator who wants more can drag for it.
+const RAIL_FRACTION: f32 = 0.15;
+
+/// The narrowest the agent list may be dragged before a card stops being one.
+const RAIL_MIN: f32 = 120.0;
+
+/// The narrowest the terminal may be *dragged*.
+///
+/// Not [`crate::panes::MIN_COLS`]: that is the width Claude Code's own layout
+/// needs, and the pane says so when it is under it. This is the width below
+/// which the column stops being a terminal at all rather than being a cramped
+/// one, and it exists so that an operator on a small screen can choose to give
+/// the row to the map.
+const DOCK_MIN_DRAG: f32 = 160.0;
+
+/// The terminal's share of the window, before the operator drags it.
+///
+/// A target, not a floor: [`crate::panes::MIN_COLS`] wins when the window is
+/// too narrow for both, because a pane below eighty columns is a broken pane
+/// and a slightly wider one is merely wider.
+const TERMINAL_FRACTION: f32 = 0.35;
+
+/// The grid a pane is opened at, before the dock has measured itself.
+///
+/// Corrected to the real size on the pane's first draw, so this only decides
+/// what the agent's first screen is laid out for. Wide enough that Claude
+/// Code's box-drawn input frame and its diffs are not born broken
+/// ([`crate::panes::MIN_COLS`] is the floor, not the target).
+const DEFAULT_PANE_ROWS: u16 = 45;
+/// Columns to match [`DEFAULT_PANE_ROWS`].
+const DEFAULT_PANE_COLS: u16 = 100;
 
 /// The ceiling on terminal-driven repaints — 30 Hz.
 ///
@@ -164,6 +195,19 @@ pub enum Mode {
     },
     /// `polis replay` with no argument — pick from this machine's own sessions.
     Pick,
+    /// `polis` and `polis home` — pick the repository first (PRD §2, §15 M3).
+    ///
+    /// The front door. PRD §2's *one window, one repository* is unchanged; what
+    /// this adds is that the operator chooses **which** one from a list that
+    /// says where agents are actually working, rather than from the folder their
+    /// shell happens to be standing in. Opening a row starts a live watch on it,
+    /// which is what `polis watch` would have done.
+    Home {
+        /// The checkout the shell is standing in, when it is standing in one.
+        /// `None` is not an error: it is the common case of a launcher opened
+        /// from a home directory or a desktop shortcut.
+        here: Option<PathBuf>,
+    },
 }
 
 /// Opens the window (PRD §13).
@@ -180,10 +224,7 @@ pub fn launch(config: Config, mode: Mode) -> anyhow::Result<()> {
     // bound is gone for good, and an OTel exporter that finds nothing listening
     // drops its first batch — which is the session start. The bounded bus holds
     // what arrives while the city is generated.
-    let feed = match &mode {
-        Mode::Live { options } => Some(Box::new(LiveFeed::start(options))),
-        _ => None,
-    };
+    let feed = feed_options(&mode).map(|options| Box::new(LiveFeed::start(&options)));
     // The inner size is in **logical points**, and this machine renders at 1.75
     // points per pixel: a naive `[1600, 1000]` asks for 2800x1750 physical on a
     // 2194x1234 screen, Windows clamps the window, and egui keeps laying out for
@@ -207,6 +248,30 @@ pub fn launch(config: Config, mode: Mode) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// The watch a window starts for itself, or `None` for a window that does not
+/// watch.
+///
+/// Separate from [`launch`] so the rule is a value rather than a side effect,
+/// and so it can be asserted: `Mode::Work` having **no** feed is the defect
+/// ADR-0105 fixed, and it was invisible because a window with a dead map and a
+/// working terminal looks like a window with nothing happening in it.
+///
+/// [`LiveOptions::watching`], not `for_repo`: it is the line that sets
+/// `SessionScope::ThisRepo`, without which Channel D tails every session on the
+/// machine and publishes no roster.
+fn feed_options(mode: &Mode) -> Option<LiveOptions> {
+    match mode {
+        Mode::Live { options } => Some((**options).clone()),
+        // The panes are already being spawned with `agent_env()` aimed at this
+        // port and a `--session-id` Polis issued itself; without this line they
+        // were producing into a socket nobody had bound.
+        Mode::Work { repo, .. } => Some(LiveOptions::watching(repo.clone())),
+        // A map is deliberately a city with no wire into it, and a replay is a
+        // recording of the past. Neither binds a port.
+        Mode::Map { .. } | Mode::Replay { .. } | Mode::Pick | Mode::Home { .. } => None,
+    }
+}
+
 /// Says on stdout that a window is opening and that the command will not return
 /// until it closes.
 ///
@@ -222,6 +287,7 @@ fn announce(mode: &Mode) {
     let what = match mode {
         Mode::Map { repo } => format!("opening the map for {}", repo.display()),
         Mode::Pick => "opening the session picker".to_owned(),
+        Mode::Home { .. } => "opening the repository launcher".to_owned(),
         Mode::Replay { transcript, .. } => format!("replaying {}", transcript.display()),
         Mode::Work {
             repo,
@@ -229,7 +295,7 @@ fn announce(mode: &Mode) {
             program,
             ..
         } => format!(
-            "opening {} with {panes} {program} pane(s) — the agents run in \
+            "opening {} with {panes} {program} pane(s), watching it live — the agents run in \
              polis-sessiond and outlive this window",
             repo.display()
         ),
@@ -249,6 +315,9 @@ fn announce(mode: &Mode) {
 pub struct PolisApp {
     stage: Stage,
     config: Config,
+    /// The look as it is on disk, so a slider the operator is still dragging is
+    /// not written once per frame. See the write in `ui`.
+    saved_look: crate::config::Look,
     overlay: Overlay,
     /// When the process started, for PRD §13.1's cold-start budget.
     ///
@@ -278,6 +347,24 @@ pub struct PolisApp {
     /// A live feed started before the window existed, waiting for the city it
     /// will drive. Moved into the [`Scene`] the moment the load thread lands.
     pending_live: Option<Box<LiveFeed>>,
+    /// How this window starts a live feed, kept so it can start another one
+    /// against a different checkout (PRD §2, [`crate::repos`]).
+    ///
+    /// `Some` exactly when this window is a **watch**: the ports, the channel
+    /// set and the session scope the operator asked for on the command line,
+    /// with only `repo_root` moving. `None` for `polis map` and `polis replay`,
+    /// which is what makes switching keep the window the kind of window it was
+    /// — a map stays a map rather than quietly binding 4317.
+    live_template: Option<Box<LiveOptions>>,
+    /// The repository launcher, when it is open over the map.
+    ///
+    /// Held beside the stage rather than replacing it, so dismissing it is
+    /// instant: the city, the camera and the feed underneath are untouched, and
+    /// an operator who opened it to look and then changed their mind has not
+    /// paid a reload for the glance.
+    launcher: Option<Box<Launcher>>,
+    /// How long [`Repaint::Browsing`] is willing to sleep.
+    home_wake: Duration,
     /// How long [`Repaint::Live`] is willing to sleep. `ZERO` is "now".
     ///
     /// The one wake reason with a variable interval: a backlog wants the next
@@ -298,6 +385,32 @@ pub struct PolisApp {
     /// sixty times a second and the operator could neither pan nor zoom for as
     /// long as they were following anything.
     followed_to: Option<(polis_events::ThreadId, Option<LogicalPath>)>,
+    /// The thread the dock and the map last agreed on (PRD §15 M7d).
+    ///
+    /// The correlation is two-way and both halves run in one place, so this is
+    /// what tells a *new* selection from the same one seen again: without it the
+    /// map would re-focus a tab on every frame, and the operator could never
+    /// look at one terminal while a different agent's cloud was lit.
+    dock_thread: Option<polis_events::ThreadId>,
+    /// The terminal font family, bound once at start-up.
+    ///
+    /// Held so a dock opened later takes the record rather than re-installing —
+    /// see [`crate::panes::Dock::use_fonts`] for why re-installing panics.
+    term_fonts: polis_term::font::Installed,
+    /// The model-written "what is it working on" line on each cloud's caption.
+    ///
+    /// Always present and always pumped, because [`crate::intent::Captions`]
+    /// with the feature off is a struct with three empty maps and no worker —
+    /// an `Option` here would buy nothing and would put a `match` on every
+    /// caller of a thing that already answers `None`.
+    captions: crate::intent::Captions,
+    /// An agent asked for in a window that has no dock yet.
+    ///
+    /// Deferred by one frame rather than acted on where it is asked for, because
+    /// the scene is borrowed for the rest of the frame and starting a dock takes
+    /// all of `self`. The repaint is requested with it, so the operator sees a
+    /// terminal on the next frame and not on the next input.
+    pending_dock: bool,
 }
 
 impl std::fmt::Debug for PolisApp {
@@ -332,6 +445,14 @@ pub enum Repaint {
     /// "< 2 % of one core" is a budget for a window with nothing happening in
     /// it. Saying so beats hiding it.
     Terminal,
+    /// The repository launcher is open and waiting for its next scan.
+    ///
+    /// Named rather than folded into [`Repaint::Loading`] because its interval
+    /// is the launcher's, not the picker's: a scan in flight wants 80 ms and a
+    /// list on screen wants the two seconds until the next rescan, and calling
+    /// both "loading" would spend twenty-five frames a second on a screen that
+    /// changes twice a second.
+    Browsing,
     /// A recording is playing.
     Playing,
     /// A tween or a pulse is in flight.
@@ -346,6 +467,7 @@ impl Repaint {
             Self::Idle => "idle",
             Self::Loading => "loading",
             Self::Live => "live",
+            Self::Browsing => "browsing",
             Self::Terminal => "terminal",
             Self::Playing => "playing",
             Self::Animating => "animating",
@@ -358,6 +480,8 @@ impl Repaint {
 enum Stage {
     /// The session picker.
     Picking(Box<Picker>),
+    /// The repository launcher, with nothing behind it.
+    Home(Box<Launcher>),
     /// A city and, maybe, a recording are being read.
     Loading {
         rx: Receiver<Result<Loaded, String>>,
@@ -373,6 +497,7 @@ impl std::fmt::Debug for Stage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Picking(_) => f.write_str("Picking"),
+            Self::Home(_) => f.write_str("Home"),
             Self::Loading { what, .. } => write!(f, "Loading({what})"),
             Self::Running(_) => f.write_str("Running"),
             Self::Failed(e) => write!(f, "Failed({e})"),
@@ -418,7 +543,7 @@ impl PolisApp {
     /// hardcoded.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        config: Config,
+        mut config: Config,
         mode: Mode,
         feed: Option<Box<LiveFeed>>,
         started: Instant,
@@ -442,6 +567,23 @@ impl PolisApp {
         if let Some(feed) = feed.as_mut() {
             feed.wake_with(&cc.egui_ctx);
         }
+        // # Bound once, whether or not this window will ever show a terminal
+        //
+        // `Context::set_fonts` takes effect on the **next** frame. While the
+        // only dock was built here, before the first frame, that was invisible.
+        // Since a dock can be opened part-way through a frame (`Ctrl+Alt+T` in
+        // any live window, ADR-0105) it is not: the pane drew in the same frame
+        // that asked for the family and epaint panicked with
+        // `FontFamily::Name("polis-term") is not bound to any fonts`.
+        //
+        // So the family is bound here for every window, and the dock is handed
+        // the record rather than installing anything. The cost is reading one
+        // system font on a window that may never open a pane; the alternative
+        // was a crash on the path an operator reaches from the launcher.
+        //
+        // After `theme`, which is where the visuals are set — a font install
+        // before it would be undone.
+        let term_fonts = polis_term::font::install(&cc.egui_ctx);
         let mut dock = None;
         let mut pending_panes = 0;
         if let Mode::Work {
@@ -462,9 +604,7 @@ impl PolisApp {
                     polis_ingest::default_otlp_addr()
                 )),
             );
-            // After `theme`, which resets the font definitions: installing the
-            // terminal family first would be undone by it.
-            built.install_fonts(&cc.egui_ctx);
+            built.use_fonts(term_fonts.clone());
             eprintln!("polis: {}", built.status);
             // Only open what is not already there. Reattaching to three agents
             // and then starting three more is the one behaviour nobody wants.
@@ -472,8 +612,24 @@ impl PolisApp {
             dock = Some(Box::new(built));
         }
 
+        // Taken before `mode` is consumed below: this is how the window starts
+        // a feed, and switching repositories starts another one exactly like it.
+        let live_template = match &mode {
+            Mode::Live { options } => Some(options.clone()),
+            // The front door opens live watches, because that is what the
+            // launcher promises on it: *every agent working in it, live*. The
+            // repository is a placeholder until a row is picked.
+            Mode::Home { here } => Some(Box::new(LiveOptions::watching(
+                here.clone().unwrap_or_else(|| PathBuf::from(".")),
+            ))),
+            _ => None,
+        };
+
         let stage = match mode {
             Mode::Pick => Stage::Picking(Box::new(Picker::start())),
+            Mode::Home { here } => {
+                Stage::Home(Box::new(Launcher::start(here, config.state_dir(), None)))
+            }
             // The city is this repository's, and nothing is read from disk that a
             // `polis map` would not read: live is the same city with a wire into
             // it, and `work` is the same city with agents beside it.
@@ -486,9 +642,23 @@ impl PolisApp {
             } => spawn_load(repo, Some(transcript), speed),
         };
 
+        // Before `config` is moved. A window that was not asked for captions
+        // starts no worker and reads no key.
+        let captions = crate::intent::Captions::for_operator(config.captions);
+        // What the operator last settled the cloud layer on. `Config` carries
+        // what this *run* was started with; the look is what they tuned while
+        // watching, and it outlives the run — see `config::Look::load`.
+        config.look = crate::config::Look::load(config.state_dir().as_deref());
+        let saved_look = config.look;
+        if captions.is_on() {
+            eprintln!("polis: cloud captions on — the agents' own call notes go to the model");
+        }
+
         Self {
             stage,
             config,
+            saved_look,
+            captions,
             overlay: Overlay::default(),
             started,
             frames: Vec::with_capacity(FRAME_WINDOW),
@@ -500,10 +670,16 @@ impl PolisApp {
             last_editor: None,
             repaint: Repaint::Loading,
             pending_live: feed,
+            live_template,
+            launcher: None,
+            home_wake: crate::repos::POLL,
             live_wake: live::IDLE_TICK,
             dock,
             pending_panes,
             followed_to: None,
+            dock_thread: None,
+            term_fonts,
+            pending_dock: false,
         }
     }
 
@@ -512,6 +688,38 @@ impl PolisApp {
         match &self.stage {
             Stage::Running(scene) => Some(&scene.reader),
             _ => None,
+        }
+    }
+
+    /// The end of every frame: what it cost, and when to draw the next one.
+    ///
+    /// One place rather than two, because the launcher returns early and a
+    /// second copy of the repaint decision is a second place for the idle budget
+    /// to be got wrong (PRD §13.1).
+    fn finish_frame(&mut self, ctx: &egui::Context, started: Instant) {
+        let frame_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        if std::mem::take(&mut self.skip_frame) {
+            // A base-map rebuild. Counted in the cold-start line instead.
+        } else {
+            self.record_frame(frame_ms);
+        }
+        if std::env::var_os("POLIS_DEBUG_FRAMES").is_some() {
+            eprintln!("frame {frame_ms:.2} ms  repaint={}", self.repaint.label());
+        }
+        match self.repaint {
+            Repaint::Idle => {}
+            Repaint::Loading => ctx.request_repaint_after(crate::session::POLL),
+            // `Duration::ZERO` is egui's own spelling of "as soon as you can",
+            // so a backlog and a heartbeat go through one call.
+            Repaint::Live => ctx.request_repaint_after(self.live_wake),
+            // A 30 Hz ceiling on terminal-driven frames. Claude Code's spinner
+            // runs at 8–12 Hz, so this is invisible; the ceiling exists for the
+            // `cat`-a-large-file case, where uncapped repaint pins a core.
+            Repaint::Terminal => ctx.request_repaint_after(TERMINAL_TICK),
+            // Two intervals in one reason: 80 ms while a scan is in flight, and
+            // the time left until the next rescan otherwise.
+            Repaint::Browsing => ctx.request_repaint_after(self.home_wake),
+            _ => ctx.request_repaint(),
         }
     }
 
@@ -590,8 +798,21 @@ impl eframe::App for PolisApp {
 
         self.collect_load();
 
+        // The launcher, when it is open, is the whole frame: the operator asked
+        // *which repository*, and a map behind a list is a map nobody is
+        // reading. The scene stays in `stage` untouched — including its feed,
+        // which is still pumped below, so the map is current the moment the
+        // launcher closes rather than replaying a backlog of what it missed.
+        if self.launcher.is_some() {
+            self.pump_beneath();
+            self.draw_launcher(ui);
+            self.finish_frame(&ctx, frame_started);
+            return;
+        }
+
         match &mut self.stage {
             Stage::Picking(_) => self.draw_picker(ui),
+            Stage::Home(_) => self.draw_home(ui),
             Stage::Loading { what, .. } => {
                 let what = what.clone();
                 self.repaint = Repaint::Loading;
@@ -617,27 +838,7 @@ impl eframe::App for PolisApp {
             Stage::Running(_) => self.draw_scene(ui, dt),
         }
 
-        let frame_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
-        if std::mem::take(&mut self.skip_frame) {
-            // A base-map rebuild. Counted in the cold-start line instead.
-        } else {
-            self.record_frame(frame_ms);
-        }
-        if std::env::var_os("POLIS_DEBUG_FRAMES").is_some() {
-            eprintln!("frame {frame_ms:.2} ms  repaint={}", self.repaint.label());
-        }
-        match self.repaint {
-            Repaint::Idle => {}
-            Repaint::Loading => ctx.request_repaint_after(crate::session::POLL),
-            // `Duration::ZERO` is egui's own spelling of "as soon as you can",
-            // so a backlog and a heartbeat go through one call.
-            Repaint::Live => ctx.request_repaint_after(self.live_wake),
-            // A 30 Hz ceiling on terminal-driven frames. Claude Code's spinner
-            // runs at 8–12 Hz, so this is invisible; the ceiling exists for the
-            // `cat`-a-large-file case, where uncapped repaint pins a core.
-            Repaint::Terminal => ctx.request_repaint_after(TERMINAL_TICK),
-            _ => ctx.request_repaint(),
-        }
+        self.finish_frame(&ctx, frame_started);
     }
 
     /// Runs before egui processes the frame's input (`eframe-0.36.1/src/epi.rs:279`).
@@ -695,6 +896,151 @@ impl PolisApp {
             }
         };
         self.stage = Stage::Running(Box::new(build_scene(loaded, self.pending_live.take())));
+    }
+
+    /// The launcher as the front door: [`Mode::Home`], with nothing behind it.
+    fn draw_home(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut chosen = None;
+        if let Stage::Home(launcher) = &mut self.stage {
+            chosen = launcher.draw(ui);
+            self.home_wake = launcher.wake_after();
+        }
+        self.repaint = self.repaint.max_urgency(Repaint::Browsing);
+        // `Dismiss` cannot arrive here: the front door is constructed with no
+        // map behind it, so it never offers the way back.
+        if let Some(Choice::Open(root)) = chosen {
+            self.open_repo(root, &ctx);
+        }
+    }
+
+    /// The launcher over a running map: the same screen, with a way back.
+    fn draw_launcher(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut chosen = None;
+        if let Some(launcher) = self.launcher.as_mut() {
+            chosen = launcher.draw(ui);
+            self.home_wake = launcher.wake_after();
+        }
+        self.repaint = self.repaint.max_urgency(Repaint::Browsing);
+        match chosen {
+            None => {}
+            Some(Choice::Dismiss) => self.launcher = None,
+            Some(Choice::Open(root)) => {
+                self.launcher = None;
+                // Picking the repository already being watched is a dismissal.
+                // Tearing the city down and rebuilding it identically would cost
+                // seconds and lose the camera, for a click that asked for
+                // nothing to change.
+                if root != self.config.repo_root {
+                    self.open_repo(root, &ctx);
+                }
+            }
+        }
+    }
+
+    /// Keeps the live feed under the launcher current while it is covered.
+    ///
+    /// The window is not drawing the map this frame, but events are still
+    /// arriving on a bounded bus. Draining it here means closing the launcher
+    /// shows the map as it is *now*, rather than replaying however many seconds
+    /// of backlog the operator spent choosing — and it keeps the drop counter
+    /// honest, because a full bus drops the oldest event whether or not anybody
+    /// was looking.
+    fn pump_beneath(&mut self) {
+        let Stage::Running(scene) = &mut self.stage else {
+            return;
+        };
+        let Some(feed) = scene.feed.as_mut() else {
+            return;
+        };
+        let pumped = feed.pump(&mut scene.world, Instant::now());
+        scene.publisher.publish(&scene.world);
+        scene.snapshot = scene.reader.load();
+        self.live_wake = feed.wake_after(&scene.snapshot, pumped.backlog);
+    }
+
+    /// Starts the terminal dock in a window that opened without one, and asks
+    /// it for one agent.
+    ///
+    /// `polis work` builds a dock in [`PolisApp::new`] because it was told to.
+    /// This is the same dock, reached from a window that was only watching —
+    /// which is what makes Polis one surface rather than a map command and a
+    /// terminal command that happen to share a binary. The daemon is the same
+    /// daemon either way, so a `polis watch` that grows a pane and a `polis
+    /// work` started beside it are attached to the *same* agents.
+    ///
+    /// Idempotent: a second ask goes to [`crate::panes::Dock::open`], which is
+    /// what `Ctrl+Alt+T` reaches once there is a dock to reach.
+    fn open_dock(&mut self, ctx: &egui::Context, repo: PathBuf) {
+        if self.dock.is_some() {
+            return;
+        }
+        let mut dock = crate::panes::Dock::start(
+            ctx,
+            self.config.state_dir.clone(),
+            repo,
+            crate::run::DEFAULT_AGENT.to_owned(),
+            Vec::new(),
+            polis_ingest::env::agent_env(&format!("http://{}", polis_ingest::default_otlp_addr())),
+        );
+        dock.use_fonts(self.term_fonts.clone());
+        eprintln!("polis: {}", dock.status);
+        self.dock = Some(Box::new(dock));
+        // One agent, once the daemon answers. The frame loop owns the retry, so
+        // a daemon that takes a moment to start is not a lost keystroke.
+        self.pending_panes += 1;
+    }
+
+    /// Opens the launcher over whatever is on screen.
+    fn open_launcher(&mut self, here: Option<PathBuf>, over: Option<String>) {
+        self.launcher = Some(Box::new(Launcher::start(
+            here,
+            self.config.state_dir(),
+            over,
+        )));
+    }
+
+    /// Switches this window to another repository, in place (PRD §2).
+    ///
+    /// The order of the first three statements is the whole of this function,
+    /// and it is not interchangeable. A live window's feed **holds 4317 and the
+    /// hook port**, and the next one needs both: `OtlpReceiver::shutdown` and
+    /// `HookListener::shutdown` each join their thread, so dropping the old
+    /// scene frees the ports synchronously, and starting the new feed first
+    /// would leave Channel A dead on a map that looked perfectly healthy.
+    ///
+    /// The feed is started **before** the city is generated, for the same reason
+    /// [`launch`] does: a hook datagram that arrives with nothing bound is gone
+    /// for good, and the bounded bus holds what lands while the city is built.
+    fn open_repo(&mut self, root: PathBuf, ctx: &egui::Context) {
+        // Spawning the load binds nothing; it only starts a thread.
+        let loading = spawn_load(root.clone(), None, 1.0);
+        let previous = std::mem::replace(&mut self.stage, loading);
+        // Explicit, and load-bearing: this is the line that closes the ports.
+        drop(previous);
+        drop(self.pending_live.take());
+
+        if let Some(template) = self.live_template.as_mut() {
+            template.ingest.repo_root.clone_from(&root);
+            let mut feed = Box::new(LiveFeed::start(template));
+            // The waker and the reporter, which [`PolisApp::new`] attaches for
+            // the feed the process started with. Without this the window would
+            // only notice a new repository's events when something else asked
+            // for a frame.
+            feed.wake_with(ctx);
+            self.pending_live = Some(feed);
+        }
+
+        crate::repos::remember(self.config.state_dir().as_deref(), &root);
+        self.config.repo_root = root;
+        // PRD §13.1's cold start is "how long until there is a frame", and the
+        // operator reading the launcher is not part of it.
+        self.started = Instant::now();
+        self.first_frame_ms = None;
+        self.followed_to = None;
+        self.overlay.attention_cursor = None;
+        self.repaint = Repaint::Loading;
     }
 
     fn draw_picker(&mut self, ui: &mut egui::Ui) {
@@ -791,6 +1137,19 @@ impl PolisApp {
             crate::explain::remember_dismissed();
         }
 
+        // Asked for last frame, started now — before the scene is borrowed,
+        // because starting a dock takes all of `self`. See [`Self::pending_dock`].
+        if self.pending_dock {
+            self.pending_dock = false;
+            let repo = match &self.stage {
+                Stage::Running(scene) => Some(scene.generated.root.clone()),
+                _ => None,
+            };
+            if let Some(repo) = repo {
+                self.open_dock(&ctx, repo);
+            }
+        }
+
         let Stage::Running(scene) = &mut self.stage else {
             return;
         };
@@ -882,22 +1241,33 @@ impl PolisApp {
             self.overlay.rail = !self.overlay.rail;
         }
         if keys.toggle_help {
-            self.overlay.help = !self.overlay.help;
-            // The sheet is drawn inside the rail, so `h` with the rail closed
-            // used to do nothing at all — the one key the guide promises shows
-            // "every key, on screen".
-            if self.overlay.help {
-                self.overlay.rail = true;
-            }
+            // The same panel the map's corner button opens. It used to be a
+            // sheet drawn *inside* the rail, which meant `h` with the rail
+            // closed did nothing at all — and once the rail became a fifteen
+            // percent column, it meant a two-column table of every keystroke in
+            // a space narrower than the table.
+            self.overlay.legend = !self.overlay.legend;
         }
         if keys.clear {
             scene.view.selected = None;
+            // The other way out of a thread's trail and tethers, and it used to
+            // stop one field short: Esc dropped the camera binding and left
+            // `selected_thread` set, so the lines the rail's click had put on
+            // the map stayed on it. A key whose whole job is "clear" has to
+            // clear.
+            scene.view.selected_thread = None;
             scene.view.follow = None;
             self.overlay.attention_cursor = None;
-            self.overlay.help = false;
+            self.overlay.legend = false;
         }
         if keys.back_to_picker || action.back_to_picker {
             self.stage = Stage::Picking(Box::new(Picker::start()));
+            return;
+        }
+        if keys.open_repos && self.dock.is_none() {
+            let here = scene.generated.root.clone();
+            let over = scene.generated.title();
+            self.open_launcher(Some(here), Some(over));
             return;
         }
 
@@ -930,18 +1300,73 @@ impl PolisApp {
 
         let snapshot = Arc::clone(&scene.snapshot);
 
+        // The captions, before anything is drawn, so a phrase that arrived
+        // while the last frame was painting is on this one. Costs a `try_recv`
+        // on an empty channel when the feature is off, and does not block when
+        // it is on: the call itself is on `intent`'s own worker thread.
+        self.captions.pump(&snapshot.threads, snapshot.at);
+
         // --- Panels ---------------------------------------------------------
         let vitals_slot = std::cell::Cell::new(None);
+        // Set inside the title bar's closure and acted on after it, because
+        // opening the launcher takes `&mut self` and the scene is borrowed for
+        // the rest of the frame.
+        let mut open_launcher = false;
+        // Likewise: a window that is only watching can grow a terminal, and
+        // starting one takes all of `self`.
+        let mut want_agent = false;
+        let live = scene.feed.is_some();
         egui::Panel::top("polis-title")
             .exact_size(30.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(scene.generated.title())
-                            .monospace()
-                            .strong()
-                            .color(palette::selection().color()),
+                    // The repository is a **button**, because which repository
+                    // this window is about is now a thing the operator changes
+                    // rather than only a thing they read. `polis work` is the
+                    // one window where it is not: its agents are attached to
+                    // this checkout's session daemon and would be left behind by
+                    // a switch, so the button says so instead of doing it.
+                    let attached = self.dock.is_some();
+                    let title = ui.add_enabled(
+                        !attached,
+                        egui::Button::new(
+                            RichText::new(scene.generated.title())
+                                .monospace()
+                                .strong()
+                                .color(palette::selection().color()),
+                        )
+                        .frame(false),
                     );
+                    let switch = ui.add_enabled(!attached, egui::Button::new("switch repo (o)"));
+                    if attached {
+                        let note = "the agents in the dock are running in this checkout — close them, or open another window, to watch another repository";
+                        title.on_hover_text(note);
+                        switch.on_hover_text(note);
+                    } else {
+                        let note = "watch another repository — the list says where agents are working right now";
+                        if title.on_hover_text(note).clicked()
+                            || switch.on_hover_text(note).clicked()
+                        {
+                            open_launcher = true;
+                        }
+                    }
+                    // An agent, from the same window that is watching them.
+                    // Only where the map is live: on a replay the past has
+                    // already happened, and `polis map` is deliberately a city
+                    // with no wire into it, so a pane opened on either would
+                    // work beside a map that could never show it.
+                    if live
+                        && ui
+                            .button("+ agent")
+                            .on_hover_text(
+                                "start a Claude Code session in a pane \
+                                 beside the map (Ctrl+Alt+T) — it runs in \
+                                 polis-sessiond and outlives this window",
+                            )
+                            .clicked()
+                    {
+                        want_agent = true;
+                    }
                     ui.label(
                         RichText::new(&scene.label)
                             .small()
@@ -949,14 +1374,14 @@ impl PolisApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .selectable_label(self.overlay.help, "what is this? (h)")
+                            .selectable_label(self.overlay.legend, "what is this? (h)")
                             .on_hover_text(
                                 "what a building is, what the shapes and colours mean, \
                                  and every key",
                             )
                             .clicked()
                         {
-                            self.overlay.help = !self.overlay.help;
+                            self.overlay.legend = !self.overlay.legend;
                             self.overlay.rail = true;
                         }
                         if ui.selectable_label(self.overlay.rail, "rail (i)").clicked() {
@@ -971,6 +1396,32 @@ impl PolisApp {
                     });
                 });
             });
+        if open_launcher {
+            // The fields are assigned directly rather than through
+            // `open_launcher()`: the scene is borrowed for the rest of this
+            // frame, and this way the map still draws under the click that
+            // opened the launcher instead of blinking out for one frame.
+            self.launcher = Some(Box::new(Launcher::start(
+                Some(scene.generated.root.clone()),
+                self.config.state_dir(),
+                Some(scene.generated.title()),
+            )));
+        }
+
+        // A new agent, asked for by button or by chord. With a dock already up,
+        // `Dock::reserved_chords` has the chord first and this sees nothing —
+        // which is why the key half is gated on there being no dock, and the
+        // button half routes through the dock when there is one.
+        if want_agent || (keys.new_agent && self.dock.is_none() && live) {
+            if let Some(dock) = self.dock.as_mut() {
+                dock.collapsed = false;
+                dock.open(DEFAULT_PANE_ROWS, DEFAULT_PANE_COLS);
+            } else {
+                // Deferred one frame: see `pending_dock`.
+                self.pending_dock = true;
+                ctx.request_repaint();
+            }
+        }
 
         // --- Live mode says what it is doing, always ------------------------
         //
@@ -1026,50 +1477,94 @@ impl PolisApp {
         // it publishes what the rail and the map said about the pointer last
         // frame, before either of them draws this one.
         scene.view.begin_frame();
-        // The dock goes in after `polis-title` and before `polis-rail`, so the
-        // map keeps `available_rect_before_wrap()` and neither panel has to know
-        // about the other.
+
+        // --- Three columns, left to right: map, rail, terminal --------------
+        //
+        // The map is the central panel, so it is leftmost and takes whatever the
+        // other two leave. The other two are **right** panels, and egui gives
+        // the first one added the outer edge — so the terminal is added first to
+        // land on the right, and the rail second to land between it and the map.
+        //
+        // That order puts the rail against the map, which is what the connectors
+        // want: a line from a cloud to its card crosses nothing.
+        //
+        // `total` is taken **once**, before any panel is added, because both
+        // defaults are fractions of the window and `available_width` shrinks as
+        // each panel claims its share: reading it twice would make the terminal
+        // 35 % of what was left rather than 35 % of the window. Only the first
+        // frame uses them — egui remembers a width once it has been dragged,
+        // which is the point of the panels being draggable.
+        let total = ui.available_width();
+        let rail_want = if self.overlay.rail {
+            (total * RAIL_FRACTION).max(RAIL_MIN)
+        } else {
+            0.0
+        };
+        let mut jump: Option<drill::Jump> = None;
+        let mut panel = ui::PanelAction::default();
+        let mut subject: Option<LogicalPath> = None;
+        let mut dismissed: Option<polis_events::ThreadId> = None;
+
+        // The terminal, on the far right.
         if let Some(dock) = self.dock.as_mut() {
             // Before anything else in the dock, and before a pane can consume
             // them: `Ctrl+Alt+…`, `Ctrl+\``, `F6`. Safe to read without
             // consuming, because `polis_term::input` declines to encode
             // `Ctrl+Alt` at all — the same rule that keeps `AltGr` working.
             dock.reserved_chords(&ctx);
+            // What the city knows about each pane's agent, before the tab strip
+            // is drawn from it. The dock reads the same published snapshot the
+            // map and the rail read, so a tab and a cloud cannot disagree.
+            dock.observe(&snapshot);
             let outcome = dock.poll();
             if outcome.active {
                 self.repaint = self.repaint.max_urgency(Repaint::Terminal);
             }
             if self.pending_panes > 0 && dock.connected() {
                 self.pending_panes -= 1;
-                dock.open(45, 100);
+                dock.open(DEFAULT_PANE_ROWS, DEFAULT_PANE_COLS);
             }
+            // Which agent the pane shows is the selection, not a tab: the rail
+            // is the selector (ADR-0108). It reads the selection as the frame
+            // begins — a card clicked *this* frame lands next frame, which is
+            // one repaint away and already requested.
+            dock.show_selected(scene.view.selected_thread.as_ref());
+
             let collapsed = dock.collapsed;
-            let (minimum, preferred) = (dock.minimum_width(), dock.preferred_width());
-            let available = ui.available_width();
+            // # The eighty-column floor is a target here, not a veto
+            //
+            // It used to be a veto: the panel took `dock.minimum_width()`
+            // whatever else wanted the row. Measured on this machine that is
+            // **647 points of a 907-point window**, so a fifteen percent rail
+            // beside it left the map **110 points wide**, which is not a map.
+            // The rule was written when the dock had one neighbour and it now
+            // has two.
+            //
+            // So the map's floor wins, the asked-for fraction is the default,
+            // and a pane that ends up under eighty columns says so on its own
+            // screen (`panes::MIN_COLS`). That message names the fix — widen it
+            // — and the drag handle is right there; a squeezed map offers
+            // neither.
+            let widest = (total - rail_want - MAP_MIN_WIDTH).max(DOCK_MIN_DRAG);
+            let asked = (total * TERMINAL_FRACTION).clamp(DOCK_MIN_DRAG, widest);
+            // Eighty columns when the row can spare them, the asked-for fraction
+            // when it cannot. Taking `widest` whenever the eighty did not fit is
+            // how the terminal ate the map: it turned "I cannot have what I
+            // wanted" into "then I will have everything".
+            let eighty = dock.minimum_width();
+            let preferred = if eighty <= widest {
+                asked.max(eighty)
+            } else {
+                asked
+            };
 
-            // Three things want this row and two of them have hard floors. When
-            // they do not all fit, the rail closes rather than the dock
-            // shrinking below eighty columns or the map disappearing.
-            if !collapsed && self.overlay.rail {
-                let rest = available - minimum - RAIL_WIDTH;
-                if rest < MAP_MIN_WIDTH {
-                    self.overlay.rail = false;
-                }
-            }
-            let rail = if self.overlay.rail { RAIL_WIDTH } else { 0.0 };
-            let widest = (available - rail - MAP_MIN_WIDTH).max(minimum);
-
-            egui::Panel::left("polis-terminals")
+            egui::Panel::right("polis-terminals")
                 .resizable(!collapsed)
-                .default_size(if collapsed {
-                    COLLAPSED_DOCK
-                } else {
-                    preferred.min(widest)
-                })
+                .default_size(if collapsed { COLLAPSED_DOCK } else { preferred })
                 .size_range(if collapsed {
                     COLLAPSED_DOCK..=COLLAPSED_DOCK
                 } else {
-                    minimum..=widest
+                    DOCK_MIN_DRAG.min(widest)..=widest
                 })
                 .show(ui, |ui| {
                     let drew = dock.draw(ui);
@@ -1079,29 +1574,18 @@ impl PolisApp {
                 });
         }
 
-        let mut jump: Option<drill::Jump> = None;
-        let mut panel = ui::PanelAction::default();
-        let mut subject: Option<LogicalPath> = None;
-        let mut dismissed: Option<polis_events::ThreadId> = None;
+        // The agent list, between the map and the terminal: it selects what one
+        // shows and what the other lights up, so it sits between the two things
+        // it is about.
         if self.overlay.rail {
-            egui::Panel::right("polis-rail")
-                .default_size(370.0)
-                .size_range(280.0..=620.0)
+            let widest = (ui.available_width() - MAP_MIN_WIDTH).max(RAIL_MIN);
+            egui::Panel::right("polis-threads")
+                .default_size(rail_want.min(widest))
+                .size_range(RAIL_MIN.min(widest)..=widest)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if self.overlay.help {
-                                ui::help(ui);
-                                ui.separator();
-                                ui.label(
-                                    RichText::new(&self.adapter)
-                                        .small()
-                                        .monospace()
-                                        .color(palette::worker().color()),
-                                );
-                                ui.separator();
-                            }
                             // PRD §1's primary decision comes first on the
                             // column, above everything the operator might merely
                             // be curious about.
@@ -1115,7 +1599,8 @@ impl PolisApp {
                                 panel = ui::building_panel(ui, &snapshot, path);
                                 ui.separator();
                             }
-                            dismissed = ui::status_rail(ui, &snapshot, &mut scene.view);
+                            dismissed =
+                                ui::status_rail(ui, &snapshot, &mut scene.view, &self.captions);
                         });
                 });
         }
@@ -1176,12 +1661,17 @@ impl PolisApp {
         // was bound to; following is *stay with it*, and the two fighting over
         // the camera every frame would look like a bug in both.
         let mut cut_to = None;
+        // An attention jump names the thread it is jumping to, and that is the
+        // one input that means *take me to this agent* rather than *highlight
+        // it*. Kept here because `jump` is consumed below.
+        let mut dock_jump: Option<polis_events::ThreadId> = None;
         if let Some(jump) = jump {
             if let Some(path) = &jump.path {
                 scene.view.selected = Some(path.clone());
                 scene.tree.reveal(path);
             }
             scene.view.follow = None;
+            dock_jump = Some(jump.thread.clone());
             cut_to = mapview::mark_position(base, &snapshot, &jump.thread, jump.path.as_ref());
         }
 
@@ -1262,6 +1752,7 @@ impl PolisApp {
                     &snapshot,
                     &mut scene.view,
                     self.config.cloud_cap,
+                    self.config.look,
                     dt,
                 );
                 scene.view.hovered.clone_from(&frame.hovered);
@@ -1297,6 +1788,55 @@ impl PolisApp {
             }
         }
 
+        // --- The legend, and the corner it opens from -----------------------
+        //
+        // Drawn after the central area so the button sits *over* the map rather
+        // than under it, and anchored to the map's own rect rather than to the
+        // window, so it stays in the map's corner as the two columns beside it
+        // are dragged.
+        //
+        // Bottom-left, because the legend panel itself anchors bottom-right and
+        // a control underneath the thing it opens is a control nobody finds.
+        if matches!(self.overlay.view, View::Map) {
+            egui::Area::new(egui::Id::new("polis-legend-button"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.left_bottom() + egui::vec2(10.0, -32.0))
+                .show(&ctx, |ui| {
+                    if ui
+                        .selectable_label(self.overlay.legend, "legend")
+                        .on_hover_text(
+                            "what the shapes and colours mean, and why the selected \
+                             agent looks the way it does",
+                        )
+                        .clicked()
+                    {
+                        self.overlay.legend = !self.overlay.legend;
+                    }
+                });
+        }
+        if self.overlay.legend {
+            // `overlay.legend` is handed straight to the window, so its own `✕`
+            // and this button write the same flag and cannot disagree about
+            // whether the panel is up.
+            ui::legend(
+                &ctx,
+                &mut self.overlay.legend,
+                &snapshot,
+                scene.view.selected_thread.as_ref(),
+                &self.captions,
+                &mut self.config.look,
+                &self.adapter,
+            );
+        }
+        // Written once the operator lets go, not once per frame of a drag: a
+        // slider dragged across its range is sixty writes a second otherwise,
+        // and the value in hand between two frames of a drag is not one they
+        // have chosen yet.
+        if self.config.look != self.saved_look && !ctx.input(|i| i.pointer.any_down()) {
+            self.saved_look = self.config.look;
+            self.saved_look.remember(self.config.state_dir().as_deref());
+        }
+
         if let Some(path) = clicked.filter(|_| !explaining) {
             scene.view.selected = Some(path.clone());
             open_in_editor(
@@ -1305,6 +1845,38 @@ impl PolisApp {
                 &path,
                 &scene.generated.root,
             );
+        }
+
+        // --- The dock and the map are one surface (PRD §15 M7d) -------------
+        //
+        // Both directions resolved in one place, after every panel has had its
+        // say, so they cannot fight over the same frame. The dock wins when the
+        // operator moved a tab, because that is the more recent of the two
+        // inputs; otherwise the map drives, and only when its selection has
+        // actually changed.
+        //
+        // A thread with no pane is the ordinary case — most agents on a `polis
+        // work` map were started in some other terminal — so nothing here says
+        // anything when the lookup misses.
+        if let Some(dock) = self.dock.as_mut() {
+            if let Some(session) = dock.take_reveal() {
+                // Pane -> map: the focused terminal lights its agent's cloud,
+                // its rail row and its trail.
+                let thread = polis_events::ThreadId::of_session(session);
+                scene.view.selected_thread = Some(thread.clone());
+                self.dock_thread = Some(thread);
+            } else {
+                let moved = scene.view.selected_thread != self.dock_thread;
+                self.dock_thread.clone_from(&scene.view.selected_thread);
+                // Map -> pane: a cloud, a rail row, or the attention list. The
+                // jump is honoured every time it fires; a selection only when
+                // it moves.
+                let want = dock_jump
+                    .or_else(|| moved.then(|| scene.view.selected_thread.clone()).flatten());
+                if let Some(thread) = want {
+                    dock.focus_session(thread.session());
+                }
+            }
         }
 
         if frame.animating {
@@ -1383,9 +1955,12 @@ impl Repaint {
             // Above `Live`, whose heartbeat is allowed to be a whole second,
             // and below the two the operator is driving by hand.
             Self::Terminal => 3,
-            Self::Animating => 4,
-            Self::KeyHeld => 5,
-            Self::Playing => 6,
+            // Between the two: a launcher that has to rescan outranks a live
+            // heartbeat and is outranked by anything the operator is driving.
+            Self::Browsing => 4,
+            Self::Animating => 5,
+            Self::KeyHeld => 6,
+            Self::Playing => 7,
         };
         if rank(other) > rank(self) {
             other
@@ -1418,6 +1993,15 @@ struct Keys {
     attention: bool,
     clear: bool,
     back_to_picker: bool,
+    /// `o` — the repository launcher, over the map.
+    open_repos: bool,
+    /// `Ctrl+Alt+T` — a new agent, in a pane beside the map.
+    ///
+    /// The same chord [`crate::panes::RESERVED`] uses once the dock is open, so
+    /// there is one way to ask for an agent whether or not there is a terminal
+    /// on screen yet. Read here only when there is no dock; after that
+    /// `Dock::reserved_chords` has it first.
+    new_agent: bool,
     play: bool,
     step: bool,
     step_back: bool,
@@ -1438,7 +2022,8 @@ fn read_keys(ctx: &egui::Context) -> Keys {
         return Keys::default();
     }
     ctx.input(|i| Keys {
-        swap_view: i.key_pressed(egui::Key::T),
+        // Not `Ctrl+Alt+T`, which asks for an agent, not a view.
+        swap_view: i.key_pressed(egui::Key::T) && !i.modifiers.ctrl,
         toggle_rail: i.key_pressed(egui::Key::I),
         toggle_help: i.key_pressed(egui::Key::H) || i.key_pressed(egui::Key::Questionmark),
         toggle_streets: i.key_pressed(egui::Key::S),
@@ -1447,6 +2032,8 @@ fn read_keys(ctx: &egui::Context) -> Keys {
         attention: i.key_pressed(egui::Key::A),
         clear: i.key_pressed(egui::Key::Escape),
         back_to_picker: i.key_pressed(egui::Key::P),
+        open_repos: i.key_pressed(egui::Key::O),
+        new_agent: i.key_pressed(egui::Key::T) && i.modifiers.ctrl && i.modifiers.alt,
         play: i.key_pressed(egui::Key::Space),
         step: i.key_pressed(egui::Key::Period),
         step_back: i.key_pressed(egui::Key::Comma),
@@ -1634,9 +2221,25 @@ fn build_scene(loaded: Loaded, feed: Option<Box<LiveFeed>>) -> Scene {
     }
 }
 
+/// How much bigger than egui's defaults the whole window is drawn.
+///
+/// Every text size here is small on purpose and none of them agree: the map's
+/// labels are 9.5 to 13 points so a city can carry hundreds of them at once, the
+/// chrome is egui's 12.5 point default, and a terminal pane is 13. Read on a
+/// second monitor at arm's length that is all but unreadable, and raising each
+/// number by hand would break the ratios each was picked for. A zoom factor
+/// multiplies `pixels_per_point` instead, so every one of them grows by the same
+/// amount and the map keeps its own proportions.
+///
+/// `Ctrl` `+` and `Ctrl` `-` move it from here while the window is open. Nothing
+/// persists it — the build has no `persistence` feature — so the next window
+/// opens back at this number, which is why it is the one worth getting right.
+const ZOOM: f32 = 1.3;
+
 /// The window's palette: PRD §10.3's budget applies to the map, and the chrome
 /// around it has to stay out of the way of the same range.
 fn theme(ctx: &egui::Context) {
+    ctx.set_zoom_factor(ZOOM);
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = Color32::from_rgb(12, 13, 16);
     visuals.window_fill = Color32::from_rgb(14, 16, 20);
@@ -1750,6 +2353,39 @@ mod tests {
             Repaint::Idle.max_urgency(Repaint::Animating),
             Repaint::Animating
         );
+    }
+
+    /// The defect ADR-0105 fixed, pinned: `polis work` starts the agents, so it
+    /// is the mode with the strongest claim to watching them. It had none.
+    #[test]
+    fn every_window_that_owns_agents_also_watches_them() {
+        let repo = PathBuf::from("/repo");
+        let work = Mode::Work {
+            repo: repo.clone(),
+            panes: 1,
+            program: "claude".to_owned(),
+            args: Vec::new(),
+        };
+        let options = feed_options(&work).expect("work watches the checkout its panes run in");
+        assert_eq!(options.repo(), repo.as_path());
+        // Not the `All` default: without this Channel D tails every session on
+        // the machine and publishes no roster, so the panes' own agents would
+        // arrive unscoped.
+        assert_eq!(
+            options.ingest.sessions,
+            polis_ingest::SessionScope::ThisRepo
+        );
+
+        // And the modes that must not bind a port keep not binding one: a map is
+        // a city with no wire into it, a replay is the past.
+        assert!(feed_options(&Mode::Map { repo: repo.clone() }).is_none());
+        assert!(feed_options(&Mode::Pick).is_none());
+        assert!(feed_options(&Mode::Replay {
+            transcript: repo.join("s.jsonl"),
+            repo,
+            speed: 1.0,
+        })
+        .is_none());
     }
 
     #[test]

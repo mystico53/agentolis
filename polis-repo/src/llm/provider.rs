@@ -269,6 +269,11 @@ impl ChatProvider for OpenAiCompatibleProvider {
         if config.request_json_object {
             body["response_format"] = serde_json::json!({"type": "json_object"});
         }
+        // Only when the caller asked: an endpoint that does not know the field
+        // rejects the whole request rather than ignoring it.
+        if let Some(effort) = &config.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
         let mut headers = Vec::new();
         match key {
             Some(key) => headers.push((
@@ -553,6 +558,30 @@ mod tests {
             .expect("a request");
         let body: serde_json::Value = serde_json::from_str(&request.body).expect("json");
         assert!(body.get("response_format").is_none(), "{body}");
+    }
+
+    /// `reasoning_effort` is absent unless a caller asked for it, because an
+    /// endpoint that has never heard of the field answers `400` rather than
+    /// ignoring it — so the default must not send it, and a caller that has
+    /// checked its endpoint must be able to.
+    #[test]
+    fn reasoning_effort_is_sent_only_when_it_is_configured() {
+        let mut config = config(Provider::Glm);
+        assert!(config.reasoning_effort.is_none(), "off by default");
+        let bare = Provider::Glm
+            .client()
+            .request(&config, Some(&key("POLIS_TEST_KEY_EFFORT", "k")), "s", "u")
+            .expect("a request");
+        let body: serde_json::Value = serde_json::from_str(&bare.body).expect("json");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+
+        config.reasoning_effort = Some("low".to_owned());
+        let asked = Provider::Glm
+            .client()
+            .request(&config, Some(&key("POLIS_TEST_KEY_EFFORT", "k")), "s", "u")
+            .expect("a request");
+        let body: serde_json::Value = serde_json::from_str(&asked.body).expect("json");
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[test]

@@ -174,6 +174,23 @@ pub const TRAIL_TTL: Duration = Duration::from_mins(15);
 /// How many glyph-bearing operations a thread keeps for the §10.1 shape layer.
 pub const OPS_CAP: usize = 128;
 
+/// How many of the agent's own call summaries a thread keeps ([`Intent`]).
+///
+/// Twenty. The question this ring exists to answer is *"what is this thread
+/// working on **now**"*, and twenty calls is roughly the last few minutes of a
+/// working thread — long enough that one `Read` in the middle of an edit does
+/// not become the whole story, short enough that a summary written from it is
+/// about the present rather than the session. [`OPS_CAP`] is 128 because the
+/// map draws a decaying trail; nothing draws this.
+pub const INTENT_CAP: usize = 20;
+
+/// The longest single summary kept, in characters.
+///
+/// Every one of these is written by an agent asked for "a clear, concise
+/// description", and the ones that come back long are long because a command
+/// was pasted into them. Cutting at 160 keeps the sentence and loses the paste.
+pub const INTENT_TEXT_MAX: usize = 160;
+
 /// How long a thread may be silent before [`ThreadStatus::Working`] decays to
 /// [`ThreadStatus::Idle`].
 ///
@@ -500,6 +517,74 @@ impl HueRing {
     }
 }
 
+/// Which cloud layer each thread's field is drawn on, and never two threads on
+/// one layer.
+///
+/// # Why this is not the hue
+///
+/// The renderer groups cloud kernels by a small integer — [`Thread::layer`] —
+/// and every surface that paints a cloud looks the thread's colour up by it.
+/// The obvious integer is [`Thread::tint`], and it is the wrong one twice over.
+///
+/// It is not **unique**: [`HueRing`] hands out twelve slots and then degrades to
+/// the bare preference, so past twelve threads two of them share a tint, and two
+/// territories sharing a layer are *summed* — PRD §6.4's contention signal reads
+/// two threads in one place as one thread working hard, which is the one
+/// distinction the layer exists to make.
+///
+/// And it is not what was there before: what the two producers actually passed
+/// was the thread's **position in the visible list**, which
+/// [`territory::select_clouds`] sorts by `last_activity`. Two agents working at
+/// once swap that position every time either one runs a tool. The layer id is
+/// what the tween matches its two sides on and what the tint table is indexed
+/// by, so a swap made `polis_render::live::CloudTween` ease each cloud's shape
+/// toward the *other's* and repaint both in the other's hue — the operator's
+/// report was *"the clouds contract and rebuild a lot, colours change a lot"*.
+/// Ranking still decides which territories survive PRD §10.4's cap and which is
+/// painted over which; it no longer decides **who anything is**.
+///
+/// # Never released, for the reason the hue ring is not
+///
+/// A monotonic counter alone would be wrong, and [`HueRing`]'s doc has the
+/// argument in full: a thread retired for silence and heard from again is
+/// created **twice** in the window and once under `run_to_end`, so a counter
+/// would give it a second id in one driver and not the other, and the two
+/// renderers would disagree about a recording they were both handed. Recording
+/// the owner makes a second `assign` a lookup, so the id depends only on the set
+/// of thread ids and the order they were first seen — the event order, in both
+/// drivers and across a [`World::reset`]-and-re-apply seek.
+///
+/// The table therefore grows by one `(ThreadId, u16)` per distinct thread the
+/// world has ever seen, where [`HueRing`] stops at twelve. That is the price of
+/// an id that stays unique past the twelfth thread, and it is a few dozen bytes
+/// a session against a bug the operator can see.
+#[derive(Debug, Default)]
+struct LayerRing {
+    /// The thread that took each layer, ever. Never cleared except by
+    /// [`World::reset`].
+    held: BTreeMap<ThreadId, u16>,
+    /// The next unclaimed layer.
+    next: u16,
+}
+
+impl LayerRing {
+    /// The layer for `id` — the one it already had, or a fresh claim.
+    ///
+    /// Saturates at [`u16::MAX`], so a world that has seen 65 535 distinct
+    /// threads puts every one after that on the last layer and sums them. That
+    /// is 65 523 threads past the point [`HueRing`] gives up, and both would be
+    /// long past PRD §16's hundred.
+    fn assign(&mut self, id: &ThreadId) -> u16 {
+        if let Some(layer) = self.held.get(id) {
+            return *layer;
+        }
+        let layer = self.next;
+        self.next = self.next.saturating_add(1);
+        self.held.insert(id.clone(), layer);
+        layer
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The world
 // ---------------------------------------------------------------------------
@@ -581,6 +666,9 @@ pub struct World {
     /// Who owns which identity hue (PRD §11.4). Private, because the only way
     /// to get a slot is to be created through [`World::thread_entry`].
     hues: HueRing,
+    /// Who owns which cloud layer. Private for the same reason, and assigned in
+    /// the same breath.
+    layers: LayerRing,
 }
 
 impl World {
@@ -629,6 +717,7 @@ impl World {
             layout_generation: 0,
             files_generation: 0,
             hues: HueRing::default(),
+            layers: LayerRing::default(),
         }
     }
 
@@ -838,6 +927,37 @@ impl World {
         self.health.threads_dismissed = self.health.threads_dismissed.saturating_add(1);
     }
 
+    /// Closes one thread because its conversation was cleared.
+    ///
+    /// The one ending on this list that is **evidence rather than a timer**. A
+    /// session that goes quiet might be finished or might be waiting for its
+    /// operator, and `World::retire_threads` spends half an hour refusing to
+    /// guess. `/clear` is not ambiguous: Claude Code abandons the transcript and
+    /// opens a new one under the same `bridge-session.bridgeSessionId`, so the
+    /// old file will never be appended to again and the operator cannot get back
+    /// to that conversation either (`polis_ingest::live`, ADR-0105).
+    ///
+    /// # Why it is removed rather than marked done
+    ///
+    /// [`EventKind::SessionEnd`] finishes a thread and leaves it on the rail
+    /// carrying its attention mark, because "this agent stopped, and its work is
+    /// unverified" is a queue item. A cleared conversation is not: there is no
+    /// thread left to go back to, and a *done, unverified* mark pinned to it
+    /// would sit in the rail for [`MARK_HOLD_MAX`] naming a session the operator
+    /// deliberately threw away. The buildings keep their height either way —
+    /// uncommitted lines are a fact about the disk, not about the chat.
+    ///
+    /// Like [`World::dismiss_thread`], **not a tombstone**: a session that
+    /// somehow speaks again rebuilds its thread on the next event.
+    pub fn supersede_thread(&mut self, id: &ThreadId) {
+        if !self.threads.contains_key(id) {
+            return;
+        }
+        self.forget_thread(id);
+        self.health.threads_retired = self.health.threads_retired.saturating_add(1);
+        self.health.threads_cleared = self.health.threads_cleared.saturating_add(1);
+    }
+
     /// Removes a thread and every reference to it, so nothing dangles.
     ///
     /// A half-removed thread is worse than a leaked one: an attention mark whose
@@ -922,6 +1042,7 @@ impl World {
     pub fn reset(&mut self, now: Instant) {
         self.now = now;
         self.hues = HueRing::default();
+        self.layers = LayerRing::default();
         self.threads.clear();
         self.files.clear();
         self.claims = contention::ClaimTable::default();
@@ -1072,6 +1193,7 @@ impl World {
         let id = ThreadId::of_session(session.clone());
         if !self.threads.contains_key(&id) {
             let mut thread = Thread::new(id.clone(), session.clone(), at);
+            thread.layer = self.layers.assign(&id);
             match self.hues.assign(&id) {
                 Some(slot) => thread.tint = slot,
                 // Every hue this world has ever handed out is gone. `Thread::new`
@@ -1493,6 +1615,21 @@ pub struct Thread {
     /// named an owner for this pixel"* and no thread may ever carry it.
     pub tint: u8,
 
+    /// Which cloud layer this thread's field is drawn on — unique among the
+    /// threads of one [`World`], and fixed for the thread's life.
+    ///
+    /// [`Thread::tint`] says what colour the cloud is; this says **which cloud
+    /// it is**. The renderer groups kernels by it, the tween matches its two
+    /// sides on it, and the tint table is indexed by it, so it has to be stable
+    /// across frames and unique across threads — see [`LayerRing`] for why
+    /// neither the tint nor the thread's rank in the visible list is either.
+    ///
+    /// [`Thread::new`] defaults it to the bare [`ThreadId::hue_preference`], on
+    /// the same reasoning as `tint`: a fixture built outside a `World` is not
+    /// exclusive, deliberately, because exclusivity is a property of the set.
+    /// Inside a world the ring overrides it.
+    pub layer: u16,
+
     /// The same steps as [`Thread::trail`] with PRD §10.1's shape channel
     /// attached: which operation, how it went, and which worker did it.
     ///
@@ -1500,6 +1637,13 @@ pub struct Thread {
     /// each stop. Kept separate because §10.1 is emphatic that shape and colour
     /// are orthogonal channels and the trail's own encoding is neither.
     pub ops: VecDeque<Operation>,
+    /// The agent's own one-line summaries of its recent calls, newest last.
+    ///
+    /// The only prose in the world that is not a name, and the narrowest
+    /// channel that could carry intent — see [`Intent`] for why it is a
+    /// separate ring rather than a field on [`Operation`], and what may never
+    /// arrive on it.
+    pub intents: VecDeque<Intent>,
     /// Every path this thread has ever touched, with its revisit count.
     ///
     /// > you can see backtracking, thrashing (the same building revisited six
@@ -1541,6 +1685,7 @@ impl Thread {
         // `World` still gets the colour that thread has always had, and a
         // defaulted `0` would have made every fixture thread the same rose.
         let tint = id.hue_preference();
+        let layer = u16::from(tint);
         Self {
             id,
             session_id,
@@ -1553,7 +1698,9 @@ impl Thread {
             turn_ended: false,
             interrupted_at: None,
             tint,
+            layer,
             ops: VecDeque::new(),
+            intents: VecDeque::new(),
             visits: BTreeMap::new(),
             started: at,
             last_activity: at,
@@ -1661,6 +1808,25 @@ impl Thread {
         self.ops.push_back(op);
         while self.ops.len() > OPS_CAP {
             self.ops.pop_front();
+        }
+    }
+
+    /// Appends one of the agent's own summaries, bounded and de-duplicated.
+    ///
+    /// A repeat of the newest line is dropped rather than stacked: an agent
+    /// retrying one command writes the same sentence three times, and three
+    /// copies of *"Run the workspace tests"* would crowd out the three
+    /// different things it did before them.
+    pub(crate) fn push_intent(&mut self, intent: Intent) {
+        if intent.text.is_empty() {
+            return;
+        }
+        if self.intents.back().is_some_and(|b| b.text == intent.text) {
+            return;
+        }
+        self.intents.push_back(intent);
+        while self.intents.len() > INTENT_CAP {
+            self.intents.pop_front();
         }
     }
 
@@ -1986,6 +2152,52 @@ impl fmt::Display for ThreadStatus {
             Self::Done => "done",
         })
     }
+}
+
+/// One line the agent wrote about its own call, kept so something can say what
+/// a thread is *doing* rather than only where it is.
+///
+/// # Why this is the only prose in the world
+///
+/// Every other field here is a name, a count, a time or an enum. The map can
+/// therefore say where a thread is working, how hard, and whether it is stuck,
+/// and it cannot say what the work *is* — the operator's report was that the
+/// notation is exact and unreadable at the same time. Intent is not recoverable
+/// from tool kinds and paths: `Edit src/auth/token.rs` is equally *"adding the
+/// refresh path"* and *"reverting yesterday's refresh path"*.
+///
+/// It is recoverable from the transcript, because Claude Code asks for it. The
+/// `Bash`, `PowerShell` and `Agent` tools all carry a `description` in their
+/// input — *"Run the workspace tests"*, *"Find callout usage in mapview"* — and
+/// it is the agent's own one-line summary of the call it is about to make.
+/// Twenty of those is a near-complete account of what a thread has been up to,
+/// written by the only party that knows.
+///
+/// # What may never arrive here, and why it is a separate ring
+///
+/// A `description` is prose *about* the work. A tool's other inputs are the
+/// work: `Write.content` is a whole file, `Edit.old_string` is a diff, and
+/// `Bash.command` is a command line that routinely holds a token. ADR-0005 is
+/// what strips those out of the hook channel, and this ring is deliberately not
+/// a loosening of it — it is a second, narrower door that only `description`
+/// fits through, and `apply::assistant` is the one place that reads it.
+///
+/// It is a ring on the thread rather than a field on [`Operation`] for the same
+/// reason: an `Operation` is cloned into the census and walked by the renderer
+/// every frame, and a `String` on it would be both a hot-path cost and a field
+/// that every future caller could quietly fill with something else. Nothing
+/// draws an `Intent`. Only [`crate::Thread::intents`] holds one, and the only
+/// consumer is a caption.
+#[derive(Debug, Clone)]
+pub struct Intent {
+    /// Which tool the agent was describing. `Agent` means it was handing this
+    /// sentence to a subagent, which is a different claim from doing it itself.
+    pub tool: ToolKind,
+    /// The agent's own words, stripped of control characters and bounded to
+    /// [`INTENT_TEXT_MAX`].
+    pub text: String,
+    /// When the call it describes was made.
+    pub at: Instant,
 }
 
 /// One operation, carrying PRD §10.1's shape channel and §10.2's colour channel
@@ -2388,6 +2600,14 @@ pub struct Health {
     /// a rail shorter than the fleet is expected after a dismissal and is a bug
     /// report without one.
     pub threads_dismissed: u64,
+    /// Of those, the ones whose conversation was cleared
+    /// ([`World::supersede_thread`]).
+    ///
+    /// Also separate, and for the same reason: these left the map on *proof*
+    /// rather than on the clock, so a rail that is short by this many is short
+    /// because the operator ended those chats, seconds ago, not because
+    /// [`THREAD_RETIRE_AFTER`] eventually gave up on them.
+    pub threads_cleared: u64,
     /// Of those, the ones the [`MAX_THREADS`] ceiling took rather than the
     /// clock.
     ///

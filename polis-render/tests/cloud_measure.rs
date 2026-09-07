@@ -681,7 +681,7 @@ fn measure_clouds_on_real_threads() {
             peak = field.peak();
             let stack = field.stack(&[]);
             contested = stack.contested();
-            live::paint_cloud_stack(&mut with, &stack);
+            live::paint_cloud_stack(&mut with, &stack, 0.0);
             band_map = stack.flattened();
         }
         draw.push(started.elapsed());
@@ -1288,7 +1288,7 @@ fn lift_versus_shipped_side_by_side() {
             1.0 / 24.0,
             live::CLOUD_TWEEN_RATE,
         ) {
-            live::paint_cloud_stack(&mut lifted, &field.stack(&[]));
+            live::paint_cloud_stack(&mut lifted, &field.stack(&[]), 0.0);
         }
         // The right panel is the shipped **field**, painted onto the same bare
         // frame at the same point in the stack as the left. Comparing the
@@ -1299,7 +1299,7 @@ fn lift_versus_shipped_side_by_side() {
         // reported below — but it is not the difference this image is about.
         let mut shipped_panel = bare.clone();
         if let Some(field) = shipped_r.cloud_field() {
-            live::paint_cloud_stack(&mut shipped_panel, &field.stack(&[]));
+            live::paint_cloud_stack(&mut shipped_panel, &field.stack(&[]), 0.0);
         }
         let covered = ink(&shipped_panel).saturating_sub(ink(&shipped));
 

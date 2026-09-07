@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText};
 use polis_events::{LogicalPath, ThreadId};
-use polis_render::camera::ZoomTier;
 use polis_render::live::CloudCensus;
+use polis_render::camera::ZoomTier;
 use polis_world::attention::AttentionKind;
 use polis_world::replay::{Interest, ReplayProgress};
 use polis_world::snapshot::WorldSnapshot;
@@ -80,8 +80,15 @@ pub struct Overlay {
     pub view: View,
     /// Whether the right-hand rail is open.
     pub rail: bool,
-    /// Whether the key sheet is up.
-    pub help: bool,
+    /// Whether the legend is up, over the map.
+    ///
+    /// It carries what used to be a fold on **every thread card** — PRD §12's
+    /// *why it looks like this*. Per-card it cost three lines of a column that
+    /// is now fifteen percent of the window, and it said the same thing about
+    /// notation nine times over; here it is one panel, opened from the map's own
+    /// corner, that answers for the selected thread and for the notation at
+    /// once.
+    pub legend: bool,
     /// Whether the first-run map explainer is up.
     ///
     /// True until this machine has dismissed it once ([`crate::explain`]).
@@ -107,7 +114,7 @@ impl Default for Overlay {
         Self {
             view: View::default(),
             rail: true,
-            help: false,
+            legend: false,
             explain: !crate::explain::dismissed(),
             attention_cursor: None,
         }
@@ -535,6 +542,7 @@ pub fn status_rail(
     ui: &mut egui::Ui,
     snapshot: &WorldSnapshot,
     state: &mut ViewState,
+    phrases: &crate::intent::Captions,
 ) -> Option<ThreadId> {
     ui.label(heading("THREADS"));
     if snapshot.threads.is_empty() {
@@ -559,155 +567,9 @@ pub fn status_rail(
         if thread.tool_calls == 0 && thread.workers.is_empty() {
             continue;
         }
-        let ink = palette::status(thread.status);
-        let tint = thread.tint;
-        let following = state.follow.as_ref() == Some(&thread.id);
-        let emphasised = state.emphasises(&thread.id);
-        let head = ui.horizontal(|ui| {
-            swatch(ui, tint);
-            ui.label(
-                RichText::new(status_word(thread.status))
-                    .monospace()
-                    .color(ink.color()),
-            );
-            ui.label(
-                RichText::new(thread_label(thread))
-                    .color(palette::selection().color())
-                    .strong(),
-            );
-            // What it is waiting *on*. The state word answers "should I go
-            // there"; this answers "why", which is the question the operator
-            // asked when a thread parked on a background `cargo test` and a
-            // thread blocked on a permission prompt read identically.
-            if let Some(why) = why_of(snapshot, thread) {
-                ui.label(RichText::new(why).small().color(ink.color()));
-            }
-            if following {
-                ui.label(
-                    RichText::new("following")
-                        .small()
-                        .color(palette::hover().color()),
-                );
-            }
-            // Right-aligned, and the only control on the row: a destructive
-            // action that sat next to the label would be hit by an operator
-            // reaching for "follow this one".
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    let x = ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("x")
-                                    .monospace()
-                                    .color(palette::status(ThreadStatus::Idle).color()),
-                            )
-                            .frame(false),
-                        )
-                        .on_hover_text(
-                            "Close this thread. Nothing is remembered, so its next event                              brings it back.",
-                        );
-                    (x.clicked(), x.rect)
-                },
-            )
-            .inner
-        });
-        let (closed, close_rect) = head.inner;
-        if closed {
-            dismissed = Some(thread.id.clone());
+        if let Some(closed) = thread_card(ui, snapshot, state, thread, phrases.get(&thread.id)) {
+            dismissed = Some(closed);
         }
-        let top = head.response.rect.top();
-        ui.horizontal(|ui| {
-            ui.add_space(10.0);
-            place_of(ui, thread);
-            // `0 workers` on a thread that never spawned any read as a broken
-            // row, and mixed a now-gauge with lifetime totals in one breath.
-            // Running-of-total when there are any, nothing at all when there are
-            // not.
-            let workers = match (thread.running_workers(), thread.workers.len()) {
-                (_, 0) => String::new(),
-                (live, total) => format!("{live}/{total} workers · "),
-            };
-            ui.label(dim(format!(
-                "{workers}{} calls · {} fail · +{} -{}",
-                thread.tool_calls, thread.failures, thread.lines_added, thread.lines_removed
-            )));
-        });
-        if let Some((path, count)) = thread.most_revisited() {
-            if count >= 3 {
-                // PRD §12: thrashing — "the same building revisited six times".
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(format!("revisited {count}× {}", short_path(path)))
-                            .small()
-                            .color(palette::needs_decision().color()),
-                    );
-                });
-            }
-        }
-        // The **whole block** is the row, not just its header line: the place
-        // an operator's pointer lands when they mean "that thread" is as often
-        // on `in src/services · 32 workers` as on the title, and a 26-pixel
-        // target inside a 120-pixel row is a hit area that reads as broken. It
-        // is still stopped short of the `✕`, which is a different verb and a
-        // destructive one — an operator reaching for "follow this one" must not
-        // find it.
-        //
-        // `interact` rather than the `horizontal`'s own response, because a
-        // `Ui` scope senses hover only and its `clicked()` is never true:
-        // click-to-follow here did nothing at all.
-        let target = egui::Rect::from_min_max(
-            egui::Pos2::new(ui.max_rect().left(), top),
-            egui::Pos2::new(close_rect.left() - 4.0, ui.min_rect().bottom()),
-        );
-        let hit = ui.interact(
-            target,
-            ui.id().with(("thread", thread.id.as_str())),
-            egui::Sense::click(),
-        );
-        if hit.hovered() {
-            // PRD §12's shared highlight, written from the rail; the map lights
-            // that thread's marks up when it reads it.
-            state.hover_thread(&thread.id);
-        }
-        // Painted from the shared state as well as from this frame's pointer,
-        // so a row lights up identically whether the pointer is on the row or
-        // out on that thread's cloud — which is the whole of "and vice versa".
-        // Two weights, because a selection outlives the pointer and a hover
-        // does not.
-        if emphasised || hit.hovered() {
-            let selected = state.selected_thread.as_ref() == Some(&thread.id);
-            let wash = if selected { 0.14 } else { 0.09 };
-            ui.painter()
-                .rect_filled(target, 2.0, palette::thread(tint).alpha(wash));
-            // A bar down the left edge in the thread's own colour. The wash
-            // alone is a colour difference and nothing else, which a
-            // colour-blind operator and a downscaled screenshot both lose; the
-            // bar is an edge, and an edge survives both (PRD §11.4).
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    target.min,
-                    egui::Pos2::new(target.min.x + 3.0, target.max.y),
-                ),
-                0.0,
-                palette::thread(tint).alpha(if selected { 1.0 } else { 0.75 }),
-            );
-        }
-        if hit.clicked() {
-            // One click does both verbs, because on this row they are one
-            // intention: "this thread". Follow toggles — it owns the camera and
-            // an operator must be able to give it back — while the selection
-            // moves to whatever was clicked last, so the map's highlight always
-            // matches the row the operator just used.
-            state.follow = if following {
-                None
-            } else {
-                Some(thread.id.clone())
-            };
-            state.selected_thread = Some(thread.id.clone());
-        }
-        ui.separator();
     }
 
     if !snapshot.unattributed.is_empty() {
@@ -722,6 +584,280 @@ pub fn status_rail(
         }
     }
     dismissed
+}
+
+/// Text lines in one card. Fixed, not derived from the content.
+///
+/// The column is fifteen percent of the window by default, so a card that grew
+/// with its thread would make the list unreadable exactly when there is most to
+/// read: nine cards of nine different heights cannot be scanned, and an operator
+/// scans this list before reading any single row of it. Three lines, every row,
+/// and anything longer is truncated into the hover.
+const CARD_LINES: f32 = 3.0;
+
+/// Width of the tint bar down a card's left edge.
+const CARD_BAR: f32 = 4.0;
+
+/// Padding inside a card, on every side.
+const CARD_PAD: f32 = 5.0;
+
+/// One thread, as three fixed lines with its own colour down the side.
+///
+/// Painted rather than assembled from widgets, because the two things the card
+/// owes — an exact height, and a bar the *full* height of it — are both
+/// properties of a rectangle that has to be known before the text goes into it,
+/// and `Ui::horizontal` decides its height afterwards.
+///
+/// # The bar is always drawn, and that is the point
+///
+/// It used to appear only under hover or selection, which meant the thing PRD
+/// §11.4 makes identity out of — the thread's own hue — was invisible until the
+/// operator was already pointing at the row they wanted. A cloud on the map and
+/// its card in the list now carry the same colour at all times, so the match is
+/// made by looking rather than by hunting.
+///
+/// Returns the thread if the operator closed it.
+fn thread_card(
+    ui: &mut egui::Ui,
+    snapshot: &WorldSnapshot,
+    state: &mut ViewState,
+    thread: &Thread,
+    phrase: Option<&crate::intent::Caption>,
+) -> Option<ThreadId> {
+    let ink = palette::status(thread.status);
+    let tint = thread.tint;
+    let following = state.follow.as_ref() == Some(&thread.id);
+    let selected = state.selected_thread.as_ref() == Some(&thread.id);
+
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let line = ui.text_style_height(&egui::TextStyle::Body).max(14.0);
+    let height = line.mul_add(CARD_LINES, CARD_PAD * 2.0);
+
+    let (rect, hit) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let text_left = rect.left() + CARD_BAR + CARD_PAD;
+    // Room kept clear on the first line for the close control, which is a
+    // destructive verb and must not be found by an operator reaching for
+    // "follow this one".
+    let close = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - CARD_PAD - line, rect.top() + CARD_PAD),
+        egui::vec2(line, line),
+    );
+    let text_right = close.left() - CARD_PAD;
+    let width = (text_right - text_left).max(1.0);
+
+    if ui.is_rect_visible(rect) {
+        if selected || state.emphasises(&thread.id) || hit.hovered() {
+            let wash = if selected { 0.14 } else { 0.09 };
+            ui.painter()
+                .rect_filled(rect, 2.0, palette::thread(tint).alpha(wash));
+        }
+        // The bar, the full height of the card (PRD §11.4: an edge survives
+        // greyscale and the periphery, where a colour difference does not).
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + CARD_BAR, rect.max.y)),
+            0.0,
+            palette::thread(tint).alpha(if selected || hit.hovered() { 1.0 } else { 0.8 }),
+        );
+
+        let mut y = rect.top() + CARD_PAD;
+        // Line one — the state word, and how long ago this thread last did
+        // anything. One meaning for the time column in every card: a working
+        // thread reads seconds, and a thread that has gone quiet says how long.
+        let age = format::duration(snapshot.at.saturating_duration_since(thread.last_activity));
+        let stamp = ui
+            .painter()
+            .layout_no_wrap(age, small.clone(), palette::worker().color());
+        ui.painter().galley(
+            egui::pos2(
+                text_right - stamp.size().x,
+                y + (line - stamp.size().y) / 2.0,
+            ),
+            stamp.clone(),
+            palette::worker().color(),
+        );
+        clipped_line(
+            ui,
+            egui::pos2(text_left, y),
+            (width - stamp.size().x - CARD_PAD).max(1.0),
+            line,
+            status_word(thread.status).trim(),
+            small.clone(),
+            ink.color(),
+        );
+
+        // Line two — what this agent is, in its own words when it has given us
+        // any.
+        //
+        // A phrase from `crate::intent` **replaces** the name rather than
+        // sitting under it, and that is the whole reason the line is worth
+        // having: `thread_label` is the `ai-title`, written from the session's
+        // first prompt and never revised, so on a thread that has been running
+        // for an hour it names something that finished long ago. A phrase is
+        // about the last few minutes. Two answers to one question on one card
+        // would leave the operator working out which is current, which is the
+        // lookup the phrase exists to remove.
+        //
+        // A stale phrase still shows, dimmed — see `intent::Caption::is_stale`.
+        // Blanking it would trade a line the operator can see is old for no line
+        // at all. This is where the map's cloud captions went: the naming
+        // belongs in the column that has room for it, and the map keeps the
+        // line pointing at the shape (`mapview::draw_thread_connectors`).
+        y += line;
+        let outdated = phrase.is_some_and(|p| {
+            p.is_stale(&polis_repo::llm::cache::Sketch::build(
+                thread.intents.iter().map(|i| i.text.as_str()),
+            ))
+        });
+        clipped_line(
+            ui,
+            egui::pos2(text_left, y),
+            width,
+            line,
+            &phrase.map_or_else(|| crate::mapview::thread_label(thread), |p| p.text.clone()),
+            body,
+            if outdated {
+                palette::selection().alpha(0.55)
+            } else {
+                palette::selection().color()
+            },
+        );
+
+        // Line three — where it is working, or what it is waiting on when that
+        // is the more urgent of the two. `why_of` answers "why", which is the
+        // question an operator asks of a thread that has stopped.
+        y += line;
+        let blocked = why_of(snapshot, thread);
+        let detail = blocked.clone().unwrap_or_else(|| place_word(thread));
+        clipped_line(
+            ui,
+            egui::pos2(text_left, y),
+            width,
+            line,
+            &detail,
+            small,
+            if blocked.is_some() {
+                ink.color()
+            } else {
+                palette::worker().color()
+            },
+        );
+
+        if following || hit.hovered() {
+            ui.painter().text(
+                close.center(),
+                egui::Align2::CENTER_CENTER,
+                if following { "◉" } else { "✕" },
+                egui::TextStyle::Small.resolve(ui.style()),
+                palette::status(ThreadStatus::Idle).color(),
+            );
+        }
+    }
+
+    if hit.hovered() {
+        // PRD §12's shared highlight, written from the list; the map lights that
+        // thread's marks up when it reads it.
+        state.hover_thread(&thread.id);
+    }
+    // Where this card ended up, for the line the map draws from it to this
+    // thread's cloud. Clipped to what the list is actually showing, so a card
+    // scrolled out of view anchors nothing.
+    state.rail_card(&thread.id, rect, ui.clip_rect());
+
+    // The close control is a separate target inside the card, claimed before the
+    // card's own click is read.
+    let closed = ui
+        .interact(
+            close,
+            ui.id().with(("close", thread.id.as_str())),
+            egui::Sense::click(),
+        )
+        .on_hover_text(
+            "Close this thread. Nothing is remembered, so its next event brings it back.",
+        )
+        .clicked();
+    if closed {
+        return Some(thread.id.clone());
+    }
+
+    if hit.clicked() {
+        // One click does both verbs, because on this card they are one
+        // intention: "this thread". Follow owns the camera and selection owns
+        // the highlight, but the operator is not asking for two things and must
+        // not have to put them away separately. The second click on the same
+        // card clears both — a mark that can only be moved and never dismissed
+        // is a mark the operator stops trusting.
+        let asked_about = following || selected;
+        let (follow, chosen) = if asked_about {
+            (None, None)
+        } else {
+            (Some(thread.id.clone()), Some(thread.id.clone()))
+        };
+        state.follow = follow;
+        state.selected_thread = chosen;
+    }
+    // Everything the card had to truncate. The list is for scanning; this is for
+    // the one row the operator stopped on.
+    hit.on_hover_text(format!(
+        "{}\n{} · {} calls · {} fail · +{} -{}",
+        crate::mapview::thread_label(thread),
+        place_word(thread),
+        thread.tool_calls,
+        thread.failures,
+        thread.lines_added,
+        thread.lines_removed
+    ));
+    None
+}
+
+/// One line of a card, truncated to the width it was given.
+///
+/// `max_rows = 1` with `break_anywhere`, so a long title or a long district ends
+/// in an ellipsis instead of pushing the card past [`CARD_LINES`].
+fn clipped_line(
+    ui: &egui::Ui,
+    at: egui::Pos2,
+    width: f32,
+    line: f32,
+    text: &str,
+    font: egui::FontId,
+    colour: Color32,
+) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, colour);
+    job.wrap.max_width = width;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        egui::pos2(at.x, at.y + (line - galley.size().y) / 2.0),
+        galley,
+        colour,
+    );
+}
+
+/// Where a thread is, in the few words a card has room for.
+///
+/// The rail used to spend a line and a hover on this ([`place_of`], which the
+/// legend still uses in full). A card gets part of one line, so §6.4's lobes
+/// become the heaviest one and a count, and §6.2's refusal to place a thread
+/// stays the honest word it has always been rather than becoming a guess.
+fn place_word(thread: &Thread) -> String {
+    use polis_world::territory::Placement;
+
+    match thread.territory.placement() {
+        Placement::Claim(claim) => format!("in {}", claim.as_str()),
+        Placement::Lobes(lobes) => {
+            let named = lobes.first().map_or("", |l| l.path.as_str());
+            match lobes.len() {
+                0 | 1 => format!("in {named}"),
+                n => format!("in {named} +{}", n - 1),
+            }
+        }
+        Placement::Nowhere => "unplaced".to_owned(),
+    }
 }
 
 /// The attention list: every live state, worst first, one click from the thing
@@ -1531,6 +1667,243 @@ pub fn notation(ui: &mut egui::Ui) {
     }
 }
 
+/// The legend, over the map: what the notation means, and why the selected
+/// thread looks the way it does.
+///
+/// # One panel instead of a fold on every card
+///
+/// *Why it looks like this* used to be a `CollapsingHeader` on **each** thread
+/// row. That was the right content in the wrong place three times over: it
+/// pushed every card past the height a list can be scanned at, it repeated the
+/// same notation once per thread, and it was closed by default — so the reading
+/// that explains a colour was hidden behind a click on a row the operator had
+/// already decided not to care about.
+///
+/// Here it is one panel, reached from the map's own corner or from `h`, and it
+/// answers for whichever thread is selected. Selection is already the thing that
+/// binds the list, the map and the terminal pane together (ADR-0105), so the
+/// legend follows it for free and there is nothing new to keep in sync.
+///
+/// `open` is egui's own window flag, so the title bar's `✕` closes it and the
+/// caller's toggle and the window agree without a second piece of state.
+pub fn legend(
+    ctx: &egui::Context,
+    open: &mut bool,
+    snapshot: &WorldSnapshot,
+    selected: Option<&ThreadId>,
+    captions: &crate::intent::Captions,
+    look: &mut crate::config::Look,
+    adapter: &str,
+) {
+    egui::Window::new("legend")
+        .open(open)
+        .default_width(420.0)
+        .max_height(620.0)
+        .resizable(true)
+        .collapsible(false)
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let thread = selected.and_then(|id| snapshot.thread(id));
+                    if let Some(thread) = thread {
+                        selected_thread_reading(ui, snapshot, thread, captions);
+                        ui.separator();
+                    } else {
+                        ui.label(dim("select an agent to read why it looks the way it does"));
+                        ui.separator();
+                    }
+                    // The key sheet lives here now, not in a column of its
+                    // own. `h` used to open it inside the agent list, which is
+                    // fifteen percent of the window — a two-column table of
+                    // every keystroke in a space narrower than the table. It is
+                    // the same question this panel already answers, so it is the
+                    // same panel: the map's corner, the title bar and `h` are
+                    // three doors into one room.
+                    look_controls(ui, look);
+                    ui.separator();
+                    help(ui);
+                    ui.separator();
+                    ui.label(
+                        RichText::new(adapter)
+                            .small()
+                            .monospace()
+                            .color(palette::worker().color()),
+                    );
+                });
+        });
+}
+
+/// The two things about the cloud layer that are the operator's call, next to
+/// the panel that explains what the layer means.
+///
+/// # Why these two are settings and nothing else here is
+///
+/// Every other number in the notation was settled by measurement — the iso
+/// thresholds against real sessions, the hatch spacing against an ink budget,
+/// the identity ring against CIEDE2000 at the luminance each role is drawn at.
+/// These two cannot be, because they are trades between things the code has no
+/// way to rank:
+///
+/// * **cloud body** trades the city's own legibility for the cloud's. A dense
+///   core is the shape that survives being seen from across the room (PRD §1)
+///   and it is also the shape that hides the buildings under it (PRD §10.3).
+///   Which one an operator wants depends on whether they are reading the map or
+///   watching it, and that changes through the day.
+/// * **rail points at cloud** trades quiet for naming. One line answers *which
+///   thread is that* when asked; a line per thread answers it before it is
+///   asked, at the cost of several lines across the window.
+///
+/// So they are here, live, next to the picture they change — a slider the
+/// operator can drag while looking at the map is worth more than a number
+/// somebody else measured once.
+fn look_controls(ui: &mut egui::Ui, look: &mut crate::config::Look) {
+    use crate::config::Connectors;
+    ui.label(heading("LOOK"));
+    ui.horizontal(|ui| {
+        ui.label(dim("cloud body"));
+        ui.add(
+            egui::Slider::new(&mut look.cloud_veil, 0.0..=1.0)
+                .fixed_decimals(2)
+                .show_value(true),
+        )
+        .on_hover_text(
+            "How much of the city a cloud may hide. 0 draws contour and hatch over an \
+             untouched map; 1 gives each thread a core dense enough to read from across \
+             the room, and the buildings under it are gone.",
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(dim("rail points at cloud"));
+        for mode in [Connectors::Off, Connectors::Asked, Connectors::Always] {
+            if ui
+                .selectable_label(look.connectors == mode, mode.label())
+                .on_hover_text(match mode {
+                    Connectors::Off => "No line. A cloud is matched to its agent by hue alone.",
+                    Connectors::Asked => {
+                        "One line, to the cloud of the agent you are pointing at, have \
+                         selected, or are following."
+                    }
+                    Connectors::Always => "A line from every card to its own cloud, all the time.",
+                })
+                .clicked()
+            {
+                look.connectors = mode;
+            }
+        }
+    });
+}
+
+/// The selected thread, in full: the detail a three-line card had to truncate.
+/// The model-written phrase, in full, with how old it is.
+///
+/// # Why it is longer here than on the map
+///
+/// The caption beside a cloud is cut to `intent::PHRASE_CHARS` and carries its
+/// age only as a dimming — which is the right trade at map scale, where the
+/// question is *"which of these four agents do I care about"* and a second line
+/// per cloud is four more lines of type over the city.
+///
+/// This panel is where the operator has already chosen a thread and is asking
+/// about it, so the phrase gets its age in words and its staleness in a
+/// sentence. ADR-0089 §5 requires staleness to be *visible*, and a dimmed line
+/// on a map says "old" without ever saying *how* old.
+///
+/// # It also says when there is nothing, and why
+///
+/// An operator who passed `--captions` and sees no phrase has exactly one
+/// question, and every way it can happen — no key, a dead endpoint, a 429, a
+/// model that declined — is a line in [`crate::intent::Captions::last_error`].
+/// Printing it here is the difference between a feature that failed and a
+/// feature that appears not to exist.
+fn what_it_is_doing(
+    ui: &mut egui::Ui,
+    thread: &Thread,
+    captions: &crate::intent::Captions,
+    now: std::time::Instant,
+) {
+    let Some(caption) = captions.get(&thread.id) else {
+        if captions.is_on() {
+            ui.label(dim(captions.last_error().map_or_else(
+                || "no phrase for this agent yet".to_owned(),
+                |why| format!("no phrase — {why}"),
+            )));
+        }
+        return;
+    };
+    let notes =
+        polis_repo::llm::cache::Sketch::build(thread.intents.iter().map(|i| i.text.as_str()));
+    ui.label(
+        RichText::new(&caption.text)
+            .color(palette::selection().color())
+            .italics(),
+    );
+    let age = crate::format::duration(caption.age(now));
+    ui.label(dim(if caption.is_stale(&notes) {
+        format!("written {age} ago, from notes this agent has since moved past")
+    } else {
+        format!(
+            "written {age} ago, from the agent's own notes on {} of its calls",
+            thread.intents.len()
+        )
+    }));
+    ui.add_space(4.0);
+}
+
+fn selected_thread_reading(
+    ui: &mut egui::Ui,
+    snapshot: &WorldSnapshot,
+    thread: &Thread,
+    captions: &crate::intent::Captions,
+) {
+    ui.horizontal(|ui| {
+        swatch(ui, thread.tint);
+        ui.label(
+            RichText::new(status_word(thread.status).trim())
+                .monospace()
+                .color(palette::status(thread.status).color()),
+        );
+        ui.label(
+            RichText::new(crate::mapview::thread_label(thread))
+                .color(palette::selection().color())
+                .strong(),
+        );
+    });
+    what_it_is_doing(ui, thread, captions, snapshot.at);
+    place_of(ui, thread);
+    // PRD §12: thrashing — "the same building revisited six times". It has no
+    // room on a card and it is exactly the kind of thing this panel is for.
+    if let Some((path, count)) = thread.most_revisited() {
+        if count >= 3 {
+            ui.label(
+                RichText::new(format!("revisited {count}× {}", short_path(path)))
+                    .small()
+                    .color(palette::needs_decision().color()),
+            );
+        }
+    }
+    ui.add_space(4.0);
+    for reading in crate::explain::thread_reading(thread, snapshot.at) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(reading.mark)
+                    .small()
+                    .monospace()
+                    .color(palette::hover().color()),
+            );
+            ui.label(
+                RichText::new(reading.says)
+                    .small()
+                    .color(palette::selection().color()),
+            );
+        });
+        ui.label(dim(reading.because).line_height(Some(15.0)));
+        ui.add_space(6.0);
+    }
+}
+
 /// The key sheet, under the map explanation it exists to be found from.
 pub fn help(ui: &mut egui::Ui) {
     what_you_are_looking_at(ui);
@@ -1566,6 +1939,10 @@ pub fn help(ui: &mut egui::Ui) {
         ("[ ]", "slower / faster"),
         ("n", "next interesting moment"),
         ("home / end", "start / end of the recording"),
+        (
+            "o",
+            "switch to another repository — every one with agents working in it",
+        ),
         ("p", "back to the session picker"),
         ("h or ?", "this sheet"),
         ("esc", "clear the selection"),
@@ -1579,8 +1956,38 @@ pub fn help(ui: &mut egui::Ui) {
             ui.label(dim(what));
         });
     }
+    terminals(ui);
     ui.separator();
     notation(ui);
+}
+
+/// The terminal dock's own keys, and what a pane is.
+///
+/// Read from [`crate::panes::RESERVED`] rather than retyped, which is the whole
+/// reason that table is data: a chord that works and a chord the sheet claims
+/// cannot drift apart.
+fn terminals(ui: &mut egui::Ui) {
+    ui.separator();
+    ui.label(heading("TERMINALS"));
+    ui.label(dim(
+        "Ctrl+Alt+T starts a Claude Code session in a pane beside the map. \
+         Its agent runs in polis-sessiond, not in this window — closing the \
+         window leaves it working, and opening one again puts the same \
+         screen back. Clicking its tab lights its cloud on the map; \
+         picking it on the map — its rail row, or `a` — brings the tab to \
+         the front.",
+    ));
+    ui.add_space(2.0);
+    for (chord, what) in crate::panes::RESERVED {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{chord:>16}"))
+                    .monospace()
+                    .color(palette::hover().color()),
+            );
+            ui.label(dim(*what));
+        });
+    }
 }
 
 /// The first-run overlay: what the map is, over the map itself.
@@ -1654,7 +2061,13 @@ pub fn explainer(ctx: &egui::Context) -> bool {
         })
 }
 
-fn status_word(status: ThreadStatus) -> &'static str {
+/// The state word, padded to one column width.
+///
+/// `pub(crate)` because `crate::mapview`'s cloud captions say the same word
+/// about the same thread, and a map and a rail that disagree about whether a
+/// thread is parked or idle is the disagreement this vocabulary exists to
+/// prevent.
+pub(crate) fn status_word(status: ThreadStatus) -> &'static str {
     match status {
         ThreadStatus::Waiting => "WAITING    ",
         // Upper case is a budget, and only `blocks_operator` states may spend
@@ -1712,7 +2125,7 @@ fn trim(speed: f32) -> String {
 /// "how long" separates a thread that just asked from one that has been ignored.
 /// A parked thread names the job holding it, because "1 shell still running" is
 /// the fact the operator was reading off their own terminal footer.
-fn why_of(snapshot: &WorldSnapshot, thread: &Thread) -> Option<String> {
+pub(crate) fn why_of(snapshot: &WorldSnapshot, thread: &Thread) -> Option<String> {
     match thread.status {
         ThreadStatus::Waiting => {
             let mark = snapshot
@@ -1828,6 +2241,352 @@ mod tests {
         // And `h` reaches the same words from the sheet, forever after.
         let mut full = ctx.run_ui(raw_input(&[]), help);
         full.textures_delta.clear();
+    }
+
+    /// The sheet is the only place the dock's chords are written down, and
+    /// `RESERVED` is data precisely so the two cannot drift. Asserted against
+    /// text that reached the tessellator, not against the table it came from —
+    /// a section that compiles and never draws would pass the weaker test.
+    #[test]
+    fn the_help_sheet_lists_every_terminal_chord() {
+        let ctx = egui::Context::default();
+        let mut full = ctx.run_ui(raw_input(&[]), help);
+        let text: String = laid_out(&full)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        full.textures_delta.clear();
+
+        for (chord, what) in crate::panes::RESERVED {
+            assert!(
+                text.contains(chord),
+                "the sheet never mentions {chord} ({what})"
+            );
+        }
+        assert!(
+            text.contains("TERMINALS"),
+            "the terminal section did not draw"
+        );
+    }
+
+    /// Every string the frame actually laid out, with where it landed.
+    ///
+    /// The panel's failure mode is not a wrong sentence, it is a fold that
+    /// compiles and never opens — so the assertion has to be about text that
+    /// reached the tessellator, not about the `Vec<Reading>` behind it, which
+    /// `crate::explain`'s own tests already cover.
+    fn laid_out(full: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text.pos)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &full.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// A rail with one thread in it, which is the shape both rail tests need.
+    fn one_thread(name: &str) -> WorldSnapshot {
+        let mut snapshot =
+            WorldSnapshot::empty(std::sync::Arc::new(polis_layout::CityLayout::default()));
+        let session = polis_events::SessionId::new(name);
+        let mut thread = Thread::new(ThreadId::of_session(session.clone()), session, snapshot.at);
+        // The rail skips a thread that has done nothing, and rightly.
+        thread.tool_calls = 1;
+        snapshot.threads.push(thread);
+        snapshot
+    }
+
+    /// One rail pass, and the strings it laid out.
+    fn rail_frame(
+        ctx: &egui::Context,
+        snapshot: &WorldSnapshot,
+        state: &mut ViewState,
+        input: egui::RawInput,
+    ) -> Vec<(String, egui::Pos2)> {
+        let mut full = ctx.run_ui(input, |ui| {
+            status_rail(ui, snapshot, state, &crate::intent::Captions::off());
+        });
+        let texts = laid_out(&full);
+        // `epaint` panics if a texture delta is dropped unapplied.
+        full.textures_delta.clear();
+        texts
+    }
+
+    /// A press and a release on one point, which is what egui counts as a click.
+    fn click_at(at: egui::Pos2) -> egui::RawInput {
+        let mut input = raw_input(&[]);
+        input.events.push(egui::Event::PointerMoved(at));
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        input
+    }
+
+    /// The operator's report was *"this is all a bit cryptic"* about four marks
+    /// at once. That answer used to be a fold on **every** card; it is one
+    /// legend now (ADR-0108), so what has to hold is that the legend reads the
+    /// *selected* thread. A legend that explained the notation but not the agent
+    /// in front of the operator would be the fold's content with its point
+    /// removed, and the cryptic marks would be back.
+    #[test]
+    fn the_legend_reads_the_selected_thread() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let snapshot = one_thread("explained");
+        let id = snapshot.threads[0].id.clone();
+        let mut look = crate::config::Look::default();
+        let mut open = true;
+
+        // A window is an `Area`, and an area has no size until it has been laid
+        // out once — so the first pass places it and the second is the one with
+        // text in it. Reading the first would be asserting egui's bootstrap.
+        let mut frame = |selected: Option<&ThreadId>| {
+            let mut texts = Vec::new();
+            for _ in 0..2 {
+                let mut full = ctx.run_ui(raw_input(&[]), |ui| {
+                    legend(
+                        ui.ctx(),
+                        &mut open,
+                        &snapshot,
+                        selected,
+                        &crate::intent::Captions::off(),
+                        &mut look,
+                        "adapter",
+                    );
+                });
+                texts = laid_out(&full);
+                full.textures_delta.clear();
+            }
+            texts
+        };
+
+        // Nothing selected: it still explains the map, and says what it is
+        // waiting for rather than showing an empty panel.
+        let idle = frame(None);
+        assert!(
+            idle.iter()
+                .any(|(text, _)| text.contains("select an agent")),
+            "with nothing selected the legend said nothing about what it wants: {:?}",
+            idle.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+
+        // Selected: the readings a three-line card has no room for.
+        let read = frame(Some(&id));
+        for mark in ["the cloud", "the ring in the middle", "the arrow"] {
+            assert!(
+                read.iter().any(|(text, _)| text == mark),
+                "{mark:?} is not in the legend: {:?}",
+                read.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The map cuts the phrase to fit beside a cloud and says its age only by
+    /// dimming. This panel is where the operator has already picked a thread, so
+    /// the phrase is whole and its age is in words — and ADR-0089 §5 requires
+    /// staleness to be visible, which a dimmed line on a map never quite is.
+    #[test]
+    fn the_legend_says_what_the_selected_agent_is_doing_and_how_old_that_is() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut snapshot = one_thread("doing");
+        let id = snapshot.threads[0].id.clone();
+        let notes = ["Rewrite the token refresh", "Run the auth tests"];
+        for note in notes {
+            snapshot.threads[0].intents.push_back(polis_world::Intent {
+                tool: polis_events::ToolKind::Bash,
+                text: note.to_owned(),
+                at: snapshot.at,
+            });
+        }
+        let mut look = crate::config::Look::default();
+        let mut open = true;
+
+        let mut frame = |captions: &crate::intent::Captions| {
+            let mut texts = Vec::new();
+            for _ in 0..2 {
+                let mut full = ctx.run_ui(raw_input(&[]), |ui| {
+                    legend(
+                        ui.ctx(),
+                        &mut open,
+                        &snapshot,
+                        Some(&id),
+                        captions,
+                        &mut look,
+                        "adapter",
+                    );
+                });
+                texts = laid_out(&full);
+                full.textures_delta.clear();
+            }
+            texts
+        };
+
+        // A phrase written from the notes this thread still has: whole, with an
+        // age, and saying where the words came from.
+        let fresh = frame(&crate::intent::Captions::seeded(
+            id.clone(),
+            "rewriting the token refresh",
+            &notes,
+        ));
+        let words = |texts: &[(String, egui::Pos2)]| {
+            texts.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>()
+        };
+        assert!(
+            fresh
+                .iter()
+                .any(|(t, _)| t == "rewriting the token refresh"),
+            "the phrase is not in the legend: {:?}",
+            words(&fresh)
+        );
+        assert!(
+            fresh
+                .iter()
+                .any(|(t, _)| t.contains("written") && t.contains("own notes")),
+            "the phrase has no age and no provenance: {:?}",
+            words(&fresh)
+        );
+
+        // A phrase written from notes the thread has since moved past is still
+        // shown — blanking it would trade a line the operator can see is old for
+        // no line at all — and it says so.
+        let stale = frame(&crate::intent::Captions::seeded(
+            id.clone(),
+            "rewriting the token refresh",
+            &["something", "else", "entirely", "and", "more"],
+        ));
+        assert!(
+            stale
+                .iter()
+                .any(|(t, _)| t == "rewriting the token refresh"),
+            "a stale phrase was blanked: {:?}",
+            words(&stale)
+        );
+        assert!(
+            stale.iter().any(|(t, _)| t.contains("moved past")),
+            "a stale phrase did not say it was stale: {:?}",
+            words(&stale)
+        );
+
+        // Off: the panel says nothing about captions at all, rather than
+        // explaining a feature the operator did not ask for.
+        let off = frame(&crate::intent::Captions::off());
+        assert!(
+            !off.iter().any(|(t, _)| t.contains("written")),
+            "the panel talked about a feature that is off: {:?}",
+            words(&off)
+        );
+    }
+
+    /// The card is a fixed three lines whatever the thread has to say, because
+    /// a list of nine different heights cannot be scanned — and scanning is what
+    /// the column is for. Asserted on the geometry rather than on the text: a
+    /// card that wrapped instead of truncating would still contain every word.
+    #[test]
+    fn a_card_is_the_same_height_however_much_the_thread_has_to_say() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+
+        let height = |title: Option<&str>| {
+            let mut snapshot = one_thread("sized");
+            snapshot.threads[0].title = title.map(str::to_owned);
+            let mut state = ViewState::default();
+            let texts = rail_frame(&ctx, &snapshot, &mut state, raw_input(&[]));
+            // The two lines the card always draws: the state word, and the line
+            // under it. Their spacing is the card's line height, and the card is
+            // `CARD_LINES` of them plus padding.
+            let top = texts
+                .iter()
+                .find(|(t, _)| t == "working")
+                .map(|(_, p)| p.y)
+                .expect("the state word never drew");
+            let bottom = texts.iter().map(|(_, p)| p.y).fold(top, f32::max);
+            bottom - top
+        };
+
+        let short = height(None);
+        let long = height(Some(
+            "a title long enough that it would wrap onto a second and probably \
+             a third line if the card let it",
+        ));
+        assert!(
+            (short - long).abs() < 1.0,
+            "a long title changed the card's height: {short} vs {long}"
+        );
+    }
+
+    /// > after clicking a thread the lines show and they never hide until i
+    /// > click another thread, i want to click again to hide the lines
+    ///
+    /// What a click asks for is gated on [`ViewState::interrogates`], and the
+    /// row's click used to re-assert the selection every time — so the only way
+    /// out of a thread's marks was to put them onto a different thread. Both
+    /// verbs now go away together, and this asserts the second click rather
+    /// than the first, because the first one was never the broken half.
+    ///
+    /// The lines the operator was complaining about here are gone entirely —
+    /// asking about a thread brightens its cloud instead
+    /// (`crate::clouds::LIT_GAIN`) — but the toggle is the same one, and a
+    /// highlight that cannot be put away is a highlight the operator stops
+    /// trusting.
+    #[test]
+    fn a_second_click_on_the_same_row_puts_the_lines_away() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+
+        let snapshot = one_thread("toggled");
+        let id = snapshot.threads[0].id.clone();
+        let mut state = ViewState::default();
+
+        let first = rail_frame(&ctx, &snapshot, &mut state, raw_input(&[]));
+        let row = first
+            .iter()
+            .find(|(text, _)| text.starts_with("thread "))
+            .map(|(_, pos)| *pos)
+            .expect("the row never drew its own name");
+        assert!(
+            !state.interrogates(&id),
+            "nothing has been asked about yet, so nothing is drawn for it"
+        );
+
+        let at = row + egui::Vec2::new(4.0, 4.0);
+        rail_frame(&ctx, &snapshot, &mut state, click_at(at));
+        assert_eq!(
+            state.selected_thread.as_ref(),
+            Some(&id),
+            "the first click asks about this thread"
+        );
+        assert_eq!(state.follow.as_ref(), Some(&id), "and binds the camera");
+
+        rail_frame(&ctx, &snapshot, &mut state, click_at(at));
+        assert_eq!(
+            state.selected_thread, None,
+            "the second click has to put the highlight away"
+        );
+        assert_eq!(state.follow, None, "and give the camera back");
+        assert!(
+            !state.interrogates(&id),
+            "which is the whole point: the thread stops being the asked-about one"
+        );
     }
 
     #[test]

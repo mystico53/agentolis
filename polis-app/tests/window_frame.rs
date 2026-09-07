@@ -224,6 +224,9 @@ fn frame(
             snapshot,
             state,
             12,
+            // The shipped look, so a frame test measures the notation the
+            // operator gets rather than one tuned for the test.
+            polis_app::config::Look::default(),
             1.0 / 60.0,
         ));
     });
@@ -601,5 +604,244 @@ fn rain_falls_while_calls_are_arriving_and_stops_when_they_are_not() {
     assert!(
         wet.animating,
         "rain is on screen but the frame did not ask for another, so it will freeze mid-ripple"
+    );
+}
+
+/// Every string this pass actually painted, in order.
+///
+/// The point of reading the shapes rather than the return value: a caption that
+/// is laid out, measured, decluttered and then not drawn leaves every counter
+/// in `MapFrame` looking correct. The only proof is the type on the canvas.
+fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+/// The rail points at the cloud, and nothing on the map is captioned.
+///
+/// > didnt we code somewhere that the clouds should show somehow what is going
+/// > on? like at least what the claude session provides, minutes active, etc.?
+///
+/// It did, for a while, as a caption on a leader beside every cloud. The answer
+/// to that question is now the **rail** — every line of the caption was already
+/// there, in a column with room for it — and the map's share of it is the line
+/// joining the two (ADR-0107). So what this pins is the line: it starts at the
+/// thread's own rail card, it ends on that thread's own cloud, and it is drawn
+/// in that thread's hue.
+///
+/// The card rectangle is published by `ui::status_rail`; here it is written
+/// straight onto the `ViewState`, because what is under test is the map's half.
+#[test]
+fn the_rail_card_is_joined_to_its_own_cloud() {
+    use polis_app::config::{Connectors, Look};
+
+    let city = city();
+    let ctx = egui::Context::default();
+    let layout = Arc::new(city.layout.clone());
+    let base = BaseMap::render(&ctx, &city, &layout, false);
+    let snapshot = populated(&city);
+
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+    let mut camera = Camera::fit(base.edge(), base.geometry.median_building_px, viewport);
+    let mut clouds = Clouds::default();
+    let mut state = ViewState::default();
+
+    // Where the rail would have drawn `alpha`'s card: a column down the left,
+    // which is the shipped layout.
+    let card = Rect::from_min_size(Pos2::new(0.0, 120.0), Vec2::new(240.0, 60.0));
+    let panel = Rect::from_min_size(Pos2::ZERO, Vec2::new(240.0, 900.0));
+    let alpha = snapshot.threads[0].id.clone();
+    // The connector is the thread's own hue, at the two weights the setting
+    // draws it in: dim for an ambient line, bright for the one being asked
+    // about. Matched exactly, because "a line somewhere in that colour" is what
+    // the operator is actually looking for on the map.
+    let ink = polis_app::palette::thread(snapshot.threads[0].tint);
+    let hues = [
+        ink.alpha(mapview::CONNECTOR_AMBIENT.1),
+        ink.alpha(mapview::CONNECTOR_ASKED.1),
+    ];
+
+    // A plain function rather than a closure: the closure would hold `camera`
+    // and `clouds` borrowed for as long as it lived, and this test reads both
+    // between two runs of it.
+    #[allow(clippy::items_after_statements, clippy::too_many_arguments)]
+    fn run(
+        ctx: &egui::Context,
+        base: &BaseMap,
+        camera: &mut Camera,
+        clouds: &mut Clouds,
+        snapshot: &WorldSnapshot,
+        state: &mut ViewState,
+        viewport: Rect,
+        card: Rect,
+        panel: Rect,
+        alpha: &polis_events::ThreadId,
+        hues: &[egui::Color32],
+        look: Look,
+    ) -> Vec<egui::Shape> {
+        let mut lines = Vec::new();
+        // Two passes: the first builds the cloud field, and the tween needs a
+        // step before `Clouds::marks` describes anything. The window gets that
+        // for free because it repaints while a cloud is arriving.
+        for _ in 0..2 {
+            let mut full = ctx.run_ui(raw_input(viewport.size()), |ui| {
+                let rect = ui.max_rect();
+                camera.set_viewport(rect);
+                state.rail_card(alpha, card, panel);
+                mapview::draw(
+                    ui,
+                    rect,
+                    base,
+                    camera,
+                    clouds,
+                    snapshot,
+                    state,
+                    12,
+                    look,
+                    1.0 / 60.0,
+                );
+            });
+            lines = full
+                .shapes
+                .iter()
+                .map(|s| s.shape.clone())
+                .filter(|s| {
+                    matches!(s, egui::Shape::LineSegment { stroke, .. }
+                        if hues.contains(&stroke.color))
+                })
+                .collect();
+            full.textures_delta.clear();
+        }
+        lines
+    }
+
+    let drawn = run(
+        &ctx,
+        &base,
+        &mut camera,
+        &mut clouds,
+        &snapshot,
+        &mut state,
+        viewport,
+        card,
+        panel,
+        &alpha,
+        &hues,
+        Look {
+            connectors: Connectors::Always,
+            ..Look::default()
+        },
+    );
+    assert!(
+        !clouds.marks().is_empty(),
+        "the cloud layer named no thread, so nothing could be joined"
+    );
+    // One straight segment per connector since ADR-0108. It was three — a run,
+    // a knee and an arrival — and the elbow was dropped because with the rail
+    // against the map the detour was most of the line, and several of them
+    // folded into a comb of parallel horizontals that said nothing about which
+    // card went to which cloud.
+    assert!(
+        !drawn.is_empty(),
+        "the connector drew no segment in the thread's own hue"
+    );
+    // It leaves the card, not the map's edge: a leader that starts at the
+    // viewport boundary points at nothing, which is the whole reason this is
+    // painted above the panels rather than inside the map.
+    let leaves_the_card = drawn.iter().any(|s| match s {
+        egui::Shape::LineSegment { points, .. } => {
+            (points[0].x - card.right()).abs() < 1.0 && card.y_range().contains(points[0].y)
+        }
+        _ => false,
+    });
+    assert!(leaves_the_card, "no segment starts at the rail card");
+    // Straight: the segment that starts on the card is the same one that lands
+    // on the cloud. With the elbow this was three segments and only the middle
+    // one knew both ends; now a single stroke has to span the whole distance,
+    // which is what makes the angle mean something.
+    let straight_through = drawn.iter().any(|s| match s {
+        egui::Shape::LineSegment { points, .. } => {
+            (points[0].x - card.right()).abs() < 1.0 && points[1].x > card.right() + 1.0
+        }
+        _ => false,
+    });
+    assert!(
+        straight_through,
+        "the connector still bends: no single segment runs from the card onto the map"
+    );
+    // And it arrives on the cloud, at the silhouette's own height.
+    let mark = clouds
+        .marks()
+        .iter()
+        .find(|m| m.thread == alpha)
+        .expect("alpha has a cloud");
+    let landing = camera.to_screen(mark.at).y;
+    let arrives = drawn.iter().any(|s| match s {
+        egui::Shape::LineSegment { points, .. } => (points[1].y - landing).abs() < 2.0,
+        _ => false,
+    });
+    assert!(arrives, "no segment lands at the cloud's own height");
+
+    // Off means off. The setting is the operator's, and the quiet end of it has
+    // to actually be quiet.
+    let none = run(
+        &ctx,
+        &base,
+        &mut camera,
+        &mut clouds,
+        &snapshot,
+        &mut state,
+        viewport,
+        card,
+        panel,
+        &alpha,
+        &hues,
+        Look {
+            connectors: Connectors::Off,
+            ..Look::default()
+        },
+    );
+    assert!(
+        none.is_empty(),
+        "the map drew {} connectors with them turned off",
+        none.len()
+    );
+
+    // And no caption came back with them: the naming lives in the rail now.
+    let mut full = ctx.run_ui(raw_input(viewport.size()), |ui| {
+        let rect = ui.max_rect();
+        camera.set_viewport(rect);
+        mapview::draw(
+            ui,
+            rect,
+            &base,
+            &mut camera,
+            &mut clouds,
+            &snapshot,
+            &mut state,
+            12,
+            Look::default(),
+            1.0 / 60.0,
+        );
+    });
+    let painted = painted_text(&full.shapes);
+    full.textures_delta.clear();
+    assert!(
+        !painted.iter().any(|t| t.starts_with("working · ")),
+        "a cloud caption survived on the map. Painted: {painted:?}"
     );
 }

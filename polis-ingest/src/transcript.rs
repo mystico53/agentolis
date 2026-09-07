@@ -127,6 +127,15 @@ const PROJECT_KEY_LIMIT: usize = 200;
 /// number in a sentence rather than a contract.
 pub const CWD_PROBE_BYTES: u64 = 256 * 1024;
 
+/// Bytes of a transcript read when probing it for [`SessionHead`].
+///
+/// The `bridge-session` record is written near the top of the file: across the
+/// 225 transcripts on this machine that carry one, the first sits at byte 313
+/// at the median and 392 at every file but one, the exception being 17 458. A
+/// 64 KiB head covers that outlier four times over and is read **once** per
+/// session, only for sessions the liveness gate already wants to follow.
+pub const HEAD_PROBE_BYTES: u64 = 64 * 1024;
+
 /// Deepest directory nesting [`session_files`] will walk under `subagents/`.
 ///
 /// The observed maximum is 2 (`workflows/wf_<runId>`); the cap exists so a
@@ -1273,6 +1282,82 @@ pub fn project_dir_cwd(project_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// What the head of a main transcript says about the session's *identity* —
+/// which `claude` process it belongs to, and when it began.
+///
+/// Both answers come out of one bounded read because they are wanted together:
+/// [`crate::live::LiveTailer`] uses them to tell a session that was replaced by
+/// `/clear` from one that is merely quiet (ADR-0105).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionHead {
+    /// `bridge-session.bridgeSessionId`.
+    ///
+    /// A property of the CLI process, not of the conversation: it survives
+    /// `/clear`, which is what makes it the link between a dead session and the
+    /// one that replaced it. Never changes within a file (0 of 225 on this
+    /// machine). `None` for a session that carries no such record — 37 of 262
+    /// files here — and for a file whose first bytes have not landed yet.
+    pub bridge: Option<String>,
+    /// The first record timestamp in the file, which orders two sessions of one
+    /// process. Display-quality, not ordering-quality, *within* a session
+    /// (ADR-0014) — but the question here is which of two files began first,
+    /// and their opening records are minutes apart, not milliseconds.
+    pub first_record: Option<WallTime>,
+}
+
+impl SessionHead {
+    /// True when both answers were found, so the probe need never be repeated.
+    ///
+    /// A transcript is created empty and its identity records land inside the
+    /// first second, so a probe that caught that instant learnt nothing and must
+    /// not be cached as an answer. The two fields also arrive in the *wrong*
+    /// order for a single-field test: `bridge-session` is written before the
+    /// first record that carries a timestamp.
+    pub fn is_complete(&self) -> bool {
+        self.bridge.is_some() && self.first_record.is_some()
+    }
+}
+
+/// Reads [`SessionHead`] out of the front of one main transcript.
+///
+/// At most [`HEAD_PROBE_BYTES`], and it stops at the first `bridge-session`
+/// record rather than parsing the whole head. Unreadable, missing or empty file
+/// is an empty `SessionHead`, never an error: a session being born is not a
+/// fault.
+pub fn session_head(transcript: &Path) -> SessionHead {
+    let mut head = SessionHead::default();
+    let Ok(bytes) = read_head(transcript, HEAD_PROBE_BYTES) else {
+        return head;
+    };
+    for (_, line) in lines_with_offsets(&bytes) {
+        let text = String::from_utf8_lossy(line);
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        if head.first_record.is_none() {
+            head.first_record = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp);
+        }
+        if head.bridge.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("bridge-session")
+        {
+            head.bridge = value
+                .get("bridgeSessionId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+        // The `bridge-session` record carries no timestamp of its own and is
+        // written *before* the first record that does, so neither answer may
+        // end the scan on its own.
+        if head.bridge.is_some() && head.first_record.is_some() {
+            break;
+        }
+    }
+    head
 }
 
 /// Finds the directory a working directory's sessions live in.

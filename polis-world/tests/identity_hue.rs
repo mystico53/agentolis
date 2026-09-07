@@ -29,6 +29,17 @@
 //! Claim 2 needs a real schedule and a real driver, which is why this is an
 //! integration test and not an inline one.
 //!
+//! # The layer is the same claim, one field over
+//!
+//! [`polis_world::Thread::layer`] is the id the renderer groups cloud kernels
+//! by, the id `polis_render::live::CloudTween` matches its two sides on, and the
+//! index the tint table above is looked up in. It is assigned in the same breath
+//! as the tint, for the same reason and with the same never-released rule — so
+//! the tests for it live here, beside the ones whose argument they borrow. What
+//! it does **not** share is the twelve-slot ceiling: two threads may end up the
+//! same colour, and must never end up on the same layer, because two territories
+//! on one layer are summed and PRD §6.4's crowd signal goes quiet.
+//!
 //! Every test here was checked against four sabotages of the ring — recycling a
 //! released slot, forgetting whose a slot was, skipping the reset in
 //! `World::reset`, and not assigning at all — and each sabotage fails at least
@@ -428,4 +439,103 @@ fn past_twelve_live_threads_colour_degrades_to_the_preference() {
         "past the ring, the fallback is the bare preference and nothing else"
     );
     assert_eq!(w.health.identity_hues_exhausted, 1);
+}
+
+// ---------------------------------------------------------------------------
+// The cloud layer — `Thread::layer`
+// ---------------------------------------------------------------------------
+
+/// Past twelve threads the colour repeats and the layer must not.
+///
+/// This is the one place the two ids come apart, and it is why the renderer
+/// cannot simply group by the tint: `past_twelve_live_threads_colour_degrades_to
+/// _the_preference` asserts that the thirteenth thread shares a hue with a live
+/// one, and a thirteenth thread sharing a *layer* would have its territory
+/// summed into that thread's — one cloud where there are two, and no crowd
+/// signal on the ground they share.
+#[test]
+fn two_threads_never_share_a_layer_even_past_twelve() {
+    let at = Instant::now();
+    let mut w = world();
+    for n in 1..=13 {
+        w.apply(&session_start(&session_name(n), at));
+    }
+    let layers: Vec<u16> = (1..=13)
+        .map(|n| w.thread(&thread(&session_name(n))).expect("thread").layer)
+        .collect();
+    let mut sorted = layers.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        13,
+        "two threads on one layer: their territories will be summed as one — {layers:?}"
+    );
+    assert!(
+        w.health.identity_hues_exhausted > 0,
+        "this test is only about the case where the hue has already run out"
+    );
+}
+
+/// A thread keeps its layer across a retirement, which is what keeps the two
+/// renderers in step.
+///
+/// The argument is `HueRing`'s in full: retirement is tick-driven, the window
+/// and `run_to_end` tick differently, so a thread is created twice in one and
+/// once in the other. A monotonic counter would hand the rebuilt thread a second
+/// layer in the window only — and the layer is what the tween matches on, so the
+/// window would ease the returning cloud out of nothing while the recorded frame
+/// carried it straight through.
+#[test]
+fn a_session_that_comes_back_keeps_its_layer() {
+    let at = Instant::now();
+    let mut w = world();
+    w.apply(&session_start("a", at));
+    w.apply(&session_start("polis", at + Duration::from_secs(1)));
+    let a = w.thread(&thread("a")).expect("a").layer;
+    let p = w.thread(&thread("polis")).expect("polis").layer;
+    assert_ne!(a, p, "two live threads on one layer");
+
+    w.dismiss_thread(&thread("a"));
+    assert_eq!(
+        w.thread(&thread("polis")).expect("polis").layer,
+        p,
+        "an unrelated thread ending moved a live one to another layer"
+    );
+
+    w.apply(&session_start("a", at + Duration::from_secs(3)));
+    assert_eq!(
+        w.thread(&thread("a")).expect("a returns").layer,
+        a,
+        "a session that came back was put on a different layer"
+    );
+}
+
+/// A reset world hands out layers as a fresh one does.
+///
+/// Same argument as the hue's reset test, and the same failure if it is skipped:
+/// the table would keep growing across a backwards seek, so the ids a replay
+/// hands the renderer would depend on how many times it had been scrubbed.
+#[test]
+fn a_reset_world_hands_out_layers_as_a_fresh_one_does() {
+    let at = Instant::now();
+    let mut w = world();
+    for n in 1..=12 {
+        w.apply(&session_start(&session_name(n), at));
+    }
+    let before: Vec<u16> = (1..=12)
+        .map(|n| w.thread(&thread(&session_name(n))).expect("thread").layer)
+        .collect();
+
+    w.reset(at);
+    for n in 1..=12 {
+        w.apply(&session_start(&session_name(n), at));
+    }
+    let after: Vec<u16> = (1..=12)
+        .map(|n| w.thread(&thread(&session_name(n))).expect("thread").layer)
+        .collect();
+    assert_eq!(
+        before, after,
+        "a reset world carried the previous city's layer table"
+    );
 }

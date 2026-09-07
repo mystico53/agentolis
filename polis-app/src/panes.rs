@@ -111,6 +111,29 @@ struct Tab {
     pending: Option<((u16, u16), Instant)>,
     /// Set by a bell or an exit; cleared when the tab is focused.
     attention: bool,
+    /// What the *map* knows about this pane's agent, refreshed every frame by
+    /// [`Dock::observe`] from the world snapshot.
+    ///
+    /// `None` means the correlation has not landed yet — the agent has started
+    /// but no channel has carried its session id onto the bus. That is a
+    /// legitimate state for the first second or two of a pane's life, and it is
+    /// drawn as an absence rather than as a claim.
+    seen: Option<Seen>,
+}
+
+/// One pane's agent, as the city sees it.
+///
+/// The whole of the map-to-dock direction: a tab that can say where its agent
+/// is working and whether it is waiting on a human is a tab the operator can
+/// read without looking at the map at all.
+#[derive(Debug, Clone, Default)]
+struct Seen {
+    /// PRD §6.2's claim, or §6.4's heaviest lobe — whatever the rail would say.
+    place: Option<String>,
+    /// Working / Waiting / Done / …, derived by `polis-world`, never authored.
+    status: Option<polis_world::ThreadStatus>,
+    /// An attention mark points at this agent and it is the amber one.
+    needs_decision: bool,
 }
 
 /// The terminal dock.
@@ -135,6 +158,16 @@ pub struct Dock {
     pub status: String,
     /// How many panes have been opened, for session-id ordinals.
     opened: u32,
+    /// Which agent the pane is currently pointed at, from the agent list.
+    ///
+    /// Kept so the empty state can tell the two silences apart: nothing
+    /// selected, and an agent selected that is not running in this dock.
+    showing: Option<polis_events::ThreadId>,
+    /// The pane the operator moved to this frame, taken by [`Dock::take_reveal`].
+    ///
+    /// Recorded rather than acted on, because the map is drawn after the dock
+    /// and the selection it publishes belongs to the frame it was clicked in.
+    revealed: Option<PaneId>,
 }
 
 impl std::fmt::Debug for Dock {
@@ -176,6 +209,8 @@ impl Dock {
             collapsed: false,
             status: String::new(),
             opened: 0,
+            showing: None,
+            revealed: None,
         };
         let Some(dir) = state_dir.or_else(transport::default_state_dir) else {
             "no state directory, so no session daemon".clone_into(&mut dock.status);
@@ -196,9 +231,16 @@ impl Dock {
         dock
     }
 
-    /// Installs the terminal font family. Call from the window's `theme`.
-    pub fn install_fonts(&mut self, ctx: &egui::Context) {
-        self.fonts = font::install(ctx);
+    /// Takes the terminal font family the window bound at start-up.
+    ///
+    /// The dock does **not** install it. `Context::set_fonts` takes effect on
+    /// the *next* frame, and a dock created part-way through a frame draws its
+    /// pane later in that same one — so installing here panicked epaint with
+    /// `FontFamily::Name("polis-term") is not bound to any fonts` the moment
+    /// the dock stopped being built before the first frame. See
+    /// [`crate::app::PolisApp::new`], which binds it unconditionally.
+    pub fn use_fonts(&mut self, installed: font::Installed) {
+        self.fonts = installed;
     }
 
     /// The `polis doctor` line about glyph coverage.
@@ -241,10 +283,14 @@ impl Dock {
                 sent,
                 pending: None,
                 attention: false,
+                seen: None,
             },
         );
         self.order.push(pane);
-        self.active.get_or_insert(pane);
+        if self.active.is_none() {
+            self.active = Some(pane);
+            self.revealed = Some(pane);
+        }
     }
 
     /// True when there is a daemon to talk to.
@@ -283,6 +329,139 @@ impl Dock {
                 .and_then(|tab| tab.state.info.lock().ok())
                 .is_some_and(|info| info.session_id.as_ref() == Some(session))
         })
+    }
+
+    /// Points the pane at whichever agent the list has selected.
+    ///
+    /// The dock used to answer *which agent am I looking at* with its own tab
+    /// strip. It now answers it with the **selection**, which is the same
+    /// question the map and the agent list already answer, so the three cannot
+    /// disagree and there is no second selector to keep in sync.
+    ///
+    /// Three cases, and the middle one is the one worth naming:
+    ///
+    /// * nothing selected — the pane shows its empty state;
+    /// * an agent selected that is **not** running here — Polis is only
+    ///   *watching* it, which is the ordinary case for a session started in
+    ///   some other terminal. The pane says so. It must not fall back to
+    ///   whatever was on screen before, because a terminal showing a different
+    ///   agent than the one the operator just clicked is worse than a terminal
+    ///   showing nothing;
+    /// * an agent selected that is running here — its screen.
+    pub fn show_selected(&mut self, thread: Option<&polis_events::ThreadId>) {
+        self.showing = thread.cloned();
+        let Some(thread) = thread else {
+            // # Nothing selected keeps the pane, it does not blank it
+            //
+            // Blanking here was wrong twice. Clicking `+ agent` starts an agent
+            // and selects nothing — so the pane the operator had just asked for
+            // was hidden behind *"select an agent to see its terminal"* until
+            // the map noticed it, which needs a tool call and a channel. And
+            // `polis work --panes 1` opened its window on the same message with
+            // a live agent one pane away.
+            //
+            // So an empty selection means "no opinion", not "show nothing": the
+            // front pane stays, and the empty state is reached the only way it
+            // should be — by there being no panes.
+            if self
+                .active
+                .is_none_or(|pane| !self.tabs.contains_key(&pane))
+            {
+                self.active = self.order.first().copied();
+            }
+            return;
+        };
+        // `focus_tab` rather than a bare assignment: it clears the tab's bell
+        // and records the reveal, so selecting an agent here and selecting it on
+        // the map end in exactly the same state.
+        if let Some(pane) = self.pane_for_session(thread.session()) {
+            if self.active != Some(pane) {
+                self.focus_tab(pane);
+            }
+        } else {
+            self.active = None;
+        }
+    }
+
+    /// Brings an agent's pane to the front, opening the dock if it was shut.
+    ///
+    /// This is the map-to-dock half of PRD §15 M7d: a cloud goes amber, the
+    /// operator picks that agent — its rail row, or `a`, which jumps to
+    /// whatever is waiting on a human — and the terminal it is typing into is
+    /// the one on screen. The map's own anchors are hover targets and not yet
+    /// click targets, so an anchor is the one route this does not have. Returns false when no pane is running that session —
+    /// which is the ordinary case for an agent Polis is only *watching*, so it
+    /// is not an error and nothing is said about it.
+    pub fn focus_session(&mut self, session: &SessionId) -> bool {
+        let Some(pane) = self.pane_for_session(session) else {
+            return false;
+        };
+        if self.active == Some(pane) && !self.collapsed {
+            return true;
+        }
+        self.collapsed = false;
+        self.focus_tab(pane);
+        true
+    }
+
+    /// The pane the operator moved to since this was last called, if any.
+    ///
+    /// Taken rather than read, because acting on it twice would fight the
+    /// operator for the map's selection every frame.
+    pub fn take_reveal(&mut self) -> Option<SessionId> {
+        let pane = self.revealed.take()?;
+        self.session_of(pane)
+    }
+
+    /// Tells the dock what the city knows about each of its agents.
+    ///
+    /// Call once a frame, after the world has been published. Everything it
+    /// writes is derived — the dock is a *reader* of the world here, exactly as
+    /// the map and the rail are, so a tab and a cloud can never disagree about
+    /// the same agent.
+    ///
+    /// The amber flag is deliberately **not** merged into [`Tab::attention`]'s
+    /// sticky bell flag: a bell is a thing that happened and stays until it is
+    /// looked at, while *waiting on you* is a thing that is **true right now**
+    /// and has to stop being true the instant the agent is unblocked — even if
+    /// the operator answered the prompt in the pane without ever clicking the
+    /// tab.
+    pub fn observe(&mut self, snapshot: &polis_world::snapshot::WorldSnapshot) {
+        use polis_world::attention::AttentionKind;
+
+        // Walked over the tabs themselves rather than over `order`, and the
+        // session id read straight off the pane: this runs every frame, and the
+        // obvious spelling — `for pane in self.order.clone()` around
+        // `self.session_of` — buys a `Vec` per frame to work around a borrow
+        // that is not actually there. Both scans below are over a handful of
+        // panes and a capped mark list, so neither allocates either.
+        for tab in self.tabs.values_mut() {
+            let session = tab
+                .state
+                .info
+                .lock()
+                .ok()
+                .and_then(|info| info.session_id.clone());
+            // No session id means a pane running something that is not Claude
+            // Code, or one whose id has not reached the bus yet. Cleared rather
+            // than left standing: a stale district is worse than none.
+            let Some(session) = session else {
+                tab.seen = None;
+                continue;
+            };
+            tab.seen = snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.session_id == session)
+                .map(|thread| Seen {
+                    place: place_label(&thread.territory),
+                    status: Some(thread.status),
+                    needs_decision: snapshot.attention.iter().any(|mark| {
+                        matches!(mark.kind, AttentionKind::NeedsDecision { .. })
+                            && *mark.thread().session() == session
+                    }),
+                });
+        }
     }
 
     /// Starts an agent in a new pane.
@@ -325,6 +504,7 @@ impl Dock {
                     self.insert(pane, state);
                 }
                 self.active = Some(pane);
+                self.revealed = Some(pane);
                 self.status = format!("opened {pane}");
             }
             Ok(other) => self.status = format!("the daemon answered open with {other:?}"),
@@ -354,15 +534,35 @@ impl Dock {
                     }
                 }
                 ClientEvent::Exited(pane, code) => {
-                    if let Some(tab) = self.tabs.get_mut(&pane) {
-                        tab.attention = true;
+                    // # A clean exit takes its tab with it
+                    //
+                    // The daemon keeps an exited pane on purpose — its screen
+                    // and its code survive so a reattached window can still read
+                    // how it ended (`polis_sessiond::panes`, and the test that
+                    // pins it). The *window* had no matching rule, so a pane the
+                    // operator had just quit sat in the strip for ever reading
+                    // `done`, over an empty grid, because Claude Code clears the
+                    // screen on its way out. Two dead things and no way to tell
+                    // they were finished rather than broken.
+                    //
+                    // `Some(0)` is the operator's own `/exit`: they know how it
+                    // ended, there is nothing left to read, and the tab is
+                    // clutter. Anything else is **news** — a non-zero code or a
+                    // child that was killed — so that pane stays, with its last
+                    // screen and a banner saying what happened.
+                    if closes_itself(code) {
+                        self.close(pane);
+                        self.status = format!("{pane} finished");
+                    } else {
+                        if let Some(tab) = self.tabs.get_mut(&pane) {
+                            tab.attention = true;
+                        }
+                        frame.attention = true;
+                        self.status = match code {
+                            Some(code) => format!("{pane} exited {code}"),
+                            None => format!("{pane} ended"),
+                        };
                     }
-                    frame.attention = true;
-                    self.status = match code {
-                        Some(0) => format!("{pane} finished"),
-                        Some(code) => format!("{pane} exited {code}"),
-                        None => format!("{pane} ended"),
-                    };
                 }
                 ClientEvent::Closed(pane) => {
                     self.tabs.remove(&pane);
@@ -450,8 +650,14 @@ impl Dock {
                     |_| (String::from("?"), false, None),
                     |info| (info.title.clone(), info.alive(), info.exit),
                 );
-                let colour = if tab.attention {
+                let seen = tab.seen.clone().unwrap_or_default();
+                // The map's colour wins when the map has one, so a tab and its
+                // cloud say the same thing about the same agent. `alive` is the
+                // pty's answer and only stands in until a channel has spoken.
+                let colour = if tab.attention || seen.needs_decision {
                     palette::needs_decision().color()
+                } else if let Some(status) = seen.status {
+                    palette::status(status).color()
                 } else if alive {
                     palette::status(polis_world::ThreadStatus::Working).color()
                 } else {
@@ -460,13 +666,32 @@ impl Dock {
                 let label = match exit {
                     Some(code) if code != 0 => format!("{} {title} · exit {code}", ordinal + 1),
                     Some(_) => format!("{} {title} · done", ordinal + 1),
-                    None => format!("{} {title}", ordinal + 1),
+                    None => match &seen.place {
+                        // Where the agent is working is worth more of a narrow
+                        // tab strip than a repeated program name is.
+                        Some(place) => format!("{} {}", ordinal + 1, tail(place)),
+                        None => format!("{} {title}", ordinal + 1),
+                    },
                 };
                 let selected = self.active == Some(pane);
-                if ui
-                    .selectable_label(selected, RichText::new(label).color(colour).monospace())
-                    .clicked()
-                {
+                let chip =
+                    ui.selectable_label(selected, RichText::new(label).color(colour).monospace());
+                let chip = match (&seen.place, seen.status) {
+                    // `status_word`, not `{status:?}`: the rail and the map say
+                    // this word about this thread, and a tab inventing its own
+                    // spelling is exactly the disagreement that vocabulary
+                    // exists to prevent.
+                    (Some(place), Some(status)) => chip.on_hover_text(format!(
+                        "{title} — {} in {place}\nthis agent's cloud is on the map",
+                        crate::ui::status_word(status).trim()
+                    )),
+                    _ if alive => chip.on_hover_text(format!(
+                        "{title} — running, but no channel has carried its session id \
+                         onto the map yet"
+                    )),
+                    _ => chip,
+                };
+                if chip.clicked() {
                     select = Some(pane);
                 }
             }
@@ -506,8 +731,11 @@ impl Dock {
                     continue;
                 };
                 let alive = tab.state.info.lock().is_ok_and(|info| info.alive());
-                let colour = if tab.attention {
+                let seen = tab.seen.clone().unwrap_or_default();
+                let colour = if tab.attention || seen.needs_decision {
                     palette::needs_decision().color()
+                } else if let Some(status) = seen.status {
+                    palette::status(status).color()
                 } else if alive {
                     palette::status(polis_world::ThreadStatus::Working).color()
                 } else {
@@ -532,24 +760,61 @@ impl Dock {
         }
     }
 
+    /// What the pane shows when it is not showing a terminal.
+    ///
+    /// Four different silences, and saying "no agents" for all four is how an
+    /// operator learns to stop reading this column. In order of how often they
+    /// happen: nothing selected, an agent selected that Polis is only watching,
+    /// nothing running here at all, and no daemon to ask.
     fn draw_empty(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
-            if self.connected() {
-                ui.label(
-                    RichText::new("no agents running here yet").color(palette::worker().color()),
-                );
-                ui.add_space(6.0);
-                if ui.button("start one").clicked() {
-                    let (rows, cols) = self.last_size();
-                    self.open(rows, cols);
-                }
-            } else {
+            if !self.connected() {
                 ui.label(
                     RichText::new(&self.status)
                         .color(palette::contention().color())
                         .small(),
                 );
+                return;
+            }
+            if self.showing.is_some() && !self.order.is_empty() {
+                // The selected agent is real and on the map; it is simply not
+                // one of ours. Saying which is the difference between a window
+                // that looks broken and one that is telling the truth: most
+                // agents on a `polis watch` map were started in some other
+                // terminal, and Polis cannot attach to a pty it did not create.
+                ui.label(
+                    RichText::new("this agent is running somewhere else")
+                        .color(palette::worker().color()),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Polis is watching it, not hosting it — only a session started \
+                         here has a terminal to show.",
+                    )
+                    .small()
+                    .color(palette::worker().color())
+                    .line_height(Some(15.0)),
+                );
+            } else if self.order.is_empty() {
+                ui.label(
+                    RichText::new("no agents running here yet").color(palette::worker().color()),
+                );
+            } else {
+                ui.label(
+                    RichText::new("select an agent to see its terminal")
+                        .color(palette::worker().color()),
+                );
+            }
+            ui.add_space(8.0);
+            if ui
+                .button("+ agent")
+                .on_hover_text("Ctrl+Alt+T — start a Claude Code session in this checkout")
+                .clicked()
+            {
+                let (rows, cols) = self.last_size();
+                self.open(rows, cols);
             }
         });
     }
@@ -569,8 +834,8 @@ impl Dock {
     fn draw_pane(&mut self, ui: &mut egui::Ui, pane: PaneId) -> DockFrame {
         let ctx = ui.ctx().clone();
         let metrics = self.metrics.as_ref().expect("built above");
-        let rect = ui.available_rect_before_wrap();
-        let (rows, cols) = metrics.grid_for(rect);
+        let mut rect = ui.available_rect_before_wrap();
+        let (mut rows, mut cols) = metrics.grid_for(rect);
 
         if cols < MIN_COLS {
             ui.colored_label(
@@ -581,6 +846,40 @@ impl Dock {
                 ),
             );
             return DockFrame::default();
+        }
+
+        // A pane only reaches here still exited when it ended badly — a clean
+        // exit closed itself above. Its last screen is the evidence, so the
+        // banner goes *over* it rather than replacing it, and the way out is on
+        // the banner rather than only in a chord nobody has memorised.
+        let ended = tab_exit(self.tabs.get(&pane));
+        if let Some(how) = ended {
+            let mut close = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(match how {
+                        Ended::Code(code) => format!("this agent exited {code}"),
+                        Ended::Killed => "this agent was ended".to_owned(),
+                    })
+                    .color(palette::contention().color()),
+                );
+                close = ui
+                    .button("close pane")
+                    .on_hover_text("Ctrl+Alt+W — the screen below is its last")
+                    .clicked();
+            });
+            ui.separator();
+            if close {
+                self.close(pane);
+                return DockFrame::default();
+            }
+        }
+
+        if ended.is_some() {
+            rect = ui.available_rect_before_wrap();
+            let grid = metrics.grid_for(rect);
+            rows = grid.0;
+            cols = grid.1;
         }
 
         let id = egui::Id::new(("polis-pane", pane.0));
@@ -805,7 +1104,11 @@ impl Dock {
     }
 
     fn focus_tab(&mut self, pane: PaneId) {
+        let moved = self.active != Some(pane);
         self.active = Some(pane);
+        if moved {
+            self.revealed = Some(pane);
+        }
         if let Some(tab) = self.tabs.get_mut(&pane) {
             tab.attention = false;
         }
@@ -870,6 +1173,82 @@ impl Dock {
 /// **`TERM_PROGRAM` is deliberately unset.** Claude Code branches on it, and
 /// claiming to be an unknown terminal is a worse bet than claiming nothing until
 /// somebody measures which branch is better.
+/// What a tab calls the place its agent is working, or `None` for nowhere yet.
+///
+/// The rail's `place_of` answers the same question with a whole paragraph and a
+/// hover; a tab has room for about twenty characters, so a claim is written
+/// plainly and lobes are written as the heaviest one and a count. What it must
+/// **not** do is invent a place for a thread PRD §6.2 has refused to place —
+/// `unplaced` is a real state, and a tab that guessed would be the map and the
+/// dock disagreeing about the same agent.
+fn place_label(territory: &polis_world::territory::Territory) -> Option<String> {
+    use polis_world::territory::Placement;
+
+    match territory.placement() {
+        Placement::Claim(claim) => Some(claim.as_str().to_owned()),
+        Placement::Lobes(lobes) => lobes.first().map(|lobe| match lobes.len() {
+            1 => lobe.path.as_str().to_owned(),
+            n => format!("{} +{}", lobe.path.as_str(), n - 1),
+        }),
+        Placement::Nowhere => None,
+    }
+}
+
+/// The last two segments of a place, for a tab that has no room for the rest.
+///
+/// The tab strip is `horizontal_wrapped` inside a dock with an eighty-column
+/// floor, so a full `polis-app/src/components/widgets` on three tabs costs the
+/// terminal a row of its own height for something the operator can already see
+/// on the map. Two segments is what PRD §6.2's claims mostly are —
+/// `MIN_CLAIM_DEPTH` is 2 — so for a lobe this trims nothing at all. Applied
+/// **here and not in [`place_label`]**, because the hover shows the whole path
+/// and a truncation that reached the data would have thrown it away.
+fn tail(place: &str) -> &str {
+    match place.rmatch_indices('/').nth(1) {
+        Some((cut, _)) => &place[cut + 1..],
+        None => place,
+    }
+}
+
+/// Whether a pane that has just exited should take its tab with it.
+///
+/// `Some(0)` is the operator's own `/exit`: they know how it ended, the screen
+/// Claude Code left behind is blank because it clears on the way out, and the
+/// tab is clutter that reads `done` for ever. Everything else is news and is
+/// kept — a non-zero code, and `None` for a child that was killed or lost with
+/// its daemon, which is the case a rule written as `code != Some(0)` would have
+/// got right by accident and a rule written as `code.is_some()` would have got
+/// wrong.
+fn closes_itself(code: Option<i32>) -> bool {
+    code == Some(0)
+}
+
+/// How a pane's child ended, or `None` while it is still running.
+///
+/// `Some(None)` is a child that was ended without a code — killed, or the daemon
+/// taken down under it — which is a different sentence from `Some(Some(3))` and
+/// has to stay distinguishable.
+fn tab_exit(tab: Option<&Tab>) -> Option<Ended> {
+    let info = tab?.state.info.lock().ok()?;
+    if info.alive() {
+        return None;
+    }
+    Some(info.exit.map_or(Ended::Killed, Ended::Code))
+}
+
+/// How a pane's child ended, once it has.
+///
+/// A named pair rather than `Option<Option<i32>>`, which is the same two cases
+/// spelled so that neither the compiler nor a reader can tell which `None` is
+/// which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// It exited, with this code.
+    Code(i32),
+    /// It ended without one — killed, or lost with its daemon.
+    Killed,
+}
+
 fn pane_env(extra: &[(String, String)]) -> Vec<(String, String)> {
     let mut env = vec![
         ("TERM".to_owned(), "xterm-256color".to_owned()),
@@ -1013,6 +1392,77 @@ mod tests {
             !text.contains("Esc"),
             "Esc belongs to Claude Code — interrupt and clear-input both use it"
         );
+    }
+
+    /// PRD §6.2's three placements, as a tab writes them.
+    #[test]
+    fn a_tab_says_where_its_agent_is_and_never_guesses() {
+        use polis_world::territory::{Lobe, Territory};
+
+        let path = |s: &str| polis_events::LogicalPath::new(s).expect("a valid logical path");
+        let mut territory = Territory::default();
+        // Nowhere: no claim, no lobes. A thread the world has refused to place
+        // reads as an absence on the tab, exactly as it reads on the map.
+        assert_eq!(place_label(&territory), None);
+
+        // §6.4's lobes, heaviest first, with the rest counted rather than named.
+        territory.lobes = vec![
+            Lobe {
+                path: path("src/components"),
+                mass: 0.6,
+            },
+            Lobe {
+                path: path("src/hooks"),
+                mass: 0.4,
+            },
+        ];
+        assert_eq!(
+            place_label(&territory).as_deref(),
+            Some("src/components +1")
+        );
+
+        // A converged claim wins over the lobes that produced it.
+        territory.claim = Some(path("src/services"));
+        assert_eq!(place_label(&territory).as_deref(), Some("src/services"));
+
+        // The data keeps the whole path; only the tab shortens it.
+        territory.claim = Some(path("polis-app/src/components/widgets"));
+        assert_eq!(
+            place_label(&territory).as_deref(),
+            Some("polis-app/src/components/widgets")
+        );
+    }
+
+    /// A tab has about twenty characters. The map has the rest.
+    #[test]
+    fn a_tab_shortens_a_deep_place_and_leaves_a_shallow_one_alone() {
+        assert_eq!(
+            tail("polis-app/src/components/widgets"),
+            "components/widgets"
+        );
+        assert_eq!(tail("src/services"), "src/services");
+        assert_eq!(tail("src"), "src");
+        assert_eq!(tail(""), "");
+        // The lobe form keeps its count, because the count is the part that
+        // says this thread is in more than one place.
+        assert_eq!(tail("a/b/c +2"), "b/c +2");
+    }
+
+    /// > when i close a claude code instance it just says "done" but the
+    /// > terminal tab doesn't close, or no terminal shows
+    ///
+    /// Both halves were one omission: the daemon keeps an exited pane on purpose
+    /// and the window had no matching rule, so the tab stayed for ever over the
+    /// blank screen Claude Code leaves when it clears on exit.
+    #[test]
+    fn a_clean_exit_closes_its_own_pane_and_a_failure_stays() {
+        assert!(closes_itself(Some(0)), "the operator's own /exit");
+        assert!(!closes_itself(Some(1)), "a non-zero code is news");
+        assert!(!closes_itself(Some(130)), "an interrupt is news");
+        // Killed, or lost with its daemon. No code at all is not success, and
+        // this is the case that decides between `code != Some(0)` and
+        // `code.is_some()` — the second would throw the evidence away.
+        assert!(!closes_itself(None), "a child that was ended is news");
     }
 
     #[test]

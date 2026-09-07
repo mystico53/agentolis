@@ -692,18 +692,34 @@ impl FrameRenderer {
         // still carry which territory dropped them, because a sum cannot tell
         // one busy thread from two threads on one file and only the second is
         // news — see [`CloudKernel::thread`].
-        for (rank, territory) in selection.visible.iter().enumerate() {
-            // The rank is a per-frame group index the field sampler sorts on;
-            // the tint beside it is the thread's own identity, read off the
-            // thread rather than derived here. Matched back by pointer because
-            // `select_clouds` hands out territories and the hue is the
-            // *thread's* — the pairs it chose from are right here.
-            frame.cloud_tints.push(
-                pairs
-                    .iter()
-                    .find(|(_, t)| std::ptr::eq(*t, *territory))
-                    .map_or(live::NO_TINT, |(thread, _)| thread.tint),
-            );
+        // A territory `visible` holds that is somehow not in `pairs` — which
+        // cannot happen, because `visible` is borrowed from `pairs` — still gets
+        // a layer nothing else can be on, counting down from the top. Sharing
+        // layer 0 with a real thread would sum the two territories into one.
+        let mut orphan = u16::MAX;
+        for territory in &selection.visible {
+            // The layer is the thread's own and so is the tint: both are read
+            // off the thread rather than derived from where this territory
+            // happens to sit in the ranking, because `select_clouds` sorts on
+            // `last_activity` and two agents working at once swap places on
+            // every tool call. Matched back by pointer because `select_clouds`
+            // hands out territories — the pairs it chose from are right here.
+            let found = pairs.iter().find(|(_, t)| std::ptr::eq(*t, *territory));
+            let (layer, tint) = if let Some((thread, _)) = found {
+                (thread.layer, thread.tint)
+            } else {
+                let layer = orphan;
+                orphan = orphan.saturating_sub(1);
+                (layer, live::NO_TINT)
+            };
+            // Indexed by layer, not pushed in rank order: `CloudField::stack`
+            // looks a layer's tint up by the id the layer carries. The table is
+            // therefore as long as the highest live layer — a byte per thread
+            // this world has ever seen, and holes where a thread has retired.
+            if frame.cloud_tints.len() <= layer as usize {
+                frame.cloud_tints.resize(layer as usize + 1, live::NO_TINT);
+            }
+            frame.cloud_tints[layer as usize] = tint;
             for k in &territory.kernels {
                 if k.weight <= 0.0 {
                     continue;
@@ -716,7 +732,7 @@ impl FrameRenderer {
                     // of the cloud *is* the width of the claim.
                     radius: f64::from(k.radius) * view.scale(),
                     weight: f64::from(k.weight),
-                    thread: u16::try_from(rank).unwrap_or(u16::MAX),
+                    thread: layer,
                 });
             }
         }

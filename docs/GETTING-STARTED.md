@@ -11,7 +11,9 @@ minutes.
 
 If you want one line before the rest of the page: **`polis watch`** shows every
 agent working in the folder you are standing in, live, with no configuration at
-all.
+all. If you are not standing in the right folder, **`polis`** on its own lists
+every checkout that has agents in it and lets you pick — and `o` inside the
+window switches to another one without closing it.
 
 ---
 
@@ -309,6 +311,7 @@ build it for you.
 | `polis` | The first run explains itself, then opens the session picker. Afterwards, maps the folder you are in. |
 | `polis map` | This repository as a city, right now. A window, and blocks. |
 | `polis run -- claude` | `polis watch`, plus token and subagent detail for the agent it starts. |
+| `polis work` | The same live map, with agents running in terminals inside the window. `Ctrl+Alt+T` adds another; `--panes N` starts N at once. The agents live in `polis-sessiond`, so closing the window leaves them working. |
 | `polis connect` | Add hook detail — including knowing when a session ends — in this repository. `--user` for every repository; `--uninstall` reverses either. |
 | `polis doctor` | What is wrong, and how to fix it. `--fix` applies what it can. |
 | `polis snapshot --out city.png` | Save a picture of the city instead of opening a window. |

@@ -206,6 +206,22 @@ impl LiveOptions {
         }
     }
 
+    /// Every default for **watching** a checkout: this repository's sessions,
+    /// a roster, and all four channels.
+    ///
+    /// [`LiveOptions::for_repo`] leaves [`IngestConfig::sessions`] at its
+    /// `All` default, which is right for `polis tail` and wrong for a window:
+    /// it opens a tail on every session that has ever run on the machine and
+    /// publishes no roster. This is the one line that makes Channel D discover
+    /// *this repository's live agents*, and it is shared by `polis watch`, the
+    /// repository launcher and an in-place repository switch so the three
+    /// cannot drift.
+    pub fn watching(repo: impl Into<PathBuf>) -> Self {
+        let mut options = Self::for_repo(repo);
+        options.ingest.sessions = polis_ingest::SessionScope::ThisRepo;
+        options
+    }
+
     /// The checkout this window is for.
     pub fn repo(&self) -> &Path {
         &self.ingest.repo_root
@@ -1066,8 +1082,8 @@ pub fn waiting(ui: &mut egui::Ui, feed: &LiveFeed, now: Instant) {
             if elsewhere > 0 {
                 ui.label(dim(format!(
                     "{elsewhere} live elsewhere on this machine — reported, not drawn, \
-                     because one window maps one repository. Open another with  polis -C \
-                     <that repository> watch",
+                     because one window maps one repository. Press  o  to switch this \
+                     window to one of them.",
                 )));
             }
         });

@@ -83,7 +83,7 @@ impl Canvas {
     }
 
     #[inline]
-    fn blend(&mut self, x: usize, y: usize, colour: Rgb, alpha: f64) {
+    pub(crate) fn blend(&mut self, x: usize, y: usize, colour: Rgb, alpha: f64) {
         if alpha <= 0.0 || x >= self.width || y >= self.height {
             return;
         }

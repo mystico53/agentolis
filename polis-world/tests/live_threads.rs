@@ -198,6 +198,18 @@ fn read(path: &str, id: &str) -> serde_json::Value {
     tool_use("Read", id, &serde_json::json!({ "file_path": path }))
 }
 
+/// The `bridge-session` sidecar Claude Code writes near the top of every
+/// transcript. Flat: no `uuid`, no position in any tree.
+fn bridge(id: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "bridge-session", "bridgeSessionId": id, "lastSequenceNum": 0 })
+}
+
+/// Stamps a record with the `timestamp` every threaded record carries.
+fn at(mut value: serde_json::Value, when: &str) -> serde_json::Value {
+    value["timestamp"] = serde_json::json!(when);
+    value
+}
+
 fn append(path: &Path, value: &serde_json::Value) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("parent dir");
@@ -1059,6 +1071,74 @@ fn the_operator_can_close_a_thread_and_its_next_event_brings_it_back() {
 }
 
 #[test]
+fn clearing_a_chat_takes_its_thread_off_the_map() {
+    // > "when i clear a chat, that thread should disappear in the app"
+    //
+    // The operator's own words, and the one ending the transcript channel can
+    // prove: `/clear` abandons the file and opens a new one under the same
+    // `bridge-session.bridgeSessionId`, which belongs to the `claude` process
+    // rather than to the conversation (ADR-0105). Nothing here waits for
+    // silence, and no hook is installed.
+    let fleet = Fleet::new();
+    let mut tailer = fleet.watch();
+    let mut world = fleet.world();
+
+    let before = fleet.session("11111111-0000-0000-0000-00000000000a");
+    let after = fleet.session("22222222-0000-0000-0000-00000000000b");
+    let bystander = fleet.session("33333333-0000-0000-0000-00000000000c");
+
+    before.main_record(bridge("cse_operator"));
+    before.main_record(at(
+        edit(&fleet.file("src/auth/token.rs"), "t1"),
+        "2026-09-06T22:24:31Z",
+    ));
+    bystander.main_record(bridge("cse_someone_else"));
+    bystander.main_record(at(
+        edit(&fleet.file("src/render/frame.rs"), "t2"),
+        "2026-09-06T22:25:02Z",
+    ));
+    drain(&mut tailer, &mut world, 2);
+
+    let cleared = ThreadId::of_session(SessionId::new(&before.id));
+    let fresh = ThreadId::of_session(SessionId::new(&after.id));
+    let other = ThreadId::of_session(SessionId::new(&bystander.id));
+    assert!(
+        world.thread(&cleared).is_some(),
+        "the chat before the clear"
+    );
+    assert!(world.thread(&other).is_some(), "and another terminal's");
+
+    // The operator types `/clear`. Claude Code writes no ending: it starts a
+    // second transcript, carrying the same bridge id.
+    after.main_record(bridge("cse_operator"));
+    after.main_record(at(
+        edit(&fleet.file("src/auth/login.rs"), "t3"),
+        "2026-09-06T22:30:44Z",
+    ));
+    drain(&mut tailer, &mut world, 1);
+
+    assert!(
+        world.thread(&cleared).is_none(),
+        "the cleared conversation leaves the map at once, not after {THREAD_RETIRE_AFTER:?}"
+    );
+    assert!(
+        world.thread(&fresh).is_some(),
+        "and the conversation that replaced it is drawn in its place"
+    );
+    assert!(
+        world.thread(&other).is_some(),
+        "a session of another process is untouched — the bridge id is the whole          of the evidence"
+    );
+    assert_eq!(world.health.threads_cleared, 1);
+    assert!(
+        world
+            .file(&LogicalPath::new("src/auth/token.rs").unwrap())
+            .is_some_and(|f| f.touched_by.iter().all(|t| t != &cleared)),
+        "nothing dangles behind it, exactly as retirement leaves nothing"
+    );
+}
+
+#[test]
 fn a_transcript_that_vanishes_mid_tail_neither_corrupts_the_world_nor_stops_the_channel() {
     let fleet = Fleet::new();
     let mut tailer = fleet.watch();
@@ -1072,8 +1152,11 @@ fn a_transcript_that_vanishes_mid_tail_neither_corrupts_the_world_nor_stops_the_
     assert_eq!(world.threads.len(), 2);
     let before = world.health.events_applied;
 
-    // The file is deleted underneath the tail — a `/clear`, a cleanup script, an
-    // operator tidying up. The session that is still alive must keep flowing.
+    // The file is deleted underneath the tail — a cleanup script, an operator
+    // tidying up, a `claude -p` run whose temp directory went. (Not `/clear`,
+    // which leaves the file exactly where it is: see
+    // `clearing_a_chat_takes_its_thread_off_the_map`.) The session that is still
+    // alive must keep flowing.
     std::fs::remove_file(&a.main).expect("delete the transcript mid-tail");
     b.main_record(edit(&fleet.file("src/render/camera.rs"), "t3"));
     let more = drain(&mut tailer, &mut world, 1);

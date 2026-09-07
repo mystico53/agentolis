@@ -280,12 +280,13 @@ impl Picker {
 /// words.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone, Copy)]
-struct Nav {
+pub(crate) struct Nav {
     up: bool,
     down: bool,
     page_up: bool,
     page_down: bool,
-    open: bool,
+    /// Enter — open whatever the cursor is on.
+    pub(crate) open: bool,
 }
 
 /// How far page up and page down move. A screenful is about this many rows at
@@ -294,7 +295,7 @@ struct Nav {
 const PAGE: usize = 12;
 
 impl Nav {
-    fn read(ctx: &egui::Context) -> Self {
+    pub(crate) fn read(ctx: &egui::Context) -> Self {
         ctx.input(|i| Self {
             up: i.key_pressed(egui::Key::ArrowUp),
             down: i.key_pressed(egui::Key::ArrowDown),
@@ -308,7 +309,7 @@ impl Nav {
     ///
     /// Deliberately clamping rather than wrapping: a list of 195 sessions that
     /// jumps from the top to the bottom on one keypress reads as a bug.
-    fn apply(self, cursor: &mut usize, len: usize) -> bool {
+    pub(crate) fn apply(self, cursor: &mut usize, len: usize) -> bool {
         if len == 0 {
             *cursor = 0;
             return false;

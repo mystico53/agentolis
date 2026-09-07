@@ -58,6 +58,18 @@ fn dispatch() -> anyhow::Result<i32> {
         // or nothing here to map) or this repository as a city.
         None => setup::first_run(&cli).map(|()| 0),
 
+        // PRD §2 keeps one window to one repository; this is where the operator
+        // chooses which, from a list that says where agents are actually
+        // working. Bare `polis` opens the same screen.
+        Some(Command::Home) => {
+            let repo = cli.repo_root()?;
+            let here = polis_app::repos::checkout_containing(&repo);
+            let config = polis_app::config::Config {
+                repo_root: repo,
+                ..polis_app::config::Config::default()
+            };
+            polis_app::launch(config, polis_app::Mode::Home { here }).map(|()| 0)
+        }
         Some(Command::Run(args)) => run::run(&cli, args),
         Some(Command::Map) => {
             let config = polis_app::config::Config {

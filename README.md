@@ -30,7 +30,7 @@ hash of the logical path, so the same repo produces the same city on every launc
 and every machine; spatial memory is the entire point.
 
 The spec is [`docs/PRD.md`](docs/PRD.md). Where the built system deliberately
-diverges from it — 102 recorded decisions, every one grounded in a measurement —
+diverges from it — 106 recorded decisions, every one grounded in a measurement —
 see [`docs/DECISIONS.md`](docs/DECISIONS.md). The evidence behind those decisions
 is in [`docs/verified/`](docs/verified/).
 
@@ -57,16 +57,17 @@ is just `polis`:
 ```sh
 polis watch            # every agent working in this repository, live
 polis watch --list     # the same answer as text, opening nothing
-polis                  # the first run explains itself
+polis                  # pick a repository, then watch it
 polis map              # this repository, drawn as a city
 polis run -- claude    # start an agent with the map already watching
+polis work             # agents in terminals inside the window, beside the city
 polis replay           # pick a session you already ran and watch it back
 polis connect          # add hook detail to what a watch already sees
 polis doctor           # what is wrong, and how to fix it
 ```
 
-The three that open a window — `watch`, `map`, `replay` — say on stdout what they
-are opening and do not return until you close it.
+The five that open a window — bare `polis`, `watch`, `map`, `work` and `replay`
+— say on stdout what they are opening and do not return until you close it.
 
 **`polis watch` is the headline command, and it needs nothing set up.** Point it
 at a repository and it shows every Claude Code session working in it right now —
@@ -84,12 +85,21 @@ less than they expected can find out why at a glance.
 
 **`polis` with no arguments is the whole product for someone who has read
 nothing.** It detects the checkout, Claude Code and `~/.claude/projects`,
-explains the map in one screen, and — on a machine that has not run it before —
-opens the session picker, because the operator already has hundreds of real
-recorded sessions on disk and watching one is the shortest path from "installed"
-to "I see what this is". After that, bare `polis` maps the checkout you are
-standing in. To see what is happening *now* rather than what happened, that is
-`polis watch`.
+explains the map in one screen, and opens the **repository launcher**: every
+checkout on this machine with an agent working in it right now, with the live
+count against each, plus the ones you have run agents in before. Pick one and it
+is watched live. `polis home` is the same screen on demand.
+
+Which repository a window is about is not the folder your shell happens to be
+standing in — an operator running agents in three checkouts is standing in at
+most one of them — so it is a choice you make on screen, and one you can change
+without closing anything: **`o`, or the repository name in the title bar, opens
+the same launcher over the map and switches the watch in place.** The old feed is
+shut down and its ports released before the new one binds them, a watch stays a
+watch and a map stays a map, and PRD §2's one-window-one-repository is unchanged
+— you are moving the window, not adding a second city to it. The one window that
+will not switch is `polis work`: its agents are attached to that checkout's
+session daemon, and it says so instead of leaving them behind.
 
 **`polis run -- claude` is `polis watch` with telemetry added.** It opens a
 `polis watch` window — which owns the receivers, so there is one ingest stack and
@@ -102,6 +112,27 @@ You do not need it to see an agent: `polis watch` already shows the one you
 started yourself. Measured on this machine against real Claude Code: 46
 telemetry, 3 hook, 1 filesystem and 15 transcript events from one six-second
 session, all four channels live.
+
+**`polis work` puts the agents *inside* the window.** Claude Code runs in a
+pane beside the city — the real TUI over a pty, so slash commands, plan mode,
+permission prompts and `/resume` all work — and `Ctrl+Alt+T` or the title bar's
+`+ agent` adds another. You do not need the subcommand: any live window grows a
+terminal from the same button, so `polis` and `polis watch` are the same app
+with the dock shut.
+
+The panes and the map are one surface, not two. Each agent is started with a
+session id Polis issued itself, which is the key its telemetry, its hooks and
+its transcript all carry — so **clicking a tab lights that agent's cloud on the
+map, and picking that agent on the map — its row in the rail, or `a`, which
+jumps to whatever is waiting on you — brings its terminal to the front.** A
+tab says which district its agent has claimed and turns amber when it is
+waiting on you, read from the same published world the map draws from rather
+than from the terminal, so a tab and a cloud cannot disagree.
+
+**The agents are not owned by the window.** They live in `polis-sessiond`, so
+closing Polis — or a GPU driver reset taking it out — leaves every agent
+working, and the next launch reattaches and replays each pane's byte log to put
+the same screen back, scrollback included. An agent stops when you stop it.
 
 On Windows, `Polis.bat` is double-clickable and offers the same choices with no
 terminal at all — including offering to build Polis the first time. Double-
@@ -230,6 +261,7 @@ Ordered. Each ends in something demonstrable. Do not skip ahead — PRD §15.
 | **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | **Done, exercised against a real fleet.** Three real agents in one checkout became three threads, never merged; worker attribution 1/1 via `record agentId`; territory converged in 2-3 observations (5.0-11.5 s) onto exactly the directory each agent was told to work in, with zero district changes. Clouds render live: **5 clouds / 15 kernels** on a concentrated fleet. A thread whose reads are spread across unrelated directories correctly gets **no** cloud — PRD §6.2's convergence gates refusing to claim, not a missing feature. |
 | **M5** | Attention layer | The three states, contention detection, drill-down, linked filesystem view. **The first milestone that delivers the product thesis.** | **Done, with one live defect (below).** All three states observed firing live, which no replay can do: contention (`same file · two agents`), *needs review* (`done, unverified`), and `done · tests ran after the change`. Contention is now keyed by **actor** `(thread, worker)`, not by thread — **4 of 4 real contentions in the operator's corpus are worker-versus-worker inside one session**, the exact class the old thread-keyed table could not represent. Failure salience: the reddest real frame went from 3 hot px / 3600 to **42** (0.08 % -> 1.17 %), plus a ≤400 ms arrival pulse. Drill-down and the linked tree view are in. |
 | **M6** | Landmarks and polish | Monuments, overgrowth, industrial zoning, scaffolding, trails, follow-thread camera, drift detection. | **Mostly built incidentally; not yet a milestone.** Monuments (`MAX_MONUMENTS = 24`; 4-24 found on every real repo tried), overgrowth (`overgrowth_over`, 90 -> 270 days), industrial zoning (fires on real repos: 5 districts in `stickingplacebooks`, 1 in `biwt`), scaffolding (`MAX_SCAFFOLDS = 24`), trails, `FollowCamera` (bound to `f`, cut not pan) and drift (`DRIFT_CONFIRMATIONS = 8`, shown in the rail) all exist and are tested. What M6 still owes is the pass that decides which of them **change a decision** (PRD §17) and cuts the rest. |
+| **M7** | Terminals in the window | Claude Code sessions in panes beside the map, owned by a daemon rather than by the window, correlated with the city in both directions. | **M7a-M7d done; M7c and M7e outstanding.** The ptys live in `polis-sessiond` (ADR-0095), so a force-killed window leaves its agents running and the next launch reattaches and replays each pane's byte log. `Mode::Work` runs the four channels, so the panes' own agents draw their own clouds (ADR-0105). Clicking a tab lights that agent's cloud; a cloud, a rail row or an `a` jump brings its pane to the front; a tab reads its district and its amber state from the same `WorldSnapshot` the map reads. `Ctrl+Alt+T` or `+ agent` starts a terminal in any live window, so `polis` and `polis watch` grow one without the subcommand. Still owed: scrollback selection, OSC 52, the `polis doctor` glyph line, splits, and moving ingest into the daemon so a detached period records. |
 
 ### M1, measured
 

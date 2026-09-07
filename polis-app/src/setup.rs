@@ -11,11 +11,13 @@
 //! * [`detect`] — what is actually on this machine: a repository, Claude Code,
 //!   a transcripts directory, past sessions, installed hooks, a built
 //!   `polis-hook`. One struct, printed as one screen.
-//! * [`first_run`] — what bare `polis` does. On a machine that has never run it,
-//!   that is the **session picker**, because the operator already has real
-//!   sessions on disk and watching one is the shortest path from "installed" to
-//!   "I see what this is". Afterwards bare `polis` maps the checkout it is
-//!   standing in, and `polis watch` is the picker on demand.
+//! * [`first_run`] — what bare `polis` does: say what is on this machine in one
+//!   screen, then open the **repository launcher** ([`crate::repos`]), which
+//!   lists every checkout with an agent working in it right now and watches the
+//!   one that is picked. It used to guess instead — the session picker on a
+//!   first run, a map of the current directory afterwards — and both guesses
+//!   were about the folder the terminal happened to be standing in rather than
+//!   the repository the work is in. `polis replay` is still the session picker.
 //! * [`connect`] — hook installation with explicit consent: the exact file, a
 //!   line diff against what is there now, a backup, a confirmation, and an
 //!   uninstall that is tested to put the file back.
@@ -376,23 +378,35 @@ pub fn first_run(cli: &Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let pick = (first && detected.replayable > 0) || !detected.is_git;
-    if pick {
-        if first {
-            writeln!(
-                out,
-                "  First run, so Polis is opening the session picker: pick any past\n  \
-                 session and watch it replay over its own city. Nothing to set up.\n"
-            )?;
-        } else {
-            writeln!(
-                out,
-                "  This folder is not a git repository, so Polis opened the session\n  \
-                 picker instead of a map.\n"
-            )?;
-        }
+    // The launcher, always. Which repository to watch is a question the shell's
+    // working directory answers badly — an operator with agents in three
+    // checkouts is standing in at most one of them — and the answer is already
+    // on disk: every session on this machine says which directory it is working
+    // in. So bare `polis` asks, with the live count against each row, rather
+    // than guessing between a map of wherever the terminal happens to be and a
+    // picker of what has already finished.
+    let here = crate::repos::checkout_containing(&repo);
+    if first {
+        writeln!(
+            out,
+            "  First run, so Polis is opening the repository launcher: it lists every\n  \
+             checkout with an agent working in it right now, and every one this machine\n  \
+             has run them in before. Pick one and it is watched live, with nothing to\n  \
+             set up.\n"
+        )?;
+    } else if let Some(here) = &here {
+        writeln!(
+            out,
+            "  Opening the repository launcher. {} is at the top of it; pick it\n  \
+             or any other checkout agents are working in.\n",
+            here.display()
+        )?;
     } else {
-        writeln!(out, "  Opening {} as a city.\n", detected.repo.display())?;
+        writeln!(
+            out,
+            "  This folder is not a git repository, so the launcher opens without it:\n  \
+             pick any checkout agents are working in.\n"
+        )?;
     }
     next_steps(&mut out, &detected)?;
     // Every command just printed begins with the word `polis`, and on a fresh
@@ -410,12 +424,7 @@ pub fn first_run(cli: &Cli) -> anyhow::Result<()> {
         repo_root: repo.clone(),
         ..crate::config::Config::default()
     };
-    let mode = if pick {
-        crate::Mode::Pick
-    } else {
-        crate::Mode::Map { repo }
-    };
-    crate::launch(config, mode)
+    crate::launch(config, crate::Mode::Home { here })
 }
 
 /// The warning that the commands just printed cannot be typed as written.

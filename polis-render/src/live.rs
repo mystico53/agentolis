@@ -98,6 +98,72 @@ use crate::raster::{Canvas, Px, Rgb};
 /// underneath it by a single level.
 pub const CLOUD_TONES: [Rgb; 3] = [[56, 64, 74], [64, 72, 80], [74, 80, 84]];
 
+/// The tone a cloud's **body** settles the ground toward, before identity.
+///
+/// The body is the even ground a cloud sits on, under its own contour and
+/// hatch. It exists because the marks alone did not answer the operator's
+/// complaint — *"the clouds need an even background, they don't distinguish
+/// themselves"*: a sparse weave over a city block reads as texture **on** the
+/// city, not as a region of it, and the silhouette PRD §1 wants legible from
+/// across the room was carried by a contour one to three pixels wide.
+///
+/// # Why this is a floor tone and not the marks' own
+///
+/// The obvious body is the mark's ink, thinned. It is wrong, and measurably so:
+/// [`CLOUD_TONES`] runs 56–84 and PRD §10.3 confines the base map to 48, so
+/// blending toward the mark tone **lifts** the city — the pale-grey fog every
+/// earlier fill here was removed for, which lifted 40 % of the map by more than
+/// six levels and moved the median under a cloud from `L 22` to `L 45`. Thinning
+/// it only makes the lift smaller, never absent.
+///
+/// This sits *under* the base map's ceiling instead, so the operation is a
+/// levelling rather than a lift: a lit district under a cloud comes down toward
+/// it, near-black ground barely moves, and the region's own variance collapses.
+/// That is what "an even background" is — evenness, not brightness — and it
+/// leaves the mark tones the brightest thing inside a cloud, which is the order
+/// §10.3 asks for.
+pub const CLOUD_BODY: Rgb = [26, 28, 32];
+
+// A body brighter than the base map's ceiling is the fog this layer keeps being
+// rewritten to remove. The bound is the whole argument above, so it is checked
+// rather than trusted.
+const _: () = assert!(
+    CLOUD_BODY[0] < crate::plan::BASE_MAP_CEILING
+        && CLOUD_BODY[1] < crate::plan::BASE_MAP_CEILING
+        && CLOUD_BODY[2] < crate::plan::BASE_MAP_CEILING,
+    "the cloud body must sit under the base map's own ceiling"
+);
+
+/// How far a band's body carries the ground to [`CLOUD_BODY`] at full veil,
+/// fringe → body → core.
+///
+/// # Why the ramp is this steep
+///
+/// The band ladder is the one thing §10.4 asks a cloud to say — *"that file is
+/// in the core of this thread's work" versus "it's at the fringe"* — and an even
+/// ground says it with area rather than with texture only if the three levels
+/// are separated by more than the eye's threshold. At 0.22 the fringe keeps the
+/// streets under it plainly legible and reads as a tint; at 0.72 the core is
+/// nearly the floor tone and the buildings under it are gone, which is the point
+/// of a core.
+///
+/// Scaled by [`CLOUD_VEIL`], which is the operator's. At zero the layer is
+/// exactly the marks-only notation this crate has shipped — **zero** disturbed
+/// pixels, `0.000` levels of median shift — and that guarantee is now a
+/// statement about a setting rather than about the layer. See
+/// `the_veil_levels_the_ground_under_a_cloud_and_only_when_it_is_on`.
+pub const CLOUD_BODY_ALPHA: [f64; 3] = [0.22, 0.50, 0.80];
+
+/// How much of [`CLOUD_BODY_ALPHA`] the shipped notation actually uses.
+///
+/// One number, in `[0, 1]`, scaling all three bands together: `0` is marks only
+/// and `1` is a core that hides the city under it. It is the default the window
+/// starts at and the value every headless frame is rendered with, so a recorded
+/// session and a live one agree unless somebody has moved the window's own
+/// slider — which is a tuning control, not a second notation. When the number is
+/// settled, it belongs here.
+pub const CLOUD_VEIL: f64 = 0.5;
+
 /// The axis the cloud hatch runs along: across the sun, and therefore across
 /// [`crate::plan`]'s industrial hatch.
 ///
@@ -279,6 +345,14 @@ pub const CLOUD_ISO: [f64; 3] = [0.55, 1.60, 3.20];
 
 /// The band index meaning "outside the fringe" in a per-pixel band map.
 pub const NO_BAND: u8 = u8::MAX;
+
+/// A band map that is not one territory's, so [`BandMap::thread`] names none.
+///
+/// The flattened and the summed maps are the whole sky at once: every pixel is
+/// an argmax over the territories, so no one layer owns the map and there is no
+/// id to carry. `u16::MAX` because that is what `polis_app::clouds` already
+/// hands an orphan territory, and the two must not collide.
+pub const NO_LAYER: u16 = u16::MAX;
 
 /// The [`polis_world::Thread::tint`] meaning "nobody named an owner for this
 /// pixel", which draws in the neutral [`CLOUD_TONES`].
@@ -769,7 +843,8 @@ pub struct CloudKernel {
     pub radius: f64,
     /// Weight after PRD §6.3's decay.
     pub weight: f64,
-    /// Which territory dropped it.
+    /// Which territory dropped it — `polis_world::Thread::layer`, an id that
+    /// belongs to the thread and not to its position in this frame's list.
     ///
     /// Kernels sharing an id are **one thread's field**. The layer needs the
     /// distinction for one reason and it is PRD §6.4's: *"overlap is field
@@ -1376,7 +1451,7 @@ pub fn draw_clouds(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
     let Some(field) = CloudField::sample(&frame.clouds, canvas.width, rows) else {
         return start.elapsed();
     };
-    paint_cloud_stack(canvas, &field.stack(&frame.cloud_tints));
+    paint_cloud_stack(canvas, &field.stack(&frame.cloud_tints), CLOUD_VEIL);
     start.elapsed()
 }
 
@@ -1386,7 +1461,7 @@ pub fn draw_clouds(canvas: &mut Canvas, frame: &LiveFrame) -> Duration {
 /// `tints` is `LiveFrame::cloud_tints`; an empty slice draws the neutral tones.
 pub fn draw_cloud_field(canvas: &mut Canvas, field: &CloudField, tints: &[u8]) -> Duration {
     let start = Instant::now();
-    paint_cloud_stack(canvas, &field.stack(tints));
+    paint_cloud_stack(canvas, &field.stack(tints), CLOUD_VEIL);
     start.elapsed()
 }
 
@@ -1479,7 +1554,10 @@ pub struct CloudField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloudLayer {
     /// Whose. Indexes the caller's tint table, exactly as
-    /// [`CloudKernel::thread`] does.
+    /// [`CloudKernel::thread`] does, and is what [`CloudTween::advance`] matches
+    /// its two sides on — so it has to mean the same thread from one frame to
+    /// the next, which `polis_world::Thread::layer` guarantees and a rank in a
+    /// list sorted by activity does not.
     pub thread: u16,
     /// This territory's density alone, row-major, `grid_x * grid_y`.
     pub density: Vec<f32>,
@@ -1541,8 +1619,30 @@ impl CloudField {
         // `polis_world::territory::CLOUD_CAP` of these.
         let mut layers: Vec<CloudLayer> = Vec::new();
 
+        // Grouped by thread, and the groups kept in the order the caller pushed
+        // them. The producers push one territory at a time in
+        // `polis_world::territory::select_clouds`'s ranking order and
+        // [`CloudField::stack`] paints the last layer first, so this order is
+        // what puts a promoted territory on top of the one it overlaps.
+        //
+        // Sorting on the id instead — which is what this did while the id *was*
+        // the rank — now keys the paint order to
+        // `polis_world::Thread::layer`, the order threads were first seen,
+        // which ranks nothing. The two came apart deliberately: see that field.
+        let mut first: Vec<u16> = Vec::new();
+        for k in kernels.iter().filter(|k| live(k)) {
+            if !first.contains(&k.thread) {
+                first.push(k.thread);
+            }
+        }
         let mut order: Vec<usize> = (0..kernels.len()).filter(|i| live(&kernels[*i])).collect();
-        order.sort_by_key(|i| kernels[*i].thread);
+        // Stable, so kernels stay in the order they were pushed within a group.
+        order.sort_by_key(|i| {
+            first
+                .iter()
+                .position(|t| *t == kernels[*i].thread)
+                .unwrap_or(usize::MAX)
+        });
 
         let mut i = 0;
         while i < order.len() {
@@ -1849,6 +1949,7 @@ impl CloudField {
             height: h,
             cells,
             crowd,
+            thread: NO_LAYER,
             tint: owner,
             weave: 0,
             cross_contested: true,
@@ -1925,6 +2026,7 @@ impl CloudField {
                 height: h,
                 cells,
                 crowd,
+                thread: layer.thread,
                 tint: vec![tint; w * h],
                 weave,
                 cross_contested: false,
@@ -2038,6 +2140,7 @@ impl CloudStack {
             height,
             cells,
             crowd,
+            thread: NO_LAYER,
             tint,
             weave: 0,
             cross_contested: false,
@@ -2151,16 +2254,21 @@ impl CloudTween {
                 let to = t.layers_onto(&merged);
                 let n = merged.grid_x * merged.grid_y;
                 // The union of both sides' threads, so a territory that only one
-                // side has still has a layer to ease along. Both sides are
-                // already sorted by thread, which is what makes the union a
-                // merge rather than a search.
-                let mut threads: Vec<u16> = from
-                    .iter()
-                    .chain(to.iter())
-                    .map(|l| l.thread)
-                    .collect::<Vec<_>>();
-                threads.sort_unstable();
-                threads.dedup();
+                // side has still has a layer to ease along.
+                //
+                // Taken in the **target's** order rather than sorted, because
+                // the order of a field's layers is its paint order and the
+                // target's is the current ranking. A layer only the outgoing
+                // side has is a territory that has just left the selection, and
+                // it goes on the end: it is dissipating, and the thing it must
+                // not do on the way out is paint over a territory that is still
+                // there.
+                let mut threads: Vec<u16> = to.iter().map(|l| l.thread).collect();
+                for layer in &from {
+                    if !threads.contains(&layer.thread) {
+                        threads.push(layer.thread);
+                    }
+                }
                 let mut layers = Vec::with_capacity(threads.len());
                 for thread in threads {
                     let a = from.iter().find(|l| l.thread == thread);
@@ -2219,6 +2327,16 @@ pub struct BandMap {
     /// How many territories reach fringe level at each pixel. `>= CLOUD_CROWD`
     /// is contested ground.
     pub crowd: Vec<u8>,
+    /// Which territory this map is: `polis_world::Thread::layer`, or
+    /// [`NO_LAYER`] on a map that is the whole sky rather than one layer of it.
+    ///
+    /// Not [`Self::tint`], and the difference is the whole reason it is here.
+    /// A hue has twelve slots and then repeats, so two live threads can share
+    /// one; a layer is unique across threads and stable across frames, which is
+    /// what a caller singling **one** territory out has to match on. The window
+    /// does exactly that when the operator points at a card — see
+    /// `polis_app::clouds`.
+    pub thread: u16,
     /// The owning thread's [`polis_world::Thread::tint`] per pixel, or
     /// [`NO_TINT`] where the caller offered no identity table.
     ///
@@ -2257,6 +2375,22 @@ impl BandMap {
         match self.tint.get(i).copied() {
             Some(t) if t != NO_TINT => thread_ink(t, band),
             _ => band,
+        }
+    }
+
+    /// The ground tone under one banded pixel: [`CLOUD_BODY`] in the owning
+    /// thread's hue.
+    ///
+    /// One tone for all three bands, unlike [`Self::tone`]. The band ladder is
+    /// carried by [`CLOUD_BODY_ALPHA`] — how far the ground is taken to this
+    /// tone — rather than by the tone itself, because the body's job is to make
+    /// the region **even**, and three floor tones would put a second gradient
+    /// inside a shape whose whole point is not having one.
+    #[must_use]
+    pub fn body_tone(&self, i: usize) -> Rgb {
+        match self.tint.get(i).copied() {
+            Some(t) if t != NO_TINT => thread_ink(t, CLOUD_BODY),
+            _ => CLOUD_BODY,
         }
     }
 
@@ -2346,8 +2480,8 @@ pub fn contour_steps(bands: &BandMap) -> [isize; 3] {
 /// one territory, or, where the caller has no identity to split by, the sum of
 /// all of them with [`BandMap::cross_contested`] standing in for the layers it
 /// does not have.
-pub fn paint_cloud_bands(canvas: &mut Canvas, bands: &BandMap) {
-    paint_cloud_bands_into(canvas, bands, [0, 0]);
+pub fn paint_cloud_bands(canvas: &mut Canvas, bands: &BandMap, veil: f64) {
+    paint_cloud_bands_into(canvas, bands, [0, 0], veil);
 }
 
 /// [`paint_cloud_bands`] onto a canvas that covers only part of the map.
@@ -2357,7 +2491,34 @@ pub fn paint_cloud_bands(canvas: &mut Canvas, bands: &BandMap) {
 /// the canvas's: the hatch is a texture anchored to the map, and re-phasing it
 /// when the cloud's bounding rectangle happens to move would make it swim under
 /// a territory that is merely growing.
-pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usize; 2]) {
+pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usize; 2], veil: f64) {
+    cloud_ink(bands, origin, veil, &mut |x, y, tone, alpha| {
+        canvas.blend(x, y, tone, alpha);
+    });
+}
+
+/// One layer's ink, handed to the caller instead of to a canvas.
+///
+/// `emit` receives `(x, y, tone, alpha)` in the caller's own coordinates —
+/// `origin` is where its top-left sits in the band map's — with `alpha` at `1.0`
+/// for a mark and at [`CLOUD_BODY_ALPHA`] scaled by `veil` for the body under
+/// it. Pixels arrive at most once per layer, so a caller compositing a
+/// [`CloudStack`] gets them in paint order and can blend them however its target
+/// wants: [`paint_cloud_bands_into`] blends onto an opaque canvas, and the
+/// window blends onto transparency because its clouds are a texture over the
+/// base map rather than a pass across it.
+///
+/// This is the one definition of the mark. Both surfaces call it, so the window
+/// and the recorded frame cannot disagree about a single stroke — the rule this
+/// module has enforced since the layer had two implementations and no visual
+/// language.
+pub fn cloud_ink(
+    bands: &BandMap,
+    origin: [usize; 2],
+    veil: f64,
+    emit: &mut impl FnMut(usize, usize, Rgb, f64),
+) {
+    let veil = veil.clamp(0.0, 1.0);
     let step = contour_steps(bands);
     let axis = CLOUD_WEAVES[bands.weave as usize % CLOUD_WEAVES.len()];
     for y in 0..bands.height {
@@ -2404,7 +2565,18 @@ pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usi
                     a.rem_euclid(spacing) < width
                 }
             };
-            if contour || hatched {
+            // A mark is opaque ink at the band's own tone; the ground under it
+            // is the veil, carried toward `CLOUD_BODY` instead — see there for
+            // why the body cannot be the mark's colour thinned.
+            let (tone, alpha) = if contour || hatched {
+                (bands.tone(y * bands.width + x, band), 1.0)
+            } else {
+                (
+                    bands.body_tone(y * bands.width + x),
+                    veil * CLOUD_BODY_ALPHA[band as usize % CLOUD_BODY_ALPHA.len()],
+                )
+            };
+            if alpha > 0.0 {
                 let (Some(px), Some(py)) = (cx.checked_sub(origin[0]), cy.checked_sub(origin[1]))
                 else {
                     continue;
@@ -2413,7 +2585,7 @@ pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usi
                 // and neither can take the other's channel: two threads' clouds
                 // are the same three tones apart in tone and a hue apart in
                 // identity, so "core versus fringe" still reads in greyscale.
-                cloud_pixel(canvas, px, py, bands.tone(y * bands.width + x, band));
+                emit(px, py, tone, alpha);
             }
         }
     }
@@ -2429,15 +2601,37 @@ pub fn paint_cloud_bands_into(canvas: &mut Canvas, bands: &BandMap, origin: [usi
 ///
 /// `origin` is where the canvas's top-left sits in the stack's coordinates, as
 /// in [`paint_cloud_bands_into`].
-pub fn paint_cloud_stack_into(canvas: &mut Canvas, stack: &CloudStack, origin: [usize; 2]) {
+pub fn paint_cloud_stack_into(
+    canvas: &mut Canvas,
+    stack: &CloudStack,
+    origin: [usize; 2],
+    veil: f64,
+) {
     for layer in &stack.layers {
-        paint_cloud_bands_into(canvas, layer, origin);
+        paint_cloud_bands_into(canvas, layer, origin, veil);
     }
 }
 
 /// [`paint_cloud_stack_into`] onto a canvas that covers the whole map.
-pub fn paint_cloud_stack(canvas: &mut Canvas, stack: &CloudStack) {
-    paint_cloud_stack_into(canvas, stack, [0, 0]);
+pub fn paint_cloud_stack(canvas: &mut Canvas, stack: &CloudStack, veil: f64) {
+    paint_cloud_stack_into(canvas, stack, [0, 0], veil);
+}
+
+/// [`cloud_ink`] for a whole [`CloudStack`], bottom layer first.
+///
+/// The layers arrive in paint order and a pixel can be emitted once per layer,
+/// which is exactly what a translucent body needs: two clouds sharing ground
+/// composite, rather than the upper one replacing the lower. See
+/// [`paint_cloud_stack_into`] for why the ordering is what it is.
+pub fn cloud_ink_stack(
+    stack: &CloudStack,
+    origin: [usize; 2],
+    veil: f64,
+    emit: &mut impl FnMut(usize, usize, Rgb, f64),
+) {
+    for layer in &stack.layers {
+        cloud_ink(layer, origin, veil, emit);
+    }
 }
 
 /// Layer 4 — trails, tethers, thrash rosettes, scaffolding, marks, agents.
@@ -3964,7 +4158,12 @@ mod tests {
             cloud_tints: vec![0, 6],
             ..LiveFrame::default()
         };
-        draw_clouds(&mut c, &frame);
+        // Marks only. This is an assertion about identity spending none of PRD
+        // §10.3's brightness budget, and the body deliberately paints *below*
+        // the cloud band — it is ground, not ink, and it is measured as ground
+        // by `the_veil_levels_the_ground_under_a_cloud_and_only_when_it_is_on`.
+        let field = CloudField::sample(&frame.clouds, 320, 200).expect("a field");
+        paint_cloud_stack(&mut c, &field.stack(&frame.cloud_tints), 0.0);
 
         let mut left: Vec<Rgb> = Vec::new();
         let mut right: Vec<Rgb> = Vec::new();
@@ -4026,8 +4225,8 @@ mod tests {
         let field = CloudField::sample(&kernels, 200, 200).expect("a field");
         let mut plain = Canvas::new(200, 200, [20, 21, 24]);
         let mut empty = Canvas::new(200, 200, [20, 21, 24]);
-        paint_cloud_bands(&mut plain, &field.bands());
-        paint_cloud_bands(&mut empty, &field.bands_tinted(&[]));
+        paint_cloud_bands(&mut plain, &field.bands(), 0.0);
+        paint_cloud_bands(&mut empty, &field.bands_tinted(&[]), 0.0);
         assert_eq!(plain.pixels, empty.pixels);
         for p in plain.pixels.as_chunks::<3>().0 {
             if p != &[20, 21, 24] {
@@ -4039,6 +4238,14 @@ mod tests {
     /// PRD §10.4, as an assertion: a cloud is contour and hatch, never a fill.
     /// The measure is the one that matters to the operator — how much of the
     /// city the cloud covered.
+    ///
+    /// Painted with **no veil**, which is the notation this assertion is about.
+    /// The body added later is a fill by construction and inks its whole
+    /// footprint on purpose; what must stay true underneath it is that the marks
+    /// are sparse, because they are what carries the band ladder and the
+    /// identity, and a hatch that had quietly closed up would be invisible
+    /// against the ground it stands on. The body's own cost is measured by
+    /// `the_veil_levels_the_ground_under_a_cloud_and_only_when_it_is_on`.
     #[test]
     fn a_cloud_is_sparse_marks_and_the_city_shows_through() {
         let mut c = Canvas::new(300, 300, [20, 21, 24]);
@@ -4059,7 +4266,8 @@ mod tests {
             clouds: kernels,
             ..LiveFrame::default()
         };
-        draw_clouds(&mut c, &frame);
+        let field = CloudField::sample(&frame.clouds, 300, 300).expect("a field");
+        paint_cloud_stack(&mut c, &field.stack(&frame.cloud_tints), 0.0);
         let painted = c
             .pixels
             .as_chunks::<3>()
@@ -4228,9 +4436,9 @@ mod tests {
         let field = CloudField::sample(&kernels, w, h).expect("a field");
 
         let mut summed = Canvas::new(w, h, bg);
-        paint_cloud_bands(&mut summed, &field.bands_tinted(&tints));
+        paint_cloud_bands(&mut summed, &field.bands_tinted(&tints), 0.0);
         let mut stacked = Canvas::new(w, h, bg);
-        paint_cloud_stack(&mut stacked, &field.stack(&tints));
+        paint_cloud_stack(&mut stacked, &field.stack(&tints), 0.0);
 
         let mut sheet = Canvas::new(w * 2 + 12, h, [10, 10, 12]);
         for (panel, x0) in [(&summed, 0usize), (&stacked, w + 12)] {
@@ -4789,6 +4997,186 @@ mod tests {
             .collect()
     }
 
+    /// What the veil does to the city, measured rather than asserted by design.
+    ///
+    /// The layer's standing claim is that a cloud does not fog the map: over 192
+    /// frames of six real sessions it disturbed **zero** pixels and moved the
+    /// median luminance under it by `0.000` levels. A body touches the map, so
+    /// that claim is now conditional and this is where the condition is written:
+    ///
+    /// * at `veil = 0` it holds exactly — nothing outside a mark moves, and the
+    ///   marks stay sparse enough to see the city between them;
+    /// * at [`CLOUD_VEIL`] the ground under a cloud is **levelled** toward
+    ///   [`CLOUD_BODY`], which is what "an even background" means numerically:
+    ///   the variance of the base map inside the region falls, and falls further
+    ///   fringe → core;
+    /// * it never carries a pixel past [`CLOUD_BODY`] itself. Levelling moves
+    ///   the darkest ground up as well as the lit ground down — that is what
+    ///   levelling is — but the destination is a tone under the base map's own
+    ///   ceiling, so the pale-grey fog every earlier fill here was removed for
+    ///   is bounded out rather than tuned down;
+    /// * and under the fringe the city still shows: two ground tones stay at
+    ///   least half as far apart as they were.
+    #[test]
+    fn the_veil_levels_the_ground_under_a_cloud_and_only_when_it_is_on() {
+        let (w, h) = (300usize, 300usize);
+        // Two tones, so the test can ask about variance and contrast rather than
+        // only about brightness. The lighter one is at the base map's ceiling,
+        // which is the worst case for a body that might lift it.
+        let dark: Rgb = [18, 19, 22];
+        let light: Rgb = [44, 46, 48];
+        let mut bare = Canvas::new(w, h, dark);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let tone = if (x / 8) % 2 == 0 { dark } else { light };
+                bare.pixels[i..i + 3].copy_from_slice(&tone);
+            }
+        }
+        // One territory dense enough to reach all three bands.
+        let kernels = territory(0, [150.0, 150.0], 70.0, 60.0, 14);
+        let field = CloudField::sample(&kernels, w, h).expect("a field");
+        let stack = field.stack(&[]);
+        let bands = stack.flattened().expect("a footprint");
+
+        let mut off = bare.clone();
+        paint_cloud_stack(&mut off, &stack, 0.0);
+        let mut on = bare.clone();
+        paint_cloud_stack(&mut on, &stack, CLOUD_VEIL);
+        // And the far end of the slider, which is the setting that answers "as
+        // much of the city as it takes".
+        let mut full = bare.clone();
+        paint_cloud_stack(&mut full, &stack, 1.0);
+
+        let luma = |p: &[u8]| {
+            f64::from(p[0]).mul_add(
+                0.2126,
+                f64::from(p[1]).mul_add(0.7152, f64::from(p[2]) * 0.0722),
+            )
+        };
+        // A pixel the veil-free painting changed is a mark; a banded pixel it
+        // left alone is body, and the body is what this test is about.
+        let mut marks = 0usize;
+        let mut footprint = 0usize;
+        let mut before: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut after: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut wide_open: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let bare_px = bare.pixels[i..i + 3].to_vec();
+                let band = bands.at(x, y);
+                if band == NO_BAND {
+                    // Outside every cloud, neither painting may touch anything.
+                    assert_eq!(
+                        off.pixels[i..i + 3],
+                        bare_px[..],
+                        "a mark landed outside the banded region at {x},{y}"
+                    );
+                    assert_eq!(
+                        on.pixels[i..i + 3],
+                        bare_px[..],
+                        "the veil painted outside the banded region at {x},{y}"
+                    );
+                    continue;
+                }
+                footprint += 1;
+                if off.pixels[i..i + 3] != bare_px[..] {
+                    marks += 1;
+                    continue;
+                }
+                let now = luma(&on.pixels[i..i + 3]);
+                // Never past the floor tone, and never out of the base map's
+                // band. One pixel is enough to fail this: the fog it guards
+                // against was a systematic lift, and a systematic lift has to
+                // start somewhere.
+                let ceiling = luma(&bare_px).max(luma(&CLOUD_BODY)) + 0.5;
+                assert!(
+                    now <= ceiling,
+                    "the body carried the city past its own floor at {x},{y}: {:.1} -> {now:.1}",
+                    luma(&bare_px)
+                );
+                assert!(
+                    now < f64::from(crate::plan::BASE_MAP_CEILING),
+                    "the body lifted a pixel out of the base map's band at {x},{y}: {now:.1}"
+                );
+                before[band as usize].push(luma(&bare_px));
+                after[band as usize].push(now);
+                wide_open[band as usize].push(luma(&full.pixels[i..i + 3]));
+            }
+        }
+        // The marks-only notation stays sparse — the 28 % the module docs quote,
+        // and the ground the veil is laid over.
+        assert!(
+            marks * 2 < footprint,
+            "the marks alone inked {marks} of {footprint} banded pixels"
+        );
+        assert!(
+            before.iter().all(|b| b.len() > 200),
+            "the fixture has to reach all three bands, got {:?}",
+            before.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        let spread = |v: &[f64]| {
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            (v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+        let evened: Vec<f64> = (0..3)
+            .map(|b| spread(&after[b]) / spread(&before[b]).max(1e-9))
+            .collect();
+        assert!(
+            evened[0] < 0.95,
+            "the fringe left the ground as uneven as it found it ({:.2})",
+            evened[0]
+        );
+        assert!(
+            evened[0] > evened[1] && evened[1] > evened[2],
+            "the ground has to even out fringe -> core, got {evened:?}"
+        );
+        assert!(
+            evened[2] < 0.75,
+            "at the shipped veil a core has to be visibly more even than its fringe              ({:.2})",
+            evened[2]
+        );
+        // At full veil the core is the answer to "hide whatever it takes": what
+        // is left of the city under it is a fifth of the contrast it had.
+        let flattened = spread(&wide_open[2]) / spread(&before[2]).max(1e-9);
+        assert!(
+            flattened < 0.3,
+            "full veil has to leave a core reading as one region ({flattened:.2})"
+        );
+
+        // And the readability floor: under the **fringe**, the two ground tones
+        // must still be told apart. A veil that flattens them there has stopped
+        // being a veil and started being a lid, whatever its alpha says.
+        let mut pairs = 0usize;
+        for y in 0..h {
+            for x in 8..w - 8 {
+                if bands.at(x, y) != 0 || bands.at(x + 8, y) != 0 {
+                    continue;
+                }
+                let (a, b) = ((y * w + x) * 3, (y * w + x + 8) * 3);
+                if bare.pixels[a] == bare.pixels[b] {
+                    continue;
+                }
+                // Ground, not ink. A contour or a hatch stroke is opaque by
+                // design and says nothing about whether the veil is see-through.
+                if off.pixels[a..a + 3] != bare.pixels[a..a + 3]
+                    || off.pixels[b..b + 3] != bare.pixels[b..b + 3]
+                {
+                    continue;
+                }
+                let was = i32::from(bare.pixels[a]) - i32::from(bare.pixels[b]);
+                let now = i32::from(on.pixels[a]) - i32::from(on.pixels[b]);
+                assert!(
+                    now.abs() * 2 >= was.abs(),
+                    "the fringe flattened the city under it at {x},{y}: {was} -> {now}"
+                );
+                pairs += 1;
+            }
+        }
+        assert!(pairs > 100, "not enough fringe to measure, {pairs} pairs");
+    }
+
     /// How many pixels are in one iso band.
     ///
     /// A fold rather than `filter(..).count()` because the band index is a `u8`
@@ -4876,8 +5264,8 @@ mod tests {
 
         let mut ca = Canvas::new(300, 300, bg);
         let mut cb = Canvas::new(300, 300, bg);
-        paint_cloud_bands(&mut ca, &a);
-        paint_cloud_bands(&mut cb, &b);
+        paint_cloud_bands(&mut ca, &a, 0.0);
+        paint_cloud_bands(&mut cb, &b, 0.0);
         assert_ne!(ca.pixels, cb.pixels, "the overlap is not drawn at all");
 
         // Ink where the other frame has none, in both directions: the crossing
@@ -4950,8 +5338,8 @@ mod tests {
 
         let mut ca = Canvas::new(300, 300, bg);
         let mut cb = Canvas::new(300, 300, bg);
-        paint_cloud_stack(&mut ca, &solo.stack(&tints));
-        paint_cloud_stack(&mut cb, &pair.stack(&tints));
+        paint_cloud_stack(&mut ca, &solo.stack(&tints), 0.0);
+        paint_cloud_stack(&mut cb, &pair.stack(&tints), 0.0);
 
         // Who drew what: a band tone through each thread's hue.
         let ink_of =
@@ -5160,7 +5548,7 @@ mod tests {
         // a speck is a marker, not a fog.)
         let bg: Rgb = [20, 21, 24];
         let mut canvas = Canvas::new(300, 300, bg);
-        paint_cloud_bands(&mut canvas, &large);
+        paint_cloud_bands(&mut canvas, &large, 0.0);
         let share = 100 * inked(&canvas, bg) / banded(&large).max(1);
         assert!(
             share <= 35,
@@ -5208,6 +5596,132 @@ mod tests {
         assert!(
             frames > 12,
             "the cloud vanished in {frames} frames: that is a cut, not a fade"
+        );
+    }
+
+    /// Two agents working at once must not repaint each other every time one of
+    /// them runs a tool.
+    ///
+    /// `polis_world::territory::select_clouds` ranks by `last_activity`, so with
+    /// two live threads the visible list reorders on almost every event. While
+    /// the id a kernel carried *was* that position, the reorder renamed both
+    /// territories: [`CloudTween::advance`] matches its two sides on the id, so
+    /// each cloud was eased toward the other's shape, and
+    /// [`CloudField::stack`] looks the tint up by the same id, so each was
+    /// repainted in the other's hue. The operator saw it as *"the clouds
+    /// contract and rebuild a lot, colours change a lot"*.
+    ///
+    /// The id is now `polis_world::Thread::layer`, which belongs to the thread.
+    /// A reorder is then a no-op for the field — the same two territories in the
+    /// same two places — and the only thing that changes is which is painted
+    /// over which, which is what the ranking is *for*.
+    #[test]
+    fn reordering_the_visible_list_moves_no_cloud_and_repaints_none() {
+        // Not 0 and 1: the ids are the threads' own, and nothing renumbers them
+        // to the frame.
+        const A: u16 = 7;
+        const B: u16 = 3;
+        let a = territory(A, [90.0, 150.0], 40.0, 55.0, 9);
+        let b = territory(B, [300.0, 150.0], 40.0, 55.0, 9);
+
+        // Frame one had A first; then B ran a tool and took the top of the
+        // ranking. Same two threads, same two places, same two ids.
+        let first: Vec<CloudKernel> = a.iter().chain(b.iter()).copied().collect();
+        let second: Vec<CloudKernel> = b.iter().chain(a.iter()).copied().collect();
+        let f1 = CloudField::sample(&first, 400, 300).expect("a field");
+        let f2 = CloudField::sample(&second, 400, 300).expect("a field");
+        assert!(
+            f1.aligned_with(&f2),
+            "the two frames must share a lattice or this tests the wrong thing"
+        );
+
+        // Where a layer's mass actually is, as a lattice cell. A swap moves it
+        // clear across the field, so this is the coarsest possible probe and
+        // still catches it.
+        let peak_cell = |field: &CloudField, id: u16| -> usize {
+            let layer = field
+                .layers
+                .iter()
+                .find(|l| l.thread == id)
+                .unwrap_or_else(|| panic!("no layer for thread {id}"));
+            layer
+                .density
+                .iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.total_cmp(y))
+                .map(|(i, _)| i)
+                .expect("a non-empty lattice")
+        };
+
+        let dt = 1.0 / 24.0;
+        let mut tween = CloudTween::default();
+        for _ in 0..60 {
+            tween.advance(Some(f1.clone()), dt, CLOUD_TWEEN_RATE);
+        }
+        let settled = tween.field().expect("a field").clone();
+        assert_ne!(
+            peak_cell(&settled, A),
+            peak_cell(&settled, B),
+            "the two territories are in one place; a swap would be invisible"
+        );
+
+        // Long enough that a cloud eased toward the *other* one would have got
+        // there. Reordering the list is not news, so the right answer is that
+        // nothing happens at all.
+        for _ in 0..30 {
+            tween.advance(Some(f2.clone()), dt, CLOUD_TWEEN_RATE);
+        }
+        let after = tween.field().expect("a field").clone();
+        for id in [A, B] {
+            let cell = peak_cell(&settled, id);
+            assert_eq!(
+                peak_cell(&after, id),
+                cell,
+                "thread {id}'s cloud moved because the *other* thread ran a tool"
+            );
+            let (was, now) = (
+                settled
+                    .layers
+                    .iter()
+                    .find(|l| l.thread == id)
+                    .expect("a layer")
+                    .density[cell],
+                after
+                    .layers
+                    .iter()
+                    .find(|l| l.thread == id)
+                    .expect("a layer")
+                    .density[cell],
+            );
+            assert!(
+                (now - was).abs() < was * 0.02,
+                "thread {id}'s cloud rebuilt itself over a reorder: {was} -> {now}"
+            );
+        }
+
+        // The ranking still decides what is painted over what: the promoted
+        // territory is first in the layer list, and `stack` paints the list in
+        // reverse so first is on top.
+        assert_eq!(
+            after.layers.first().map(|l| l.thread),
+            Some(B),
+            "the newly promoted territory is not on top"
+        );
+
+        // And the hue follows the id, because the tint table is indexed by it.
+        let mut tints = vec![NO_TINT; 8];
+        tints[A as usize] = 0;
+        tints[B as usize] = 6;
+        let stack = after.stack(&tints);
+        let painted: Vec<u8> = stack
+            .layers
+            .iter()
+            .filter_map(|l| l.tint.first().copied())
+            .collect();
+        assert_eq!(
+            painted,
+            vec![0, 6],
+            "the stack paints bottom-first, so A's hue is laid down and B's goes over it"
         );
     }
 

@@ -255,6 +255,35 @@ pub struct LlmConfig {
     /// [`cache::DEFAULT_DRIFT_THRESHOLD_PERMILLE`] for the measurement behind
     /// the default.
     pub drift_threshold_permille: u16,
+    /// How hard the model should think before answering, when the endpoint
+    /// takes an `OpenAI`-style `reasoning_effort`.
+    ///
+    /// # Measured, on the endpoint, not assumed
+    ///
+    /// `glm-5.3-flash` reasons before every answer and **cannot be told not
+    /// to** — `{"thinking": {"type": "disabled"}}` is refused outright with
+    /// *"This model always engages in thinking and cannot be disabled; please
+    /// use low, high, or max"*. The level is carried by `reasoning_effort`, and
+    /// on one live caption request it is worth a great deal:
+    ///
+    /// | setting | completion tokens | answer |
+    /// |---|---:|---|
+    /// | unset (the default) | 226 | "Running map frame integration tests" |
+    /// | `reasoning_effort: "low"` | **12** | "Running map frame integration tests" |
+    /// | `thinking: {"effort": "low"}` | 332 | ignored — the wrong key, so it thought more |
+    ///
+    /// Nineteen times the output tokens for the same sentence. Labelling is not
+    /// a reasoning task, which is the same argument the temperature already
+    /// makes.
+    ///
+    /// `None` does not send the field at all, because an `OpenAI`-compatible
+    /// endpoint that has never heard of it answers `400` rather than ignoring
+    /// it —
+    /// `thinking: "low"` on this same endpoint is a Jackson parse error, not a
+    /// shrug. So the default is off and a caller that has checked its endpoint
+    /// turns it on.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Ask for a JSON object with `response_format`.
     ///
     /// `models.dev` reports that `glm-5.3-flash` supports structured output, and
@@ -293,6 +322,9 @@ impl Default for LlmConfig {
             max_districts_per_run: 400,
             max_names_per_district: 60,
             price: Price::GLM_FLASH_PROMO,
+            // Off: see the field. A caller that has checked its endpoint takes
+            // it, and everything that has not keeps the shape it always sent.
+            reasoning_effort: None,
             drift_threshold_permille: cache::DEFAULT_DRIFT_THRESHOLD_PERMILLE,
             request_json_object: true,
             doc_comment_trust_max_files: 25,

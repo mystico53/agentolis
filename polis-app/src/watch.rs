@@ -66,6 +66,7 @@ pub fn watch(cli: &Cli, args: &WatchArgs) -> anyhow::Result<i32> {
     banner(&repo, args, &report)?;
     let config = Config {
         repo_root: repo,
+        captions: args.captions,
         ..Config::default()
     };
     crate::launch(
@@ -101,11 +102,8 @@ fn list(repo: &Path, report: &Connectivity) -> anyhow::Result<i32> {
 /// able to tell them apart. One Polis window maps one repository (PRD §2), so
 /// the remedy is another window, and this says so.
 pub fn write_roster(out: &mut impl Write, roster: &Roster) -> io::Result<()> {
-    let here: Vec<_> = roster.here().filter(|s| s.activity.is_live()).collect();
-    let elsewhere: Vec<_> = roster
-        .elsewhere()
-        .filter(|s| s.activity.is_live())
-        .collect();
+    let here: Vec<_> = roster.here().filter(|s| s.is_live()).collect();
+    let elsewhere: Vec<_> = roster.elsewhere().filter(|s| s.is_live()).collect();
 
     if here.is_empty() {
         writeln!(
@@ -119,10 +117,7 @@ pub fn write_roster(out: &mut impl Write, roster: &Roster) -> io::Result<()> {
             writeln!(out, "    {}", session.line())?;
         }
     }
-    let starting: Vec<_> = roster
-        .resolving()
-        .filter(|s| s.activity.is_live())
-        .collect();
+    let starting: Vec<_> = roster.resolving().filter(|s| s.is_live()).collect();
     if !starting.is_empty() {
         writeln!(out)?;
         writeln!(
@@ -150,7 +145,8 @@ pub fn write_roster(out: &mut impl Write, roster: &Roster) -> io::Result<()> {
         writeln!(out)?;
         writeln!(
             out,
-            "  To watch one of those:  polis -C <that repository> watch"
+            "  To watch one of those:  polis -C <that repository> watch\n  \
+             …or press  o  in the window and pick it from the list."
         )?;
     }
     Ok(())
@@ -212,6 +208,7 @@ mod tests {
             quiet_for: None,
             activity: Activity::Working,
             subagents: 0,
+            superseded_by: None,
             tailing: fit == Fit::Inside,
             started_while_watching: false,
         }

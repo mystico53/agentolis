@@ -130,6 +130,7 @@ fn draw_once(city: &City, snapshot: &WorldSnapshot) -> usize {
             snapshot,
             &mut state,
             polis_world::territory::CLOUD_CAP,
+            polis_app::config::Look::default(),
             1.0 / 60.0,
         );
     });

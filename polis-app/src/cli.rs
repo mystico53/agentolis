@@ -26,7 +26,7 @@ use crate::run::DEFAULT_AGENT;
     after_help = "Start here:\n  \
       polis watch            every agent working in this repository, live\n  \
       polis watch --list     …the same answer as text, opening nothing\n  \
-      polis                  the first run explains itself\n  \
+      polis                  pick a repository, then watch it\n  \
       polis map              this repository, drawn as a city\n  \
       polis run -- claude    start an agent with the map watching\n  \
       polis work             agents in panes, the city beside them\n  \
@@ -69,6 +69,13 @@ pub enum Command {
     /// the window, so closing the window — or losing it to a GPU driver reset —
     /// leaves them running; `polis work` again reattaches and puts the same
     /// screens back, scrollback and all.
+    ///
+    /// The map beside them is a **live watch** of the same checkout, so the
+    /// panes' own agents draw their own clouds, a tab says which district its
+    /// agent has claimed, and picking an agent on one side selects it on the
+    /// other. `Ctrl+Alt+T` opens another pane; the same chord opens a dock in a
+    /// `polis watch` window, so this subcommand is only the shortcut that
+    /// starts one for you.
     ///
     /// `polis run -- claude` is untouched and still the right command for
     /// wrapping a single agent in a script: it keeps the real console and
@@ -133,6 +140,16 @@ pub enum Command {
     ///
     /// PRD §15 M1's gate: byte-identical layout across two runs and two machines.
     Snapshot(SnapshotArgs),
+
+    /// Pick a repository to watch, from the ones agents are working in.
+    ///
+    /// What bare `polis` opens. The list is every checkout this machine has live
+    /// agents in, plus the ones it has run them in before, plus whatever Polis
+    /// has opened — with the live count against each, so the answer to *which
+    /// repository* is on the screen rather than in the operator's head. Opening
+    /// a row starts a live watch on it, and the same screen is one key (`o`)
+    /// away inside the window, where it switches the watch in place.
+    Home,
 
     /// Every problem on this machine, with the command that fixes it.
     ///
@@ -248,6 +265,19 @@ pub struct WatchArgs {
     /// `~/.claude/projects`, or an override.
     #[arg(long, value_name = "DIR")]
     pub projects: Option<PathBuf>,
+
+    /// Let a model write each cloud's "what is it working on" line.
+    ///
+    /// **This sends something off the machine**, which nothing else in Polis
+    /// does: the one-line `description` each agent writes about its own `Bash`,
+    /// `PowerShell` and `Agent` calls, plus the directories it is working in
+    /// and its call counts. Never a prompt, never a file, never a diff, never a
+    /// command line — see `polis_app::intent`.
+    ///
+    /// Needs `ZAI_API_KEY` (or `GLM_API_KEY`). Without one, the map is exactly
+    /// the map you get without this flag.
+    #[arg(long)]
+    pub captions: bool,
 }
 
 impl WatchArgs {
@@ -257,7 +287,7 @@ impl WatchArgs {
     /// discover *this repository's live agents* and publish a roster, rather
     /// than opening a tail on every session that has ever run on the machine.
     pub fn options(&self, repo: PathBuf) -> crate::app::live::LiveOptions {
-        let mut options = crate::app::live::LiveOptions::for_repo(repo);
+        let mut options = crate::app::live::LiveOptions::watching(repo);
         options.scope = if self.machine {
             crate::app::live::Scope::Machine
         } else {

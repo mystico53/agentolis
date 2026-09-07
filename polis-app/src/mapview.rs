@@ -18,10 +18,10 @@
 //! * [`ZoomTier::City`] — districts, monuments, skyline, clouds. Buildings are
 //!   sub-pixel and **not drawn individually**: the district polygons carry the
 //!   shape and a per-district skyline bar carries the mass.
-//! * [`ZoomTier::District`] — buildings, streets, workers, trails. Every
+//! * [`ZoomTier::District`] — buildings, streets, workers, write rings. Every
 //!   building is a polygon of its own and the roads are drawn.
-//! * [`ZoomTier::Building`] — the above plus file labels, operation glyphs at
-//!   each stop on a trail, and the detail panel [`crate::ui`] opens.
+//! * [`ZoomTier::Building`] — the above plus file labels, an operation glyph
+//!   wherever a call landed, and the detail panel [`crate::ui`] opens.
 //!
 //! # Text is not drawn here
 //!
@@ -108,7 +108,7 @@ const RAIN_REACH: f32 = 34.0;
 /// set the eye can take in and start being the cobweb PRD §12's trail rule
 /// already removed once. The count itself is never lost — it is
 /// `Thread::visits` and the rail reads it.
-const WRITE_RINGS_PER_THREAD: usize = 24;
+pub const WRITE_RINGS_PER_THREAD: usize = 24;
 
 /// One stack of operation marks that landed on the same pixel with the same
 /// shape and the same outcome.
@@ -189,6 +189,16 @@ pub struct ViewState {
     /// 16 ms, and symmetric, which is the part that matters — instead of one
     /// direction working and the other silently not.
     next_hovered_thread: Option<ThreadId>,
+    /// Where each thread's rail card sits on screen, this frame.
+    ///
+    /// Written by the rail as it lays itself out and read by the map when it
+    /// draws the connectors, which is the one mark on the window that belongs to
+    /// neither surface: it starts in a list and ends on a picture. Not
+    /// double-buffered, unlike the hover — the rail is drawn **before** the map
+    /// in the same frame, so the rects are already true when the map asks, and a
+    /// line lagging its own row by a frame would visibly swim while the list
+    /// scrolls.
+    rail_cards: Vec<(ThreadId, Rect)>,
     /// Tween state, so agents move rather than teleport.
     pub motion: Motion,
 }
@@ -201,6 +211,27 @@ impl ViewState {
     /// clears by itself on the next frame.
     pub fn begin_frame(&mut self) {
         self.hovered_thread = self.next_hovered_thread.take();
+        self.rail_cards.clear();
+    }
+
+    /// The rail reporting where it drew a thread's card.
+    ///
+    /// Only cards the operator can actually see: a row scrolled out of its own
+    /// panel would otherwise anchor a line to a point behind the list, and the
+    /// line would appear to come from nowhere.
+    pub fn rail_card(&mut self, id: &ThreadId, rect: Rect, visible: Rect) {
+        if rect.intersects(visible) {
+            self.rail_cards.push((id.clone(), rect.intersect(visible)));
+        }
+    }
+
+    /// Where this thread's rail card is, if the rail drew one this frame.
+    #[must_use]
+    pub fn rail_card_of(&self, id: &ThreadId) -> Option<Rect> {
+        self.rail_cards
+            .iter()
+            .find(|(row, _)| row == id)
+            .map(|(_, rect)| *rect)
     }
 
     /// A view reporting that the pointer is over this thread.
@@ -214,6 +245,22 @@ impl ViewState {
         self.hovered_thread.as_ref()
     }
 
+    /// The **one** thread the operator is asking about, if any — what the cloud
+    /// layer lights up (`crate::clouds::LIT_GAIN`).
+    ///
+    /// [`Self::interrogates`] is the same question asked of a given thread and
+    /// can be true of two at once: a pointer resting on one card while another
+    /// is selected. A highlight that answers *"which shape is this row?"* has to
+    /// name one shape, so the pointer wins — it is the live question, and the
+    /// selection is still carried by the card's own wash and the anchor ring.
+    #[must_use]
+    pub fn asked_about(&self) -> Option<&ThreadId> {
+        self.hovered_thread
+            .as_ref()
+            .or(self.selected_thread.as_ref())
+            .or(self.follow.as_ref())
+    }
+
     /// Whether this thread is the one the operator is pointing at or has
     /// selected — the highlight the map and the rail share.
     #[must_use]
@@ -225,9 +272,12 @@ impl ViewState {
     /// verbs that mean it: pointing at it, selecting it, or following it.
     ///
     /// This is the gate on PRD §12's *"exact below"* — the marks that answer a
-    /// question rather than set a scene. Ownership tethers are the first of
-    /// them: drawn ambiently they were a line across the whole map per worker,
-    /// and one session on this machine has a hundred workers.
+    /// question rather than set a scene. It used to gate **lines**: a fan of
+    /// ownership tethers, then the thread's trail as well, and the operator's
+    /// verdict on a map that sprouted them whenever the pointer crossed a row
+    /// was *"still lines everywhere!!"*. What it gates now is emphasis on marks
+    /// the map was already drawing — the connector to the cloud this thread
+    /// owns, and, through [`Self::asked_about`], that cloud brightening.
     ///
     /// Wider than [`Self::emphasises`] by [`Self::follow`] on purpose. Emphasis
     /// is a *highlight* and follow is a *camera binding*, so they are different
@@ -333,6 +383,7 @@ pub fn draw(
     snapshot: &WorldSnapshot,
     state: &mut ViewState,
     cloud_cap: usize,
+    look: crate::config::Look,
     dt: f32,
 ) -> MapFrame {
     let started = Instant::now();
@@ -372,25 +423,39 @@ pub fn draw(
     }
 
     // --- 3. Clouds — beneath district outlines and labels (PRD §10.3) -------
-    if let Some((texture, cloud_rect)) = clouds.update(ui.ctx(), base, snapshot, cloud_cap, dt) {
+    //
+    // Two images over one rectangle: the even body, filtered smoothly because it
+    // is a region, then the contour and hatch, filtered nearest because they are
+    // marks. See `Clouds` for why one texture could not be both.
+    //
+    // `asked_about` is PRD §12's shared highlight reaching this layer: the cloud
+    // of the thread the operator is pointing at in the rail is drawn brighter,
+    // which is where the trail and the tethers used to answer the same question
+    // with lines. See `crate::clouds::LIT_GAIN`.
+    if let Some((body, ink, cloud_rect)) = clouds.update(
+        ui.ctx(),
+        base,
+        snapshot,
+        cloud_cap,
+        look.cloud_veil,
+        state.asked_about(),
+        dt,
+    ) {
         let screen = Rect::from_min_max(
             camera.to_screen(cloud_rect.min),
             camera.to_screen(cloud_rect.max),
         );
         if screen.intersects(rect) {
-            painter.image(
-                texture.id(),
-                screen,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            painter.image(body.id(), screen, uv, Color32::WHITE);
+            painter.image(ink.id(), screen, uv, Color32::WHITE);
         }
     }
 
     // --- 2b. The wayfinding skeleton, which survives every declutter --------
     draw_districts(&painter, base, camera, snapshot, vis, tier);
 
-    // --- 4. Agents: trails, tethers, workers, operation glyphs --------------
+    // --- 4. Agents: workers, write rings, operation glyphs, rain ------------
     // The pointer is read before the layer rather than after it, because the
     // agent layer is where a thread is picked: PRD §12's shared highlight has to
     // be settled on the same frame the rail is drawn, not one frame behind it.
@@ -444,6 +509,11 @@ pub fn draw(
     if response.clicked() {
         out.clicked.clone_from(&out.hovered);
     }
+
+    // --- The rail's own line to the cloud it names --------------------------
+    //
+    // Where a caption on a leader used to be. See `draw_thread_connectors`.
+    draw_thread_connectors(ui, camera, snapshot, clouds, state, look, rect);
 
     // --- Text, last, through the declutterer (PRD §13, §8) ------------------
     let mut placer = LabelPlacer::new(rect);
@@ -645,24 +715,37 @@ fn skyline(
     );
 }
 
-/// Layer 4 (PRD §10.3): trails, tethers, workers and operation glyphs.
+/// Layer 4 (PRD §10.3): workers, write rings, operation glyphs and rain.
 ///
 /// # One thread, one colour
 ///
-/// Everything here that *is* the thread — its trail, its tethers, its workers'
-/// bodies, its anchor ring — is drawn in `palette::thread_*` at that role's own
+/// Everything here that *is* the thread — its workers' bodies, its write rings,
+/// its anchor ring — is drawn in `palette::thread_*` at that role's own
 /// brightness, so the operator can match a mark on the map against the
 /// rectangle in the rail without reading a single character. The operation
 /// glyphs are the exception and keep PRD §10.2's outcome colour; the reason is
 /// written out on `polis_render::live::Mark`.
 ///
+/// # No lines
+///
+/// This layer used to draw two, both of them for the thread being asked about:
+/// a fan of tethers from each worker back to its thread's anchor, and the
+/// thread's own trail through the city. Together they were most of the ink on
+/// an interrogated map — a trail is 192 points held for fifteen minutes — and
+/// the operator's answer to both was the same: *"instead of these lines when
+/// hovering over a thread card, highlight the cloud, make it brighter"*. That
+/// highlight is `crate::clouds::LIT_GAIN`, reached from
+/// [`ViewState::asked_about`]; ownership here is carried by hue alone, and
+/// `polis-app/tests/asked_about.rs` holds the map to it.
+///
 /// # Picking, which is the other half of PRD §12's shared highlight
 ///
 /// `pointer` is the map's pointer, and the nearest thread mark under it wins
 /// [`ViewState::hovered_thread`] — which is what the rail reads to light the
-/// matching row. Anchors and worker bodies only: a trail is a long thin thing
-/// that crosses half the city, and picking one would mean the pointer selected
-/// a different thread every few pixels of travel.
+/// matching row, and what lights this thread's cloud. Anchors and worker bodies
+/// only: everything else this layer draws is either transient or shared, and
+/// picking one would mean the pointer chose a different thread every few pixels
+/// of travel.
 fn draw_agents(
     painter: &egui::Painter,
     base: &BaseMap,
@@ -699,50 +782,6 @@ fn draw_agents(
         } else {
             0.0
         };
-
-        // --- Trails: history without a timeline scrubber (PRD §12) ----------
-        //
-        // Drawn only for the thread the operator is asking about, for the same
-        // reason as the tether below it. TRAIL_CAP is 192 points held for
-        // TRAIL_TTL = 15 minutes, so five live threads put up to 960 persisting
-        // segments across the city at once — measured on the operator's own map,
-        // and their verdict was "still lines everywhere!!". §12 wants a trail to
-        // show backtracking and thrashing; a permanent cobweb over every
-        // district shows neither, and buries the buildings it is drawn on.
-        //
-        // The ambient answer to "whose work is this" is the thread's colour,
-        // which is on every building it has touched. The trail is the exact
-        // answer to "where has this one been", and §12 asks for exactly that
-        // split: fuzzy above, exact below.
-        let mut points: Vec<(Pos2, f32)> = if state.interrogates(&thread.id) {
-            Vec::with_capacity(thread.trail.len())
-        } else {
-            Vec::new()
-        };
-        for (path, at) in thread
-            .trail
-            .iter()
-            .filter(|_| state.interrogates(&thread.id))
-        {
-            let Some(map) = base.geometry.position_of(path) else {
-                continue;
-            };
-            let age = now.saturating_duration_since(*at).as_secs_f32();
-            let fade = 1.0 - (age / ttl).clamp(0.0, 1.0);
-            points.push((camera.to_screen(map), fade));
-        }
-        for pair in points.windows(2) {
-            let (a, fa) = pair[0];
-            let (b, fb) = pair[1];
-            let fade = f32::midpoint(fa, fb);
-            if fade <= 0.02 {
-                continue;
-            }
-            painter.line_segment(
-                [a, b],
-                Stroke::new(1.4 + lift, palette::thread_trail(tint).aged(fade)),
-            );
-        }
 
         // --- Every file this thread has written, for as long as it lives ----
         //
@@ -919,14 +958,13 @@ fn draw_agents(
             animating = true;
         }
 
-        // --- Workers, and the tethers only the asked-about thread gets ------
+        // --- Workers ---------------------------------------------------------
         //
-        // Ownership is carried ambiently by `tint`: the worker's body, the
-        // thread's anchor ring, its trail, its cloud and the rail's swatch are
-        // one hue. The *line* back to the anchor is the exact answer to a
-        // question about one thread, so it is drawn only for the thread the
-        // operator is pointing at, has selected or is following.
-        // `polis_render::live::draw_tether` carries the measurement.
+        // Ownership is carried by `tint` alone: the worker's body, the thread's
+        // anchor ring, its cloud and the rail's swatch are one hue, and asking
+        // about the thread brightens that cloud (`crate::clouds::LIT_GAIN`)
+        // rather than drawing a line from each hand back to it.
+        //
         // One ladder, walked from one place. `polis_render::frame::thread_anchor`
         // has always gone through `place::thread_position`; the window read
         // `centre_of_mass` and stopped, so a thread with a trail and no kernels
@@ -936,9 +974,9 @@ fn draw_agents(
         // this side adds.
         let anchor = polis_world::place::thread_position(thread, &snapshot.layout)
             .map(|p| camera.to_screen(base.to_map(p)));
-        let tethered = state.interrogates(&thread.id);
-        // The renderer's rank, so the window and a recorded frame stop at the
-        // same sixteen hands: running first, then the most recently active.
+        // The renderer's rank, kept although nothing is drawn from it any more:
+        // it is the order the window and a recorded frame agree on, and the ease
+        // below is registered per worker in it.
         let mut ranked: Vec<&polis_world::Worker> = thread.workers.iter().collect();
         ranked.sort_by(|a, b| {
             b.running
@@ -946,8 +984,7 @@ fn draw_agents(
                 .then(b.last_activity.cmp(&a.last_activity))
                 .then(a.id.cmp(&b.id))
         });
-        let fan = live::TETHERS_PER_THREAD.min(ranked.len()).max(2) - 1;
-        for (rank, worker) in ranked.iter().enumerate() {
+        for worker in &ranked {
             // The same ladder again, not the raw `focus` field: a worker whose
             // last located call named no file has no focus at all, and asking
             // for one and giving up drew nothing for it. Measured over session
@@ -966,16 +1003,6 @@ fn draw_agents(
             let (eased, moving) = state.motion.ease(&worker.id, map);
             animating |= moving;
             let at = camera.to_screen(eased);
-            if let Some(anchor) = anchor.filter(|_| tethered && rank < live::TETHERS_PER_THREAD) {
-                draw_tether(
-                    painter,
-                    anchor,
-                    at,
-                    (rank as f32 / fan as f32).mul_add(2.0, -1.0),
-                    worker.running,
-                    tint,
-                );
-            }
             let r = if worker.running { 5.0 } else { 3.5 };
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -1023,66 +1050,6 @@ fn draw_agents(
         state.hover_thread(&id);
     }
     animating
-}
-
-/// How far a tether bows off the straight line, at most, in screen pixels.
-///
-/// `polis_render::live::draw_tether` states it as five glyph radii; the window's
-/// worker mark is five pixels, so this is the same number in the units the
-/// overlay works in. It is a cap on `len * 0.075`, which is what does the work
-/// on the short tethers — a fan of workers inside one district would otherwise
-/// bow by a few pixels and stay a ribbon.
-const TETHER_BOW: f32 = 26.0;
-
-/// One tether, in the window, drawn exactly as `polis_render::live::draw_tether`
-/// draws it in a recorded frame.
-///
-/// > A visual language with two definitions has none.
-///
-/// So the geometry is that function's: a quadratic bow whose sign and size come
-/// from `spread`, eight segments, solid while the worker is running and dashed
-/// once it has finished — a **shape** difference, because PRD §11.4 says
-/// peripheral vision cannot do the three-grey-levels one. The ink is that
-/// module's constant faded to that module's tones (0.70 running, 0.34
-/// finished), in the thread's own hue.
-///
-/// Who gets one is decided by the caller: [`ViewState::interrogates`], and the
-/// reasoning is on `polis_render::live::draw_tether`.
-fn draw_tether(
-    painter: &egui::Painter,
-    anchor: Pos2,
-    worker: Pos2,
-    spread: f32,
-    running: bool,
-    tint: u8,
-) {
-    let (width, tone) = if running { (1.6, 0.70) } else { (1.2, 0.34) };
-    let ink = palette::thread_tether(tint).aged(tone);
-    let d = worker - anchor;
-    let len = d.length().max(1e-3);
-    let bow = (len * 0.075).min(TETHER_BOW) * spread.clamp(-1.0, 1.0);
-    let mid = anchor + d * 0.5;
-    let ctrl = mid + Vec2::new(-d.y / len, d.x / len) * bow;
-    let steps = 8;
-    let pts: Vec<Pos2> = (0..=steps)
-        .map(|i| {
-            let t = i as f32 / steps as f32;
-            let u = 1.0 - t;
-            Pos2::new(
-                (t * t).mul_add(worker.x, (u * u).mul_add(anchor.x, 2.0 * u * t * ctrl.x)),
-                (t * t).mul_add(worker.y, (u * u).mul_add(anchor.y, 2.0 * u * t * ctrl.y)),
-            )
-        })
-        .collect();
-    if running {
-        painter.add(egui::Shape::line(pts, Stroke::new(width, ink)));
-    } else {
-        // One segment on, one off: four dashes along the bow, the same period
-        // the renderer uses.
-        for pair in pts.as_chunks::<2>().0 {
-            painter.line_segment([pair[0], pair[1]], Stroke::new(width, ink));
-        }
-    }
 }
 
 /// PRD §10.4's leading-edge mark — the redirect signal.
@@ -1643,33 +1610,12 @@ fn draw_labels(
         );
     }
 
-    // 2. Threads waiting on a human get a name on the map, because that is what
-    //    the product is for (PRD §1, §11.2). Before the districts, not after:
-    //    they are anchors, and an anchor that arrives late has to shove an
-    //    already-placed label aside to take its place.
-    for thread in snapshot.waiting() {
-        // Substituted, not extended: `anchor()` is `Some` exactly when there are
-        // kernels and `centre_of_mass` is `Some` exactly when they carry weight,
-        // so the same set of waiting threads gets a name as before. What changes
-        // is where the name goes — over the work rather than over the gap
-        // between two lobes, which is where a name is least readable.
-        let Some(centre) = thread
-            .territory
-            .anchor()
-            .or(thread.territory.centre_of_mass)
-        else {
-            continue;
-        };
-        label(
-            painter,
-            placer,
-            camera.to_screen(base.to_map(centre)) - Vec2::new(0.0, 26.0),
-            &shorten(&thread_label(thread), MAP_TITLE_CHARS),
-            FontId::proportional(12.0),
-            palette::monument_label(),
-            Priority::Anchor,
-        );
-    }
+    // 2. Thread names used to be placed here, over the anchor, for threads
+    //    waiting on a human. They are now `draw_cloud_callouts`, which runs
+    //    before this function so that its captions are already reserved: a name
+    //    over the work said *which thread* and nothing else, and it said it only
+    //    for the two states that block the operator, so a working cloud was
+    //    still an anonymous shape.
 
     // 3. Districts — the rest of the wayfinding skeleton, largest first.
     let mut districts: Vec<(f32, &LogicalPath, &MapShape)> = base
@@ -1747,24 +1693,156 @@ fn draw_labels(
     }
 }
 
-/// The most characters of a thread's title the **map** draws.
+/// Draws a line from a thread's rail card to its own cloud (PRD §1, §6.4, §12).
 ///
-/// The rail has a column and can wrap; the map has a building. A generated
-/// title runs to whatever the session was about — *"Ultracode CSS tokens and
-/// manifest bug"* — and at 12 pt that is a 260-pixel bar of type lying across
-/// four districts, forced into place because a waiting thread is
-/// [`Priority::Anchor`]. Twenty-two characters is enough to tell four threads
-/// apart, which is all the map is being asked for; the rail has the rest.
-const MAP_TITLE_CHARS: usize = 22;
+/// # What this replaced, and why
+///
+/// The map used to put a **caption on a leader** beside every cloud: the
+/// thread's name, its state and age, and its call counts, laid out in gutters
+/// down the sides of the viewport. It answered the right question — *which
+/// thread is that?* — by saying everything the rail already said, a second time,
+/// in the one place the product is short of room. The operator's reading was
+/// blunt: *"the labels we build aren't necessary; instead the rail thread should
+/// point to the cloud."*
+///
+/// So the naming stays in the rail, where there is a column for it, and the map
+/// keeps only the part it alone can draw: the **line**. A thread is a card on
+/// a card in the rail and a shape on the map, and this is the sentence joining
+/// them.
+///
+/// # Drawn above every panel, on purpose
+///
+/// The line starts in a panel and ends in another one. Since ADR-0108 the rail
+/// sits **against** the map, so the two are adjacent and the line usually
+/// crosses nothing — but the panels are draggable, and a connector clipped to
+/// the map would begin at the map's own edge, which is a line pointing at
+/// nothing. So it is painted into [`egui::Order::Foreground`] and crosses
+/// whatever lies between: the crossing is the honest picture of the geometry,
+/// and a line over a terminal is cheaper than a leader that lies about where it
+/// came from.
+///
+/// # Straight, and thick enough to follow
+///
+/// It was three segments — out of the card horizontally, a bend, then in to the
+/// cloud — on the theory that the horizontal run reads the way the list reads.
+/// With the rail against the map that costs more than it buys: the detour is
+/// most of the line's length, and several of them fold into a comb of parallel
+/// horizontals that says nothing about *which* card goes to *which* cloud. A
+/// straight segment answers that by its angle alone, which is what a leader
+/// line is for, and the operator asked for exactly that.
+///
+/// # How many
+///
+/// [`crate::config::Connectors`], which is the operator's own setting. `Asked`
+/// draws one — the thread being pointed at, selected or followed, which is the
+/// same gate every other interrogation mark uses — and `Always` draws one per
+/// cloud on screen. The asked-about line is drawn last and brighter, so it still
+/// reads as *the* answer in a window full of them.
+/// Width and alpha of an ambient connector — one per cloud, all the time.
+///
+/// Public because `tests/window_frame.rs` finds the line by its exact colour,
+/// and a test that hard-codes the alpha silently stops finding anything the day
+/// the line is restyled. It found nothing exactly once; that is what these are.
+pub const CONNECTOR_AMBIENT: (f32, f32) = (1.8, 0.45);
 
-/// Truncates on a character boundary, with an ellipsis when it cut.
-fn shorten(text: &str, chars: usize) -> String {
-    if text.chars().count() <= chars {
-        return text.to_owned();
+/// Width and alpha of the connector for the thread being asked about.
+///
+/// Drawn last as well as heavier, so it still reads as *the* answer in a window
+/// full of lines.
+pub const CONNECTOR_ASKED: (f32, f32) = (2.6, 0.9);
+
+fn draw_thread_connectors(
+    ui: &egui::Ui,
+    camera: &Camera,
+    snapshot: &WorldSnapshot,
+    clouds: &Clouds,
+    state: &ViewState,
+    look: crate::config::Look,
+    rect: Rect,
+) {
+    use crate::config::Connectors;
+    if look.connectors == Connectors::Off {
+        return;
     }
-    let mut out: String = text.chars().take(chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    // Above the panels, because the two ends of the line are in different ones.
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("polis-connectors"),
+    ));
+    // Asked-about last: a painter's last stroke wins, and the operator's own
+    // question outranks the ambient set.
+    let mut ordered: Vec<(&crate::clouds::CloudMark, bool)> = clouds
+        .marks()
+        .iter()
+        .map(|mark| (mark, state.interrogates(&mark.thread)))
+        .filter(|(mark, asked)| {
+            *asked
+                || (look.connectors == Connectors::Always
+                    && snapshot.thread(&mark.thread).is_some())
+        })
+        .collect();
+    ordered.sort_by_key(|(_, asked)| *asked);
+
+    for (mark, asked) in ordered {
+        let Some(card) = state.rail_card_of(&mark.thread) else {
+            continue;
+        };
+        // The near edge of the silhouette at the anchor's own height, not the
+        // anchor itself: the line stops where the cloud starts, so it reads as
+        // an arrow into a region rather than a wire through one. `span` is the
+        // union of the kernels' chords at that height, so this point has ink
+        // behind it (see `CloudMark::span`).
+        let anchor = camera.to_screen(mark.at);
+        let (left, right) = (
+            camera.to_screen(Pos2::new(mark.span.0, mark.at.y)).x,
+            camera.to_screen(Pos2::new(mark.span.1, mark.at.y)).x,
+        );
+        // Whichever side of the *card* faces the map, and then whichever side
+        // of the cloud faces the card. The rail sits to the **right** of the map
+        // in the default layout, so the line leaves the card's left edge — but
+        // the panels are draggable and the rail can end up on either side, so
+        // neither end is hard-coded.
+        let from = Pos2::new(
+            if card.center().x > rect.center().x {
+                card.left()
+            } else {
+                card.right()
+            },
+            card.center().y,
+        );
+        let edge = if (from.x - left).abs() <= (from.x - right).abs() {
+            left
+        } else {
+            right
+        };
+        let to = Pos2::new(edge.clamp(rect.left(), rect.right()), anchor.y);
+        if !rect.contains(to) {
+            continue;
+        }
+        let ink = palette::thread(mark.tint);
+        let (width, alpha) = if asked {
+            (CONNECTOR_ASKED.0, CONNECTOR_ASKED.1)
+        } else {
+            (CONNECTOR_AMBIENT.0, CONNECTOR_AMBIENT.1)
+        };
+        let stroke = Stroke::new(width, ink.alpha(alpha));
+        // # One straight segment, not a knee
+        //
+        // The three-segment elbow was drawn on the theory that a horizontal run
+        // out of the card reads the way the list reads. With the rail against
+        // the map that theory costs more than it buys: the card and its cloud
+        // are a few centimetres apart, so the detour is most of the line's
+        // length, and eight of them fold into a comb of parallel horizontals
+        // that says nothing about *which* card goes to *which* cloud — the one
+        // question the connector exists to answer.
+        //
+        // A straight segment answers it by its angle alone, which is the whole
+        // of what a leader line is for.
+        painter.line_segment([from, to], stroke);
+        // A bead where it lands, so the arrival is visible against a hatch
+        // running the same way the line does.
+        painter.circle_filled(to, if asked { 3.4 } else { 2.4 }, stroke.color);
+    }
 }
 
 /// A short, stable name for a thread.

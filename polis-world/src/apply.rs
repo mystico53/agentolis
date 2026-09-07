@@ -699,6 +699,15 @@ fn assistant(
             .and_then(|v| v.get("command"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        // The agent's own sentence about this call, and the only prose that
+        // gets past this line. `command` above is read for its *shape* — is
+        // this a test run — and is never stored; a `description` is stored, so
+        // it is vetted first. See `crate::Intent`.
+        if let Some(intent) = intent_of(&tool, input, at) {
+            if let Some(t) = world.threads.get_mut(thread) {
+                t.push_intent(intent);
+            }
+        }
         let verification = command
             .as_deref()
             .is_some_and(verify::is_verification_command);
@@ -1224,6 +1233,10 @@ pub(crate) fn control(world: &mut World, event: &ControlEvent) {
         } => {
             tracing::debug!(%channel, %detail, "schema drift");
             world.health.drift += 1;
+        }
+        ControlEvent::SessionSuperseded { session, by } => {
+            tracing::debug!(%session, %by, "conversation cleared; closing its thread");
+            world.supersede_thread(&ThreadId::of_session(session.clone()));
         }
         ControlEvent::Shutdown => world.health.events_ignored += 1,
         // `ControlEvent` is `#[non_exhaustive]`: a new failure mode is itself a
@@ -2101,6 +2114,47 @@ fn tool_input_paths(
     out
 }
 
+/// The agent's own summary of a call, vetted, or nothing.
+///
+/// # This is the whole door
+///
+/// [`crate::Intent`] explains why the world holds this at all. This function is
+/// the only thing that fills it, and it reads exactly one key — `description` —
+/// out of a tool input that also contains `command`, `content`, `old_string`
+/// and `prompt`. A future key is a deliberate edit here, not an oversight
+/// somewhere else.
+///
+/// # It is vetted on the way in, not on the way out
+///
+/// [`polis_repo::llm::outbound::vet`] is the gate ADR-0089 built for text
+/// leaving the machine, and it is applied *here*, at capture. The stricter
+/// placement is the point: a caption is written from these lines and the world
+/// is snapshotted, cloned and drawn, so a credential-shaped `description` that
+/// lived in the ring would be one bug away from a screenshot as well as one bug
+/// away from a request. Refusing it at the door means no copy of it exists.
+///
+/// The cost of a false positive is one missing sentence out of twenty, which
+/// the caption will not notice.
+fn intent_of(tool: &ToolKind, input: Option<&Value>, at: Instant) -> Option<crate::Intent> {
+    let raw = input?.get("description")?.as_str()?;
+    // The report is discarded: `RedactionReport` names paths, and there is no
+    // path here to name. What matters is the `Err`, which is the refusal.
+    let mut report = polis_repo::llm::outbound::RedactionReport::default();
+    let mut text = polis_repo::llm::outbound::vet(raw, &mut report).ok()?;
+    if text.chars().count() > crate::INTENT_TEXT_MAX {
+        let cut = text
+            .char_indices()
+            .nth(crate::INTENT_TEXT_MAX)
+            .map_or(text.len(), |(i, _)| i);
+        text.truncate(cut);
+    }
+    (!text.is_empty()).then(|| crate::Intent {
+        tool: tool.clone(),
+        text,
+        at,
+    })
+}
+
 /// Whether a path came from the tool's own input or from the shell fallback.
 ///
 /// The distinction is the difference between rung 1 and rung 2 of
@@ -2236,6 +2290,82 @@ mod tests {
         assert_eq!(range, (10, 41));
         assert!(patch_totals(&serde_json::json!([])).is_none());
         assert!(patch_totals(&serde_json::json!("error string")).is_none());
+    }
+
+    /// The door is one key wide. Everything else in a tool input is the work
+    /// itself, and the whole argument for `Intent` being safe rests on this
+    /// function reading `description` and nothing beside it.
+    #[test]
+    fn only_the_description_gets_through_the_intent_door() {
+        let now = Instant::now();
+        let input = serde_json::json!({
+            "command": "curl -H 'x-api-key: sk-live-9f2b' https://example.test",
+            "description": "Check the workspace tests",
+            "content": "fn main() { let password = \"hunter2\"; }",
+            "old_string": "before",
+            "prompt": "the operator's own words",
+        });
+        let intent = intent_of(&ToolKind::Bash, Some(&input), now).expect("a description");
+        assert_eq!(intent.text, "Check the workspace tests");
+        assert_eq!(intent.tool, ToolKind::Bash);
+        // A tool that carries no description contributes nothing, which is most
+        // of them: `Read`, `Grep`, `Edit`.
+        let bare = serde_json::json!({"file_path": "src/auth/token.rs"});
+        assert!(intent_of(&ToolKind::Read, Some(&bare), now).is_none());
+        assert!(intent_of(&ToolKind::Read, None, now).is_none());
+    }
+
+    /// Vetting happens at capture, so a credential-shaped sentence never
+    /// reaches the ring — not the snapshot, not a caption, not a screenshot.
+    #[test]
+    fn a_credential_shaped_description_is_refused_at_the_door() {
+        let now = Instant::now();
+        let leaky = serde_json::json!({
+            "description": "Set ANTHROPIC_API_KEY=sk-ant-api03-Zx9Q2mVn8LpR4TdW6YbK1JhF7CsG",
+        });
+        assert!(
+            intent_of(&ToolKind::Bash, Some(&leaky), now).is_none(),
+            "a secret in a description is a secret"
+        );
+        // Control characters and bidi overrides are stripped rather than
+        // refused: they are a spoofing channel, not a credential. Runs of
+        // ordinary whitespace collapse to one space.
+        let spoof = serde_json::json!({"description": "  Run \u{202E} the   tests  "});
+        let intent = intent_of(&ToolKind::Bash, Some(&spoof), now).expect("still a sentence");
+        assert_eq!(intent.text, "Run the tests");
+    }
+
+    /// A retried command writes the same sentence again, and three copies of
+    /// one line would crowd out the three different things before it.
+    #[test]
+    fn the_intent_ring_is_bounded_and_drops_an_immediate_repeat() {
+        let now = Instant::now();
+        let mut thread = crate::Thread::new(
+            ThreadId::of_session(polis_events::SessionId::new("intents")),
+            polis_events::SessionId::new("intents"),
+            now,
+        );
+        for _ in 0..3 {
+            thread.push_intent(crate::Intent {
+                tool: ToolKind::Bash,
+                text: "Run the workspace tests".to_owned(),
+                at: now,
+            });
+        }
+        assert_eq!(thread.intents.len(), 1, "a repeat refreshes nothing");
+        for i in 0..(crate::INTENT_CAP * 2) {
+            thread.push_intent(crate::Intent {
+                tool: ToolKind::Bash,
+                text: format!("step {i}"),
+                at: now,
+            });
+        }
+        assert_eq!(thread.intents.len(), crate::INTENT_CAP);
+        assert_eq!(
+            thread.intents.back().expect("newest").text,
+            format!("step {}", crate::INTENT_CAP * 2 - 1),
+            "newest last"
+        );
     }
 
     #[test]

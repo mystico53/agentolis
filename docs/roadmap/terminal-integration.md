@@ -65,12 +65,32 @@
 >   Claude Code session it passes `CLAUDE_CODE_CHILD_SESSION` on, which turns
 >   transcript saving — Channel D — off for every agent it starts (ADR-0098).
 >
+> ### M7d landed — the dock and the map are one window
+>
+> *Updated 2026-09-06 (ADR-0105).* Three things were missing and the first was
+> the feature: **`Mode::Work` started no ingest at all.** Every pane was already
+> being spawned with `agent_env()` aimed at `127.0.0.1:4317` and a Polis-issued
+> `--session-id`, and nothing was bound to receive any of it — so the one window
+> that owned its agents was the one window that could not see them. `launch` now
+> starts `LiveOptions::watching(repo)` for `Mode::Work` too.
+>
+> On top of that, `pane_for_session` finally has callers, both ways: clicking a
+> tab selects that agent's thread on the map, and a changed map selection or an
+> attention jump brings its pane to the front. `Dock::observe` reads the same
+> published `WorldSnapshot` the map and the rail read, so a tab says where its
+> agent is working and goes amber when it is waiting on a human — from the world,
+> never from the pty, which is what stops a tab and a cloud disagreeing.
+>
+> And the dock stopped being locked behind a subcommand: `Ctrl+Alt+T` or the
+> title bar's `+ agent` starts one in any **live** window, so `polis` and `polis
+> watch` grow terminals. Not on `polis map` or `polis replay` — a pane beside a
+> map with no wire into it would look exactly like the bug this fixed.
+>
 > ### Still ahead
 >
 > M7b's persisted dock width and collapsed state; M7c's selection, OSC 52 and the
 > `polis doctor` glyph line (the report exists, the command does not print it
-> yet); M7d's map↔pane correlation in both directions (`pane_for_session` is
-> there and unused); M7e entirely. And the four ingest channels still start in the
+> yet); M7e entirely. And the four ingest channels still start in the
 > window rather than the daemon — until they move, a detached period records
 > nothing, so "shut the lid for an hour and watch it play back" is not yet real.
 
