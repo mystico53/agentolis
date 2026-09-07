@@ -79,6 +79,12 @@ pub fn snapshot(cli: &Cli, args: &SnapshotArgs) -> anyhow::Result<()> {
         )
     } else {
         let root = cli.repo_root().context("resolving the repository root")?;
+        // The same question the window asks before it draws: is there a city
+        // here at all? Without it a folder that is not a checkout gets git's
+        // plumbing instead of a sentence (`citygen::preflight`).
+        if let Some(notice) = crate::citygen::preflight(&root)? {
+            println!("  {notice}");
+        }
         let tree = index(&root, args, &mut phases)?;
         let name = root.file_name().map_or_else(
             || root.display().to_string(),

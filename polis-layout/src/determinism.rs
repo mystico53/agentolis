@@ -510,6 +510,38 @@ pub fn det_from_angle(radians: f32) -> Vec2 {
     Vec2::new(narrow(cos), narrow(sin))
 }
 
+/// An angle in radians, in `f64`, for use as an **ordering key**.
+///
+/// [`det_angle`] narrows to `f32` because its callers hand the result to layout
+/// geometry. This one does not narrow, because its caller —
+/// [`crate::roads`]'s counter-clockwise adjacency sort — keeps the value only
+/// long enough to sort by it, and the crate's float discipline is `f64` inside
+/// and `f32` at the boundaries.
+///
+/// # An ordering is output, even when the number is not
+///
+/// It is tempting to argue that a sort key cannot reach output geometry and so
+/// needs no quantisation. That argument is wrong wherever the ordering *decides
+/// something*, and here it decides the most consequential thing in the stage:
+/// the counter-clockwise order around a node is what the face walk consumes, so
+/// it chooses the face set, therefore the block set, therefore the lots and the
+/// buildings. `atan2` is a platform libm call and is not correctly rounded, so
+/// two machines whose libm differ by one ulp on one near-collinear pair produce
+/// two different cities from the same repository. Quantising the key costs
+/// nothing and closes that (ADR-0110).
+///
+/// Ties after quantisation are not a problem and must not be: the caller breaks
+/// them on edge id, which is a total order that is the same everywhere.
+///
+/// Returns 0 for the zero vector, where `atan2` is free to return anything.
+#[must_use]
+pub fn det_angle_f64(y: f64, x: f64) -> f64 {
+    if x == 0.0 && y == 0.0 {
+        return 0.0;
+    }
+    snap_to_grid(y.atan2(x), TRIG_SCALE)
+}
+
 /// A vector's angle in radians — the deterministic replacement for
 /// `Vec2::angle` in layout code (rule 4).
 ///

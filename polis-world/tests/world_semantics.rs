@@ -16,12 +16,16 @@ use polis_events::{
 use polis_layout::CityLayout;
 use polis_world::attention::{AttentionKind, DecisionSource};
 use polis_world::contention::{ContentionPrecision, Severity};
-use polis_world::{ThreadStatus, World};
+use polis_world::{ThreadStatus, World, MARK_HOLD_MAX};
 
 const REPO: &str = "C:/repo";
 
 fn world() -> World {
     let mut w = World::for_replay(CityLayout::default());
+    // These are live-world semantics, and several of them turn on the
+    // quiet-thread clock that `for_replay` leaves off (see
+    // `World::set_retire_quiet_threads`).
+    w.set_retire_quiet_threads(true);
     w.mapper_mut()
         .add_worktree(WorktreeId::PRIMARY, std::path::Path::new(REPO))
         .expect("primary root");
@@ -193,12 +197,19 @@ fn a_claim_expires_at_the_ttl_and_the_link_goes_with_it() {
 }
 
 #[test]
-fn a_landed_write_releases_the_claim_before_the_ttl() {
+fn a_landed_write_keeps_its_claim_and_a_failed_one_releases_it() {
+    // PRD §11.3's early release is for the write that **did not happen**. A
+    // write that did happen is not a reservation any more; it is a hazard, and
+    // the thirty seconds is its duration. Deleting it on landing is what made
+    // the operator's real collisions render as nothing: in a transcript the
+    // result follows the call by under a second, so two workers 4.7 s apart
+    // never held claims at the same instant.
     let mut w = world();
     let t0 = Instant::now();
+
+    // ADR-0044: Channel A's `tool_result` is one of the two landing triggers.
     w.apply(&pre_edit("a", "src/auth.ts", "main", t0));
     assert_eq!(w.claims.len(), 1);
-    // ADR-0044: Channel A's `tool_result` is one of the two release triggers.
     w.apply(&tool_result(
         "a",
         None,
@@ -207,11 +218,29 @@ fn a_landed_write_releases_the_claim_before_the_ttl() {
         Outcome::Done,
         t0 + Duration::from_secs(1),
     ));
-    assert!(w.claims.is_empty());
+    let landed = w
+        .claims
+        .claims_on(&LogicalPath::new("src/auth.ts").unwrap());
+    assert_eq!(landed.len(), 1, "the claim survives the write landing");
+    assert!(landed[0].has_landed(), "and it says the bytes are on disk");
 
-    // And Channel C's `Modified` is the other.
+    // Which is what lets a sibling four seconds later collide with it.
+    w.apply(&pre_edit(
+        "b",
+        "src/auth.ts",
+        "main",
+        t0 + Duration::from_secs(5),
+    ));
+    w.tick(t0 + Duration::from_secs(5));
+    assert!(
+        w.attention
+            .iter()
+            .any(|m| matches!(m.kind, AttentionKind::Contention(_))),
+        "a write that landed is still a thing to write over"
+    );
+
+    // Channel C's `Modified` is the other landing trigger.
     w.apply(&pre_edit("a", "src/other.ts", "main", t0));
-    assert_eq!(w.claims.len(), 1);
     let mut meta = EventMeta::now(Channel::Fs);
     meta.observed = t0 + Duration::from_secs(2);
     w.apply(&Event::new(
@@ -223,7 +252,35 @@ fn a_landed_write_releases_the_claim_before_the_ttl() {
             ),
         }),
     ));
-    assert!(w.claims.is_empty());
+    let other = w
+        .claims
+        .claims_on(&LogicalPath::new("src/other.ts").unwrap());
+    assert_eq!(other.len(), 1);
+    assert!(other[0].has_landed());
+
+    // A **failed** write wrote nothing, so its reservation goes at once — this
+    // is the early release, doing the job it is actually for.
+    w.apply(&pre_edit("a", "src/gone.ts", "main", t0));
+    assert_eq!(
+        w.claims
+            .claims_on(&LogicalPath::new("src/gone.ts").unwrap())
+            .len(),
+        1
+    );
+    w.apply(&tool_result(
+        "a",
+        None,
+        ToolKind::Edit,
+        "src/gone.ts",
+        Outcome::Failed,
+        t0 + Duration::from_secs(1),
+    ));
+    assert!(
+        w.claims
+            .claims_on(&LogicalPath::new("src/gone.ts").unwrap())
+            .is_empty(),
+        "nothing was written, so there is nothing to write over"
+    );
 }
 
 #[test]
@@ -294,7 +351,7 @@ fn a_permission_request_parks_the_thread_and_the_answer_frees_it() {
 }
 
 #[test]
-fn a_pin_never_expires_on_a_timer() {
+fn a_pin_never_expires_while_anything_could_still_resolve_it() {
     let mut w = world();
     let t0 = Instant::now();
     w.apply(&hook(
@@ -303,16 +360,28 @@ fn a_pin_never_expires_on_a_timer() {
         t0,
         HookPayload::default(),
     ));
-    w.tick(t0 + Duration::from_hours(6));
+    w.tick(t0 + MARK_HOLD_MAX);
     assert_eq!(
         w.attention.len(),
         1,
-        "needs-decision persists until resolved, however long that takes"
+        "needs-decision persists until resolved, and hours of waiting is what          waiting on a human looks like"
     );
     assert_eq!(
         w.thread(&thread("a")).unwrap().status,
         ThreadStatus::Waiting
     );
+
+    // The one end of it. No timer expires the pin — `AttentionKind::decays` is
+    // still false for `NeedsDecision` — but past `MARK_HOLD_MAX` of total
+    // silence `polis_ingest::live::LIVE_WINDOW` stopped following the session
+    // seven retirement windows ago, so no channel can ever answer this
+    // question. The thread is retired and the mark goes with it, which is the
+    // difference between a queue and a rail that accumulates every session of
+    // the day. Nothing here is a *timer on the pin*: it is the pin losing the
+    // thread it was about.
+    w.tick(t0 + MARK_HOLD_MAX + Duration::from_secs(1));
+    assert!(w.thread(&thread("a")).is_none());
+    assert!(w.attention.is_empty());
 }
 
 #[test]
@@ -728,7 +797,13 @@ fn a_subagent_edit_with_no_sidecar_degrades_and_marks_itself() {
         state.diff_precision,
         polis_world::DiffPrecision::Approximate
     );
-    assert!(w.health.contention_without_line_ranges > 0);
+    // The edit lacked a line range; nothing collided with it. Those are two
+    // different counters and this test is about the first.
+    assert!(w.health.edits_without_line_ranges > 0);
+    assert_eq!(
+        w.health.contention_without_line_ranges, 0,
+        "a lone degraded edit is not a contention hit"
+    );
 }
 
 #[test]

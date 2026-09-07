@@ -8,6 +8,8 @@ members = [
     "polis-layout",
     "polis-world",
     "polis-render",
+    "polis-term",
+    "polis-sessiond",
     "polis-app",
 ]
 
@@ -52,6 +54,7 @@ polis-repo = { path = "polis-repo", version = "0.1.0" }
 polis-layout = { path = "polis-layout", version = "0.1.0" }
 polis-world = { path = "polis-world", version = "0.1.0" }
 polis-render = { path = "polis-render", version = "0.1.0" }
+polis-term = { path = "polis-term", version = "0.1.0", default-features = false }
 
 # --- serialization ----------------------------------------------------------
 serde = { version = "1.0.229", features = ["derive"] }
@@ -103,6 +106,28 @@ tokio-stream = { version = "0.1.17", default-features = false, features = ["net"
 # above the `tonic` pin for why they are declared directly.
 prost = "0.14.4"
 tonic-prost = "0.14.6"
+
+# --- terminal ---------------------------------------------------------------
+# The VT state machine and the pty. Nobody should write a VTE parser twice, and
+# `alacritty_terminal` *is* the ConPTY code Alacritty itself ships — which is
+# what `polis-app/src/run.rs`'s "anything else is a pty emulation Polis has no
+# reason to write" was really objecting to. See ADR-0095.
+#
+# `vte` arrives here and is **re-exported** as `alacritty_terminal::vte`. It must
+# never be pinned directly: a second copy in the graph is the exact failure the
+# wgpu/winit ban above exists to prevent.
+#
+# Measured against this workspace's existing lock, `alacritty_terminal 0.26.0`
+# adds nine crates and *no* second `windows-sys`: it wants 0.61.2, which
+# `notify` already pulls in. See `docs/roadmap/terminal-integration.md`.
+alacritty_terminal = "0.26.0"
+# The pty master's readiness comes from a `polling::Poller`, not from a blocking
+# `read` — measured, see ADR-0095. Already in the lock via `alacritty_terminal`;
+# declared because `polis-term` names the type in its own signatures.
+polling = "3.11.0"
+# Pane bytes cross the session-daemon boundary inside JSON, which cannot hold
+# arbitrary bytes. Already in the lock via `opentelemetry-proto`; zero new crates.
+base64 = "0.22.1"
 
 # --- ingest (Channel C: filesystem watch) -----------------------------------
 # 8.2.0 is the latest STABLE. 9.0.0-rc.5 exists but is a release candidate.

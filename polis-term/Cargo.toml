@@ -1,0 +1,35 @@
+[package]
+name = "polis-term"
+description = "Terminal panes: the pty the session daemon owns, the wire between them, and the grid the window draws."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The egui half. `polis-sessiond` takes this crate with `default-features =
+# false` and gets the pty, the wire and the transport with **no** eframe in its
+# dependency graph — which is the whole point of the split (ADR-0093).
+default = ["ui"]
+ui = ["dep:eframe"]
+
+[dependencies]
+polis-events = { workspace = true }
+
+alacritty_terminal = { workspace = true }
+polling = { workspace = true }
+base64 = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+
+eframe = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

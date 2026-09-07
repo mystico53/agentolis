@@ -1,21 +1,30 @@
 <#
   Polis launcher - the friendly front door.
 
-  Nobody should need to know a command line to see their repository as a city.
-  This finds the binary (offering to build it), finds git repositories on this
-  machine, and renders the one you pick.
+  Nobody should need to know a command line to see their agents as a city. This
+  finds the binary (offering to build it), then offers everything Polis can do.
+  A folder dragged onto Polis.bat arrives as -Repo and skips the repository
+  menu.
 
   Run it by double-clicking Polis.bat in the repo root.
 #>
 
 param(
-  # A folder dragged onto Polis.bat arrives here and skips the menu.
-  [string]$Repo
+  # A folder dragged onto Polis.bat arrives here and skips the repository menu.
+  [string]$Repo,
+  # Skip the action menu and do this. Used by nothing yet; handy for a shortcut.
+  [ValidateSet('watch', 'map', 'run', 'picture', 'doctor')]
+  [string]$Do
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Exe  = Join-Path $Root 'target\release\polis.exe'
+
+# polis.exe pauses on failure when it was started with no arguments and has a
+# terminal, so that a double-clicked binary never vanishes. Here the launcher
+# does its own pause, and two of them in a row is one too many.
+$env:POLIS_NO_PAUSE = '1'
 
 function Say([string]$t, [string]$c = 'Gray') { Write-Host $t -ForegroundColor $c }
 function Title([string]$t) {
@@ -38,7 +47,7 @@ function Pause-Exit([int]$code = 0) {
 Clear-Host
 Write-Host ''
 Write-Host '   P O L I S' -ForegroundColor Cyan
-Write-Host '   your repository, drawn as a city seen from above' -ForegroundColor DarkGray
+Write-Host '   your coding agents, drawn as a city seen from above' -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------- the binary
 
@@ -56,11 +65,145 @@ if (-not (Test-Path $Exe)) {
   Say ''
   Say '  Building (this is the slow part, once)...' 'DarkGray'
   Push-Location $Root
-  try { & cargo build --release -p polis-app } finally { Pop-Location }
+  try {
+    & cargo build --release -p polis-app
+    # The hook transport is a separate, tiny binary with its own profile. Only
+    # `polis connect` needs it, and building it now means that path is never a
+    # second wait.
+    & cargo build --profile hook -p polis-hook
+  } finally { Pop-Location }
   if (-not (Test-Path $Exe)) { Say '  Build failed. The output above says why.' 'Red'; Pause-Exit 1 }
 }
 
-# --------------------------------------- a folder was dragged on: skip the menu
+# ------------------------------------------------------------------ on PATH?
+
+# The first command in the getting-started guide is `polis`, and a fresh
+# checkout has it nowhere near PATH. Offering it here - once, with consent, at
+# user scope - is the difference between "it works" and "now go and edit an
+# environment variable". Never `setx PATH "%PATH%;..."`: %PATH% there is the
+# combined machine and user value, so that line copies the system path into the
+# user one, permanently, truncated at 1024 characters.
+
+$BinDir     = Split-Path $Exe -Parent
+$ConfigDir  = Join-Path $env:LOCALAPPDATA 'polis'
+$PathMarker = Join-Path $ConfigDir 'path-offer'
+
+$OnPath = $false
+try {
+  $found = Get-Command polis -ErrorAction SilentlyContinue
+  if ($found) { $OnPath = $true }
+} catch { }
+
+if (-not $OnPath -and -not (Test-Path $PathMarker)) {
+  Title 'Type "polis" from anywhere?'
+  Say ''
+  Say '  Polis is built, but the folder it is in is not on your PATH, so the'
+  Say '  command `polis` only works spelled out in full. This adds'
+  Say ''
+  Say "    $BinDir" 'White'
+  Say ''
+  Say '  to your own user PATH - not the machine''s - and changes nothing else.'
+  Say '  It applies to terminals you open after this. Answered once either way.'
+  Say ''
+  $addIt = Read-Host '  Add it? [Y/n]'
+  if (-not $addIt -or $addIt -match '^[Yy]') {
+    try {
+      $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+      $already = $false
+      if ($current) {
+        foreach ($entry in $current.Split(';')) {
+          if ($entry.Trim().TrimEnd('\') -eq $BinDir.TrimEnd('\')) { $already = $true }
+        }
+      }
+      if (-not $already) {
+        $joined = if ($current) { "$current;$BinDir" } else { $BinDir }
+        [Environment]::SetEnvironmentVariable('Path', $joined, 'User')
+      }
+      # This window too, so the rest of this session can say `polis`.
+      $env:PATH = "$BinDir;$env:PATH"
+      Say ''
+      Say '  Done. In a new terminal, `polis` now works from any folder.' 'Green'
+      Say '  To undo it: Settings -> Environment Variables -> Path (User).' 'DarkGray'
+    } catch {
+      Say ''
+      Say "  Could not write it: $($_.Exception.Message)" 'Yellow'
+      Say '  Everything below still works - this only affects typing `polis`.'
+    }
+  } else {
+    Say ''
+    Say '  Left alone. Run Polis from this file, or spell the path out:' 'DarkGray'
+    Say "    $Exe" 'DarkGray'
+  }
+  try {
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    Set-Content -LiteralPath $PathMarker -Value 'asked' -Encoding utf8
+  } catch { }
+}
+
+# ------------------------------------------------------------ what to do
+
+# How many sessions are already on this machine, so the menu can say. This is
+# the headers-only scan polis itself uses; it costs tens of milliseconds.
+$Sessions = 0
+try {
+  $projects = Join-Path $env:USERPROFILE '.claude\projects'
+  if (Test-Path $projects) {
+    $Sessions = @(Get-ChildItem -LiteralPath $projects -Recurse -Filter '*.jsonl' -File -Depth 1 -ErrorAction SilentlyContinue).Count
+  }
+} catch { }
+
+$action = $Do
+if (-not $action) {
+  Title 'What would you like to do?'
+  Write-Host ''
+  $seen = if ($Sessions -gt 0) { "$Sessions found on this machine" } else { 'none found yet' }
+  Write-Host "   1. Watch a past session      replay something you already ran ($seen)" -ForegroundColor Gray
+  Write-Host '   2. Map a repository          open the city window for a checkout' -ForegroundColor Gray
+  Write-Host '   3. Connect a live agent      start Claude Code with the map watching' -ForegroundColor Gray
+  Write-Host '   4. Save a picture            write the city plan to a PNG on the Desktop' -ForegroundColor Gray
+  Write-Host '   5. Check my setup            what is wrong, and how to fix it' -ForegroundColor Gray
+  Write-Host ''
+  Say '  In the city: every building is a file, every district a folder, and the' 'DarkGray'
+  Say '  tallest building is the file with the most uncommitted work - so the' 'DarkGray'
+  Say '  skyline points at whatever most needs reviewing.' 'DarkGray'
+  Write-Host ''
+  if ($Repo) { Say "  A folder was dragged on: $Repo" 'DarkGray'; Write-Host '' }
+  $pick = Read-Host '  Choose [1]'
+  if (-not $pick) { $pick = '1' }
+  switch ($pick.Trim()) {
+    '1' { $action = 'watch' }
+    '2' { $action = 'map' }
+    '3' { $action = 'run' }
+    '4' { $action = 'picture' }
+    '5' { $action = 'doctor' }
+    default { Say '  Nothing chosen.' 'Yellow'; Pause-Exit 0 }
+  }
+}
+
+# `watch` and `doctor` need no repository at all, so they run before the finder.
+
+if ($action -eq 'watch') {
+  Title 'Your past sessions'
+  Write-Host ''
+  Say '  A window is opening with every session recorded on this machine, most' 'DarkGray'
+  Say '  recent first. Pick one and it replays over that repository''s own city.' 'DarkGray'
+  Say '  Space pauses, . and , step, h shows every key. It is a recording;' 'DarkGray'
+  Say '  nothing you do in there can break anything.' 'DarkGray'
+  Write-Host ''
+  & $Exe watch
+  if ($LASTEXITCODE -ne 0) { Say ''; Say '  That did not work. The output above says why.' 'Red'; Pause-Exit 1 }
+  Pause-Exit 0
+}
+
+if ($action -eq 'doctor') {
+  & $Exe doctor
+  Write-Host ''
+  Say '  Anything above that is not "ok" has the command that fixes it beside it.' 'DarkGray'
+  Say '  Some of them Polis can do itself:  polis doctor --fix' 'DarkGray'
+  Pause-Exit 0
+}
+
+# ------------------------------------------- a folder was dragged on: skip the menu
 
 if ($Repo) {
   $Repo = $Repo.Trim('"', ' ')
@@ -152,7 +295,7 @@ if ($repos.Count -eq 0) {
 
 $ordered = @($repos | Sort-Object -Property @{Expression='Files';Descending=$true})
 
-Title 'Which repository should Polis map?'
+Title 'Which repository?'
 Write-Host ''
 $max = [Math]::Min($ordered.Count, 12)
 for ($i = 0; $i -lt $max; $i++) {
@@ -181,15 +324,45 @@ if ($choice -match '^[Pp]') {
   Say '  Nothing chosen.' 'Yellow'; Pause-Exit 0
 }
 
-}  # end of the menu path
-
-# ------------------------------------------------------------------- render
+}  # end of the repository menu
 
 $name = Split-Path $chosen -Leaf
+
+# ----------------------------------------------------------------- do it
+
+if ($action -eq 'map') {
+  Title "Mapping $name"
+  Write-Host ''
+  Say '  A window is opening. Drag to pan, scroll to zoom, click a building to' 'DarkGray'
+  Say '  open that file. Close the window to come back here.' 'DarkGray'
+  Write-Host ''
+  & $Exe --repo $chosen map
+  if ($LASTEXITCODE -ne 0) { Say ''; Say '  That did not work. The output above says why.' 'Red'; Pause-Exit 1 }
+  Pause-Exit 0
+}
+
+if ($action -eq 'run') {
+  Title "Starting an agent in $name"
+  Write-Host ''
+  Say '  Claude Code is about to start in this window, exactly as if you had' 'DarkGray'
+  Say '  typed `claude` yourself - same prompt, same keys. Polis sets up what it' 'DarkGray'
+  Say '  needs on that one process; nothing is changed in your shell.' 'DarkGray'
+  Say '  The map opens in its own window beside it. Today it shows the city and' 'DarkGray'
+  Say '  the session plays back afterwards - Polis prints the one command for' 'DarkGray'
+  Say '  that when the agent exits.' 'DarkGray'
+  Write-Host ''
+  # The launcher's pause would sit on top of the agent's own screen, so this one
+  # path lets polis print its own closing summary and returns.
+  & $Exe --repo $chosen run -- claude
+  Pause-Exit $LASTEXITCODE
+}
+
+# picture
+
 $out  = Join-Path ([Environment]::GetFolderPath('Desktop')) "polis-$name.png"
 $junc = Join-Path ([Environment]::GetFolderPath('Desktop')) "polis-$name-junctions.png"
 
-Title "Mapping $name"
+Title "Drawing $name"
 Write-Host ''
 
 & $Exe -C $chosen snapshot --out $out --junctions $junc

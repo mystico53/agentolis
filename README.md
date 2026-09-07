@@ -30,9 +30,115 @@ hash of the logical path, so the same repo produces the same city on every launc
 and every machine; spatial memory is the entire point.
 
 The spec is [`docs/PRD.md`](docs/PRD.md). Where the built system deliberately
-diverges from it — 72 recorded decisions, every one grounded in a measurement —
+diverges from it — 106 recorded decisions, every one grounded in a measurement —
 see [`docs/DECISIONS.md`](docs/DECISIONS.md). The evidence behind those decisions
 is in [`docs/verified/`](docs/verified/).
+
+---
+
+## Start here
+
+If you have never run this before, read
+[`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) instead of this file. It is
+two pages and assumes nothing.
+
+From a fresh clone, two commands — the first takes a few minutes, once:
+
+```sh
+cargo build --release -p polis-app
+./target/release/polis                  # .\target\release\polis.exe on Windows
+```
+
+That second line is the whole product for someone who has read nothing. Once the
+binary is [on your `PATH`](#putting-polis-on-your-path) — `polis doctor` prints
+the exact command for this machine, and `Polis.bat` offers to do it for you — it
+is just `polis`:
+
+```sh
+polis watch            # every agent working in this repository, live
+polis watch --list     # the same answer as text, opening nothing
+polis                  # pick a repository, then watch it
+polis map              # this repository, drawn as a city
+polis run -- claude    # start an agent with the map already watching
+polis work             # agents in terminals inside the window, beside the city
+polis replay           # pick a session you already ran and watch it back
+polis connect          # add hook detail to what a watch already sees
+polis doctor           # what is wrong, and how to fix it
+```
+
+The five that open a window — bare `polis`, `watch`, `map`, `work` and `replay`
+— say on stdout what they are opening and do not return until you close it.
+
+**`polis watch` is the headline command, and it needs nothing set up.** Point it
+at a repository and it shows every Claude Code session working in it right now —
+**including the ones you started yourself, in other terminals, that Polis never
+launched**. Every session on this machine already writes a JSONL transcript
+carrying the directory it is working in, so presence, activity and every tool
+call are on disk before Polis is involved at all. Sessions that start after the
+window opens are picked up as they appear; sessions in other repositories are
+listed and labelled rather than silently drawn onto the wrong city. Telemetry
+(`polis run`) and hooks (`polis connect`) then add detail on top — token counts,
+subagent attribution, sub-second latency, and `Stop`, which is the only signal
+that proves a session ended rather than merely going quiet. The window and
+`polis doctor` both say which of the three are connected, so an operator seeing
+less than they expected can find out why at a glance.
+
+**`polis` with no arguments is the whole product for someone who has read
+nothing.** It detects the checkout, Claude Code and `~/.claude/projects`,
+explains the map in one screen, and opens the **repository launcher**: every
+checkout on this machine with an agent working in it right now, with the live
+count against each, plus the ones you have run agents in before. Pick one and it
+is watched live. `polis home` is the same screen on demand.
+
+Which repository a window is about is not the folder your shell happens to be
+standing in — an operator running agents in three checkouts is standing in at
+most one of them — so it is a choice you make on screen, and one you can change
+without closing anything: **`o`, or the repository name in the title bar, opens
+the same launcher over the map and switches the watch in place.** The old feed is
+shut down and its ports released before the new one binds them, a watch stays a
+watch and a map stays a map, and PRD §2's one-window-one-repository is unchanged
+— you are moving the window, not adding a second city to it. The one window that
+will not switch is `polis work`: its agents are attached to that checkout's
+session daemon, and it says so instead of leaving them behind.
+
+**`polis run -- claude` is `polis watch` with telemetry added.** It opens a
+`polis watch` window — which owns the receivers, so there is one ingest stack and
+it is in the process that draws — and launches Claude Code as a child with the
+twelve-variable telemetry block set **on that process**, not exported into your
+shell and not written to any file. Arguments after `--` are passed through
+untouched and the agent's exit code becomes the command's, so
+`polis run -- claude -p "…"` behaves in a script exactly like `claude -p "…"`.
+You do not need it to see an agent: `polis watch` already shows the one you
+started yourself. Measured on this machine against real Claude Code: 46
+telemetry, 3 hook, 1 filesystem and 15 transcript events from one six-second
+session, all four channels live.
+
+**`polis work` puts the agents *inside* the window.** Claude Code runs in a
+pane beside the city — the real TUI over a pty, so slash commands, plan mode,
+permission prompts and `/resume` all work — and `Ctrl+Alt+T` or the title bar's
+`+ agent` adds another. You do not need the subcommand: any live window grows a
+terminal from the same button, so `polis` and `polis watch` are the same app
+with the dock shut.
+
+The panes and the map are one surface, not two. Each agent is started with a
+session id Polis issued itself, which is the key its telemetry, its hooks and
+its transcript all carry — so **clicking a tab lights that agent's cloud on the
+map, and picking that agent on the map — its row in the rail, or `a`, which
+jumps to whatever is waiting on you — brings its terminal to the front.** A
+tab says which district its agent has claimed and turns amber when it is
+waiting on you, read from the same published world the map draws from rather
+than from the terminal, so a tab and a cloud cannot disagree.
+
+**The agents are not owned by the window.** They live in `polis-sessiond`, so
+closing Polis — or a GPU driver reset taking it out — leaves every agent
+working, and the next launch reattaches and replays each pane's byte log to put
+the same screen back, scrollback included. An agent stops when you stop it.
+
+On Windows, `Polis.bat` is double-clickable and offers the same choices with no
+terminal at all — including offering to build Polis the first time. Double-
+clicking `polis.exe` itself is also safe now: with no arguments it opens a
+window, and on the one path where that can fail it prints why and waits for a
+keypress instead of closing the console before it can be read.
 
 ---
 
@@ -59,14 +165,19 @@ polis-events ──┬── polis-ingest ────────────�
 polis-hook     (depends on nothing at all, not even polis-events)
 ```
 
-Two crates are implemented; six are signatures with `todo!()` bodies and doc
-comments naming the PRD section each one owes.
+Seven of the eight crates are implemented and tested. The remaining stubs are
+`polis-render`'s **wgpu** pipeline modules (`agents`, `camera`, `city`,
+`density`, `marks`) — 22 `todo!()` bodies naming the PRD section each one owes.
+The window does not depend on them: it draws the base map through
+`polis-render`'s deterministic CPU rasteriser and composites the live layers in
+`egui`, which is what PRD §13 asks for anyway (*"text lives in a UI overlay, not
+the GPU layer"*). The GPU path is the optimisation, not the product.
 
-**`polis-events`** is the contract eight crates key on, so it is real code with
-tests: `LogicalPath` and its worktree-stripping `PathMapper` (PRD §7.6 says
-deciding this late is painful, and on Windows it is the most error-prone type in
-the system), the hook wire codec, the event-kind tag table, and the `Event` enum
-whose variant names are the real wire names from `docs/verified/`.
+**`polis-events`** is the contract eight crates key on: `LogicalPath` and its
+worktree-stripping `PathMapper` (PRD §7.6 says deciding this late is painful, and
+on Windows it is the most error-prone type in the system), the hook wire codec,
+the event-kind tag table, and the `Event` enum whose variant names are the real
+wire names from `docs/verified/`.
 
 **`polis-hook`** is the verified reference implementation from
 [`docs/verified/hook-ipc.md`](docs/verified/hook-ipc.md), which passed a 36-row
@@ -84,7 +195,7 @@ rather than a toolchain one. See ADR-0001.
 
 ```sh
 cargo build --workspace           # everything
-cargo test  --workspace           # 628 tests
+cargo test  --workspace           # 973 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -102,6 +213,31 @@ regression, and CI fails on it.
 
 The first build compiles wgpu and tonic and takes a few minutes.
 
+### Putting Polis on your `PATH`
+
+`cargo build --release -p polis-app` lands the binary in `target/release/polis`
+(`target\release\polis.exe` on Windows). It runs from there as it stands; putting
+that folder on `PATH` is what makes the command `polis`.
+
+```powershell
+# Windows PowerShell — your user PATH, not the machine's. New terminals see it.
+[Environment]::SetEnvironmentVariable('Path',
+  [Environment]::GetEnvironmentVariable('Path','User') + ';C:\path\to\agentolis\target\release', 'User')
+```
+
+Not `setx PATH "%PATH%;…"`: `%PATH%` there is the combined machine **and** user
+value, so that line copies the whole system path into your user one, permanently,
+truncated at 1024 characters.
+
+```sh
+# macOS / Linux — this shell, and then your shell profile to keep it.
+export PATH="$PWD/target/release:$PATH"
+```
+
+`polis doctor` prints whichever of these applies with this machine's own path
+already substituted in, and on Windows `Polis.bat` offers to do it for you the
+first time it runs.
+
 ### House style
 
 Stub bodies are `todo!("PRD §X — what is owed")` with a `let _ = (params);` line
@@ -118,13 +254,14 @@ Ordered. Each ends in something demonstrable. Do not skip ahead — PRD §15.
 
 | | Milestone | Delivers | Status |
 |---|---|---|---|
-| **M0** | Event spine | `polis-events` + `polis-ingest`; `polis tail` prints a normalized event stream. Prove the hook's budget under synthetic load. | **Contracts done.** `polis-events` and `polis-hook` are implemented and tested; the four channels in `polis-ingest` are signatures. |
-| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Structure and budgets met on one machine; the render is still being judged.** `polis snapshot` draws any checkout. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Both PRD §13.1 budgets now hold on both real repositories — see below. The geometry is now a partition of the plot adjacency graph rather than of the plane (ADR-0074): solidity 0.995-0.999 -> **0.76-0.83** on four corpora, radial spokes 4-9 -> **0**, boulevards through the civic square 1 -> **0**, and the longest dead-straight district border 46-93 % of the diameter -> **6.7-11.1 %**. All three are asserted by the gate rather than measured in a notebook. |
-| **M2** | Single-session replay | One JSONL file animated over the city, offline. The fastest iteration loop the project has; most of the visual notation gets decided here. | Not started. Fixtures are in `tests/fixtures/transcripts/`. |
-| **M3** | Live, single session | M0 wired into M2. One agent, real time. | Not started. |
-| **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | Not started. Depends on the beta traces channel (ADR-0006). |
-| **M5** | Attention layer | The three states, contention detection, drill-down, linked filesystem view. **The first milestone that delivers the product thesis.** | Not started. |
-| **M6** | Landmarks and polish | Monuments, overgrowth, industrial zoning, scaffolding, trails, follow-thread camera, drift detection. | Not started. |
+| **M0** | Event spine | `polis-events` + `polis-ingest`; `polis tail` prints a normalized event stream. Prove the hook's budget under synthetic load. | **Done.** All four channels run; `polis tail` prints the normalized stream. `polis-hook` passed a 36-row exit-code safety matrix and is registered in exec form (ADR-0016). Observed live against real Claude Code through `polis run`: telemetry, hook, filesystem and transcript events all arriving in one session. |
+| **M1** | Deterministic city, static | `polis-repo` + `polis-layout`; a city from git history rendered to a window or PNG. **Gate: byte-identical layout across two runs and two machines.** | **Done on one machine; the two-machine leg is unobserved.** `polis map` opens the window and `polis snapshot` writes the PNG. Byte-identical across runs, processes, optimization levels, input permutation and `RandomState` order; the two-*machine* leg is wired in CI (`m1_gate.rs` leg f) and has not been observed. Both PRD §13.1 budgets hold on both real repositories — see below. The geometry is a partition of the plot adjacency graph rather than of the plane (ADR-0074): solidity 0.995-0.999 -> **0.76-0.83** on four corpora, radial spokes 4-9 -> **0**, boulevards through the civic square 1 -> **0**, and the longest dead-straight district border 46-93 % of the diameter -> **6.7-11.1 %**. All three are asserted by the gate rather than measured in a notebook. |
+| **M2** | Single-session replay | One JSONL file animated over the city, offline. The fastest iteration loop the project has; most of the visual notation gets decided here. | **Done.** `polis watch` picks from this machine's own recordings — 187 sessions indexed in 67 ms headers-only — and animates the chosen one over its repository's city with a two-timeline transport clock. 22 759 real events applied in 239 ms (10.5 µs/event, ~190× PRD §13.1's 500/s budget); a 26.1-hour session compresses to 18.4 watchable minutes. |
+| **M3** | Live, single session | M0 wired into M2. One agent, real time. | **Done.** The window drives the world from the live bus, once per frame. `polis watch` needs **no setup at all**: three real `claude` sessions started by hand in one checkout, with no hooks and no `OTEL_*` exported, all appeared — verified end to end, see below. Hooks and telemetry are enrichment on top, and the status rail says which of the four channels are actually delivering, because the failure this milestone existed to fix was silence. |
+| **M4** | Multi-thread, territories, clouds | Territory inference, KDE, iso-contour rendering, tethers to workers. | **Done, exercised against a real fleet.** Three real agents in one checkout became three threads, never merged; worker attribution 1/1 via `record agentId`; territory converged in 2-3 observations (5.0-11.5 s) onto exactly the directory each agent was told to work in, with zero district changes. Clouds render live: **5 clouds / 15 kernels** on a concentrated fleet. A thread whose reads are spread across unrelated directories correctly gets **no** cloud — PRD §6.2's convergence gates refusing to claim, not a missing feature. |
+| **M5** | Attention layer | The three states, contention detection, drill-down, linked filesystem view. **The first milestone that delivers the product thesis.** | **Done, with one live defect (below).** All three states observed firing live, which no replay can do: contention (`same file · two agents`), *needs review* (`done, unverified`), and `done · tests ran after the change`. Contention is now keyed by **actor** `(thread, worker)`, not by thread — **4 of 4 real contentions in the operator's corpus are worker-versus-worker inside one session**, the exact class the old thread-keyed table could not represent. Failure salience: the reddest real frame went from 3 hot px / 3600 to **42** (0.08 % -> 1.17 %), plus a ≤400 ms arrival pulse. Drill-down and the linked tree view are in. |
+| **M6** | Landmarks and polish | Monuments, overgrowth, industrial zoning, scaffolding, trails, follow-thread camera, drift detection. | **Mostly built incidentally; not yet a milestone.** Monuments (`MAX_MONUMENTS = 24`; 4-24 found on every real repo tried), overgrowth (`overgrowth_over`, 90 -> 270 days), industrial zoning (fires on real repos: 5 districts in `stickingplacebooks`, 1 in `biwt`), scaffolding (`MAX_SCAFFOLDS = 24`), trails, `FollowCamera` (bound to `f`, cut not pan) and drift (`DRIFT_CONFIRMATIONS = 8`, shown in the rail) all exist and are tested. What M6 still owes is the pass that decides which of them **change a decision** (PRD §17) and cuts the rest. |
+| **M7** | Terminals in the window | Claude Code sessions in panes beside the map, owned by a daemon rather than by the window, correlated with the city in both directions. | **M7a-M7d done; M7c and M7e outstanding.** The ptys live in `polis-sessiond` (ADR-0095), so a force-killed window leaves its agents running and the next launch reattaches and replays each pane's byte log. `Mode::Work` runs the four channels, so the panes' own agents draw their own clouds (ADR-0105). Clicking a tab lights that agent's cloud; a cloud, a rail row or an `a` jump brings its pane to the front; a tab reads its district and its amber state from the same `WorldSnapshot` the map reads. `Ctrl+Alt+T` or `+ agent` starts a terminal in any live window, so `polis` and `polis watch` grow one without the subcommand. Still owed: scrollback selection, OSC 52, the `polis doctor` glyph line, splits, and moving ingest into the daemon so a detached period records. |
 
 ### M1, measured
 
@@ -207,24 +344,148 @@ polis --repo ../neovim snapshot --out city.png --junctions junctions.png
 polis snapshot --synthetic 5000 --out fixture.png   # the shipped fixture
 ```
 
+### M3-M5, measured end to end
+
+Everything below was measured on one machine (Windows 11, 24 cores, rustc
+1.98.0) against **real Claude Code sessions**, not fixtures.
+
+**The operator's sentence, tested literally.** *"i want to see all agents active
+in a repository on the machine."* Three `claude` processes started in one
+checkout from separate shells, with no hooks registered and no `OTEL_*` in the
+environment. All three appeared, correctly scoped, with sessions in other
+repositories listed but **not drawn** onto the wrong city. Ten at once: all ten
+finished correctly, 0 dropped events, 0.4/0.5 ms frames, no panic.
+
+| PRD §13.1 budget | Target | Measured | |
+|---|---|---|---|
+| Frame | 16.6 ms | **0.4-4.8 ms** live, worst observed | pass |
+| Agent + attention draw | < 4 ms | **p50 1.2 µs, p95 28.6 µs** over a real 37 437-event session; **1.60 ms** with 48 marks in all four states, all escalated | pass |
+| Incremental layout step | < 50 ms | median **42.4 ms**, p95 **45.8 ms** | pass, thin |
+| Sustained ingest, zero drops | 500 ev/s | 500/s x 25 s: **12 499 sent, 12 499 received, 0 dropped**. Headroom: 5 000/s x 12 s, **59 995 / 59 995, 0 dropped** | pass, 10x |
+| Idle CPU | < 2 % of one core | **1.56 %** over 45 s (54 threads, 156 MB RSS) | pass, thin |
+| Cold start -> first frame, 5 k files | < 3 s | warm **816 ms**; cold **3.9-7.6 s** when all 5 000 files are parseable source | **miss, 1.3-2.5x** |
+
+**The cold-start miss is real, reproducible, and narrower than it looks.** It is
+not the layout and not the render — it is tree-sitter, once, on first sight of a
+repository. Five thousand files in one language, nothing cached, this machine:
+
+| all 5 040 files are | imports | cold start | warm |
+|---|---:|---:|---:|
+| `.py` | 2 896 ms | **3 923 ms** | — |
+| `.ts` | 3 945 ms | **4 936 ms** | — |
+| `.rs` | 4 915 ms | **5 933 ms** | 816 ms |
+| `.rs`, no `use` statements at all | 5 161 ms | **6 156 ms** | — |
+| `.js` | 6 557 ms | **7 595 ms** | — |
+
+Removing every import statement did not help, so this is per-file parse cost, not
+edge resolution. It is **0.86-1.30 ms per parseable file** here, and the same
+0.86 ms/file falls out of `qurio-toolset` (1 557 files, imports 1 340 ms cold).
+
+That number is what makes **ADR-0082's Django row unrepresentative**: it reports
+423 ms of imports over 7 014 files, or 0.06 ms/file — fourteen times cheaper than
+any measurement in this round, across four grammars and a real repository.
+Django's tree is mostly `.html`, `.po`, migrations and static assets, so most of
+those 7 014 files were never handed to a grammar. The budget therefore holds for
+a repository with a typical mix, and misses for one whose 5 000 files are *all*
+source — a large Rust or TypeScript monorepo, which is not an exotic case. Every
+launch after the first is 816 ms, because the import cache is keyed on content
+rather than path. `polis snapshot` prints the budget beside the measurement and
+does not warn when it is over.
+
+**M4 against a real fleet.** Three agents, one checkout, watch started before
+anything was running in it:
+
+```text
+threads              3 now, 3 at peak          workers 1/1 attributed (100.0%) via record agentId
+converged after 2 observations (11.5s)  claim src/notes     depth 2 mass 1.00
+converged after 3 observations (5.1s)   claim src/auth      depth 2 mass 1.00
+converged after 3 observations (5.5s)   claim src/render    depth 2 mass 1.00
+contention 0        health: drift 0, unmapped 0, retired 0
+```
+
+Each thread claimed exactly the directory its prompt named, and no claim ever
+changed district. Clouds render at **5 clouds / 15 kernels**.
+
+**M5's three states, live.** A replay structurally cannot show contention (it
+needs two threads) or *done* (it needs `Stop`). Live does:
+
+```text
+CONTENTION    same file · two agents   23s    thread aaaa1111  src/mod1.rs
+needs review  no test ran after the change  20s   thread bbbb1111  src/mod1.rs
+done          tests ran after the change   14s   thread 574d4485  src/mod1.rs
+```
+
+The status rail's worst-first summary flips from `WAITING ON YOU` to
+`CONTENTION` when one fires, which is PRD §11.1's ordering doing its job.
+
+**Contention is keyed by actor, and that is what made it fire.** On the
+operator's own corpus: **4 of 4 real contentions are worker-versus-worker inside
+a single session** — `settings.css` (two subagents 4.7 s apart), plus
+`polis-render/src/live.rs`, `polis-world/src/apply.rs` and `polis-app/src/cli.rs`
+in a 69-worker fan-out. A `ThreadId`-keyed table represents **none** of them.
+Caveat: `edits_without_line_ranges` is 1 768 against 8 hits, so PRD §11.3's
+**Critical** tier (overlapping line ranges) is effectively unreachable from the
+transcript and everything lands at **High**.
+
+### The live defect this verification found
+
+**A headless `claude -p` session that has exited still reads `WAITING ON YOU`,
+for ever.** `DecisionSource::TurnEnded` fires when a main agent ends its turn
+with no tool call and no human reply yet. For an interactive session that is
+exactly right and is the reason a replay can show the primary state at all. For
+a headless one, the process is *gone* and no human will ever reply, so the mark
+is permanent and false; `retire_threads` then deliberately never retires a thread
+an attention mark still points at, so the pins accumulate. Observed: 12 sessions
+run, 12 threads on the map, 12 amber pins, none of them real, ageing past 3
+minutes and climbing.
+
+It is fixable and the evidence is already on disk. Every transcript record
+carries `entrypoint`, which `docs/verified/jsonl-schema.md` records as **STABLE
+100 %** with values `"cli"` (125 553) and `"sdk-cli"` (120), and which
+`polis-ingest` already parses into `TranscriptRecord::entrypoint`. **Nothing in
+`polis-world` reads it.** Gating `TurnEnded` on an interactive entrypoint is the
+fix. Impact is small for an operator typing at a terminal (`sdk-cli` is 0.1 % of
+the real corpus) and total for anyone driving a fleet with `claude -p` — which is
+the shape PRD §16's synthetic load assumes.
+
 ---
 
 ## Installing the hooks
 
 ```sh
-polis install-hooks            # writes the .claude/settings.json hooks block
-polis install-hooks --dry-run  # show what it would write
+polis connect              # shows the file, the diff and the backup, then asks
+polis connect --dry-run    # everything, plus the full file it would write
+polis connect --uninstall  # removes what it added and puts the file back
 ```
 
+`polis connect` is `install-hooks` with consent: it names the exact file, prints
+the nineteen registrations, shows a line diff against what is there now, states
+that the current file is copied to `<name>.polis-backup` first, and then waits
+for a yes. With no terminal to ask on it refuses rather than assuming, and
+`--yes` is the explicit override for scripts. `polis install-hooks` is still
+there and unchanged for the non-interactive case.
+
 Nineteen event registrations, in **exec form** — never a shell command, which
-costs 6× on Git Bash and 25× on PowerShell per event (ADR-0016). `WorktreeCreate`
-is deliberately **not** registered: a handler there replaces git's worktree
-creation and then fails it, which would break every worktree on the machine
-(ADR-0002).
+costs 6× on Git Bash and 25× on PowerShell per event (ADR-0016). Two rules are
+enforced twice, once in `polis-ingest` where the block is built and once in
+`polis_app::setup::audit` against the JSON about to be written:
+
+* `WorktreeCreate` is **never** registered. A handler there replaces git's
+  worktree creation and then fails it, which would break every `git worktree`,
+  every `claude --worktree` and every isolated subagent on the machine
+  (ADR-0002, `hooks-schema.md` §9.1).
+* `PreToolUse` is **narrowed and anchored** to `^(Edit|Write|NotebookEdit)$`.
+  Unmatched it is the ~200 call/sec firehose PRD §4.2 exists to avoid, and
+  unanchored `Edit` also matches `NotebookEdit` (`hooks-schema.md` §9.3).
+
+The uninstall is tested rather than asserted: install into a settings file that
+already had other keys and other tools' hooks in it, uninstall, and the parsed
+JSON has to equal what was there before — and when Polis created the file, "put
+it back" means the file is gone.
 
 In an interactive session Claude Code runs no settings-file hook until the
 workspace trust dialog is accepted, so the first launch after installing can look
-like a silent failure. `install-hooks` says so.
+like a silent failure. `connect` says so, on the screen, right after it writes.
 
 ---
 

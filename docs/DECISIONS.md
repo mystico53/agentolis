@@ -333,6 +333,12 @@ notoriously opaque error. Note that `glow 0.17.0` in the tree is **not** eframe'
 glow renderer — it arrives via `wgpu-hal`'s GLES backend — so its presence does
 not mean you are off the wgpu path.
 
+**Superseded in part by ADR-0110.** The paragraph below describes the shape of a
+wgpu pipeline that was declared and never implemented; it was removed, and with
+it `polis-render`'s `eframe` dependency. The rule this ADR is actually about —
+wgpu and winit come through eframe, never directly — stands, and now applies to
+`polis-app` alone.
+
 PRD §14 also lists `polis-render` as if it were independent of the UI shell. It
 cannot be: the offscreen density pass can only be encoded from inside
 `egui_wgpu::CallbackTrait::prepare()` (you cannot nest a render pass inside
@@ -380,6 +386,29 @@ Parent resolution is ranked, because picking the easiest route is the trap:
 Workflow subagents (503 of 643) have neither `toolUseId` nor `parentAgentId`;
 they link structurally via `wf_<runId>` matched against the parent `Workflow`
 call's `toolUseResult.runId` (40/40 on disk, 0 orphans either way).
+
+**Amended: "0 orphans either way" is a statement about reading a session from
+disk, and it does not survive live tailing.** The run id is matched against a
+*single record* in the main transcript, and `start_discovering` follows existing
+files from their end — so a Polis started after the `Workflow` call never reads
+the record the whole route depends on, and every agent of that run parks
+unattributed for ever, with no second chance: nothing re-reads the parent.
+Observed on a live fleet as twelve rows of *"workflow run has no parent
+`Workflow` call yet"* whose parent call was in the transcript the entire time.
+Route 3 is also the one route with no fallback — an `Agent` spawn is recoverable
+because the subagent's own transcript carries the parent's `sessionId`, and a
+journal record carries no `sessionId` at all.
+
+So there is a fourth rung, and it needs no record: the journal is read out of
+`<munged-cwd>/<session-id>/subagents/workflows/wf_<runId>/`, so the **owning
+session is a parent directory of the file**.
+`polis_ingest::transcript::attribute_to_file` puts it on the envelope whenever
+the record itself names no session, and `polis_world::apply::journal` takes it
+after the run table and the worker's own transcript have both missed. It is
+attributed `WorkerAttribution::TranscriptFile` — the path rather than a record
+field — so `strength` keeps it from ever overwriting a real match, and it is
+gated on the thread already existing, because a directory name is not proof that
+a session does.
 
 **Consequences.** A parser that assumes every line has a `uuid` breaks on a
 quarter of the corpus. A parser that follows `parentUuid` alone renders a
@@ -799,8 +828,24 @@ cannot shift every later draw. Coordinates are quantised before serialisation, s
 the two-OS golden-file comparison cannot fail on a last-bit floating-point
 difference. `BTreeMap` everywhere iteration order can reach the layout.
 
+The same rule governs the **identity hue**: `ThreadId::hue_preference` is FNV-1a
+over the session id's bytes, written out in `polis-events/src/ids.rs` and pinned
+by `the_identity_hash_is_written_out_and_pinned` with literal expected values.
+
 **Consequences.** If the pinned seed test ever fails, every golden layout file in
 the repo is invalidated **on purpose** — that is the signal, not a nuisance.
+
+**Amended by ADR-0101 — the identity hue is no longer deterministic per id.**
+Anyone reading this ADR and assuming that a `ThreadId` determines its colour the
+way a `LogicalPath` determines its seed would be wrong, and it matters, because
+the hue is the one place in the product where a written-out hash stopped being
+the last word. The *preference* is still a pure function of the id and is still
+pinned by literals; the *slot actually drawn* is assigned by `polis_world::World`
+and is a function of the ordered set of distinct thread ids the world has seen.
+That is a genuine weakening of what this ADR promised, and it buys the thing the
+hash could not: two live threads are never the same colour. It is deterministic
+for a given event sequence — which is what `step`, `seek`, `run_to_end` and every
+golden test give it — rather than for a given id in isolation.
 
 ---
 
@@ -3423,3 +3468,1950 @@ description, and 15–33 % on the operator's own repositories and on Django and
 Neovim. That is a fact about how repositories are written, not a gap in the
 extractor, and `docs/neighborhoods-sample.md` reports it per repository rather
 than averaging it away.
+
+---
+
+## ADR-0088 — A description is rejected when a *tool* wrote it, and a file speaks only for the directory it is in
+
+**Context.** ADR-0087's extractor was reviewed by running it over the operator's
+eight repositories rather than over fixtures, and four of its outputs were
+indefensible on sight:
+
+* `qurio-toolset/src/components/landing` was described, on the map, as
+  **"eslint-disable"**. A leading `/* eslint-disable */` is a block comment in
+  exactly the position a module doc comment occupies, and tree-sitter was right
+  to hand it over. It is simply not prose.
+* Four of eight repositories had their **root** district — PRD §8's civic
+  square, the most prominent label on the map — described by a project
+  generator: "This is a Next.js project bootstrapped with create-next-app" on
+  three, and "This template provides a minimal setup to get React working in
+  Vite" on the fourth. That text describes the generator, not the repository.
+* `qurio-toolset`'s root was then described as "a DEV-ONLY Vite plugin", because
+  the doc-comment extractor fell back to the district's monument wherever it sat
+  in the subtree — here `vite-plugins/manualReloadPlugin.js`. The same rule made
+  `components/MediaWindow` a YouTube renderer, from
+  `MediaWindow/renderers/YouTubeRenderer.jsx`.
+* `components/ChatWindow` was described as "most imported: `ChatWindow.jsx`" and
+  `src/types` as "most imported: `index.ts`". ADR-0087's `says_nothing_new`
+  guard missed both: it compares against the *display name*
+  (`components/ChatWindow`), which a leaf file name never equals, and it does not
+  strip the extension.
+
+**Decision.** Four rules, all of which make the output *smaller*.
+
+1. **`SanitiseReject::Boilerplate`.** Two closed tables — `PRAGMA_PREFIXES`
+   (`eslint-*`, `prettier-ignore`, `ts-nocheck`, `noqa`, `pylint:`, `coding:`, …)
+   prefix-matched after markup stripping, and `BOILERPLATE_PHRASES`, verbatim
+   generator output, matched anywhere. Rejected whole and the next source tried,
+   the same contract as a secret. A phrase earns a place in the second table only
+   by being a string a tool emits, never by sounding generic: the general "says
+   nothing new" test is `says_nothing_new`, and the general "there is nothing to
+   say" answer is `None`.
+2. **The cache version is bumped with any rule change.** The cache is keyed on
+   the bytes of the file, not on the rules that read them, so a warm cache would
+   go on serving the answer the new rule exists to refuse — and only on machines
+   that had run before, which is the worst possible way to find out.
+3. **An `extra` doc-comment candidate must sit in the directory itself.** A doc
+   comment describes the file it is written in. An `ANCHOR_NAMES` file is the
+   directory's declared front door and may speak for it; any other file speaks by
+   proximity, and proximity runs out at the first subdirectory. This does not
+   make the survivors true of a whole 223-file district — that is a judgement no
+   path rule can make — it removes the cases with no basis at all.
+4. **A monument that repeats the district's own leaf name, extension stripped,
+   is not a description**, and neither is a universal entry point (`index`,
+   `main`, `mod`, `lib`, `app`, `__init__`, …). The monument itself is untouched:
+   PRD §8 still draws and labels that building. It is a useless label for the
+   *district*.
+
+Also: `.astro`, `.playwright-mcp`, `playwright-report`, `test-results`,
+`.docusaurus`, `.vercel`, `.netlify` and `.wrangler` join
+`DEFAULT_INDUSTRIAL_DIRS`. All are tool output that nobody edits, and without
+them 152 such files sat in the civic budget of the operator's repositories —
+106 of them, in `biwt`, as one of that repository's largest `config` districts.
+
+**Consequences.** Prose descriptions across the operator's eight repositories
+fall from 44 to 38 and the *informative* count stays at 10, which is the point:
+every loss was wrong. The honest number is now 23 prose descriptions across 160
+districts outside this repository — 14 % — of which 10 tell the reader something
+the label did not. `docs/design/NEIGHBORHOODS-REVIEW.md` records the grading
+district by district, and concludes that the remaining gap is not reachable by
+more rules.
+
+**One thing deliberately not fixed.** `vc-tower/vcsheet-scraper` holds 13 058
+scraped `.json` and `.html` files that read as `config` and `source`, set the
+sizing budget, and collapse that repository's whole application into one
+100-file district. `.json → Config` was chosen deliberately in ADR-0085 and
+flipping it globally is not a review's change to make. The right fix is to
+generalise ADR-0086's hold-out from *directory names* to *behaviour* — a flat
+directory of thousands of files sharing one extension is a mass whatever it is
+called — and it is the top recommendation of the review.
+
+---
+
+## ADR-0089 — A model writes the descriptions the repository does not, and everything about it is fenced
+
+**Status** accepted · Implemented in `polis_repo::llm`.
+
+**Context.** ADR-0087 derived a neighborhood's description by quoting the
+repository, and ADR-0088 tightened it. `docs/design/NEIGHBORHOODS-REVIEW.md` then
+measured the result by running it over the operator's eight repositories:
+**23 prose descriptions across 160 districts — 14 % — of which 10 told the reader
+something the label did not.** Nine of the 23 were the folder name in different
+words (`services/settings` → "The settings entry contract"). `biwt` has 20
+districts and zero prose in the whole checkout.
+
+The gap is structural, not a missing rule: **most directories in a working
+repository contain no sentence saying what they are**, and no extractor can quote
+what nobody wrote. So the operator approved adding a model, after an explicit
+discussion of the trade-offs, and PRD §2's "no telemetry leaving the box" is bent
+here — deliberately, once, and with the payload fenced.
+
+**Decision.** `GLM-5.3-Flash` on Z.ai by default, behind a provider-agnostic
+interface, with seven properties that are each load-bearing.
+
+**1. The provider is a config line.** `ChatProvider` has two methods: build a
+request, parse a response. Everything above it — planning, batching, caching,
+staleness, redaction, retries, accounting — is written against that. `Glm`,
+`Ollama` (the same `OpenAI`-compatible shape, locally, with no key at all) and
+`Anthropic` (Messages API, `x-api-key`, `anthropic-version`) ship.
+`LlmConfig::with_provider` moves base URL, model, key-variable *name* and price
+together, because changing one without the others is the failure it exists to
+prevent.
+
+**2. There is no HTTP crate.** A blocking client with TLS is ~40 crates including
+a cryptography library with a C build and a compiled-in CA set that ages;
+`polis-repo` has nine direct dependencies and this work added **zero** —
+`Cargo.lock`'s `polis-repo` entry is untouched, so a security review of the
+feature is still one directory of one crate, and `polis-hook`'s zero-dependency
+guarantee (PRD §14, ADR-0036) cannot be eroded by accident. Instead there are two
+transports behind one trait: `http://` is HTTP/1.1 over `std::net::TcpStream`,
+written out here (chunked decoding included, because Ollama uses it); `https://`
+is `curl` as a subprocess, using the operating system's own trust store. This is
+the same call `polis-repo/Cargo.toml` already made for `git log`, for the same
+reasons. **It is a trait so it is reversible**: a `ureq`-backed
+`impl Transport` is a new type in the caller's crate and no change here.
+
+A consequence worth stating: the tests drive the *shipped* plain-HTTP client
+against a real `TcpListener` on `127.0.0.1`, so the end-to-end HTTP path is
+exercised by `cargo test` with no network and no mock.
+
+**3. The key is a type, not a discipline.** `Secret` has no `Serialize`, no
+`Display` and no constructor from a literal; it prints as `Secret(<redacted>)`,
+so a `{:?}` of any struct holding one is safe to log; it is reachable only
+through `Secret::expose`, which is one greppable name. `curl`'s command line is
+visible to every process on the machine, so a secret header is written to
+`curl --config -` **on stdin** and never into `argv` and never into a file; the
+request body, which carries no key, goes to a temporary file in the state
+directory that is deleted when the call returns. Any text arriving from outside
+this crate — a subprocess's stderr — is run through `secret::scrub` before it can
+reach an error string.
+
+**4. Editing a file does not change what a folder is.** The cache key is the
+district's **identity plus a fingerprint of its file names**, never file
+contents. Keyed on content, every commit invalidates most of the cache: a
+one-time cost becomes a per-commit cost and, worse, the words on the map churn —
+which is the same failure as a city that reshuffles (PRD §7.4). A description is
+regenerated only when meaning plausibly moved, which is three things:
+
+* **a district appeared** (`Freshness::Missing`);
+* **a district split or merged** — the entry stores its child district paths, so
+  a growing `src/services` splitting into `src/services/auth` and
+  `src/services/billing` is caught *structurally*, even though the parent's own
+  file names barely moved. This is the case the operator asked about and the one
+  a name fingerprint alone misses;
+* **the name fingerprint drifted** past the threshold.
+
+Relations are deliberately not on that list. Import edges are exact and update
+instantly; they answer "what talks to what". Descriptions answer "what is this
+folder", which moves slowly. Keeping them apart is what stops the fast-changing
+half from ever triggering a call.
+
+**The threshold is 440 ‰ of Jaccard distance, and the number is measured, not
+chosen.** `polis-repo/examples/llm_drift.rs` lists every district of every
+repository in `C:/coding` at `HEAD` and at the same repository 30, 90 and 365
+days — and 25, 100 and 400 commits — earlier, using `git ls-tree` so nothing is
+checked out. Drift is `1 - |A ∩ B| / |A ∪ B|`, symmetric in additions and
+removals, which is the property you want: a district that *loses* a third of its
+files has changed as much as one that gains a third. That symmetry is also why
+the constant is not the brief's "a third" read literally — replacing a third of
+*n* names gives 500 ‰, adding a third gives 250 ‰, so "a third changed" is a band
+from 250 to 500 and the measurement picks the point inside it:
+
+| window | surviving districts | ≥250 ‰ | ≥330 ‰ | **≥440 ‰** | ≥500 ‰ | ≥660 ‰ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 30 days | 117 | 11 % | 7 % | **3 %** | 3 % | 2 % |
+| 90 days | 113 | 19 % | 12 % | **9 %** | 5 % | 4 % |
+| 25 commits | 110 | 15 % | 11 % | **9 %** | 9 % | 7 % |
+| 100 commits | 83 | 43 % | 33 % | **25 %** | 23 % | 13 % |
+| 400 commits | 55 | 60 % | 56 % | **44 %** | 40 % | 29 % |
+
+At 440 ‰ the *median* district never fires in any calendar window — median drift
+is 0 ‰ on five of the eight repositories over 90 days — so the typical caption is
+stable across a quarter, which is exactly the spatial-memory property. It still
+fires on the districts that genuinely churned: `qurio-toolset`'s 90-day p90 is
+784 ‰. 330 ‰ costs a third more regenerations for districts whose names moved by
+a quarter, which is a refactor, not a change of purpose; 250 ‰ nearly doubles it.
+
+**5. Staleness is a state, never a silence.** A caption reading "Payment
+processing" over a folder that quietly became the notification service is *worse
+than no caption*: it is confidently wrong and the operator would trust it. So
+`Neighborhood::freshness` is `Fresh` / `Stale(Drift { permille, cause })` /
+`Missing`, the cause distinguishes names from split, merge and a changed
+model-or-prompt, and the drift is a `u16` per-mille rather than an `f32` because
+`Neighborhood` derives `Eq` and a serialized value must compare bit-identically
+on every machine. A stale description is **still shown**, marked — blanking it
+would trade a caption the operator can see is old for no caption at all, and the
+requirement was that staleness be visible, not hidden.
+
+**6. Nothing is called implicitly, and every failure degrades.**
+`RepoIndex::neighborhoods_described` and `llm::apply_cached_model_descriptions`
+read; only `LlmRunner::run` calls, and `LlmRunner::spawn` puts it on a background
+thread so a render never waits for a network. **`RunMode::DryRun` is the
+default**, produces the whole priced plan having called nothing, and a
+`Generate` against a **cold cache** refuses to spend unless confirmed: cold start
+is the expensive one and nobody should discover a bill. No key, no network, a
+dead port, a 401, a 429, a timeout, a body that is not JSON, a model that
+refuses — each is one line in `RunReport::errors` and a map identical to the one
+you get with the feature off. Retries are bounded and only for errors that could
+change: a 429 and a 5xx are the endpoint asking for patience, a 401 will be just
+as wrong in half a second.
+
+**7. Empty beats filler, enforced twice.** The prompt leads with the refusal
+rule, in capitals, illustrated with three of the review's *real* failures
+verbatim, and asks for `null`. And `prompt::restates_the_name` enforces it
+independently, because a rule that lives only in a prompt holds only until the
+next model: caption words are split on `camelCase` and punctuation, singularised,
+and stripped of stopwords and a closed list of category nouns; if nothing is left
+that the district's name does not already contain, the answer is refused. Graded
+against the review's own tables it catches **six of the nine** restatements and
+**none of the ten** informative captions — "Tool Registry" survives, because
+`registry` is neither in `services/tools` nor a category noun. It is deliberately
+high-precision: a false positive here silently deletes a good caption.
+
+The same function also decides *which* districts are asked about. A real README
+or manifest sentence always wins; the model is asked only where the extractor
+returned nothing, returned an inventory line, restated the name, or hung one
+file's doc comment on a district too large for it to speak for
+(`src/services`, 223 files, labelled from `WindowManager.js`).
+
+**Consequences.**
+
+*Nothing leaves without being vetted.* `llm::outbound::vet` applies
+`describe::looks_like_secret` — the **same** predicate as the inbound sanitiser,
+not a second copy — to every file name and doc snippet, strips every control
+character and bidi override with `describe::is_unsafe_char`, and drops whole
+fields rather than redacting inside them. Measured over the operator's eight
+repositories: **169 names refused, 0 doc snippets, 0 districts skipped.** One of
+those is a genuine catch — `AuthKey_73425WW27A.p8`, the Apple private key in
+`qurio-toolset/electron/signing/apple`, the district ADR-0087's review already
+flagged. The rest are long hyphenated document names with digits
+(`1968-End-of-an-Era.pdf`) and epoch-prefixed uploads
+(`1765241215200-A Cielo Abierto.png`) that read as high-entropy. That is the
+right side to err on, and it is why vetting happens *before* the sixty-name
+truncation rather than after: otherwise `stickingplacebooks`' upload directory
+would have spent its whole budget on names that were then dropped.
+
+*Source code bodies never leave.* Structurally, not by promise: `DistrictBrief`
+has no field that could hold one and its builder opens no file.
+
+*The layout cannot move.* A description is text hung on a district. The partition
+is a pure function of the file list and runs before any of this; there is a test
+that a full generation leaves every district's path, file count and kind
+byte-identical, and the `m1_gate` goldens are untouched.
+
+*`DescriptionSource::Model` is not prose.* `is_prose()` stays false for it and
+`NeighborhoodStats` counts `described_model` separately, so the review's 14 % —
+the honest measurement of how well a repository documents *itself* — cannot be
+inflated by having paid for sentences.
+
+*Cost, measured rather than estimated.* A cold start over the operator's eight
+repositories, priced from the exact bytes that would be sent: `qurio-toolset`
+$0.0018 (41 districts, 6 calls), `stickingplacebooks` $0.0013,
+`Squigglo` $0.0008, `biwt` $0.0006, `stickingplace` $0.0004, `vc-tower` $0.0003,
+`agentolis` $0.0001, `qurio-networked` $0.0001 — **$0.0054 for all eight, about
+$0.0007 each**, an order of magnitude below the $0.006 per repository the brief
+estimated, because a district's names and doc snippet are ~250 input tokens, not
+1 000. The price is configuration, not a constant, because the shipped default is
+a promotional rate that expires on 2026-09-09, and `RunReport` prints the price
+it used and says plainly when the provider reported no usage and the figure is
+therefore an estimate.
+
+*Structured output is requested and never relied on.* `models.dev` reports that
+`glm-5.3-flash` supports it; Z.ai's documentation does not describe the syntax,
+and this round had no key to settle it with. So `response_format` is sent when
+`request_json_object` is set — one config line to turn off — and `parse_reply` is
+tolerant either way: a bare object, a bare array, a fenced block, or JSON inside
+prose. **This is unverified**, and it is written down here rather than assumed.
+
+*What the live endpoint did confirm, with no valid key.* An unauthenticated
+`POST https://api.z.ai/api/paas/v4/chat/completions` returns HTTP 401 and
+`{"error":{"code":"1001","message":"Authentication parameter not received in
+Header, unable to authenticate"}}`; the same request through the shipped
+`CurlTransport` carrying a deliberately invalid key returns HTTP 401 and
+`"token expired or incorrect"`. The two messages differ, which is the proof that
+the `--config -` stdin mechanism actually delivers the header. The run classified
+it as non-retryable, made one attempt, logged one error line and left both
+districts on their derived descriptions. **A successful completion has not been
+observed**: no key was present in this environment.
+
+---
+
+## ADR-0090 — A claim is keyed by actor, because every real contention is inside one session
+
+**Context.** PRD §11.3 says to register an `Edit`/`Write` claim "keyed by
+**thread**", and PRD §3 defines a thread as a main agent *plus its worker
+subtree*. Those two sentences together make contention unrepresentable in the
+case it actually occurs: a session that fans out to a dozen parallel subagents is
+a whole fleet inside one `ThreadId`, so "a second live claim from a different
+thread" can never fire however many workers collide.
+
+**Decision.** Key the claim on `Actor = (thread, worker)`. A hit is a second live
+claim from a different **actor**, and `Contention::within_one_thread()` reports
+whether both ends belong to one session so a surface can word it correctly.
+
+**Evidence, on the operator's own corpus.** `contention_on_real_sessions.rs`
+replays two real sessions and asserts the result:
+
+| session | events | contentions | class |
+|---|---:|---:|---|
+| `settings.css` session | 4 604 | 1 | `worker a6bb0ab5e…` vs `worker a79d04997…` on `src/components/custom/settings/settings.css`, High / FileLevel |
+| 69-worker fan-out | 37 687 | 3 | `polis-render/src/live.rs`, `polis-world/src/apply.rs`, `polis-app/src/cli.rs`, each worker-vs-worker |
+
+**Four of four real contentions are worker-versus-worker inside a single
+session.** A `ThreadId`-keyed table represents none of them; the number it
+reports on this corpus is `0`. Contention is PRD §11.1's top-ranked state — the
+only one where work is actively being destroyed — so a table that cannot
+represent the common case is not a conservative choice, it is a silent one.
+
+**Consequence we are accepting.** `edits_without_line_ranges` is 1 768 against 8
+hits, so PRD §11.3's **Critical** tier ("same branch, overlapping line ranges")
+is effectively unreachable from the transcript and every file-level hit lands at
+**High**. That is reported in `Health` rather than papered over, and it means the
+severity ladder currently has three usable rungs, not four.
+
+---
+
+## ADR-0091 — The alarm is area and motion, not a redder red
+
+**Context.** By M4 the colour channel was correct — every failure placed, drawn
+in `AGENT_FAILED` at the mark — and worth nothing from a metre away. Measured:
+the reddest frame in 1 440 held **142 red pixels out of 1.21 M**, two glyph
+outlines. An independent review: *"a failing session and a clean one are
+distinguishable in about a second by reading one number, and not distinguishable
+by peripheral vision, which is what PRD §11.4 actually asks for."*
+
+**Decision.** Treat it as an **area and motion-onset** problem, exactly as PRD
+§11.4 frames it (*"peripheral vision is poor at colour and good at motion
+onset"*, *"colour alone is never the sole channel"*). Cluster nearby failures
+into one **alarm** per region and draw three things: an expanding arrival ring
+gone in ≤400 ms, a heavy broken steady-state ring with radial ticks, and
+persistence that never fades below `ALARM_FLOOR`.
+
+**Measured on a real session** (`29c2fc6f`, 14 979 events, 120 frames, 68 of them
+carrying an alarm), reddest frame #102, 60×60 thumbnail:
+
+| notation | peak red-excess | hot px of 3 600 | share |
+|---|---:|---:|---:|
+| M4, no alarm | 42 | 3 | 0.08 % |
+| **M5, alarm** | **70** | **42** | **1.17 %** |
+
+Fourteen times the area. Making the red redder would have bought nothing and
+would have broken PRD §10.3's band scheme; the alarm is drawn at the ceiling of
+`AGENT_BAND` (channel 168 against a base map clamped at 48) rather than being
+promoted into layer 5, which PRD §11.2 reserves for exactly three states.
+
+**Bounded on purpose,** because PRD §17's default failure mode is a map that
+panics: one ring per region, `ALARM_CAP` of eight worst-by-count, and
+`ALARM_MAP_CAP` so no ring exceeds 9 % of the map.
+
+**Honest limit.** 1.17 % of the thumbnail is fourteen times better and is still
+about one part in a hundred. Whether that clears "readable in peripheral vision"
+is a human judgement this project has not run a human trial on. The channel PRD
+§11.4 actually names — motion onset — is implemented and asserted
+(`an_arriving_pin_pulses_outward_and_is_gone_in_four_hundred_milliseconds`: 48 px
+at rest, 73 px mid-pulse) and cannot be measured from a still frame at all.
+
+---
+
+## ADR-0092 — `TurnEnded` must not fire for a headless session, and the transcript already says which is which
+
+**Status: open defect, not yet fixed. Found by the M3/M4/M5 end-to-end
+verification.**
+
+**Context.** `DecisionSource::TurnEnded` raises *needs decision* when a main agent
+ends its turn with no tool call and no human has replied yet. It is the most
+common source by far — 62 / 38 / 6 occurrences in the three recorded sessions,
+median waits of 5, 13 and 27 minutes — and it is the reason a replay can show
+PRD §11.2's primary state at all. It is also correct: for an interactive session,
+"turn ended, nobody has answered" *is* the operator being waited on.
+
+**The defect.** For a headless `claude -p` session it is never correct. The
+process has exited; no human is going to reply; the mark can never resolve. And
+`World::retire_threads` deliberately never retires a thread that an attention
+mark still points at — rightly, because a thread blocked on a human may sit for
+hours and that *is* the product. The two rules compose into an unbounded pile of
+false alarms.
+
+**Observed.** Twelve headless sessions run in one scratch checkout: twelve threads
+on the map, twelve amber `WAITING ON YOU` pins, every one of them for a process
+that had already exited, ageing past three minutes and climbing. That is PRD
+§17's *"beautiful swarm view that makes the operator feel informed while telling
+them nothing actionable"* arriving through a door we built.
+
+**The fix, and why it is cheap.** Every threaded transcript record carries
+`entrypoint`. `docs/verified/jsonl-schema.md` records it as **STABLE 100 %** with
+values `"cli"` (125 553) and `"sdk-cli"` (120), and
+`polis-ingest/src/transcript.rs:182` already parses it into
+`TranscriptRecord::entrypoint`. **No code in `polis-world` reads it.** Gate
+`TurnEnded` on an interactive entrypoint and the false pins disappear; the other
+six `DecisionSource` variants are unaffected, because each of them is evidence of
+a question that was actually asked.
+
+**Why it was not fixed in this change.** The verification pass owns `README.md`
+and this file; `polis-world` belongs to the milestone that will carry the fix.
+
+**Blast radius.** Negligible for an operator typing at a terminal — `sdk-cli` is
+0.1 % of the real corpus. Total for anyone driving a fleet with `claude -p`,
+which is the shape PRD §16's synthetic load ("100 threads × 400 subagents")
+assumes and the shape a scripted fleet actually has.
+
+---
+
+## ADR-0093 — The cold-start budget is a per-parseable-file cost, and ADR-0082's Django row is not representative
+
+**Context.** ADR-0082 concluded that "a genuine 5 000-file repository is inside"
+PRD §13.1's 3-second cold-start budget, resting on Django: 7 014 files, cold
+2 998 ms, of which imports 423 ms. The end-to-end verification could not
+reproduce that ratio anywhere.
+
+**Measured.** Five thousand and forty files, one language each, nothing cached,
+release build, this machine:
+
+| all 5 040 files are | walk | history | imports | diff | layout | render | **cold** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `.py` | 16 | 75 | 2 896 | 68 | 263 | 606 | **3 923** |
+| `.ts` | 15 | 69 | 3 945 | 69 | 250 | 589 | **4 936** |
+| `.rs` | 15 | 59 | 4 915 | 73 | 264 | 608 | **5 933** |
+| `.rs`, zero `use` statements | 14 | 68 | 5 161 | 67 | 248 | 597 | **6 156** |
+| `.js` | 15 | 70 | 6 557 | 66 | 255 | 631 | **7 595** |
+
+**Every grammar Polis ships misses the budget at 5 000 parseable files.**
+Stripping every import statement made it slightly *worse*, so the cost is
+per-file parsing, not edge resolution.
+
+**The rate is 0.86–1.30 ms per parseable file,** and it is corroborated outside
+the synthetic set: `qurio-toolset`, a real checkout of 1 557 files, spends
+1 340 ms in imports on a cold cache — 0.86 ms/file, which extrapolates to ~4.3 s
+at 5 000.
+
+**Therefore ADR-0082's Django row is an artefact of file mix, not a refutation.**
+423 ms over 7 014 files is 0.06 ms/file, fourteen times below every other
+measurement taken here. Django's tree is largely `.html`, `.po`, migrations and
+static assets; most of those files were never handed to a grammar. ADR-0082's
+conclusion should be read as *"a repository with a typical mix of parseable and
+non-parseable files is inside the budget"*, which is true, and not as *"5 000
+files is inside the budget"*, which is not.
+
+**Decision.** Record the real curve and leave the budget missed rather than
+restate it. The mitigation that already exists is that the import cache is keyed
+on **content, not path**, so only the first sight of a given tree pays: every
+later launch of the same 5 040-file repository is **816 ms**. What is not yet
+built is anything that makes the *first* launch honest — a progress indication, a
+first frame that draws before imports finish, or a parse budget that yields.
+`polis snapshot` currently prints the budget beside the measurement and says
+nothing when it is over.
+
+---
+
+## ADR-0094 — What the M3/M4/M5 verification could not verify
+
+**Context.** A verification that only reports what passed is an advertisement.
+These are the things this round tried to establish and could not, recorded so the
+next round does not have to rediscover them.
+
+**Hooks were never observed firing from a real agent on this machine.** Claude
+Code runs no settings-file hook until the workspace trust dialog has been
+accepted, and a scratch checkout created by an agent has not been. The remedy
+Claude Code itself prints is to set `hasTrustDialogAccepted` in the operator's
+`~/.claude.json`, which a verification agent must not do on the operator's
+behalf. Channel B was therefore driven through the **real `polis-hook` binary**
+over the real wire instead — contention, `PermissionRequest` and `Stop` all
+arrived and rendered — which tests the transport and the world but not Claude
+Code's own invocation of the hook. `polis install-hooks` already warns about this
+exact trap at install time.
+
+**`cargo doc` is not clean, and was not clean before this round.** Ten warnings,
+all in `polis-repo` (`llm/prompt.rs`, `describe.rs`, `imports.rs`), all public
+docs linking to private items, plus two unresolved `Describer::describe` links.
+`polis-repo` has no uncommitted changes, so these arrive from the committed LLM
+work rather than from M3-M5. They are ten one-line doc-link fixes and are left
+for whoever owns that crate.
+
+**The two-machine determinism leg is still unobserved.** Byte-identical across
+runs, processes, input permutation, `RandomState` order and now **optimization
+profiles** — the fixture digests are `hamlet=23203396b91ae4bc` and
+`town=22d10d8e6e4762df` in debug and in release — but this remains one machine.
+
+**Port conflicts recover, with one rough edge.** A foreign listener on 4317 makes
+Channel A stop with an exact message, emit `control.degraded`, and leave the
+other three channels running; `--allow-second` behaves exactly as documented
+(warns, skips Channel B, does not clobber the primary's endpoint file). The rough
+edge: for a few hundred milliseconds after a Polis is killed, Windows has not yet
+released the UDP socket, so the next Polis reports "another polis is already
+receiving hook events" and names a pid that has just died. It self-heals and no
+operator action is needed, but the message is briefly wrong.
+
+**A live watch holds a handle on the directory it watches.** Deleting the watched
+repository out from under a running window removed every file including `.git`
+and Polis survived with no panic and no hang — but the now-empty top-level
+directory could not be removed until the window was closed. That is the `notify`
+watcher's handle, and on Windows it means "close Polis before you `rm -rf` the
+checkout".
+
+---
+
+## ADR-0095 — Polis grows a terminal, and the terminal is a server
+
+**Context.** `polis-app/src/run.rs` gave three reasons for launching an agent as a
+foreground child that inherits the real console, and named the alternative in the
+same breath: *"anything else is a pty emulation Polis has no reason to write."*
+All three are re-examined here rather than dismissed.
+
+1. *"A pty emulation Polis has no reason to write."* Satisfied by `ConPTY`
+   without writing one. `alacritty_terminal` **is** that code — the same crate
+   Alacritty itself ships — and nobody should write a VTE state machine twice.
+2. *"The exit code is the agent's."* Does not apply to a window, which has no
+   exit code to donate. `polis run` still does, and is untouched.
+3. *"The window prints to stderr into the agent's UI."* Is *fixed* by a pane, not
+   caused by one.
+
+What changed is the requirement, not the reasoning: `polis run` watches **one**
+agent, and PRD §11's thesis is **several**. One inherited console cannot be
+several agents.
+
+`docs/roadmap/terminal-integration.md` planned this as M7 — ptys inside the
+window — with a session daemon deferred to M8 as "later work".
+
+**Decision.** Build the terminal, and put the ptys in **`polis-sessiond` from the
+first commit**. The window is a thin client that owns the parser, the grid and
+the keyboard, and owns no child process at all. Three reasons, in order of
+weight:
+
+1. **A window that owns agents kills them when it closes.** A GPU driver reset is
+   not rare on Windows and would take an afternoon's work with it. tmux (2007),
+   herdr and cmux each reached the same split independently.
+2. **The pty master is not blocking-readable on Windows.** Measured, and it is
+   the finding that inverted the plan. The roadmap's reader loop —
+   `match reader.read(&mut buf) { Ok(0) | Err(_) => break, … }` — **exits
+   immediately, having read nothing: `Ok(0)` after 6.8 µs, zero bytes.**
+   `alacritty_terminal`'s Windows master is an `UnblockedReader` whose `Read`
+   impl is a non-blocking drain of an internal `piper` pipe; `Ok(0)` means
+   "nothing right now", and end of file arrives separately through
+   `EventedPty::next_child_event`. Readiness comes from a `polling::Poller` and
+   from nowhere else — the same spike against a poller read 89 bytes of real
+   `ConPTY` output in two reads and saw `Exited(ExitStatus(0))` at 13.4 ms.
+   A process whose main thread belongs to winit has nowhere natural to put that
+   loop. **A daemon is one.** The inversion made the hard part easier.
+3. Doing it later means doing it twice.
+
+**The one `unsafe` in Polis.** `EventedReadWrite::register` is an `unsafe fn`,
+because on Unix it lends a file descriptor to the poller. The roadmap asserted
+that neither pty option "forces `unsafe` into our crates"; that is false for this
+one. It is discharged structurally — `PtyHost` owns the `Pty` and the
+`Arc<Poller>` together, both move into the same thread, and the `Pty` is dropped
+inside that thread before it returns — and it is one `#[allow(unsafe_code)]` on
+one call with the argument written above it, not a block of raw FFI. The
+alternative, `portable-pty`, needs no poller and costs roughly ten crates on a
+legacy `winapi` 0.3 stack in the one process that must never be flaky.
+
+**Dependency cost, measured against the existing lock: nine crates.**
+`alacritty_terminal 0.26.0`, and with it `vte`, `home`, `miow`, `piper`,
+`futures-io`, and on Unix `rustix-openpty` and the two `signal-hook` crates.
+`windows-sys` 0.61.2, `polling` 3.11.0, `base64`, `parking_lot`,
+`regex-automata`, `unicode-width` and `serde` were already there — in particular
+there is **no second `windows-sys` generation**. `vte` arrives re-exported as
+`alacritty_terminal::vte` and must never be pinned directly, which is the same
+rule the root manifest already applies to `wgpu` and `winit`.
+
+**Consequences.** Two new members. `polis-term` holds the pty, the wire, the
+parser, the widget, the key table and the font chain, with the egui half behind a
+`ui` feature so `polis-sessiond` takes it with `default-features = false` and
+has no eframe in its graph at all. `polis-app` gains `panes.rs` and
+`Mode::Work`, and `polis work` joins the CLI.
+
+`polis run` is **untouched**: inherited stdio, foreground child, the agent's exit
+code, and its own careful four-step teardown. If Polis ever routes `polis run`
+through a pty that is a separate decision and a separate ADR.
+
+The window's terminal teardown, by contrast, is `drop(client)`. It never owned a
+child, so there is nothing to kill — which is the whole point, and is verified:
+a Polis window force-killed with `Stop-Process -Force` left its `claude` running,
+and the next `polis work` reattached to it and put the screen back.
+
+---
+
+## ADR-0096 — The pane's session id is issued, not inferred
+
+**Context.** A pane and a cloud on the map have to be the same thing, or the
+feature is a terminal bolted onto a map. The join is a session id, and there are
+three ways to get one: infer it, thread it through the hook, or issue it.
+
+**Decision.** Polis generates a v4-shaped uuid **before** spawning and passes
+`claude --session-id <uuid>`. Measured against `claude --help` 2.1.248: the flag
+exists and is **not** gated on `--print`. Every channel then carries it for free —
+the OTLP resource attribute, the `session_id` in every hook payload, and the
+transcript's own filename, `~/.claude/projects/<slug>/<uuid>.jsonl`. Nothing is
+inferred, nothing is timed, nothing is raced.
+
+The uuid is ~15 lines from `(process id, pane ordinal, wall clock nanoseconds)`
+with the version nibble and variant bits set, rather than a `uuid` dependency:
+the requirement is *unique on this machine*, not *unpredictable anywhere*, and
+`uuid` is presently only transitive. This is the same call that wrote out simplex
+noise rather than take `noise` (ADR-0050). Claude Code validates the *shape*, so
+the shape is asserted in `proto.rs`'s tests.
+
+**Rejected: threading a pane id through `polis-hook`.** Tempting, because the
+hook already reads one environment variable and one more `var_os` is
+sub-microsecond against a 3 ms p99 budget. **The env read is not the cost.** The
+hook ships an 8-byte header and opaque bytes, so a pane id goes *into the wire
+format*: a new field, a version bump, a matching `hook_listener` change and a
+re-derived compile-time assertion — to the one binary whose contract is "never
+blocks the agent, never exits non-zero, no dependencies beyond `std`" — in
+exchange for what `--session-id` gives free. `polis-hook` is untouched.
+
+**Rejected: a hook listener port per pane.** Needs zero hook changes and is
+elegant, but needs N sockets and N threads in `Ingest` and multiplies the
+`AddrInUse` singleton logic ADR-0026 established, for nothing over
+`--session-id`. It is the fallback if the flag is ever removed.
+
+**Consequences.** `Dock::pane_for_session` is a lookup, so clicking a cloud can
+focus its terminal in one line, and a tab can name the district its agent is
+working in. A pane running something that is not `claude` gets **no** session id
+and says so, rather than guessing: a false positive points a cloud at the wrong
+terminal, which is worse than pointing at none.
+
+---
+
+## ADR-0097 — Ctrl+C reaches the agent, `⎿` is drawn, and `has_glyph` cannot be trusted to tell you
+
+**Context.** Three findings that look cosmetic and are not. All three were
+measured; the third was measured *wrongly first*, which is the most useful part
+of this record.
+
+**One: `egui-winit` never emits Ctrl+C.** Verified at
+`egui-winit-0.36.1/src/lib.rs:1021-1035` — `is_copy_command` pushes
+`Event::Copy` and **returns**, so `Event::Key { C, ctrl }` is never produced.
+Same for Ctrl+X and Ctrl+V. Ctrl+C is the key that interrupts Claude Code, so
+untreated **the operator cannot stop a runaway agent from inside Polis**. That is
+a safety property, not a convenience.
+
+*Fix:* `eframe::App::raw_input_hook` (`eframe-0.36.1/src/epi.rs:279`) runs before
+egui processes a frame's input. When a pane has focus and no selection,
+`Event::Copy` is rewritten back into the key event — the Windows Terminal rule,
+copy when there is a selection and interrupt when there is not. `Event::Paste` is
+left alone, because pasting is what Ctrl+V means. `tests/keys.rs` asserts
+`\x03`.
+
+**Two: `Ctrl+Alt` must never become a control byte.** On a German, French or
+Polish layout **`AltGr` is reported as Ctrl+Alt**, and `AltGr+Q` is how you type
+`@`. winit delivers the `@` as `Event::Text` and *also* delivers
+`Event::Key { Q, ctrl + alt }`; encoding that as Ctrl+Q would send `@` followed
+by `\x11` into an agent's input box every time somebody typed an email address.
+The combination therefore produces nothing — which is also what makes `Ctrl+Alt`
+safe for the dock's own chords.
+
+**Three: seven glyphs, and an oracle that lies about them.** Claude Code draws
+`⎿` at the head of every tool line and cycles `✻ ✽ ✢` as its spinner. Measured
+through the renderer that will actually draw them, **eframe's four bundled fonts
+cover 8 of the 16 glyphs Claude Code is known to use** — `⎿ ✻ ✽ ✢ ✓ ✗` and the
+braille cells are missing; box-drawing and blocks are present, in Hack. Adding
+the operating system's own `seguisym.ttf` — Segoe UI Symbol, on every Windows
+since 7 — makes it **16 of 16**. Cost: zero bytes of binary and no licence
+question, because Polis *reads* a font the OS installed and redistributes
+nothing. Bundling Cascadia Mono instead would cost 363 KiB and still miss `⎿`,
+`✻` and `✗`.
+
+*And the trap.* `epaint 0.36.1` implements `Fonts::has_glyph` as
+`resolve_face(c) != cached_family.replacement_face_key` — "is this character
+served by a different face than `U+FFFD` is?" That is a **false negative for
+every glyph living in the same face as the replacement character**, which is
+normally the first font in the family; asked about a single-font family it
+reports that nothing at all is covered. Measured that way, the bundled chain
+appears to be missing `─ │ ╭ █ ░ ▶` as well, and this project spent a round
+designing a three-font fallback for a problem that did not exist before the
+oracle was replaced with "lay the character out and compare the atlas rectangle
+it got against the one `U+FFFD` gets". The roadmap's original `cmap`-parsing
+measurement was right all along.
+
+**Consequences.** `polis_term::font::coverage_line` prints
+`terminal glyphs  16/16 (seguisym.ttf)`, or names exactly which are missing and
+what each is for — a cosmetic mystery turned into a one-line diagnosis. On Linux
+none of the candidates is guaranteed present, so `install` degrades to
+replacement characters and says so; CI's ubuntu leg asserts that it degrades
+without panicking, not that coverage holds.
+
+---
+
+## ADR-0098 — The boundary is bytes, the transport is a token on loopback, and the daemon must forget its parent
+
+**Context.** Three decisions about the wire between `polis-sessiond` and the
+window, each of which had an obvious answer that is wrong.
+
+**Bytes, not screens.** The obvious design serialises a styled 45×120 grid per
+pane at 30 Hz. That is the design tmux spent years adding flow control to
+survive, and tmux's own control mode does not do it either: `%output %pane
+<data>` ships raw bytes and the client parses them, which is how iTerm2 renders
+tmux panes as native tabs. Shipping bytes is the single decision that keeps this
+cheap — the VT state machine, the grid and the widget all live on the window's
+side, and the daemon never learns what a cursor is. It also makes backpressure
+free: each subscriber tracks how far into each pane's byte log it has been sent,
+and a client whose queue is full is simply not sent to, so the next event
+coalesces the gap into one larger message. That is the outcome `pause-after`
+buys tmux, without the protocol.
+
+**Loopback TCP with a token, not a named pipe.** The roadmap planned a named pipe
+on Windows and a Unix socket elsewhere, and called it "the only genuinely
+platform-forked code in M8". There is none: `std` has no named-pipe API, so
+`CreateNamedPipeW` means either raw FFI — which `unsafe_code = "deny"` rules out,
+and which `polis_ingest::hook_listener` already refused for the same reason — or
+a Windows-only crate whose Unix twin is a second code path. Polis already binds
+fixed loopback ports (ADR-0026); this is the third.
+
+A loopback port carries no ACL, and *this* one spawns processes on request, so it
+is a meaningfully worse thing to leave open than an event receiver. The daemon
+therefore writes 256 bits of hex — seeded from the OS's own randomness through
+`RandomState` — into a file only this user can read, and serves no call before
+`hello` presents it, compared in constant time. Same shape as Jupyter's, for the
+same reason, and honest about what it defends: a process running **as this user**
+can read the token file, and could equally read `~/.claude` directly. The fence
+is against other users and other origins, not against the operator.
+
+**A daemon must forget its parent.** Found by running the end-to-end pane test
+from inside a Claude Code session: the pane worked, and the screen said
+*"Transcript saving is off — inherited `CLAUDE_CODE_CHILD_SESSION` marker"*.
+Transcript saving is **Channel D**, the one channel that needs no hooks and no
+environment, the one `polis watch` is built on, and the one carrying the
+session's own uuid in its filename. A daemon launched from inside an agent would
+have silently disabled it for every agent it went on to start, and the map would
+have been permanently short a channel for a reason nothing pointed at.
+
+`polis_term::pty::INHERITED_AGENT_MARKERS` names nine session-identity and IPC
+variables, each with its reason, and the daemon clears them from its own
+environment before starting any thread — which is the only place it works, since
+a pty's options can add to a child's environment but cannot take anything away.
+It is a **list and not a prefix rule**: `CLAUDE_CODE_USE_BEDROCK` and
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` are configuration an operator set on purpose, and
+a prefix rule would throw those away along with the identity.
+
+**Consequences.** PRD §2's non-goal says "no server", and this is a local
+background process. The clause means **no cloud, no auth, and nothing leaving the
+box** — all three of which still hold: `bind` refuses anything but `127.0.0.1`,
+there is no account, and nothing is ever sent anywhere. §2 says the shorter thing,
+so it is amended to say the longer one rather than quietly reinterpreted.
+
+The orphaned-daemon failure mode gets three answers: `--idle-timeout` (default
+600 s) exits a daemon holding **no panes and no clients**, and never one holding
+a live agent; `polis-sessiond --status` says what is running from any terminal;
+and `--stop` ends it, with the endpoint file naming its pid so a wedged one can
+still be found. Version skew is refused at `hello` by name in both directions,
+because a daemon left running across an upgrade is the expected case.
+
+Not yet moved: the four ingest channels still start in the window. ADR-0026's
+fixed-port bind makes them a singleton and the daemon is their natural owner, and
+until they move, a detached period records nothing — so "shut the lid for an hour
+and watch it play back on the map" is still ahead. `Mode::Work` constructs
+`Ingest` at a single call site so that stays a one-edit change.
+
+---
+
+## ADR-0099 — The drawn anchor is the field's mode; the centre of mass stays a mean
+
+**Context.** PRD §6 opens on a single sentence about where a thread's mark may
+go:
+
+> A main agent has no meaningful point location — it delegates rather than
+> edits. Computing a centroid of its workers is actively wrong: an orchestrator
+> with workers in `src/auth` and `tests/` gets a centroid in the empty gap
+> between them, which is the one place nothing is happening.
+
+`polis-world/src/territory.rs` has quoted that paragraph at the top of the file
+since it was written. `Territory::refresh_centre_of_mass` is `Σ(c·w)/Σw` — the
+centroid the paragraph rejects, by name — and **every** drawn mark read it: the
+anchor ring and the tether fan (`polis_app::mapview`), the headless
+`polis_render::frame::thread_anchor` through `place::thread_position`, the
+attention layer's `mark_position`, the on-map name of a waiting thread, and the
+follow camera's cut. The operator reported both halves of the consequence: a
+thread's ring drawn in empty space away from its own cloud, tethers fanning out
+of that empty point, and two different sessions landing on nearly the same
+anchor.
+
+The second half is the sharper one and it is arithmetic, not tuning. A mean
+keeps only a field's first moment, so it discards exactly the information that
+distinguishes two shapes. Two sessions touching the same repository from
+different directions therefore *converge* on the same mark — a session working
+`src/services` and `src/hooks` and a session working `src/components` and
+`src/pages` can share a centre exactly, and
+`two_threads_in_different_places_do_not_share_an_anchor` builds that case in four
+lines.
+
+Three consumers had already routed around the mean privately, which is the sign
+that the field was wrong rather than the callers: `place::agent_position`'s doc
+demoted it to rung 3 on a measurement (*"the centre of mass sat 227 city units
+from the median of the files the session touched, which put every rung-3 mark
+off the side of a camera framed on the work"*), `polis_app::app`'s follow camera
+put the trail head ahead of it, and `polis_app::clouds` computes a heaviest-
+cluster centroid of its own for the bridge band. None of them said why in a
+place the next person would look.
+
+**Decision.** Split the two meanings and give each its own name.
+
+`Territory::centre_of_mass` **stays exactly as it is**, and stays a mean, because
+two consumers genuinely want a first moment: `contention`'s
+`CloudSummary::centre` feeds a 4σ bounding rejection, which is a statement about
+spread, and `place::thread_position` keeps it as the last rung so a territory
+assembled by hand — kernels never pushed through `observe` — still answers.
+Its doc-comment's claim that *"the drift vector is measured against this"* was
+false and is deleted: `drift_state` and the drift trace both call the private
+`weighted_centre` over time-windowed *subsets* and never read the field.
+
+The **drawn** anchor becomes `Territory::anchor` — the kernel centre at which
+the density field is highest. Not a centroid, not a medoid, not the claim's
+district:
+
+* the claim's district centre is **absent in 42 % of samples** (18 of 43), which
+  is precisely the orchestrator case §6.4 exists for, and reinstating it would
+  put the mark back in the middle of the map for a root-scoped thread;
+* the weighted medoid is the same O(k²) and measurably worse (0.964 density at
+  p10 and 10.0 units of separation, against the mode's 1.000 and 12.3);
+* *"the most-edited file"* has no data inside `Territory` at all — `Evidence`
+  folds to the parent directory and `Kernel` carries no path.
+
+Measured across the same 43 field-bearing samples: density at the drawn point
+rises from **0.0103 to 1.000 of the field's peak at p10**, and the separation
+between the marks of a disjoint-lobe session pair rises from **5.8 to 12.3 units
+on a 352-unit city**, worst measured pair `e41f2794` against `dfa8cd66`, **2.3 →
+16.4**.
+
+**The curve is shared, not copied.** The anchor is only the right point if it is
+the argmax of *the field that is actually drawn*, so `polis_layout::quartic` now
+holds the one definition of `(1 - r²)²` and both `polis_render::live::kernel` and
+`Territory::density_at` call it. `polis-world` cannot depend on `polis-render`,
+so the alternative was a second definition — the failure `polis-layout`'s own
+module doc already names about `Vec2::length`, and here it would mean the ring
+being the peak of one function and the contours the bands of another. A Gaussian
+was rejected for the reason PRD §7.4 gives (`exp` is a transcendental and the
+rasteriser has none); the quartic is also about four times cheaper and has
+compact support.
+
+**No clock, and that is a determinism decision.** The obvious shape for an O(k²)
+recompute is a wall-clock throttle plus hysteresis. It would break window/
+headless parity (ADR-0029): `decay` runs from `World::tick`, `ReplayDriver::
+advance` ticks once per advance and `run_to_end` ticks once for a whole
+schedule, so a throttled state machine would settle on different anchors in the
+window and in a recorded GIF of the same recording. It is also unnecessary,
+because **a uniform rescale cannot move an argmax** — the decay factor and
+`rest`'s lift are both uniform, so the memo is carried through them
+arithmetically. The scan runs only when the kernel *list* changes: a push in
+`observe`, the window eviction beside it, and `decay`'s `retain` on the ticks it
+actually drops something. Ties are broken on `(density, x, y)` with
+`f32::total_cmp`, never `partial_cmp`, because equal densities are the common
+case here and not the corner one.
+
+**`ANCHOR_MARGIN = 1.25` is PRD §6.3's sentence, for the anchor.** §6.3 says
+*"the territory's centre of mass may only shift districts after N=8 consecutive
+weighted observations […] one read elsewhere moves nothing"*, and
+`DRIFT_CONFIRMATIONS` implements it for the *claim* only. Nothing implemented it
+for the drawn point, because a mean slides and never jumps; a mode does. The
+mode's median frame-to-frame jump is 0.26 bandwidths against the mean's 1.28 —
+much calmer — but its p90 is 14.68, and that p90 is the near-tie teleport and
+nothing else. The margin converts near-tie flicker into one decisive move, and
+buys a bound: the drawn point's density is never below `1 / ANCHOR_MARGIN` of
+`field_peak`, so hysteresis cannot park the ring somewhere cold.
+
+**Consequences.** One ladder, walked from one place. `polis_app::mapview` now
+calls `polis_world::place::thread_position(thread, &snapshot.layout)` for the
+ring and the tether fan rather than reading `centre_of_mass` itself — which also
+closes a parity bug that predates this change, since the headless renderer has
+always walked that ladder and the window had a shorter one, so a thread with a
+trail and no kernels got a ring in a recorded frame and none in the window. The
+attention layer's `mark_position` and the waiting thread's on-map name substitute
+only the first rung (`anchor()` falling back to `centre_of_mass`) and keep their
+`placement()` rungs, which exist for the documented reason that a thread with 483
+calls once had nowhere to put its pin.
+
+**The corpus is one operator, two repositories, 43 field-bearing samples**, with
+`Territory::lobes` as its own ground truth — a lobe set is what says two sessions
+are working in different places, and it is derived from the same evidence the
+anchor is. `ANCHOR_MARGIN` is **asserted, not swept**: 1.25 was read off the jump
+distribution above rather than chosen by sweeping the constant, and the harness
+that took those numbers is not in the tree, so they cannot currently be re-taken.
+`CLOUD_CAP`'s caveat applies here with more force, because that one at least had
+a fleet behind it.
+
+No PRD amendment: nothing in the PRD specifies the anchor mark, and this moves
+the code *toward* §6's opening paragraph rather than away from it.
+
+---
+
+## ADR-0100 — A thread proves it is alive by working, not by working *somewhere*; and what a resting cloud has to clear is a field value
+
+**Context.** The operator's report was *"i dont see any clouds"*, on a live map
+whose trails, glyphs and agent marks were all drawing correctly. Two independent
+defects produced it, and either one alone is enough.
+
+**The first is a unit error inside `polis_world::territory`.** PRD §10.4's
+dormancy gate asks how long a thread has been quiet, and `Territory::quiet_for`
+answered it from the newest entry in `Territory::evidence`. But `observe` drops
+every observation whose claim path is the repository root, because the root is
+the absorbing element of §6.2's lowest common ancestor and one live root-scoped
+entry pins `depth(A)` at 0 for as long as it lives — see PRD §6.1's amended
+`Bash` cwd row. A shell call's only path signal is its `cwd`, and a `cwd` at the
+checkout root is the common case rather than the corner one: **11 605 of 20 246
+observations, 57.3 %**, on the corpus this was measured against. So an agent in
+the middle of a build-and-test stretch produced a call a second, every one of
+which was thrown away, and after `DORMANT_AFTER` its territory read dormant while
+it was demonstrably working. `select_clouds` then dropped it, `rest` stopped
+holding its field up, and `decay`'s collapse deleted its claim and its lobes as
+soon as the *non-shell* evidence decayed out from under them.
+
+**Decision.** `Territory` carries `last_observation`, stamped by `observe`
+**before** the root drop, and `quiet_for` reads it — falling back to the evidence
+maximum, which is what keeps every hand-built cloud fixture in the workspace
+working. `World::observe` counts the drop in
+`Health::root_scoped_observations`. And `decay`'s collapse now waits for the same
+dormancy test rather than firing the moment the evidence list empties, so a
+converged claim outlives a shell-only stretch. The two halves are one object:
+under the old `quiet_for` the gated collapse could never fire at all, because an
+empty evidence list makes `quiet_for` return `None`.
+
+**The mechanism matters, and the plan for this change had it wrong.** The
+investigation attributed the disappearing cloud to the evidence collapse at
+roughly 600 s (a weight-1 entry survives about 6.6 half-lives). It is not: `rest`
+returns before doing anything past `DORMANT_AFTER`, `select_clouds` drops the
+territory on the same test, and `DORMANT_AFTER` is **480 s**. The cloud dies at
+eight minutes through the dormancy gate. The `last_observation` change is the
+whole fix; re-gating the collapse is second-order, and is here because a claim
+that outlives its own cloud is the rail and the map disagreeing again.
+
+**The second is a unit error across the crate boundary.** `RESTING_WEIGHT = 0.9`
+exists so that a converged territory that goes quiet keeps a drawable field
+instead of decaying to nothing — the operator's *"clouds should be there
+immediately"*. Its doc justified the value against
+`polis_render::live::CLOUD_ISO`, whose outermost band is `0.55`. But `CLOUD_ISO`
+thresholds the **density field** (ADR-0020: one full-weight kernel reads 1.0 at
+its own centre) and `rest` normalised the **mass**, the sum of the weights. Those
+are the same number only for a territory whose kernels sit on one point, and PRD
+§6.4's multi-lobed territory is spread by construction. Measured over 472
+selected clouds: **33 of them, 7.0 %, were computed, ranked, handed to the
+rasteriser and never painted** — mean mass 1.136, comfortably over the floor;
+mean peak 0.429, under the fringe.
+
+**Decision.** `rest` normalises `Territory::field_peak`, which is the exact
+quantity `CLOUD_ISO` is thresholded against, evaluated with the same
+`polis_layout::quartic` the rasteriser splats (ADR-0099). The value 0.9 stands,
+now as a peak, and the **1.64x headroom over the 0.55 fringe is the reason it
+works rather than an accident**: three separate losses sit between the world's
+peak and the drawn one, all on the window's side of the house —
+`polis_app::clouds` floors each drawn radius at `.max(2.0)` where
+`polis_render::frame` does not, it adds a chain of `BRIDGE_WEIGHT` kernels
+between lobes, and `CloudField::sample` reads a lattice at cell centres and
+under-reads a sharp peak by the sub-cell offset. At 0.55 exactly, any one of them
+would put the cloud back under the fringe.
+
+**No per-tick cost.** `rest` runs from `decay`, which runs for every thread on
+every `World::tick`, and a peak is an O(k²) scan bounded by `OBSERVATION_WINDOW`
+squared. It is not paid: ADR-0099 landed `field_peak` as a value memoised beside
+the anchor, and both rescales in play — decay's `factor` and `rest`'s own `lift`
+— are uniform, so the memo is carried through them by one multiply and the scan
+happens only when the kernel *list* changes.
+
+**Instrumentation, because both defects were silent.** The window called
+`territory::visible_clouds`, a wrapper that returns the chosen territories and
+drops `unplaced`, `dormant` and `capped` on the floor, so the status bar could
+only ever print `0 clouds (0 kernels)` — the symptom stated twice and the cause
+not at all. It now calls `select_clouds` directly, keeps the whole
+`CloudSelection`, and builds the `CloudCensus` the headless renderer has carried
+since it was written; the bar reads `0 CLOUDS · 4 UNCONVERGED`. `widest_px` is
+resolved in **output pixels** at the call site that knows the camera, because
+`CloudCensus::sub_pixel`'s *"ZOOM IN"* hint is a statement about the operator's
+scroll wheel while the cloud layer's own frame is a fixed texel grid. The rail's
+`unplaced` hover shows the undecayed total beside the live evidence count, so a
+thread with 417 tool calls stops reading *"0 observations"*.
+
+**Consequences.**
+
+* A thread running nothing but root-scoped shell commands is **not** dormant, and
+  its cloud stays over whatever it was last working on for as long as it keeps
+  running them. That is the honest reading — the field is stale about *where*,
+  and §6.3's decay is what already says so by letting it fade — where "dormant"
+  was a false claim that the agent had stopped.
+* `DORMANT_AFTER` becomes load-bearing for the **claim's** lifetime and not only
+  for the cloud's. Its doc-comment's sweep table was taken at 180 s, before
+  `ab844b1` moved the constant to eight minutes and left the justification
+  untouched; that table is corrected in place rather than deleted, and one of its
+  readings — *"at 600 s the gate has nothing left to catch, since the territory
+  has dissipated on its own"* — is now false, because `rest` means nothing
+  dissipates on its own any more.
+* Every resting territory is **brighter and wider** than before, since a peak
+  crosses the floor sooner than the mass it is a fraction of. `CLOUD_CAP = 5` was
+  chosen at the 1.5-mean-crowd crossover on the old brightness, so both real
+  harnesses were re-run on each side of the change, on the operator's own
+  sessions. `cloud_cap_policy`'s contested-fraction sweep is **identical to the
+  digit** at every cap — at its measurement instant every session is on its own
+  busiest minute, so nothing is resting and `rest` never fires. The cap is
+  therefore not re-baselined. What *did* move is that harness's dormancy sweep,
+  and only in the short windows: 13 → 15 territories survive 30 s, 16 → 19
+  survive 90 s, 22 → 24 survive 180 s, and 24 → 24 at 600 s and above. That is
+  `last_observation` doing exactly and only its job. `cloud_measure` moved the
+  same way and no further: 53 → 54 of 64 frames put a cloud on the map, dormant
+  0.03 → 0.02 per frame, kernels 34.6 → 35.8, worst ink share 51 % → 49 %, with
+  `disturbed_px = 0` and `under_cloud_median_shift = 0.000` unchanged. No
+  assertion in either harness was touched.
+* **A separate finding, which this change did not cause and does not fix.** The
+  fresh `cloud_cap_policy` sweep does not reproduce the cliff `CLOUD_CAP`'s doc
+  argues from: contested ink goes 27.0 % → 27.9 % from five clouds to six, not
+  37.7 % → 58.3 %, and the mean-crowd 1.5 crossing has moved from five to six.
+  The fleet changed underneath the table — PRD §6.4's lobes (`fb414aa`) place 24
+  of these forty sessions where 11 were placed before. Read strictly the sweep
+  now supports a cap of six. The cap is held at five and the disagreement is
+  written into its doc-comment, because what the operator sees is a decision and
+  not a consequence of this fix.
+* Both measurement harnesses now say in their headers that they measure the
+  shipped path **at its best moment**: `cloud_measure` samples through
+  `pacing::plan`, which weights frames by event mass, and `cloud_cap_policy`
+  aligns every session on its own peak. Event-weighted sampling gives 94 % cloud
+  coverage where wall-clock sampling gives 62 %, and that gap is why both were
+  green while the map was empty. The wall-clock-sampled coverage harness that
+  would catch it is **not written**, and the before/after numbers above should be
+  read with that limit in mind: they are measured where the clouds were already
+  working.
+
+**Deferred: shell evidence at depth 1.** `shell::MIN_EVIDENCE_DEPTH = 2` discards
+every depth-1 token, and in a repository whose directories are all one level deep
+— this one — the shell channel therefore contributes no scope whatever, which
+`shell.rs`'s own doc already anticipates. Admitting depth-1 tokens as lobe-only
+evidence would recover it, and would need a new field on `Evidence`, three
+separate exclusions in `convergence()` and a second denominator in `lobes_of`.
+The recovery was never measured and the change risks resurrecting the
+asymmetric-noise failure that gate exists for. Not done here.
+
+**No amendment to PRD §6.2, §6.3 or §10.4.** All three are obeyed; the code was
+not. PRD §6.1 **is** amended in place, because its `Bash` cwd row describes a
+contribution the implementation deliberately does not make.
+
+---
+
+## ADR-0101 — The identity hue is assigned by the world, not derived by the renderer
+
+**Context.** The operator ran two live sessions and could not tell them apart:
+*"the same color is super bad, can you make sure the colors have to be
+different?"*. `polis_render::live::thread_slot` was FNV-1a over the thread id
+modulo twelve, computed independently at five draw sites, and its own
+doc-comment accepted the collisions on purpose — *"Slots are handed out by
+hashing, so two threads can land on one hue — with nine threads on screen and
+twelve slots that is about three of the thirty-six pairs. That is the price …
+and it is paid on purpose."* The two ids `"a"` and `"polis"` both hash to slot 4,
+and `ThreadId::of_session` is the identity function on the session id, so that is
+a collision a real `World` can hold.
+
+Two alternatives were considered and rejected before this one:
+
+* **More hues.** `THREAD_HUES`'s measured ΔE00 table already prices it. Twenty
+  slots would take the expected number of distinct colours among nine threads
+  from 6.6 to 7.4 while cutting the worst pair from 9.80 to 5.4 — into the band
+  the cloud fringe already occupies at 5.46, which is the level that needs a
+  second channel to be read at all. And it only lowers the collision *rate*; it
+  does not satisfy "guaranteed distinct".
+* **Probing over the live thread list at draw time.** Neither stable nor
+  deterministic. Thread A (preference 3, first) and B (preference 3, probed to
+  4); A retires; a recomputation from the live set leaves B alone with
+  preference 3 and moves it 4 → 3 — an unrelated thread *ending* repainted B,
+  which is exactly what the hash was chosen to prevent.
+
+**Decision.** The hue slot is assigned **once, by the world, at thread
+creation**, and stored on `polis_world::Thread::tint`. Three parts:
+
+1. `polis_events::IDENTITY_SLOTS = 12` and `ThreadId::hue_preference()` move the
+   FNV hash down into the event model, beside `LogicalPath::layout_seed` and
+   under the same ADR-0029 rule. `polis-world` depends on `polis-events` and not
+   on `polis-render`, which is why the constant — the length of a colour table
+   two crates away — is declared there. A `const _: () = assert!(…)` beside
+   `THREAD_HUES` is what stops the two drifting.
+2. A private `HueRing` on `World` holds one thread per slot. `World::thread_entry`
+   claims a slot the first time a session is seen: the thread's own preference if
+   it is free, else a fixed index probe `(pref + k) % 12`, else nothing.
+3. `live::thread_slot` and `palette::thread_slot` are **deleted**, not shimmed,
+   and all five draw sites become field reads. A surviving function of that name
+   is an invitation to re-derive, and the point of the change is that there is
+   one answer.
+
+**A slot is never released.** A thread leaving the world does not give its colour
+back, and the ring remembers *which id* took each slot, so a session retired for
+silence and heard from again gets the colour it had. This is the load-bearing
+half of the decision and it is a determinism argument, not a product one.
+Retirement runs from `World::tick`, and tick cadence differs between the two
+renderers on the same recording: `ReplayDriver::advance` ticks once per call and
+the window calls it many times, so `retire_threads` fires repeatedly mid-run;
+`run_to_end` applies the whole schedule and ticks exactly once. Two things would
+otherwise become functions of the tick cadence — whether a slot is free when the
+next thread is created, and how many times a given thread is created at all — and
+the window and a recorded GIF would paint one thread two colours. That is the
+failure `polis_app::palette` named in prose: *"a colour that meant one thread in
+the window and another in a recorded GIF would be worse than no colour at all."*
+What is left depends only on the ordered set of distinct thread ids, which is the
+event order, which both drivers share.
+
+**The guarantee, stated precisely.** *The first twelve threads of a world are
+mutually distinct; past that, colour degrades to the bare preference and the
+rail's name carries identity (PRD §11.4).*
+
+**Consequences.**
+
+* A world degrades after twelve threads have **ever** been seen in it, not twelve
+  concurrently. Past twelve the thirteenth thread does not merely risk a
+  collision, it is certain to have one, because every slot is taken.
+* **THE GUARANTEE IS ALREADY ONE SLOT SHORT OF THIS OPERATOR'S OWN FLEET, AND
+  THAT IS NOT HIDDEN.** Measured over their `~/.claude/projects` — 193
+  main-session transcripts, subagent sidecars excluded because a subagent carries
+  its parent's session id (ADR-0030): peak threads live at once, counting a
+  session live until its last record plus `THREAD_RETIRE_AFTER`, is **13**. Per
+  day they start a median of 15 distinct sessions, and 8 of 15 days exceed
+  twelve. A Polis left running reaches its twelfth distinct session in a median
+  of 17 hours (p10 2.4). So this removes the collisions that were reported —
+  three shared pairs among nine live threads — and does not remove them all; at
+  the busiest moment one thread still shares. That is counted in
+  `Health::identity_hues_exhausted` and shown in the status bar as
+  `shared hues N`, so the residue is a reading rather than a re-report. The
+  operator's remedy is a restart, which is a `World::reset`, which clears the
+  ring. The measurement came from a scratchpad script, not from a test in the
+  tree, and cannot currently be re-taken.
+* If the fleet keeps growing, the fix is **not** a thirteenth hue — see the
+  rejected alternative above — it is a second channel on the rail row.
+* Widening the ring is **not** the answer to exhaustion — see the rejected
+  alternative above. `THREAD_HUES`'s doc now carries that argument in the
+  reversed direction it now runs in, and
+  `thread_hues_are_far_enough_apart_at_the_luminance_they_are_drawn_at` is what
+  fires if anyone widens it anyway.
+* The ring's memory is bounded at twelve ids by construction: once every slot is
+  taken nothing more is recorded.
+* ADR-0029 is amended in place. The hue *preference* is still per-id and still
+  pinned by literals; the hue *drawn* is now per-event-sequence. That is a real
+  weakening and it is written into that ADR rather than left for a reader to
+  discover.
+* A `Thread` built outside a `World` — every fixture in the workspace — keeps its
+  bare preference and is **not** exclusive. Deliberate: exclusivity is a property
+  of the set of live threads and a fixture has no set. No existing fixture
+  changes colour, and no golden file moves.
+
+**Known limit, untouched by this change: the GIF encoder.**
+`polis_render::gif` median-cuts every frame to a 256-entry palette, so two hues
+made exclusive here can still be **merged by the encoder** in recorded output.
+That is an independent second cause with its own fix, and post-quantisation ΔE00
+across the twelve hues was deliberately not measured here. "Guaranteed distinct"
+is a claim about the world and about what the window and the headless rasteriser
+paint; it is not yet a claim about a GIF.
+
+**Also not fixed: the places the hue is absent rather than colliding.**
+`polis-app/src/status.rs` and `polis-app/src/treeview.rs` carry no per-thread hue
+at all. If the operator's complaint is "I cannot tell two threads apart", those
+are a larger gap than the collision this ADR closes, and a separate defect.
+
+**No PRD amendment.** §11.4 (*"Colour alone is never the sole channel for any
+state"*) is unaffected — this makes colour more reliable, not sole — and §10.3
+and §10.4 constrain brightness and cloud count, not hue count.
+
+---
+
+## ADR-0102 — `WAITING` meant "the agent stopped talking", and four different stops were one word
+
+**Context.** The operator reported three separate symptoms in one sitting, and
+they turned out to be three causes wearing one label:
+
+1. *"i just interrupted this chat, the chat says 'idle', it should say
+   'interrupted'"*
+2. a session reading `1 shell still running` shown as waiting, *"but then it
+   starts again automatically and the 'waiting' disappears"*
+3. a session whose footer read `done 21:23 · 1 shell still running` also shown as
+   waiting — *"but its waiting on the clean run before committing, not for the
+   user"*
+
+**The cause.** `turn_boundary` raised `DecisionSource::TurnEnded` on every
+`stop_reason: end_turn`, which set `ThreadStatus::Waiting`. So the loudest state
+in the product — amber, uppercase, sorted first, never decaying, exempt from both
+the idle decay and LRU eviction — was fired by the most common thing an agent
+does: finishing. PRD §11.2 lists the sources of *needs decision* as
+`PermissionRequest`, `Elicitation` and `TeammateIdle`; a turn ending is not among
+them, and §11.2(b) files it under `done`: *"a main thread going idle is news"*.
+
+Three consequences followed, only the first of which was reported:
+
+* **The amber meant nothing.** A thread genuinely blocked on a permission prompt
+  was one amber row among fifty.
+* **Finished threads were immortal.** `retire_threads` will not retire a thread an
+  attention mark points at until `MARK_HOLD_MAX` — four hours. Every finished
+  turn pinned its thread for four hours. This is the pile-up behind ADR-0092.
+* **The map shouted too.** `mapview` gives every `snapshot.waiting()` thread a
+  `Priority::Anchor` title label, so the map named finished threads.
+
+**Measured, on this machine's own corpus** (1,420 transcripts, 238 sessions):
+
+| Signal | Count | Was |
+|---|---:|---|
+| `[Request interrupted by user]` | 45 | parsed, then discarded |
+| `[Request interrupted by user for tool use]` | 41 | read as a tool rejection |
+| — of those, last record in their file | 15 | decayed to `idle` |
+| distinct `backgroundTaskId` | 360 | **unmodelled — 0 Rust files matched** |
+| `<task-notification>` wakes read as the human replying | 218 | took down pins nobody answered |
+
+**Decision.** Two new states, and one structural change that matters more than
+either.
+
+`ThreadStatus` gains `Interrupted` and `Parked`, and `blocks_operator()` becomes
+the single bit the rail sorts and colours by — true for `Waiting` and
+`Interrupted`, false for `Parked` and `Ready`. `Parked` is the state complaints 2
+and 3 were asking for: the turn ended, a job it launched is still running, and it
+will resume by itself. `snapshot.waiting()` now filters on `blocks_operator()`, so
+the rail, the drill panel and the map cannot drift apart on what "needs me" means.
+
+**`Thread::status` is now derived, never authored.** It was written in five places
+that did not agree, and the disagreement was live: two sites resolved a decision
+without re-deriving status, and `tick` decays only `Working`, so a thread could
+sit in `Waiting` with zero live marks until it was retired half an hour later.
+Channels now write *ledgers* — the attention layer, `background`,
+`interrupted_at`, `turn_ended`, `pending` — and `apply::derive` reads them in one
+fixed precedence. Without this, every state added to the enum is another way to
+get permanently stuck; with it, `Done` is also sticky for the first time.
+
+**Both interrupt wordings count.** `for tool use` is 48% of all interrupts and is
+easy to misfile as a permission denial, because a `user-rejected` `tool_result`
+sits immediately before it. It is not one: `toolDenialKind` is present on **0 of
+41** of those records — the denial belongs to the previous record — and an
+operator who hit Esc has stopped the thread rather than answered it.
+
+**A backgrounded test run no longer counts as verification.** `settle` marked the
+thread verified when a `verification` command returned successfully; a
+`run_in_background` `cargo test` returns in milliseconds, so launching it cleared
+"done, unverified" instantly. Guarded on `backgroundTaskId`.
+
+**What this closes.** ADR-0092's open `TurnEnded` defect, without needing the
+`entrypoint` gate it proposed: a headless run that finishes now reads `ready` and
+retires on the ordinary timer, with no new field read.
+
+**Honest limits.**
+
+* A background job whose notification never arrives — 17 of 357, ~5% — is reaped
+  by `BACKGROUND_MAX`, twelve hours. The ceiling sits above real jobs rather than
+  through them: measured launch-to-notification is p90 22 min but **p99 10.4 h**.
+* `origin.kind` is absent on ~30% of genuine human prompts, so the machine-wake
+  test is deliberately one-sided: only an explicit `task-notification` is treated
+  as machine, and everything else stays the operator. This keeps the old
+  behaviour as the fallback rather than silently withholding pins from real
+  answers.
+* Deleting `TurnEnded` removes the source that produced 62/38/6 marks in the three
+  recorded M2 sessions. Replays will look emptier, and that is correct.
+* **Hooks are not registered on this machine at all** — `~/.claude/settings.json`
+  has no `hooks` key — so `Done`, `StopFailure` and all four authoritative
+  decision sources are unreachable and every symptom above was a Channel-D-only
+  artefact. The operator also runs `autoMode: true`, under which
+  `PermissionRequest` rarely fires and `PermissionDenied` (unregistered, refused
+  by ADR-0044 on an assumption never exercised) is what actually fires. Neither is
+  fixed here; both are named so the next round does not rediscover them.
+---
+
+## ADR-0103 — An alarm needs a place of its own; a mark does not
+
+**Context.** ADR-0091 gave PRD §10.2's failure red the area it needed to be seen
+from across the room: nearby failures cluster into one district-scale broken
+ring that holds `ALARM_FLOOR` ink for the whole of `TRAIL_TTL`. Separately,
+`place::site_of` gave every operation a position through a four-rung chain, so
+that the 69 % of failures which name no file stopped falling off the map.
+
+Composed, the two produce a claim neither of them makes alone. Rung 3 is *the
+agent's* position — the head of the thread's trail — deliberately, because "an
+agent has a place even when a particular call does not". Feeding that position to
+a ring turns it into a statement about a **district**. Observed on the operator's
+own session `f24c92b7`: a `PowerShell` env-var probe died on its own quoting,
+resolved on rung 3 because its cwd was the repository root, and flew a full
+district ring for fifteen minutes over a corner of the city the session had never
+opened. The report was *"why is this red? it shouldn't be — nothing needs my
+attention here"*, and it was right.
+
+**Decision.** A failure raises a ring only from rungs 1 and 2 — a place the
+operation itself named. `OpSite::sited` is the predicate, `live::Mark::sited`
+carries it through both rasterisers, and `salience::alarms` is the single place
+that applies it, so the window and the headless renderer cannot disagree about
+which failures shout.
+
+**What is deliberately unchanged.** The mark. Every failure still draws its red
+glyph wherever `site_of` put it, still at `OpSite::scale`'s reduced radius, still
+counted in the rail and in `PlacementCensus`. The defect `place` was written to
+close — a failing session rendering identically to a clean one — does not return,
+and `a_failing_session_and_a_clean_one_are_different_at_thumbnail_size` still
+passes unchanged, because its failures name files.
+
+**Why this is not a loss of signal.** The alarm ring is a layer-4 mark that had
+been given a layer-5 voice. The states that genuinely want the operator are PRD
+§11.2's three, and a failed verification already reaches them by a better road:
+`settle` withholds `mark_verified` on failure, so the thread stays *done,
+unverified* and raises amber when it stops. A shell command that failed while the
+agent is still working needs the agent, not the operator.
+
+**Honest limit.** A `cargo test` that fails at the repository root now raises no
+ring while the thread keeps working — only a red mark at the agent. That is the
+intended reading and it is a judgement, not a measurement: it trades a guaranteed
+alarm on the most important pathless failure for the absence of an alarm on the
+thousands of unimportant ones. If it proves wrong, the lever is a rung-3 ring
+drawn `unsited` — the survey circle in `salience::strokes` already exists and
+reads as *somewhere in here* — rather than a return to the confident ring.
+
+---
+
+## ADR-0104 — The repository is a choice the operator makes, not one the shell makes
+
+**Context.** PRD §2 says one Polis window maps one repository, and nothing here
+changes that. What changed is how the repository is chosen. Until now it was the
+process's working directory — `Cli::repo_root` falls back to
+`std::env::current_dir()` — and the only way to look at another checkout was to
+close the window, `cd`, and start again. Bare `polis` guessed between two
+answers that were both about that directory: the session picker on a first run,
+a map of the current folder afterwards.
+
+The roster already knew this was the wrong question. `polis watch` prints, in
+its own words:
+
+> Elsewhere on this machine — reported, not drawn, because one Polis window maps
+> one repository:
+> …
+> To watch one of those:  polis -C \<that repository\> watch
+
+That is Polis knowing exactly where the operator's other agents are working, and
+handing back a command line. An operator running agents in three checkouts is
+standing in at most one of them, and the answer to *which repository* is on disk
+already: every Claude Code session on the machine writes a transcript carrying
+the `cwd` it is working in.
+
+**Decision.** `polis-app/src/repos.rs` is one screen that answers *where could
+Polis be looking, and what is happening there*, and it is used in both places
+that ask: bare `polis` (and `polis home`) open it as the front door, and `o` — or
+the repository name in the title bar — opens the same screen over a running map
+and switches the watch in place.
+
+Rows come from three sources merged by checkout root: live sessions from a
+one-shot `LiveTailer` with `Scope::Everything` (the source that matters — it is
+the only one that knows an agent is working somewhere right now), the session
+index for checkouts worked in before, and a recents file Polis writes. The list
+is ordered by *where work is happening*, not by recency: the repository being
+watched, then working agents, then idle ones, then last activity.
+
+**Three things this deliberately does not do.**
+
+* **It does not draw two cities.** PRD §2 is unchanged. Switching tears one city
+  down and builds another; the window is still about one repository, and says
+  which in the title bar.
+* **It does not change what kind of window it is.** `PolisApp::live_template` is
+  `Some` exactly when the window is a watch, so a watch stays a watch and
+  `polis map` stays a map that binds no ports. Switching moves `repo_root` in
+  the options the command line already produced — ports, channel set and session
+  scope included — rather than inventing a fresh configuration.
+* **It does not switch under `polis work`.** Those agents are attached to this
+  checkout's `polis-sessiond` and would be left behind, so the button is
+  disabled and says why.
+
+**The one ordering that is not interchangeable.** A live feed holds 4317 and the
+hook port, and the next one needs both. `PolisApp::open_repo` therefore drops
+the old scene — which is what runs `OtlpReceiver::shutdown` and
+`HookListener::shutdown`, each of which *joins* its thread — **before**
+`LiveFeed::start` binds the new one, and starts the feed **before** the city is
+generated, for the reason `launch` already does: a hook datagram that arrives
+with nothing bound is gone for good. Getting this backwards produces a map that
+looks perfectly healthy with Channel A dead on it, which is precisely the
+silence PRD §15 M3 exists to eliminate.
+
+**Two smaller findings, both from writing it.**
+
+* `enter` on the third row opened the first one. egui delivers `enter` as a
+  click to whatever widget holds keyboard focus, and a list that binds `enter`
+  to its own cursor therefore has to require a *pointer* click on a row. The
+  same shape exists in `session.rs`'s picker and has not been observed there;
+  it is noted here rather than fixed blind.
+* The launcher keeps pumping the feed underneath it while it is open
+  (`pump_beneath`). Closing it shows the map as it is now rather than replaying
+  the seconds the operator spent choosing, and the drop counter stays honest:
+  a bounded bus drops its oldest event whether or not anybody was looking.
+
+**Honest limit.** The live counts come from a scan that re-reads every project
+directory every two seconds while the launcher is open. That is the same read
+`polis watch --list` does, on a background thread, and it is charged only while
+the screen is up — but on a machine with thousands of sessions it is the one
+part of this that will need a cheaper answer, and the shape of that answer is a
+`(size, mtime)` cache like the session index already has.
+
+## ADR-0105 — The dock and the map are one window, and the terminal is reachable from the map
+
+**Context.** ADR-0095 put the ptys in `polis-sessiond` and made the window a
+thin client, and it worked: `polis work` renders Claude Code in a pane, a
+force-killed window leaves its agent running, and reattaching puts the screen
+back. What it did not do is connect the two halves of the window it had built.
+
+Two gaps, and the first one is the whole feature:
+
+1. **`Mode::Work` started no ingest.** `launch` built a `LiveFeed` for
+   `Mode::Live` and for nothing else. Meanwhile `panes.rs` was already spawning
+   every agent with `polis_ingest::env::agent_env()` pointed at `127.0.0.1:4317`
+   and a `--session-id` Polis issued itself (ADR-0096). So the panes were
+   producing telemetry into a socket nobody had bound, and the city beside them
+   never moved. The one window that owned its agents was the one window that
+   could not see them.
+2. **`pane_for_session` existed and had no caller.** The `BTreeMap` lookup the
+   roadmap called *"nothing inferred, nothing timed, nothing raced"* was written,
+   tested, and dead.
+
+And underneath both, a product gap: the terminal was reachable only through
+`polis work`. An operator who ran `polis` or `polis watch` — the two commands the
+README calls the front door and the headline — got a city with no way to start an
+agent in it.
+
+**Decision.** Three edits, in the order they matter.
+
+**The work window watches.** `launch` starts `LiveFeed::start(&LiveOptions::watching(repo))`
+for `Mode::Work` as well. `watching`, not `for_repo`: it is the line that sets
+`SessionScope::ThisRepo`, which is what makes Channel D discover this
+repository's agents and publish a roster, and it is now shared by `polis watch`,
+the launcher, an in-place repository switch and the dock — four callers, one
+rule, no drift.
+
+**The correlation runs both ways, in one place.** After every panel has drawn,
+`app.rs` resolves the dock and the map against each other exactly once a frame:
+
+* **Pane → map.** `Dock::take_reveal` reports the tab the operator moved to, and
+  the frame sets `view.selected_thread` to `ThreadId::of_session` of it. Clicking
+  a tab lights that agent's cloud, its rail row and its trail.
+* **Map → pane.** A changed `selected_thread`, or an attention jump, calls
+  `Dock::focus_session`. A cloud goes amber, `a` — or its row in the rail —
+  takes you to it, and the terminal that agent is typing into is the one on
+  screen. **The map's own anchors stay hover targets, not click targets**: they
+  sit over buildings, and a click that both opened a file in the editor and
+  switched terminals would be one gesture doing two unrelated things. The two
+  routes that already *mean* "this agent" were wired instead; making an anchor
+  mean it too is a change to what a map click is, and belongs in its own ADR.
+
+*Taken* rather than read, and *changed* rather than current: without both, the
+map would re-focus a tab every frame and the operator could never look at one
+terminal while another agent's cloud was lit. An attention jump is honoured every
+time because it means *take me there*; a selection only when it moves.
+
+**A tab reads the world, not the pty.** `Dock::observe` runs once a frame against
+the same published `WorldSnapshot` the map and the rail read, and writes each
+tab's place, status and amber flag. A tab therefore says `2 polis-world/src` in
+`ThreadStatus::Working`'s colour rather than `2 claude`, and it cannot disagree
+with the cloud beside it, because there is one source and it is not the terminal.
+
+`place_label` deliberately keeps PRD §6.2's refusal to guess: a claim is written
+plainly, §6.4's lobes as the heaviest plus a count, and *nowhere* as an absence.
+A tab that invented a district for a thread the world declined to place would be
+the dock and the map contradicting each other about the same agent — which is the
+defect ADR-0099's `place_of` was written to end on the rail.
+
+**The amber flag is not merged into the bell flag.** `Tab::attention` is sticky —
+a bell happened, and it stays until it is looked at. *Waiting on you* is true
+*now*, and has to stop being true the instant the agent is unblocked, including
+when the operator answers the prompt in the pane and never touches the tab. Two
+different lifetimes, so two fields.
+
+**The dock is reachable without the subcommand.** `Ctrl+Alt+T` — the same chord
+`panes::RESERVED` already used for *new agent* — starts a dock in a window that
+has none, and the title bar carries a `+ agent` button beside the repository
+name. `polis work` is now "open with a pane already running", not "the mode that
+has terminals".
+
+**Gated on the map being live**, which is the one non-obvious line. `polis map`
+is deliberately a city with no wire into it and `polis replay` is a recording of
+the past; a pane opened on either would be an agent working beside a map that
+structurally could not draw it. Both would look like the bug this ADR exists to
+fix, so neither offers the button.
+
+**Starting the dock is deferred by one frame.** The scene is borrowed for the
+rest of the frame and `Dock::start` takes all of `self`, so the request is a
+field and the connection happens at the top of the next frame with a repaint
+already requested. That is also where the cost is: `connect_or_start` polls for
+the daemon's endpoint file every 50 ms on the UI thread. With a daemon already up
+it is a loopback connect; on the first agent of the session it is a visible
+hitch of roughly a process spawn. **Not measured**, and the honest fix if it
+bites is the load-thread pattern `spawn_load` already uses, not a shorter
+timeout.
+
+**Measured, on this machine.** Two things were observed rather than reasoned
+about.
+
+*The window runs the channels.* Same checkout, same debug binary, one after the
+other: `polis map` holds **44 threads / 151.7 MB**, `polis work` holds **51 /
+191.0**. The seven extra threads and the 39 MB are the ingest stack, and before
+this change `polis work` had neither.
+
+*The correlation key is real.* A pane was opened and the daemon reported it as
+`%1 claude ... 000032cc-0000-4001-98d2-dd6d64b3fdcc`. A prompt was driven into
+it through the daemon's own client, and Claude Code wrote
+`~/.claude/projects/C--coding-agentolis/000032cc-0000-4001-98d2-dd6d64b3fdcc.jsonl`
+— the Polis-issued id, as the filename, under this repository's project
+directory. `polis watch --list` then listed that same id as **working** in this
+checkout. That is every hop of the chain the dock and the map key on, and it
+held without hooks and with Channel A refused (another Polis already had 4317),
+which is the point of leaning on Channel D.
+
+It also shows ADR-0098's inherited-identity hazard is genuinely closed: the
+daemon was started from inside a Claude Code session and its pane still saved a
+transcript.
+
+**Not observed.** The click-through itself, in either direction — it needs a
+hand on the mouse, and nothing here fakes one. And PRD §13.1's frame budget was
+not re-measured in release with a live feed and a pane drawing at once, which is
+the one number this change could plausibly move.
+
+**What this does not close.** M7b's persisted dock width and collapsed state,
+M7c's selection and OSC 52, the `polis doctor` glyph line, and M7e. And the four
+channels still start in the *window*, not the daemon — so a detached period still
+records nothing, and *"shut the lid for an hour and watch it play back"* remains
+the thing M8 owes.
+
+---
+
+## ADR-0105 — `/clear` is the one ending a transcript can prove, and the next session is what proves it
+
+**Context.** The operator's sentence: *"when i clear a chat, that thread should
+disappear in the app"*. It did not. A cleared conversation sat on the map as a
+live cloud for eight minutes (`polis_ingest::live::LIVE_WINDOW`), stayed in the
+world for thirty (`polis_world::THREAD_RETIRE_AFTER`), and — if it had left an
+attention mark behind — for up to four hours (`MARK_HOLD_MAX`). Every one of
+those numbers is deliberate and none of them is wrong: they exist because
+`live.rs` and `retire_threads` both say, correctly, that *a session never ends on
+disk*. `docs/verified/jsonl-schema.md` enumerates the record types and none of
+them closes a session, so a session that ended, one that crashed and one sitting
+at a prompt are indistinguishable, and Polis waits rather than inventing
+evidence.
+
+`/clear` is the exception, and it was being missed because the proof is not in
+the file anyone was looking at. Claude Code does not truncate the conversation in
+place: it **abandons the transcript and opens a new one**, with a new session id,
+whose first user record is `<command-name>/clear</command-name>`. The dead file
+simply stops. What links the two is `bridge-session.bridgeSessionId` — an id
+belonging to the running `claude` process rather than to the conversation.
+
+**The measurement** (2026-09-06, 263 transcripts under `~/.claude/projects`, one
+unreadable for the `MAX_PATH` reason in jsonl-schema §1.3; the table is
+§10.1):
+
+* 225 of 262 files carry a `bridge-session` record; the id **never changes**
+  within a file (0 files).
+* 114 distinct bridge ids; 48 of them cover more than one session; 107 sessions
+  are the successor of another under one id, in chains up to 9 long.
+* **106 of those 107 open with `/clear`** (the odd one out opens with
+  `/design`).
+* **0 of 107** have the predecessor writing after the successor's first record.
+
+So the sessions of one bridge id are a strict, non-overlapping sequence: a second
+live session under an id means the first one is over, will never be appended to
+again, and cannot be returned to by the operator either.
+
+**Decision.** `LiveTailer::detect_supersession` groups the *live, in-scope*
+sessions by bridge id, keeps the one with the newest first record, and calls
+every other one superseded: it stops being tailed, the roster reports it
+`cleared` rather than `working`, and one `ControlEvent::SessionSuperseded`
+reaches the world, where `World::supersede_thread` removes the thread. End to
+end that is one rescan — two seconds — instead of eight minutes.
+
+**Removed, not marked done.** `EventKind::SessionEnd` finishes a thread and
+leaves it on the rail carrying its attention mark, because *"this agent stopped
+and its work is unverified"* is a queue item (PRD §11.2). A cleared conversation
+is not a queue item: there is no thread to go back to, and a *done, unverified*
+mark would pin a row naming a chat the operator deliberately threw away for
+`MARK_HOLD_MAX`. The city does not lose the work — building height is
+uncommitted diff, a fact about the disk and not about the chat.
+
+**Three things this gets right only because they were measured.**
+
+* **Ordering is by first record, never by mtime.** A finished session's file can
+  still grow — the last assistant flush, a `cost-state` written at exit — and
+  observed transcript timestamps step backwards in 20% of files (ADR-0014). The
+  first record of each file is the one comparison that survives both, and it is
+  what the probe reads.
+* **The bridge id is readable before any timestamp is.** `bridge-session` is
+  written among the opening sidecars, several records ahead of the first threaded
+  one. A reader that treated "no timestamp yet" as "oldest" would conclude the
+  *new* session was the one that ended and take the live thread off the map. So a
+  group whose members cannot all be ordered is left alone until the next rescan,
+  and the head probe is repeated while the file is still growing.
+* **The probe is bounded and it terminates.** At most `HEAD_PROBE_BYTES` (64 KiB
+  — the first bridge record sits at byte ≤ 392 in 224 of 225 files, the outlier
+  at 17 458), only for sessions the liveness gate already wants to follow, once
+  per session, and re-read only while the answer is incomplete *and* the file is
+  both growing and still under that bound. The 37 files that carry no bridge
+  record at all cost one read each, not one per scan.
+
+**Honest limits.**
+
+* **No bridge record, no inference.** 37 of 262 files have none, and those
+  sessions go back to leaving on silence. Nothing is guessed for them.
+* **This is an undocumented internal field.** It is not in the hooks reference
+  or any public schema, and a release could stop writing it or start sharing one
+  id across concurrent sessions. The failure mode if it did is bounded and
+  self-correcting: like `World::dismiss_thread`, supersession is **not a
+  tombstone**, so a session that speaks again rebuilds its thread on the next
+  event. A `SessionEnd` hook remains the stronger signal and `polis connect`
+  remains worth doing.
+* **It does not cover quitting.** Closing the terminal, `Ctrl-C`, or a crash
+  writes nothing and starts nothing, so those endings still wait for
+  `THREAD_RETIRE_AFTER`. `/clear` is the only one that leaves a witness.
+
+## ADR-0107 — A cloud gets a body, and the number that decides how much city it hides belongs to the operator
+
+**Context.** The operator's report was two sentences and they name two different
+failures: *"the cloud layers look a bit weird, super pixelated"*, and *"the
+clouds need an even background, they don't distinguish themselves; the labels we
+build aren't necessary, instead the rail thread should point to the cloud."*
+
+Both were earned by decisions this log already records.
+
+* **Pixelation.** `polis-app::clouds` rasterises the layer on the CPU into a
+  fixed 1 024² texel grid over the whole base map and uploads it with
+  `TextureOptions::NEAREST`. Nearest is right for a sparse opaque mark — a
+  linear filter turns a one-pixel hatch stroke into a smear at every
+  intermediate alpha, which is the wash the layer was rewritten twice to remove
+  — but it means one texel becomes a visible block as soon as the operator zooms
+  past about 1.5×.
+* **No even ground.** The layer had been reduced to contour and hatch precisely
+  *because* fills fogged the map: the first version inked two thirds of its
+  footprint, lifted 40 % of the city by more than six luminance levels, and
+  moved the median under a cloud from `L 22` to `L 45`. What that fix cost is
+  the thing the operator is now naming: a sparse weave over a city block reads
+  as texture **on** the city, not as a region of it, and a territory's
+  silhouette was carried by a contour one to three pixels wide.
+* **Two captions for one thread.** `crate::callout` put a leader and a caption
+  beside every cloud — name, state, age, call counts — in gutters down the sides
+  of the viewport. Every line of it was already in the rail, in a column with
+  room for it, and the map is the surface that is short of space.
+
+**Decision.**
+
+**A cloud gets a body, and the body is a levelling rather than a fill.**
+`live::CLOUD_BODY` is a floor tone *under* `plan::BASE_MAP_CEILING`, and
+`CLOUD_BODY_ALPHA` carries the ground toward it — a fifth at the fringe, four
+fifths at the core. The obvious body is the mark's own ink thinned, and it is
+wrong for a reason that is arithmetic and not taste: `CLOUD_TONES` runs 56–84
+against a base map confined to 48, so blending toward it *lifts* the city.
+Thinning makes the lift smaller and never absent. Levelling toward a tone below
+the ceiling collapses the region's variance instead — which is what "an even
+background" means numerically — and leaves the marks the brightest thing inside
+a cloud, which is the order §10.3 asks for.
+
+**How much of the city may disappear is the operator's setting, not a
+measurement.** `config::Look::cloud_veil` scales all three bands together, live,
+from a slider in the legend panel. Every other number in this notation was
+settled by measuring — the iso thresholds against real sessions, the hatch
+spacing against an ink budget, the identity ring by CIEDE2000 at the luminance
+each role is drawn at. This one cannot be, because it trades the city's
+legibility against the cloud's, and which one an operator wants depends on
+whether they are reading the map or watching it from across the room. At `0` the
+layer is exactly the marks-only notation, disturbance included; at `1` a core
+keeps a fifth of the contrast under it.
+
+**The captions come off the map and the rail keeps a line to the cloud.**
+`draw_cloud_callouts` and its gutter layout are gone from the map;
+`mapview::draw_thread_connectors` draws a hairline from a thread's rail card to
+the near edge of its own cloud, in that thread's hue, painted into
+`Order::Foreground` so it crosses the terminal dock rather than starting at the
+map's edge and pointing at nothing. `config::Look::connectors` chooses how many:
+`Asked` — the thread being pointed at, selected or followed — or `Always`, or
+`Off`. The model-written phrase `crate::intent` produces moved with it, onto the
+rail card's second line where the `ai-title` used to sit alone.
+
+**Two textures, not one, and this is what fixes the pixelation now.** A body
+wants a smooth filter and a mark wants a nearest one, and one image cannot have
+both. `Clouds` uploads the body `LINEAR` and the marks `NEAREST` over the same
+rectangle. The body's band steps become a one-texel ramp instead of a wall of
+blocks; the strokes stay strokes.
+
+**Consequences, including the one that is a real loss.**
+
+* The layer's standing claim — zero disturbed pixels, `0.000` levels of median
+  shift over 192 frames of six real sessions — is now a statement about
+  `veil = 0` rather than about the layer. It is still asserted, alongside what
+  the shipped veil actually does, by
+  `the_veil_levels_the_ground_under_a_cloud_and_only_when_it_is_on`: the ground
+  evens out fringe → core, no pixel is carried past the floor tone or out of the
+  base map's band, and under the fringe two ground tones stay at least half as
+  far apart as they were.
+* `live::CLOUD_VEIL` is what every headless frame renders with, so a recorded
+  session and a live window agree unless the operator has moved the slider. When
+  the number settles, it belongs in that constant.
+* The setting is remembered in `look.json` in the state directory rather than in
+  the config file, written when the operator lets go of the slider. A config
+  file is what a run was *started* with; rewriting somebody's hand-edited file to
+  record a drag is not something a slider should do.
+* `polis-app/src/callout.rs` is parked, not deleted. The leader-and-gutter
+  geometry is correct work and the map may want captions back for one state —
+  a thread blocked on a human is the candidate — and nothing in it is imported
+  today.
+* The pixelation fix is a mitigation, not the end of it. The real answer is
+  `polis-render::density`'s wgpu pipeline, which computes contour and hatch per
+  screen pixel and is written, tested and still unused by the window. Wiring it
+  in has to keep the per-territory stack — the accumulator there is one summed
+  `(density, crowd)` target, which is the argmax notation ADR-0020's successor
+  removed — so it is a real piece of work rather than a call site.
+
+## ADR-0108 — Three columns: the map, the list that selects, and the terminal it selects
+
+**Context.** ADR-0105 made the dock and the map one window, but left them
+arranged as two docks around a centre: a terminal panel on the left, the map in
+the middle, and a 370-point rail on the right carrying the thread list. That put
+the two things that talk about the same agent — the card and the cloud — at
+opposite ends of the window, with a terminal between them.
+
+Three things were wrong with the column that held the threads, and the operator
+named all three:
+
+1. **The card grew with its thread.** A header line, a place line, a revisit
+   line, and a `why it looks like this` fold, so nine threads were nine
+   different heights. The list is scanned before any single row of it is read,
+   and a ragged list cannot be scanned.
+2. **`why it looks like this` was on every card.** The right content, repeated
+   once per thread, closed by default, and pushing every card past scanning
+   height to say the same thing about notation nine times.
+3. **The terminal had its own selector.** A tab strip that answered *which agent
+   am I looking at* — the question the list and the map already answer.
+
+**Decision.** One row of three columns, left to right: **map, rail, terminal.**
+
+The map is the central panel and takes what is left. The other two are *right*
+panels, and egui gives the first one added the outer edge — so the terminal is
+added first to land on the right, and the rail second to land between it and the
+map. The rail therefore sits **against** the map, which is what the connectors
+want: a line from a cloud to its card now crosses nothing.
+
+Defaults are fractions of the window — 15 % rail, 35 % terminal, the rest map —
+taken **once** before any panel is added. Reading `available_width` per panel
+would have made the terminal 35 % of what was left rather than 35 % of the
+window. They are defaults only: egui keeps a width once it has been dragged.
+
+**The card is three fixed lines**, painted rather than assembled from widgets,
+because an exact height and a bar the *full* height of the card are both
+properties of a rectangle that has to exist before the text goes into it, and
+`Ui::horizontal` decides its height afterwards. The lines are the state word
+with a right-aligned age, the agent's own name, and where it is working — or
+what it is waiting on, when that is the more urgent of the two. Each is
+truncated with an ellipsis into the hover rather than wrapped, because wrapping
+is how a fixed height stops being fixed.
+
+**The tint bar is drawn always, not on hover.** It used to appear only under
+hover or selection, which meant the thing PRD §11.4 makes identity out of — the
+thread's own hue — was invisible until the operator was already pointing at the
+row they wanted. A cloud and its card now carry the same colour at all times, so
+the match is made by looking rather than by hunting.
+
+**One legend, three doors.** *Why it looks like this* left the cards for a
+single panel opened from the map's own corner, from the title bar, or with `h`.
+It answers for whichever thread is **selected**, and selection is already what
+binds the list, the map and the terminal together (ADR-0105), so it follows for
+free with nothing new to keep in sync. The key sheet moved into it too: `h` used
+to draw a two-column table of every keystroke *inside* the rail, which was
+survivable at 370 points and absurd at 15 % of the window. That also took
+`Overlay` back under clippy's four-bool ceiling without an `allow`, which is the
+house rule doing its job rather than a coincidence.
+
+**The terminal follows the selection.** `Dock::show_selected` points the pane at
+the selected agent; there is no second selector. Its empty state tells four
+silences apart, and the middle one is the one worth naming: an agent that is
+selected and real but **running somewhere else**, which is the ordinary case for
+a session started in another terminal. Falling back to whatever was on screen
+before would show one agent's terminal under another agent's name, which is
+worse than showing nothing.
+
+**Measured, and the number that forced a rule change.** The eighty-column floor
+was a *veto*: the dock took `minimum_width()` whatever else wanted the row. On
+this machine that is **647 points of a 907-point window** — so a fifteen percent
+rail beside it left the map **110 points wide**, which is not a map. The rule
+was written when the dock had one neighbour and it now has two.
+
+So the map's floor wins and the fraction is the default. A pane that ends up
+under eighty columns says so on its own screen (`panes::MIN_COLS`), and that
+message names the fix — widen it — with the drag handle right there. A squeezed
+map offers neither. Measured after the change, same window: map **435**, rail
+**136**, terminal **318**, against 454/136/318 asked for; the 19 points are
+panel separators.
+
+The honest consequence: on a 907-point window an eighty-column terminal and a
+360-point map cannot both exist. The window now says which one it gave up
+instead of silently destroying the other.
+
+**Connectors default to `Always`.** `Connectors::Asked` draws the line only for
+the thread already being pointed at, which answers a question the operator has
+stopped asking. Every cloud gets its line to its card, and the asked-about one
+is still drawn last and brighter so it reads as *the* answer in a window full of
+them. The line leaves whichever edge of the card faces the map, because the
+panels are draggable and neither end can be hard-coded.
+
+**What this does not close.** The rail still carries the attention list and the
+building panel above the cards, and at 15 % both are cramped — they were sized
+for a 370-point column and have not been redesigned for a 136-point one. And
+the map's own cloud anchors are still hover targets rather than click targets
+(ADR-0105), so the connector now points at a card the operator cannot click
+*from the map end*.
+
+## ADR-0109 — Asking about a thread lights its cloud, and the map draws no line for it
+
+**Context.** PRD §12 splits the map into *"fuzzy above, exact below"*: the
+ambient layer sets the scene, and a handful of marks answer the operator's own
+question about **one** thread. Two of those marks were lines, and both were
+withdrawn a step at a time under the same complaint.
+
+First the delegation fan: one tether from every worker back to its thread's
+anchor, for every thread at once, uncapped — *"super messy"* on a nine-thread
+repository, and one session on this machine has a hundred workers. So the fan
+was capped and put behind `ViewState::interrogates`. Then the trail went behind
+the same gate, after 192 points held for fifteen minutes across five threads
+came back as *"still lines everywhere!!"*.
+
+That left both lines appearing the moment the pointer crossed a row in the rail
+— which is something an operator does while *reading the list*, not while asking
+a question. The rule that replaced it is the operator's own: *"instead of these
+lines when hovering over a thread card, highlight the cloud, make it brighter."*
+
+**Decision.** The window's layer 4 draws **no trail and no tether at all**.
+Asking about a thread — pointing at its card, selecting it, or following it —
+brightens that thread's cloud instead: every tone its layer emits, contour,
+hatch and the body under them, multiplied by `clouds::LIT_GAIN` = 1.8.
+
+The card and the cloud already carry one hue (PRD §11.4), so the question a
+hover asks — *which shape on the map is this row?* — is answered by lighting
+that shape up. Nothing is drawn that the map was not already drawing, and the
+answer is about the region the thread is working in rather than about a path
+across the city.
+
+Three things this needed:
+
+1. **Identity is the layer, not the hue.** `polis_world::Thread::tint` has
+   twelve slots and then repeats, so lighting by hue lights two threads' clouds
+   on a busy world. `polis_render::live::BandMap` now carries the territory's
+   `thread` layer id — unique across threads, stable across frames — and
+   `CloudMark::layer` is what the window matches on.
+2. **One thread at a time.** `ViewState::interrogates` is true of two threads at
+   once when a pointer rests on one card while another is selected;
+   `ViewState::asked_about` names the single thread to light, and the pointer
+   wins because it is the live question.
+3. **A repaint, not a per-frame cost.** The lit thread invalidates the cloud
+   texture exactly the way the veil slider does: one rebuild when the pointer
+   arrives on a card and one when it leaves, and the layer goes back to being
+   still.
+
+Window-only, deliberately. A recorded frame has no pointer, so
+`polis_render::live` gains nothing to light and its own trail and tether
+notation is untouched — `polis_app::clouds` scales what that module emits and
+adds no stroke of its own.
+
+**Measured.** `polis-app/tests/asked_about.rs` composes the real window pass over
+a two-thread world with forty workers on one of them. Asking about a thread now
+changes the frame's shape count by **zero** (745 against 745), where the first
+rule drew 46 lines and the second a capped fan plus a trail. The cloud carries
+it instead: the sky's uploaded light goes up **43.3 %** for the larger of the two
+territories and **34.5 %** for the smaller, and `clouds::tests` holds the exact
+half of the claim — the lit layer comes out at `LIT_GAIN` and every other layer
+is identical texel for texel.
+
+**What this does not close.** The trail was PRD §12's answer to *"where has this
+thread been"*, and the window no longer has one: backtracking and thrashing are
+visible in a recorded frame and in the tree's history, not on the live map. The
+territory's drift mark is the only live redirect signal left. If that turns out
+to be a hole, the trail comes back as something that is not a permanent
+polyline — a few recent stops, or the drift arrow lengthened.
+
+And the connector is untouched: `Connectors::Always` still draws a line from
+every card to its own cloud (ADR-0108). It is an ambient link that is there
+before the operator asks, which is a different mark from the ones this decision
+removed — those appeared *because* they were asked for, and answered with a
+cobweb.
+
+---
+
+## ADR-0110 — Declaring a renderer is not having one: the wgpu tier is removed, and the sort key it justified is quantised
+
+**Context.** A review asked whether this architecture makes sense or whether
+half of it could be a web page. Answering it required counting the code
+honestly, and the count did not survive contact. Of 167 117 lines of Rust,
+13 761 are bake-off prototypes that are not workspace members and have never
+compiled, and roughly 55 000 are tests. Two of the remaining figures were worse
+than inflated, they were wrong:
+
+* **`polis-render` had 1 901 lines of GPU renderer that has never run.**
+  `PolisRenderer`, `PolisCallback`, `BaseMap`, `AgentLayer`, `MarkLayer`,
+  `Camera` and `FollowCamera` were declared exactly as ADR-0012 and PRD §13
+  describe, and every one of their bodies was `todo!()` — 18 of them across five
+  files. `density.rs` was the exception and was worse: 963 lines of a real,
+  finished three-pass wgpu pipeline, constructed by nothing anywhere in the
+  workspace except its own test. `grep -rln DensityField` returned two files,
+  `density.rs` and `tests/density_gpu.rs`.
+
+  What actually draws, and has since M2, is `plan` rasterising the base map into
+  one texture and `live` painting layers 3–5 over it, both onto a
+  `raster::Canvas` of plain sRGB bytes, with `polis-app` compositing that
+  texture under a few hundred `egui::Painter` shapes.
+
+* **`roads.rs` sorted the face-walk adjacency on a raw `f64::atan2`**, defended
+  by a comment reading "`atan2` produces an ordering here, never a coordinate,
+  so it cannot reach output geometry". `determinism::det_angle` sat fifteen
+  lines away in the same crate.
+
+**Decision.** Delete the wgpu tier — `agents.rs`, `city.rs`, `marks.rs`,
+`density.rs`, `tests/density_gpu.rs`, and the `PolisRenderer` / `PolisCallback`
+shell in `lib.rs`. `camera.rs` becomes `zoom.rs` and keeps only `ZoomTier`,
+which is the one thing the renderer and the window genuinely have to agree
+about and the only item in that module anything imported. Add
+`determinism::det_angle_f64` and route the adjacency sort through it. Archive
+the bake-off prototypes at the `archive/design-prototypes` tag with a pointer
+left in `docs/design/README.md`.
+
+**Why the ordering argument was wrong.** The test is not "does this number reach
+output geometry", it is "does this *decide* anything". The counter-clockwise
+order around a node is what the face walk consumes, so it chooses the face set,
+therefore the block set, therefore the lots and therefore the buildings. `atan2`
+is a platform libm call and is not correctly rounded, so two machines whose libm
+disagree by one ulp on a single near-collinear pair produce two different cities
+from the same repository — the exact failure PRD §7.4 and ADR-0029 exist to
+prevent, in the crate whose entire purpose is preventing it. `det_angle_f64`
+snaps to `TRIG_QUANTUM` and the existing edge-id tie-break makes the result a
+total order, so quantisation ties are already handled and cost nothing. It does
+not narrow to `f32`: the value lives only long enough to sort by, and the
+crate's discipline is `f64` inside and `f32` at the boundaries (ADR-0053).
+
+**Consequences.**
+
+* **`polis-render` now declares no GPU dependency at all.** `eframe`, `lyon` and
+  `bytemuck` are gone from its manifest; it keeps `thiserror` and `serde_json`.
+  The GPU stack enters the workspace exactly once, in `polis-app`, which is the
+  crate that opens a window. ADR-0012's rule — wgpu and winit come through
+  eframe, never directly — is unchanged and now has one member to apply to.
+* **ADR-0012's second half is superseded.** Its claim that PRD §14 is wrong to
+  list `polis-render` as independent of the UI shell was true only of the
+  pipeline that was never built. The crate that exists is independent of the UI
+  shell, and that is what makes the notation diffable, testable on pixels and
+  recordable without a window (PRD §15).
+* **ADR-0021 is closed on the one path that exists.** The colour-space question
+  it left open was specifically about reconciling an offscreen `Rgba8UnormSrgb`
+  target against eframe's backend-dependent non-sRGB surface. There is one
+  encoder now and it writes sRGB bytes into the file.
+* **This is not a decision about GPUs.** If the map ever needs one, `plan` and
+  `live` are where the notation is defined and tuned, and a pipeline would be
+  written against them rather than beside them. What is refused is carrying a
+  second, parallel, non-functioning definition of the notation in the meantime.
+* **`polis-app` still holds a real one.** `mapview.rs`, `clouds.rs` and
+  `basemap.rs` contain zero references to `FrameRenderer`, `LiveFrame` or
+  `build_frame`: the window reimplements the notation `polis-render` already
+  computes headlessly, so every notation change lands twice or the window and
+  the shared PNG drift. That is the larger duplication and it is not addressed
+  here.
+
+**Measured.** −15 662 lines: 1 901 of unbuilt renderer, 13 761 of archived
+prototype. +29 in `zoom.rs`, +33 in `determinism.rs`, +26 in `docs/design`.
+Every future line count of this repository stops being wrong by 8 %.
+
+**Expect the golden layout files to move.** The `atan2` change alters a sort key
+that decides the block set, so a golden that shifts is the bug being caught, not
+a regression — ADR-0029 rule 7 is explicit that this is the signal.

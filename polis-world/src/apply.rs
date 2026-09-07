@@ -36,7 +36,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::attention::{AttentionKind, DecisionSource};
-use crate::contention::Claim;
+use crate::contention::{Actor, Claim};
+
 use crate::{
     verify, DiffPrecision, Observation, Operation, PathScope, ThreadStatus, UnattributedWorker,
     WorkerAttribution, World, AT_MENTION_WEIGHT,
@@ -47,6 +48,16 @@ use crate::{
 /// A `tool_use` whose `tool_result` never arrives — an interrupted session, a
 /// transcript cut mid-turn — would otherwise leak. 4 096 is far above any real
 /// turn's fan-out.
+///
+/// **It is no longer only a memory guard.** Since [`crate::IN_FLIGHT_MAX`], an
+/// entry in this table is the evidence that keeps a thread out of `Idle` while a
+/// long call runs, so the eviction at the cap now costs the owning thread its
+/// in-flight standing and not merely a row: past 4 096 unsettled calls the
+/// oldest thread starts reading `Idle` again mid-call, and its late
+/// `tool_result` also loses the diff accounting [`settle`] does. Both failures
+/// are silent. The number stays where it is — no real fan-out approaches it, and
+/// raising it would trade a bound nothing hits for one nothing hits — but a
+/// reader reaching for this constant should know it decides status now.
 const PENDING_CAP: usize = 4_096;
 
 /// A tool call seen starting, waiting for its result.
@@ -193,29 +204,50 @@ fn tool_call(
     at: Instant,
 ) {
     working(world, thread, at);
+    // The span carries `file_path` only — never a cwd — so a shell call arrives
+    // here with no paths at all and lands on rung 3, which is the honest answer
+    // for this channel.
+    let first = call.paths.first().map(|(_, p)| p.clone());
+    let placement = world.placement_for(first.as_ref(), None);
+    let op = Operation {
+        path: first,
+        placement,
+        tool: call.tool.clone(),
+        glyph: call.tool.glyph(),
+        outcome: call.outcome,
+        worker: worker.cloned(),
+        at,
+        tool_use: call.tool_use_id.clone(),
+    };
     if let Some(t) = world.threads.get_mut(thread) {
         t.tool_calls = t.tool_calls.saturating_add(1);
         if call.outcome == Outcome::Failed {
             t.failures = t.failures.saturating_add(1);
         }
-        t.push_op(Operation {
-            path: call.paths.first().map(|(_, p)| p.clone()),
-            tool: call.tool.clone(),
-            glyph: call.tool.glyph(),
-            outcome: call.outcome,
-            worker: worker.cloned(),
-            at,
-            tool_use: call.tool_use_id.clone(),
-        });
+        t.push_op(op.clone());
     }
     for (worktree, path) in &call.paths {
         record_path(world, thread, worker, &call.tool, *worktree, path, at);
         if call.tool.is_mutating() && call.outcome.is_settled() {
-            // The write landed; Channel A is one of the two release triggers the
-            // 30 s TTL backs up (ADR-0044).
-            world.claims.release(thread, path);
+            // Channel A is one of the two landing triggers the 30 s TTL backs up
+            // (ADR-0044). Its logs never carry `agent_id`, so on a subagent's
+            // edit this names the main agent and matches nothing — which is
+            // correct, and the TTL is the backstop.
+            //
+            // A failed call wrote nothing, so its reservation is released; a
+            // successful one *did* write, and its claim stays for the rest of
+            // the TTL because that is when a sibling can write over it.
+            let actor = actor_of(thread, worker);
+            if call.outcome == Outcome::Failed {
+                world.claims.release(&actor, path);
+            } else {
+                world.claims.landed(&actor, path, at);
+            }
         }
     }
+    // After the observations, not before: rung 3 asks where the *thread* is, and
+    // this call's own step is part of that answer.
+    world.census_op(thread, &op);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +306,7 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
                 .map_or(ToolKind::Other(String::new()), ToolKind::parse);
             let cwd = payload.cwd.clone();
             let inputs = payload.tool_input.as_ref();
-            for (raw, scope) in tool_input_paths(&tool, inputs, cwd.as_deref()) {
+            for (raw, scope, _) in tool_input_paths(&tool, inputs, cwd.as_deref()) {
                 let Some((worktree, path)) = world.resolve_path(cwd.as_deref(), &raw) else {
                     continue;
                 };
@@ -292,12 +324,37 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
                     register_claim(world, claim);
                 }
             }
+            if let Some(command) = payload
+                .tool_input
+                .as_ref()
+                .and_then(|v| v.get("command"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+            {
+                shell_evidence(
+                    world,
+                    &thread_id,
+                    worker.as_ref(),
+                    &tool,
+                    cwd.as_deref(),
+                    &command,
+                    at,
+                );
+            }
             working(world, &thread_id, at);
         }
         EventKind::PostToolUseFailure => {
             if let Some(t) = world.threads.get_mut(&thread_id) {
                 t.failures = t.failures.saturating_add(1);
             }
+            // A failure is a *completion*: the tool ran and came back. It is
+            // exactly as much proof that the thread is alive as the success
+            // above, which stamps `working` on its last line — and it is the
+            // authoritative edge Channel B has for the end of a call that took
+            // minutes to fail. Without this a hook deployment drew a thread
+            // `Idle` for the whole of a failing build and then, on the next
+            // record, working again (`crate::IDLE_AFTER`).
+            working(world, &thread_id, at);
         }
         EventKind::PermissionRequest => {
             needs_decision(
@@ -402,7 +459,7 @@ pub(crate) fn hook(world: &mut World, meta: &EventMeta, hook: &HookEvent) {
 ///
 /// So this never attributes and never raises attention. It updates disk truth —
 /// which is what makes a file edited outside Claude Code still show up — and
-/// releases a claim when the write it was covering lands.
+/// marks a claim landed when the write it was covering reaches the disk.
 pub(crate) fn fs(world: &mut World, meta: &EventMeta, event: &FsEvent) {
     let at = meta.observed;
     match event {
@@ -410,7 +467,7 @@ pub(crate) fn fs(world: &mut World, meta: &EventMeta, event: &FsEvent) {
             let file = world.file_entry(&path.1);
             file.last_touched = Some(at);
             file.deleted = false;
-            release_sole_claim(world, &path.1);
+            land_sole_claim(world, &path.1, at);
         }
         FsEvent::Removed { path } => {
             // A vacant lot that goes to seed rather than vanishing (PRD §7.5).
@@ -438,18 +495,29 @@ pub(crate) fn fs(world: &mut World, meta: &EventMeta, event: &FsEvent) {
     }
 }
 
-/// Releases a claim when exactly one thread holds the path.
+/// Marks a claim landed when exactly one actor holds the path.
 ///
-/// With two or more live claims the write landing is not evidence about *which*
-/// of them landed, and clearing them would erase the contention that is the
-/// whole reason to be watching. The 30 s TTL handles that case.
-fn release_sole_claim(world: &mut World, path: &LogicalPath) {
+/// > The filesystem does not know which agent wrote. (PRD §4.3)
+///
+/// With two or more live claims the write is not evidence about *which* of them
+/// landed, and restarting the wrong one's TTL would be a small lie about the
+/// only state the operator has to be able to trust. The 30 s TTL handles that
+/// case, and Channel D reports the landing per actor anyway.
+fn land_sole_claim(world: &mut World, path: &LogicalPath, at: Instant) {
     let sole = match world.claims.claims_on(path) {
-        [only] => Some(only.thread.clone()),
+        [only] => Some(only.actor()),
         _ => None,
     };
-    if let Some(thread) = sole {
-        world.claims.release(&thread, path);
+    if let Some(actor) = sole {
+        world.claims.landed(&actor, path, at);
+    }
+}
+
+/// The claim key for a thread and the worker that acted inside it.
+fn actor_of(thread: &ThreadId, worker: Option<&WorkerId>) -> Actor {
+    Actor {
+        thread: thread.clone(),
+        worker: worker.cloned(),
     }
 }
 
@@ -476,8 +544,17 @@ pub(crate) fn transcript(world: &mut World, meta: &EventMeta, event: &Transcript
             let worker = worker_of(world, &thread_id, meta, &event.source, &record, at);
             if event.kind == TranscriptRecordKind::Assistant {
                 assistant(world, &thread_id, worker.as_ref(), &record, at);
+                turn_boundary(world, &thread_id, worker.as_ref(), &record, at);
             } else {
                 user(world, &thread_id, worker.as_ref(), &record, at);
+                answered(
+                    world,
+                    &thread_id,
+                    worker.as_ref(),
+                    &event.record,
+                    &record,
+                    at,
+                );
             }
         }
         TranscriptRecordKind::Attachment => {
@@ -496,7 +573,7 @@ pub(crate) fn transcript(world: &mut World, meta: &EventMeta, event: &Transcript
             attachment(world, &thread_id, worker.as_ref(), &record, at);
         }
         TranscriptRecordKind::Started | TranscriptRecordKind::Result => {
-            journal(world, event, at);
+            journal(world, meta, event, at);
         }
         TranscriptRecordKind::System => world.health.events_ignored += 1,
         TranscriptRecordKind::Unknown => {
@@ -622,6 +699,15 @@ fn assistant(
             .and_then(|v| v.get("command"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        // The agent's own sentence about this call, and the only prose that
+        // gets past this line. `command` above is read for its *shape* — is
+        // this a test run — and is never stored; a `description` is stored, so
+        // it is vetted first. See `crate::Intent`.
+        if let Some(intent) = intent_of(&tool, input, at) {
+            if let Some(t) = world.threads.get_mut(thread) {
+                t.push_intent(intent);
+            }
+        }
         let verification = command
             .as_deref()
             .is_some_and(verify::is_verification_command);
@@ -632,10 +718,24 @@ fn assistant(
         let branch = record.envelope.git_branch.clone();
 
         let mut resolved: Vec<(WorktreeId, LogicalPath)> = Vec::new();
-        for (raw, scope) in tool_input_paths(&tool, input, cwd.as_deref()) {
+        // Kept apart because they answer different questions: the tool's own
+        // paths are rung 1 of `place`'s chain, the working directory is rung 2,
+        // and conflating them is what put every shell call a session ever ran on
+        // one pixel at the centre of the map.
+        let mut own: Option<LogicalPath> = None;
+        let mut from_cwd: Option<LogicalPath> = None;
+        for (raw, scope, origin) in tool_input_paths(&tool, input, cwd.as_deref()) {
             let Some((worktree, path)) = world.resolve_path(cwd.as_deref(), &raw) else {
                 continue;
             };
+            match origin {
+                PathOrigin::Input => {
+                    if own.is_none() {
+                        own = Some(path.clone());
+                    }
+                }
+                PathOrigin::Cwd => from_cwd = Some(path.clone()),
+            }
             observe(world, thread, worker, &tool, scope, &path, at);
             record_file(world, thread, &tool, &path, at);
             if tool.is_mutating() {
@@ -653,18 +753,29 @@ fn assistant(
             resolved.push((worktree, path));
         }
 
+        // PRD §6.1's shell row, read sharply: the paths the command itself
+        // names. Scope evidence only — the operation still places by `cwd` or on
+        // its thread, because "what is this thread working on" and "where does
+        // this mark go" are different questions (`crate::shell`).
+        if let Some(command) = command.as_deref() {
+            shell_evidence(world, thread, worker, &tool, cwd.as_deref(), command, at);
+        }
+
+        let op = Operation {
+            path: own.clone().or_else(|| from_cwd.clone()),
+            placement: world.placement_for(own.as_ref(), from_cwd.as_ref()),
+            tool: tool.clone(),
+            glyph,
+            outcome: Outcome::Pending,
+            worker: worker.cloned(),
+            at,
+            tool_use: block.id.as_deref().map(ToolUseId::new),
+        };
         if let Some(t) = world.threads.get_mut(thread) {
             t.tool_calls = t.tool_calls.saturating_add(1);
-            t.push_op(Operation {
-                path: resolved.first().map(|(_, p)| p.clone()),
-                tool: tool.clone(),
-                glyph,
-                outcome: Outcome::Pending,
-                worker: worker.cloned(),
-                at,
-                tool_use: block.id.as_deref().map(ToolUseId::new),
-            });
+            t.push_op(op.clone());
         }
+        world.census_op(thread, &op);
 
         if let Some(id) = block.id.as_deref().map(ToolUseId::new) {
             if tool == ToolKind::Agent || tool == ToolKind::Workflow {
@@ -724,6 +835,11 @@ fn settle(
     at: Instant,
 ) {
     let pending = world.pending.remove(id);
+    // Where the failure lands, so PRD §10.2's red is countable even when it is
+    // not visible. A result whose operation has already fallen out of `OPS_CAP`
+    // has nowhere to put its outcome and is counted rather than shrugged at.
+    let mut settled: Option<Operation> = None;
+    let mut evicted = false;
     if let Some(t) = world.threads.get_mut(thread) {
         if let Some(op) = t
             .ops
@@ -732,22 +848,44 @@ fn settle(
             .find(|op| op.tool_use.as_ref() == Some(id))
         {
             op.outcome = outcome;
+            settled = Some(op.clone());
+        } else {
+            evicted = true;
         }
         if outcome == Outcome::Failed {
             t.failures = t.failures.saturating_add(1);
         }
     }
+    if outcome == Outcome::Failed {
+        match &settled {
+            Some(op) => world.census_op_failed(thread, op),
+            None => world.health.ops_failed.count(4),
+        }
+    }
+    if evicted {
+        world.health.ops_settled_after_eviction =
+            world.health.ops_settled_after_eviction.saturating_add(1);
+    }
 
     // A subagent spawn, whichever shape the result took (ADR-0013 routes 1-3).
     if let Some(sidecar) = sidecar {
         spawn_from_result(world, thread, id, sidecar, at);
+        // A job that outlives the turn that launched it. Opened here because
+        // this result is the only record that names its id.
+        open_background(world, thread, id.as_str(), sidecar, at);
     }
 
     let Some(pending) = pending else {
         return;
     };
 
-    if pending.verification && outcome != Outcome::Failed {
+    let backgrounded = sidecar.is_some_and(|s| s.get("backgroundTaskId").is_some());
+    if pending.verification && outcome != Outcome::Failed && !backgrounded {
+        // A backgrounded test run has *started*, not passed. Marking the thread
+        // verified here would let `cargo test --workspace &` clear PRD §11.2's
+        // "done, unverified" the instant it was launched — the opposite of what
+        // the operator meant by "waiting on the clean run before committing".
+        // The real verdict arrives with the `<task-notification>`.
         mark_verified(world, thread, at);
     }
 
@@ -755,20 +893,32 @@ fn settle(
     // where it did not — which is 65% of subagent results (ADR-0004).
     let patch = sidecar.and_then(|s| s.get("structuredPatch"));
     let exact = patch.and_then(patch_totals);
+    // The branch the *claim* has to carry, or the line-range upgrade below tiers
+    // its own thread's edit as `Medium` ("different branches") when it is on the
+    // one branch this session has ever been on. `PendingCall` does not carry a
+    // branch; the thread does, and it is the same one the original claim used.
+    let branch = world.threads.get(thread).and_then(|t| t.branch.clone());
     for (worktree, path) in &pending.paths {
         if pending.tool.is_mutating() {
             if let Some((added, removed, range)) = exact {
                 let file = world.file_entry(path);
                 file.add_diff(added, removed, DiffPrecision::Exact);
-                // Upgrade the claim now that a line range exists: the Critical
-                // tier only becomes reachable here.
+                // Upgrade the claim now that a line range exists — the Critical
+                // tier only becomes reachable here — and register it as
+                // **already landed**, because `structuredPatch` is proof the
+                // write happened. Registering it as pending and then landing it
+                // would be two statements about one fact.
                 let claim = Claim::write(thread.clone(), path.clone(), at)
-                    .in_checkout(*worktree, None)
+                    .in_checkout(*worktree, branch.as_deref())
                     .with_lines(range.0, range.1)
-                    .by_worker(worker.cloned());
+                    .by_worker(worker.cloned())
+                    .already_landed();
                 register_claim(world, claim);
             } else if let Some((added, removed)) = pending.approx_diff {
-                world.health.contention_without_line_ranges += 1;
+                // An edit with no `structuredPatch`, which is 65 % of subagent
+                // results. It is *not* a contention hit — nothing collided here
+                // — so it belongs to its own counter (ADR-0004).
+                world.health.edits_without_line_ranges += 1;
                 let file = world.file_entry(path);
                 file.add_diff(added, removed, DiffPrecision::Approximate);
             }
@@ -781,7 +931,18 @@ fn settle(
             world.file_entry(path).total_lines = u32::try_from(total).ok();
         }
         if pending.tool.is_mutating() && outcome.is_settled() {
-            world.claims.release(thread, path);
+            // A failed edit wrote nothing, so its reservation goes; a successful
+            // one is a hazard for the rest of the TTL. This one line is what
+            // took the operator's real collisions from zero to visible: a
+            // transcript's `tool_result` lands under a second after its
+            // `tool_use`, and deleting the claim there meant two workers 4.7 s
+            // apart never held claims at the same instant.
+            let actor = actor_of(thread, worker);
+            if outcome == Outcome::Failed {
+                world.claims.release(&actor, path);
+            } else {
+                world.claims.landed(&actor, path, at);
+            }
         }
     }
 
@@ -959,7 +1120,7 @@ fn sidecar(
 
 /// Applies a `journal.jsonl` line — the cheapest liveness signal a workflow
 /// fleet has.
-fn journal(world: &mut World, event: &TranscriptEvent, at: Instant) {
+fn journal(world: &mut World, meta: &EventMeta, event: &TranscriptEvent, at: Instant) {
     let TranscriptSource::WorkflowJournal { run } = &event.source else {
         world.health.events_ignored += 1;
         return;
@@ -969,25 +1130,54 @@ fn journal(world: &mut World, event: &TranscriptEvent, at: Instant) {
         return;
     };
     let worker = WorkerId::new(agent);
-    // The run table first, then the worker's own transcript. The journal is read
-    // last — it has no timestamps to sort by — so by the time it arrives the
-    // subagent's file has usually already placed it.
-    let Some(thread) = world
+    // Three rungs, strongest first. The run table is the parent `Workflow`
+    // call's own word. The worker's own transcript is the subagent's, and it
+    // usually wins the race: the journal is read last, because it has no
+    // timestamps to sort by, so by the time it arrives the subagent's file has
+    // normally already placed it.
+    //
+    // Rung 3 is the journal file's own directory. `polis_ingest` fills
+    // `meta.session` from the path when the record does not name one, and a
+    // journal record never does — so for a workflow agent this is the session
+    // whose `subagents/workflows/wf_<run>/` the line was read out of.
+    //
+    // It is last because it is the weakest of the three: the run table is the
+    // parent `Workflow` call's own word, and the worker's transcript is the
+    // subagent's. But it is the only rung that survives the common failure —
+    // live tailing opens an existing file at its end, so a Polis started after
+    // the `Workflow` call never reads the one record that carries the run id,
+    // and before this every agent of that run parked for ever on evidence that
+    // was still sitting in the directory name. Attribution is
+    // `WorkerAttribution::TranscriptFile`, which is exactly what it is: the
+    // file's path rather than a record field, reliable in practice and weaker
+    // in principle, and `strength` keeps it from overwriting a real match.
+    let placed = world
         .workflow_runs
         .get(run)
         .cloned()
-        .or_else(|| thread_of_worker(world, &worker))
-    else {
-        // The parent `Workflow` call has not been seen and no transcript has
-        // placed the worker. It is real and its thread is not knowable yet, so
-        // it is parked rather than guessed — and adopted later, by run id, once
-        // the parent call turns up.
+        .map(|t| (t, WorkerAttribution::WorkflowRun))
+        .or_else(|| thread_of_worker(world, &worker).map(|t| (t, WorkerAttribution::RecordAgentId)))
+        .or_else(|| {
+            meta.session
+                .as_ref()
+                .map(|s| ThreadId::of_session(s.clone()))
+                .filter(|t| world.threads.contains_key(t))
+                .map(|t| (t, WorkerAttribution::TranscriptFile))
+        });
+    let Some((thread, how)) = placed else {
+        // All three rungs missed: no parent `Workflow` call, no transcript for
+        // the worker, and no session on the record — which now means the
+        // journal was read from somewhere other than a session directory, since
+        // `polis_ingest::transcript::attribute_to_file` fills the session in
+        // from the path for every line that came out of one. It is real and its
+        // thread is not knowable, so it is parked rather than guessed, and
+        // adopted later by run id if the parent call ever turns up.
         park_unattributed(
             world,
             &worker,
             Some(AgentType::new("workflow-subagent")),
             at,
-            "workflow run has no parent `Workflow` call yet",
+            "workflow run has no parent `Workflow` call and no session on the record",
             Some(run),
         );
         return;
@@ -998,7 +1188,7 @@ fn journal(world: &mut World, event: &TranscriptEvent, at: Instant) {
         &worker,
         Some(AgentType::new("workflow-subagent")),
         at,
-        WorkerAttribution::WorkflowRun,
+        how,
     );
     let finished = event.kind == TranscriptRecordKind::Result;
     if let Some(w) = world
@@ -1044,6 +1234,10 @@ pub(crate) fn control(world: &mut World, event: &ControlEvent) {
             tracing::debug!(%channel, %detail, "schema drift");
             world.health.drift += 1;
         }
+        ControlEvent::SessionSuperseded { session, by } => {
+            tracing::debug!(%session, %by, "conversation cleared; closing its thread");
+            world.supersede_thread(&ThreadId::of_session(session.clone()));
+        }
         ControlEvent::Shutdown => world.health.events_ignored += 1,
         // `ControlEvent` is `#[non_exhaustive]`: a new failure mode is itself a
         // drift signal rather than a compile break.
@@ -1062,22 +1256,106 @@ pub(crate) fn control(world: &mut World, event: &ControlEvent) {
 /// the wait, because a thread parked on a permission prompt can still be
 /// emitting telemetry; and resolving the mark is enough to end it, because the
 /// mark *is* the wait.
+///
+/// The caller that proves that first clause is [`answered`]'s `tool_result` arm.
+/// An orchestrator blocked on a question can have a dozen subagents returning
+/// results a second, every one of them arriving here — and every one of them
+/// re-deriving the wait from the attention layer rather than overwriting it, so
+/// the thread stays [`ThreadStatus::Waiting`] while its clock advances. That is
+/// what lets that arm stamp activity without also calling
+/// [`World::resolve_decisions`].
 fn working(world: &mut World, thread: &ThreadId, at: Instant) {
+    if let Some(t) = world.threads.get_mut(thread) {
+        t.last_activity = at;
+    }
+    derive(world, thread);
+}
+
+/// The main agent picked its turn back up.
+///
+/// Separate from [`working`] because `working` stamps for a **worker's** records
+/// too — deliberately, so a live orchestrator is not retired out from under a
+/// working fleet — and a subagent churning away says nothing about the main
+/// agent's turn. Calling this from `working` made a fleet of subagents clear
+/// their parent's `turn_ended`, which put a finished thread back to `Working`
+/// and then let the 60-second clock decay it to `Idle`.
+///
+/// The interrupt clears here for the same reason, and it has to clear
+/// somewhere: measured on this machine a `<task-notification>` arrives 429 ms
+/// after an interrupt and the thread carries straight on, so a sticky
+/// `Interrupted` would hold a blocking pin over visibly working work.
+fn resumed(world: &mut World, thread: &ThreadId, at: Instant) {
+    if let Some(t) = world.threads.get_mut(thread) {
+        t.turn_ended = false;
+        t.interrupted_at = None;
+        t.last_activity = at;
+    }
+    derive(world, thread);
+}
+
+/// The **only** function that assigns [`Thread::status`].
+///
+/// # Why status is derived rather than written
+///
+/// It used to be written in five places that did not agree, and the disagreement
+/// was not theoretical. Two call sites resolved a decision without re-deriving
+/// (`OtelEvent::ToolBlockedOnUserSpan`, and the interrupt branch of
+/// [`answered`]), and [`World::tick`] decays only `Working` — so a thread could
+/// sit in `Waiting` with zero live marks until it was retired half an hour
+/// later. Every state added to the enum was another way to get permanently
+/// stuck.
+///
+/// So the channels now write *ledgers* — the attention layer,
+/// [`Thread::background`], [`Thread::interrupted_at`], [`Thread::turn_ended`],
+/// `World::pending` — and this reads them in one fixed precedence:
+///
+/// 1. **`Done`** is sticky. A session that ended cannot be resurrected by a
+///    transcript record that was merely slow to arrive.
+/// 2. **`Waiting`** — a live decision mark. Somebody asked the operator a
+///    question and it has not been answered.
+/// 3. **`Interrupted`** — the operator pressed Esc and nothing has happened
+///    since.
+/// 4. **`Working`** — a tool call is in flight, or the turn has not ended.
+/// 5. **`Parked`** — the turn ended but a background job is still open. Ranks
+///    below `Working` because a thread that is *also* calling tools is working,
+///    whatever else it has running.
+/// 6. **`Ready`** — the turn ended with the ledgers empty.
+/// 7. **`Idle`** — none of the above can be shown. The honest last resort.
+fn derive(world: &mut World, thread: &ThreadId) {
     let blocked = world
         .attention
         .iter()
         .any(|m| m.kind.is_decision_for(thread));
-    if let Some(t) = world.threads.get_mut(thread) {
-        t.status = if blocked {
-            ThreadStatus::Waiting
-        } else {
-            ThreadStatus::Working
-        };
-        t.last_activity = at;
+    let in_flight = world.pending_for(thread);
+    let Some(t) = world.threads.get_mut(thread) else {
+        return;
+    };
+    if t.status == ThreadStatus::Done {
+        return;
     }
+    t.status = if blocked {
+        ThreadStatus::Waiting
+    } else if t.interrupted_at.is_some() {
+        ThreadStatus::Interrupted
+    } else if in_flight || !t.turn_ended {
+        ThreadStatus::Working
+    } else if !t.background.is_empty() {
+        ThreadStatus::Parked
+    } else {
+        ThreadStatus::Ready
+    };
 }
 
 /// Raises a "needs decision" mark and parks the thread on it.
+///
+/// # An authoritative channel supersedes a reconstruction
+///
+/// A live session tails Channel D as well as Channel B (PRD §4.4), so the
+/// transcript-derived sources below fire *alongside* the hooks — the same wait
+/// seen twice. PRD §11.2 draws this state as **a** standing pin above the
+/// building or district, so it gets one pin: a reconstruction yields to a hook
+/// on the same thread and never draws beside it, and a reconstruction replaces
+/// an earlier reconstruction rather than stacking with it.
 fn needs_decision(
     world: &mut World,
     thread: &ThreadId,
@@ -1085,6 +1363,21 @@ fn needs_decision(
     at: Instant,
     path: Option<LogicalPath>,
 ) {
+    let reconstructed_for = |m: &crate::attention::Attention, want: bool| {
+        matches!(
+            &m.kind,
+            AttentionKind::NeedsDecision { thread: t, source: s, .. }
+                if t == thread && s.is_reconstructed() == want
+        )
+    };
+    if source.is_reconstructed() {
+        if world.attention.iter().any(|m| reconstructed_for(m, false)) {
+            return;
+        }
+        world.attention.retain(|m| !reconstructed_for(m, true));
+    } else {
+        world.attention.retain(|m| !reconstructed_for(m, true));
+    }
     if let Some(t) = world.threads.get_mut(thread) {
         t.status = ThreadStatus::Waiting;
         t.last_activity = at;
@@ -1097,6 +1390,351 @@ fn needs_decision(
         },
         at,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Channel D's reconstruction of PRD §11.2 state (a)
+//
+// A replayed transcript carries no hooks, so none of the four hook sources
+// above can fire and the attention layer was — measured — 0.000% of map area in
+// every frame of all three M2 recordings. The three rules below are what a
+// transcript *does* carry. They are marked as reconstructed
+// (`DecisionSource::is_reconstructed`) and documented in docs/replay/README.md,
+// because PRD §17 requires anything that drives an alert to come from an
+// authoritative channel and a recording is not one.
+// ---------------------------------------------------------------------------
+
+/// Raises and clears "needs decision" at an assistant turn boundary.
+///
+/// Two rules, both **prospective** — the mark's onset and duration are the real
+/// ones, exactly as a `PermissionRequest` hook would have given them:
+///
+/// * a `tool_use` for a tool that *is* a question to the operator
+///   ([`crate::attention::asks_the_operator`]) raises the mark, and its
+///   `tool_result` — the answer — clears it on the thread's next call;
+/// * a **main** agent ending its turn with no tool call at all is waiting on a
+///   human, which is the transcript's form of the `idle_prompt` /
+///   `agent_needs_input` notification PRD §11.2 lists under this state.
+///
+/// A main agent making a tool call is the thread making progress, which
+/// [`World::resolve_decisions`] already treats as equivalent to the human having
+/// answered. A **worker's** call is not: a fleet of subagents churning away says
+/// nothing about whether the operator replied.
+fn turn_boundary(
+    world: &mut World,
+    thread: &ThreadId,
+    worker: Option<&WorkerId>,
+    record: &ThreadedRecord,
+    at: Instant,
+) {
+    let calls: Vec<&str> = blocks(record)
+        .iter()
+        .filter(|b| b.kind.as_deref() == Some("tool_use"))
+        .filter_map(|b| b.name.as_deref())
+        .collect();
+    if !calls.is_empty() {
+        if worker.is_none() {
+            world.resolve_decisions(thread);
+            resumed(world, thread, at);
+        }
+        for name in calls {
+            if crate::attention::asks_the_operator(&ToolKind::parse(name)) {
+                needs_decision(world, thread, DecisionSource::AskUser, at, None);
+            }
+        }
+        return;
+    }
+    // `stop_reason` is the only field that says "this really was the end of the
+    // turn". A text-only record with no stop reason is a streamed fragment, and
+    // treating it as an idle boundary makes the pin flicker on every paragraph.
+    //
+    // An allowlist rather than a match on one value, with anything unrecognised
+    // counted rather than guessed at: `max_tokens` (the answer was truncated)
+    // and `pause_turn` ("not finished, call again") are documented boundaries
+    // that do not appear in this machine's 52,528 recorded stop reasons, and a
+    // silent mismatch would read as a thread that never finished a turn.
+    let ended = match record
+        .message
+        .as_ref()
+        .and_then(|m| m.stop_reason.as_deref())
+    {
+        Some("end_turn" | "stop_sequence") => true,
+        Some("tool_use") | None => false,
+        Some(_) => {
+            world.health.events_ignored += 1;
+            false
+        }
+    };
+    if worker.is_none() && ended {
+        // NOT a decision. This line used to raise
+        // `DecisionSource::TurnEnded`, which painted the loudest state in the
+        // product — amber, uppercase, sorted first, never decaying — on the
+        // single most common thing an agent does. PRD §11.2 lists the sources of
+        // *needs decision* as `PermissionRequest`, `Elicitation` and
+        // `TeammateIdle`; a turn ending is not among them, and §11.2(b) files it
+        // under `done` instead: "a main thread going idle is news".
+        //
+        // What the boundary means now is decided by `derive` from the ledgers:
+        // `Ready` with nothing outstanding, `Parked` with a background job still
+        // open, and still `Waiting` if a real question is pending.
+        if let Some(t) = world.threads.get_mut(thread) {
+            t.turn_ended = true;
+            t.last_activity = at;
+        }
+        derive(world, thread);
+    }
+}
+
+/// Reads a `user` record for the operator's answer.
+///
+/// The **retrospective** rule, and the only one: a `tool_result` carrying
+/// `toolDenialKind`, an `interruptedMessageId`, or the literal
+/// `[Request interrupted by user]` record is proof that a permission prompt was
+/// shown *and answered*. Channel D has no record of the prompt itself, so this
+/// mark arrives with the answer rather than with the question — late by however
+/// long the operator took to decide ([`DecisionSource::onset_is_exact`] is
+/// `false` for it).
+///
+/// Anything else that is a genuine human turn — not injected (`isMeta`), not a
+/// tool result, not a subagent's — is the answer to whatever the thread was
+/// waiting for.
+///
+/// # A `tool_result` is not an answer, but it *is* activity
+///
+/// Two different questions, and this function used to conflate them by returning
+/// without touching the clock at all. A `tool_result` is the **only** record
+/// Channel D emits when a long `Bash` call ends, and the gap between it and the
+/// assistant record that follows is the model's own latency: measured over
+/// 59 334 result→assistant pairs in this machine's transcripts, median 3.8 s,
+/// p75 7.6 s, but **p99 69 s**, so on better than one turn in a hundred a thread
+/// went [`crate::ThreadStatus::Idle`] while the model was mid-thought.
+///
+/// So the arm stamps [`working`] and returns *without*
+/// [`World::resolve_decisions`]. The omission is the point: a tool coming back
+/// says nothing about whether the human replied, so a result must never take a
+/// pin down. `working` re-derives the wait from the attention layer on every
+/// call, which is what makes stamping safe — a thread parked on a decision is
+/// re-stamped [`crate::ThreadStatus::Waiting`], not `Working`.
+///
+/// It stamps regardless of `worker`, matching [`assistant`], which calls
+/// `working` before it looks at one. **That moves the lifetime clocks, and
+/// deliberately**: `working` sets `last_activity`, which
+/// [`World::retire_threads`] and [`crate::MARK_HOLD_MAX`] read, so a thread
+/// waiting on a decision whose subagents keep returning results now lives in the
+/// world longer than it did. That is the honest reading — it *is* alive — and
+/// the alternative, a clock only a main agent's own records advance, retires a
+/// live orchestrator out from under a working fleet.
+fn answered(
+    world: &mut World,
+    thread: &ThreadId,
+    worker: Option<&WorkerId>,
+    raw: &Value,
+    record: &ThreadedRecord,
+    at: Instant,
+) {
+    if interrupted(record) {
+        // The operator pressed Esc. This used to fall into the branch below and
+        // be thrown away — the line was literally `let _ = at;` — so the thread
+        // kept whatever status it had, went silent, and 60 seconds later the
+        // decay clock relabelled it `Idle`. That is the operator's own report:
+        // *"i just interrupted this chat, the chat says 'idle', it should say
+        // 'interrupted'"*.
+        //
+        // Both wordings land here. `[Request interrupted by user for tool use]`
+        // is 41 of this machine's 86 interrupts and 15 of those are the last
+        // record in their file; classifying it as a mere tool rejection — which
+        // its neighbouring `user-rejected` tool_result makes tempting — leaves
+        // half of all interrupts decaying into `Idle`.
+        world.resolve_decisions(thread);
+        if let Some(t) = world.threads.get_mut(thread) {
+            t.interrupted_at = Some(at);
+            t.last_activity = at;
+            t.turn_ended = true;
+        }
+        derive(world, thread);
+        return;
+    }
+    if denied(raw, record) {
+        // A rejection is an ANSWER, not a question. `DecisionSource::Rejected`'s
+        // own contract says its evidence "arrives with the operator's answer
+        // rather than with the question" — so raising it as a pending decision
+        // tells the operator they owe a reply to something they already
+        // declined. On their live map it rendered as "WAITING ON YOU · you said
+        // no", which is a contradiction in four words, and PRD §11.2a reserves
+        // that state for a thread that is genuinely blocked on a human.
+        //
+        // Resolving instead: any decision this thread was waiting on is now
+        // settled, so the pin comes down rather than a second one going up.
+        world.resolve_decisions(thread);
+        working(world, thread, at);
+        return;
+    }
+    let is_tool_result = blocks(record)
+        .iter()
+        .any(|b| b.kind.as_deref() == Some("tool_result"));
+    if is_tool_result {
+        // Not the operator's answer — but proof the thread was alive at `at`.
+        // See the section above for why this deliberately does not resolve.
+        working(world, thread, at);
+        return;
+    }
+    if worker.is_some() || record.is_meta == Some(true) {
+        return;
+    }
+    // A machine waking the thread is not the operator answering it.
+    //
+    // `<task-notification>` records — a background shell reporting in, a
+    // subagent finishing — arrive as ordinary `user` records and were, until
+    // here, indistinguishable from the human typing. 218 of them in this
+    // machine's corpus were being read as "the operator replied", which took
+    // down pins nobody had answered and is the second half of the report *"then
+    // it starts again automatically and the 'waiting' disappears"*.
+    //
+    // `origin.kind` names the difference, and it is absent on ~30% of genuine
+    // human prompts, so the test is one-sided on purpose: only an explicit
+    // `task-notification` is treated as machine. Anything else — including a
+    // missing `origin` — stays the operator, which keeps today's behaviour as
+    // the fallback rather than silently withholding pins from real answers.
+    let machine_wake = record
+        .origin
+        .as_ref()
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        == Some("task-notification");
+    if machine_wake {
+        // It is activity, and it closes whatever background job just reported —
+        // but it answers nothing.
+        close_background(world, thread, raw);
+        resumed(world, thread, at);
+        return;
+    }
+    world.resolve_decisions(thread);
+    resumed(world, thread, at);
+}
+
+/// Opens a background job on the `tool_result` that launched it.
+///
+/// `Bash(run_in_background: true)` answers in milliseconds and then runs for
+/// minutes, so this is the only moment Polis learns the job exists. Two shapes
+/// carry it, measured across this machine's 125 transcripts that have any:
+/// `toolUseResult.backgroundTaskId` (360 distinct ids), and the result text
+/// `Command running in background with ID: …` for the launches that predate the
+/// structured field.
+fn open_background(
+    world: &mut World,
+    thread: &ThreadId,
+    tool_use: &str,
+    sidecar: &Value,
+    at: Instant,
+) {
+    let id = sidecar
+        .get("backgroundTaskId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let text = sidecar.get("stdout").and_then(Value::as_str)?;
+            text.split_once("Command running in background with ID:")
+                .map(|(_, rest)| rest.trim().lines().next().unwrap_or("").trim().to_owned())
+                .filter(|id| !id.is_empty())
+        });
+    let Some(id) = id else { return };
+    let Some(t) = world.threads.get_mut(thread) else {
+        return;
+    };
+    if t.background.iter().any(|b| b.id == id) {
+        return;
+    }
+    t.background.push(crate::BackgroundTask {
+        id,
+        tool_use: Some(tool_use.to_owned()),
+        label: sidecar
+            .get("command")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        since: at,
+    });
+}
+
+/// Closes the background job a `<task-notification>` reports on.
+///
+/// The notification names its `<task-id>`, so the close is keyed rather than
+/// guessed. Its own payload warns that "the same task-id may notify more than
+/// once", so removing an id that is already gone is a no-op by construction.
+///
+/// A job whose notification never arrives — measured at 17 of 357, ~5% — is
+/// reaped by [`expire_background`] instead.
+fn close_background(world: &mut World, thread: &ThreadId, raw: &Value) {
+    let text = raw
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let blocks = raw.get("message")?.get("content")?.as_array()?;
+            blocks
+                .iter()
+                .find_map(|b| b.get("text").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+        });
+    let Some(text) = text else { return };
+    let Some(id) = text
+        .split_once("<task-id>")
+        .and_then(|(_, rest)| rest.split_once("</task-id>"))
+        .map(|(id, _)| id.trim().to_owned())
+    else {
+        return;
+    };
+    if let Some(t) = world.threads.get_mut(thread) {
+        t.background.retain(|b| b.id != id);
+    }
+}
+
+/// Whether a `user` record proves the operator pressed Esc.
+///
+/// # Both wordings, and why the second one is not a rejection
+///
+/// Claude Code writes one of two text blocks, and this machine's corpus splits
+/// them 45 / 41:
+///
+/// * `[Request interrupted by user]` — Esc at the prompt, mid-thought;
+/// * `[Request interrupted by user for tool use]` — Esc while a tool call was
+///   up, which is **48% of all interrupts**, and 15 of those 41 are the last
+///   record in their file.
+///
+/// The second is easy to mistake for a permission denial, because a
+/// `user-rejected` `tool_result` sits immediately before it (verified on 4 of 4
+/// sampled contexts). It is not: `toolDenialKind` is present on **0 of 41** of
+/// these records, the denial belongs to the *previous* record, and the operator
+/// who hit Esc has stopped the thread rather than answered it. Calling it a
+/// rejection leaves half of all interrupts decaying into `Idle`, which is the
+/// bug this predicate exists to close.
+///
+/// Matched on the exact stripped text rather than a prefix, so that a tool
+/// result quoting the phrase — this repository's own source does — cannot
+/// masquerade as one.
+fn interrupted(record: &ThreadedRecord) -> bool {
+    blocks(record).iter().any(|b| {
+        b.kind.as_deref() == Some("text")
+            && b.text.as_deref().is_some_and(|t| {
+                let t = t.trim();
+                t == "[Request interrupted by user]"
+                    || t == "[Request interrupted by user for tool use]"
+            })
+    })
+}
+
+/// Whether a `user` record proves the operator was asked and said no.
+///
+/// `toolDenialKind` (`user-rejected` | `permission-rule` | `automode-blocked` |
+/// `automode-unavailable`) is a raw envelope field that `ThreadedRecord` does
+/// not model, so it is read off the verbatim record — which PRD §4.4's
+/// `{ known fields } + Value` rule keeps available exactly for cases like this.
+///
+/// `interruptedMessageId` used to be read here too. It moved to
+/// [`interrupted`]: it rides on 51 of 86 interrupt records and means Esc, not a
+/// denial, so answering it as a rejection lost the state entirely.
+fn denied(raw: &Value, _record: &ThreadedRecord) -> bool {
+    raw.get("toolDenialKind").is_some()
 }
 
 /// Finishes a thread, raising PRD §11.2's `done` split by verification.
@@ -1310,6 +1948,35 @@ fn register_claim(world: &mut World, claim: Claim) {
     }
 }
 
+/// Records the paths a shell command names as territory evidence (PRD §6.1).
+///
+/// Weighted at [`crate::shell::SHELL_ARGUMENT_WEIGHT`] and capped per command;
+/// everything that makes this safe is in [`crate::shell`]'s module docs.
+fn shell_evidence(
+    world: &mut World,
+    thread: &ThreadId,
+    worker: Option<&WorkerId>,
+    tool: &ToolKind,
+    cwd: Option<&str>,
+    command: &str,
+    at: Instant,
+) {
+    if !tool.is_shell() {
+        return;
+    }
+    for (path, scope) in world.shell_evidence(cwd, command) {
+        world.observe(&Observation {
+            thread: thread.clone(),
+            worker: worker.cloned(),
+            path,
+            tool: tool.clone(),
+            scope,
+            at,
+            weight: Some(crate::shell::SHELL_ARGUMENT_WEIGHT),
+        });
+    }
+}
+
 /// Records one observation for territory inference and the trail.
 fn observe(
     world: &mut World,
@@ -1425,26 +2092,81 @@ fn tool_input_paths(
     tool: &ToolKind,
     input: Option<&Value>,
     cwd: Option<&str>,
-) -> Vec<(String, PathScope)> {
+) -> Vec<(String, PathScope, PathOrigin)> {
     let mut out = Vec::new();
     if let Some(input) = input {
         for key in ["file_path", "notebook_path", "filename"] {
             if let Some(v) = input.get(key).and_then(Value::as_str) {
-                out.push((v.to_owned(), PathScope::File));
+                out.push((v.to_owned(), PathScope::File, PathOrigin::Input));
             }
         }
         if let Some(v) = input.get("path").and_then(Value::as_str) {
-            out.push((v.to_owned(), PathScope::for_tool(tool)));
+            out.push((v.to_owned(), PathScope::for_tool(tool), PathOrigin::Input));
         }
     }
     // A shell call's only path evidence is its working directory, and it is
     // noisy — weight 0.5 in PRD §6.1's table.
     if out.is_empty() && tool.is_shell() {
         if let Some(cwd) = cwd {
-            out.push((cwd.to_owned(), PathScope::Directory));
+            out.push((cwd.to_owned(), PathScope::Directory, PathOrigin::Cwd));
         }
     }
     out
+}
+
+/// The agent's own summary of a call, vetted, or nothing.
+///
+/// # This is the whole door
+///
+/// [`crate::Intent`] explains why the world holds this at all. This function is
+/// the only thing that fills it, and it reads exactly one key — `description` —
+/// out of a tool input that also contains `command`, `content`, `old_string`
+/// and `prompt`. A future key is a deliberate edit here, not an oversight
+/// somewhere else.
+///
+/// # It is vetted on the way in, not on the way out
+///
+/// [`polis_repo::llm::outbound::vet`] is the gate ADR-0089 built for text
+/// leaving the machine, and it is applied *here*, at capture. The stricter
+/// placement is the point: a caption is written from these lines and the world
+/// is snapshotted, cloned and drawn, so a credential-shaped `description` that
+/// lived in the ring would be one bug away from a screenshot as well as one bug
+/// away from a request. Refusing it at the door means no copy of it exists.
+///
+/// The cost of a false positive is one missing sentence out of twenty, which
+/// the caption will not notice.
+fn intent_of(tool: &ToolKind, input: Option<&Value>, at: Instant) -> Option<crate::Intent> {
+    let raw = input?.get("description")?.as_str()?;
+    // The report is discarded: `RedactionReport` names paths, and there is no
+    // path here to name. What matters is the `Err`, which is the refusal.
+    let mut report = polis_repo::llm::outbound::RedactionReport::default();
+    let mut text = polis_repo::llm::outbound::vet(raw, &mut report).ok()?;
+    if text.chars().count() > crate::INTENT_TEXT_MAX {
+        let cut = text
+            .char_indices()
+            .nth(crate::INTENT_TEXT_MAX)
+            .map_or(text.len(), |(i, _)| i);
+        text.truncate(cut);
+    }
+    (!text.is_empty()).then(|| crate::Intent {
+        tool: tool.clone(),
+        text,
+        at,
+    })
+}
+
+/// Whether a path came from the tool's own input or from the shell fallback.
+///
+/// The distinction is the difference between rung 1 and rung 2 of
+/// [`crate::place`]'s chain, and it is not recoverable after the fact: both
+/// arrive as a [`LogicalPath`] and a [`PathScope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathOrigin {
+    /// `file_path`, `notebook_path`, `filename` or `path`.
+    Input,
+    /// The record envelope's working directory, for a shell call that named
+    /// nothing.
+    Cwd,
 }
 
 /// Approximates a line delta from an edit's own strings.
@@ -1570,6 +2292,82 @@ mod tests {
         assert!(patch_totals(&serde_json::json!("error string")).is_none());
     }
 
+    /// The door is one key wide. Everything else in a tool input is the work
+    /// itself, and the whole argument for `Intent` being safe rests on this
+    /// function reading `description` and nothing beside it.
+    #[test]
+    fn only_the_description_gets_through_the_intent_door() {
+        let now = Instant::now();
+        let input = serde_json::json!({
+            "command": "curl -H 'x-api-key: sk-live-9f2b' https://example.test",
+            "description": "Check the workspace tests",
+            "content": "fn main() { let password = \"hunter2\"; }",
+            "old_string": "before",
+            "prompt": "the operator's own words",
+        });
+        let intent = intent_of(&ToolKind::Bash, Some(&input), now).expect("a description");
+        assert_eq!(intent.text, "Check the workspace tests");
+        assert_eq!(intent.tool, ToolKind::Bash);
+        // A tool that carries no description contributes nothing, which is most
+        // of them: `Read`, `Grep`, `Edit`.
+        let bare = serde_json::json!({"file_path": "src/auth/token.rs"});
+        assert!(intent_of(&ToolKind::Read, Some(&bare), now).is_none());
+        assert!(intent_of(&ToolKind::Read, None, now).is_none());
+    }
+
+    /// Vetting happens at capture, so a credential-shaped sentence never
+    /// reaches the ring — not the snapshot, not a caption, not a screenshot.
+    #[test]
+    fn a_credential_shaped_description_is_refused_at_the_door() {
+        let now = Instant::now();
+        let leaky = serde_json::json!({
+            "description": "Set ANTHROPIC_API_KEY=sk-ant-api03-Zx9Q2mVn8LpR4TdW6YbK1JhF7CsG",
+        });
+        assert!(
+            intent_of(&ToolKind::Bash, Some(&leaky), now).is_none(),
+            "a secret in a description is a secret"
+        );
+        // Control characters and bidi overrides are stripped rather than
+        // refused: they are a spoofing channel, not a credential. Runs of
+        // ordinary whitespace collapse to one space.
+        let spoof = serde_json::json!({"description": "  Run \u{202E} the   tests  "});
+        let intent = intent_of(&ToolKind::Bash, Some(&spoof), now).expect("still a sentence");
+        assert_eq!(intent.text, "Run the tests");
+    }
+
+    /// A retried command writes the same sentence again, and three copies of
+    /// one line would crowd out the three different things before it.
+    #[test]
+    fn the_intent_ring_is_bounded_and_drops_an_immediate_repeat() {
+        let now = Instant::now();
+        let mut thread = crate::Thread::new(
+            ThreadId::of_session(polis_events::SessionId::new("intents")),
+            polis_events::SessionId::new("intents"),
+            now,
+        );
+        for _ in 0..3 {
+            thread.push_intent(crate::Intent {
+                tool: ToolKind::Bash,
+                text: "Run the workspace tests".to_owned(),
+                at: now,
+            });
+        }
+        assert_eq!(thread.intents.len(), 1, "a repeat refreshes nothing");
+        for i in 0..(crate::INTENT_CAP * 2) {
+            thread.push_intent(crate::Intent {
+                tool: ToolKind::Bash,
+                text: format!("step {i}"),
+                at: now,
+            });
+        }
+        assert_eq!(thread.intents.len(), crate::INTENT_CAP);
+        assert_eq!(
+            thread.intents.back().expect("newest").text,
+            format!("step {}", crate::INTENT_CAP * 2 - 1),
+            "newest last"
+        );
+    }
+
     #[test]
     fn a_malformed_tool_input_yields_no_path_instead_of_panicking() {
         // 9 of 5 844 `Read` calls carry `__unparsedToolInput` and no `file_path`.
@@ -1582,7 +2380,10 @@ mod tests {
     fn a_shell_call_falls_back_to_its_cwd_as_directory_evidence() {
         let input = serde_json::json!({"command": "cargo test"});
         let paths = tool_input_paths(&ToolKind::PowerShell, Some(&input), Some("C:/repo"));
-        assert_eq!(paths, vec![("C:/repo".to_owned(), PathScope::Directory)]);
+        assert_eq!(
+            paths,
+            vec![("C:/repo".to_owned(), PathScope::Directory, PathOrigin::Cwd)]
+        );
         // With no cwd there is nothing to say.
         assert!(tool_input_paths(&ToolKind::Bash, Some(&input), None).is_empty());
     }
@@ -1592,12 +2393,20 @@ mod tests {
         let grep = serde_json::json!({"pattern": "x", "path": "src/auth"});
         assert_eq!(
             tool_input_paths(&ToolKind::Grep, Some(&grep), None),
-            vec![("src/auth".to_owned(), PathScope::Directory)]
+            vec![(
+                "src/auth".to_owned(),
+                PathScope::Directory,
+                PathOrigin::Input
+            )]
         );
         let read = serde_json::json!({"file_path": "C:/repo/src/auth/token.rs"});
         assert_eq!(
             tool_input_paths(&ToolKind::Read, Some(&read), None),
-            vec![("C:/repo/src/auth/token.rs".to_owned(), PathScope::File)]
+            vec![(
+                "C:/repo/src/auth/token.rs".to_owned(),
+                PathScope::File,
+                PathOrigin::Input
+            )]
         );
     }
 

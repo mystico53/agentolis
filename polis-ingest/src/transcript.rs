@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -126,6 +126,15 @@ const PROJECT_KEY_LIMIT: usize = 200;
 /// a bound in their own documentation, and a bound a caller cannot name is a
 /// number in a sentence rather than a contract.
 pub const CWD_PROBE_BYTES: u64 = 256 * 1024;
+
+/// Bytes of a transcript read when probing it for [`SessionHead`].
+///
+/// The `bridge-session` record is written near the top of the file: across the
+/// 225 transcripts on this machine that carry one, the first sits at byte 313
+/// at the median and 392 at every file but one, the exception being 17 458. A
+/// 64 KiB head covers that outlier four times over and is read **once** per
+/// session, only for sessions the liveness gate already wants to follow.
+pub const HEAD_PROBE_BYTES: u64 = 64 * 1024;
 
 /// Deepest directory nesting [`session_files`] will walk under `subagents/`.
 ///
@@ -902,6 +911,36 @@ fn meta_for(record: &Record, source: &TranscriptSource) -> EventMeta {
     meta
 }
 
+/// Says whose session a record belongs to when the record itself does not.
+///
+/// A `journal.jsonl` line is `{"type","key","agentId"}` and nothing else — no
+/// `sessionId`, no `toolUseId`, no `parentAgentId` — so [`meta_for`] leaves
+/// [`EventMeta::session`] empty for every one of them. The file's own directory
+/// is the only remaining statement of whose run it is, and it is a true one:
+/// `session_files` reads the journal out of
+/// `<project>/<session-id>/subagents/workflows/wf_<run>/`, so the owning session
+/// is a parent directory of the path the line was read from.
+///
+/// This is the same fallback [`meta_for`] already applies to the *worker* id one
+/// field above — *the file's own path is the fallback* — extended to the session
+/// for the one record type that carries neither.
+///
+/// It matters because it is the difference between a workflow fleet that is
+/// attributed and one that is not. Route 3 (the `wf_<runId>` directory matched
+/// against the parent `Workflow` call) is the only link 503 of 643 subagent
+/// transcripts have, and that parent call is a single record in the main
+/// transcript: live tailing opens existing files at their end
+/// ([`ProjectsTailer`] via `start_discovering`), so a Polis started after the
+/// `Workflow` call will never read it, and every agent of that run parks
+/// unattributed for ever with no second chance. The directory is still there.
+///
+/// Never an override: a record that named its own session keeps it.
+fn attribute_to_file(event: &mut Event, file: &TranscriptFile) {
+    if event.meta.session.is_none() {
+        event.meta.session = Some(file.session.clone());
+    }
+}
+
 /// Parses one JSONL line into a bus event and its display timestamp.
 ///
 /// `byte_offset` is the record's order (ADR-0014); the record's own `timestamp`
@@ -1243,6 +1282,82 @@ pub fn project_dir_cwd(project_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// What the head of a main transcript says about the session's *identity* —
+/// which `claude` process it belongs to, and when it began.
+///
+/// Both answers come out of one bounded read because they are wanted together:
+/// [`crate::live::LiveTailer`] uses them to tell a session that was replaced by
+/// `/clear` from one that is merely quiet (ADR-0105).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionHead {
+    /// `bridge-session.bridgeSessionId`.
+    ///
+    /// A property of the CLI process, not of the conversation: it survives
+    /// `/clear`, which is what makes it the link between a dead session and the
+    /// one that replaced it. Never changes within a file (0 of 225 on this
+    /// machine). `None` for a session that carries no such record — 37 of 262
+    /// files here — and for a file whose first bytes have not landed yet.
+    pub bridge: Option<String>,
+    /// The first record timestamp in the file, which orders two sessions of one
+    /// process. Display-quality, not ordering-quality, *within* a session
+    /// (ADR-0014) — but the question here is which of two files began first,
+    /// and their opening records are minutes apart, not milliseconds.
+    pub first_record: Option<WallTime>,
+}
+
+impl SessionHead {
+    /// True when both answers were found, so the probe need never be repeated.
+    ///
+    /// A transcript is created empty and its identity records land inside the
+    /// first second, so a probe that caught that instant learnt nothing and must
+    /// not be cached as an answer. The two fields also arrive in the *wrong*
+    /// order for a single-field test: `bridge-session` is written before the
+    /// first record that carries a timestamp.
+    pub fn is_complete(&self) -> bool {
+        self.bridge.is_some() && self.first_record.is_some()
+    }
+}
+
+/// Reads [`SessionHead`] out of the front of one main transcript.
+///
+/// At most [`HEAD_PROBE_BYTES`], and it stops at the first `bridge-session`
+/// record rather than parsing the whole head. Unreadable, missing or empty file
+/// is an empty `SessionHead`, never an error: a session being born is not a
+/// fault.
+pub fn session_head(transcript: &Path) -> SessionHead {
+    let mut head = SessionHead::default();
+    let Ok(bytes) = read_head(transcript, HEAD_PROBE_BYTES) else {
+        return head;
+    };
+    for (_, line) in lines_with_offsets(&bytes) {
+        let text = String::from_utf8_lossy(line);
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        if head.first_record.is_none() {
+            head.first_record = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp);
+        }
+        if head.bridge.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("bridge-session")
+        {
+            head.bridge = value
+                .get("bridgeSessionId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+        // The `bridge-session` record carries no timestamp of its own and is
+        // written *before* the first record that does, so neither answer may
+        // end the scan on its own.
+        if head.bridge.is_some() && head.first_record.is_some() {
+            break;
+        }
+    }
+    head
 }
 
 /// Finds the directory a working directory's sessions live in.
@@ -1796,7 +1911,7 @@ impl FileTail {
         let mut emitted = 0usize;
         for (offset, line) in lines_with_offsets(complete) {
             let text = String::from_utf8_lossy(line);
-            emitted += ctx.emit(&text, &self.file.source, base + offset, out);
+            emitted += ctx.emit(&text, &self.file, base + offset, out);
         }
         self.file.consumed = base + last_newline as u64 + 1;
         Ok(emitted)
@@ -1821,6 +1936,87 @@ fn read_as_much_as_possible(handle: &mut File, buf: &mut [u8]) -> io::Result<usi
     Ok(filled)
 }
 
+/// Puts a live transcript record's `observed` stamp where the record was
+/// *written*, not where Polis happened to read it.
+///
+/// [`EventMeta::now`] stamps the moment of receipt, which is exactly right for a
+/// hook datagram and exactly wrong for the [`crate::live::BACKFILL_BYTES`] of
+/// history Channel D reads the instant it attaches to an already-running
+/// session. Without this, opening a window replays a session the operator closed
+/// twenty minutes ago as though it were happening now: `polis-world` stamps
+/// `last_activity` from `observed`, calls the thread **working**, and holds a
+/// rail row for a full `polis_world::THREAD_RETIRE_AFTER` — a fresh
+/// thirty-minute lease granted at attach time, however old the session really
+/// is. That is the "agents do not decay" bug, and it is one clock read.
+///
+/// # Reading a wall clock here is deliberate
+///
+/// [`WallTime::now`]'s docs reserve the system clock for the construction of a
+/// recording, because PRD §7.4 forbids one anywhere that can reach a layout.
+/// This cannot reach one: the pair is read **once, when a session is opened**,
+/// and is spent entirely on [`EventMeta::observed`], which no city, layout or
+/// geometry ever reads.
+///
+/// # A backwards step still cannot reorder the bus
+///
+/// 20% of transcript files step backwards and one observed jump was 60 seconds
+/// (ADR-0014), so byte order remains the order and the aged stamp is passed
+/// through a running maximum — the same rule `monotonise` applies to the
+/// recorded path, for the same reason.
+#[derive(Debug, Clone)]
+pub struct Aging {
+    mono_origin: Instant,
+    wall_origin: WallTime,
+    running: Option<Instant>,
+}
+
+impl Aging {
+    /// Pairs the two clocks. One system-clock read, once per session.
+    pub fn start() -> Self {
+        Self {
+            mono_origin: Instant::now(),
+            wall_origin: WallTime::now(),
+            running: None,
+        }
+    }
+
+    /// Where a record written at `wall` belongs on the receipt clock.
+    ///
+    /// `wall` is `None` for a record that carried no timestamp — every sidecar
+    /// record is one — and such a record keeps the stamp it arrived with, which
+    /// is the receipt time.
+    pub fn stamp(&mut self, wall: Option<WallTime>, received: Instant) -> Instant {
+        let aged = wall.map_or(received, |w| self.at(w, received));
+        let stamp = self.running.map_or(aged, |r| r.max(aged));
+        self.running = Some(stamp);
+        stamp
+    }
+
+    /// `wall` on the monotonic clock, never later than `received`: a record
+    /// cannot have been written after it was read, whatever the two clocks
+    /// disagree by, and a record appended since the session opened arrived
+    /// within one poll of being written anyway.
+    fn at(&self, wall: WallTime, received: Instant) -> Instant {
+        let behind = self
+            .wall_origin
+            .unix_millis()
+            .saturating_sub(wall.unix_millis());
+        if behind <= 0 {
+            // Written since the session was opened, or in the same millisecond
+            // it was: the record arrived within one poll of being written, so
+            // the receipt clock is already the right answer. Negative is the
+            // two clocks disagreeing, and a record cannot have been written
+            // after it was read.
+            return received;
+        }
+        let behind = Duration::from_millis(u64::try_from(behind).unwrap_or(u64::MAX));
+        // `checked_sub`, because `Instant`'s origin is the boot on Windows: a
+        // machine that has been up for less time than the session is old has
+        // nowhere further back to go, and the record keeps its receipt time.
+        self.mono_origin.checked_sub(behind).unwrap_or(received)
+    }
+}
+
 /// The mutable state shared by every file of one tailer while it emits.
 ///
 /// Bundled into one struct so [`FileTail::poll`] takes one borrow rather than
@@ -1832,6 +2028,9 @@ pub struct EmitCtx<'a> {
     /// Unknown `type` strings already reported, so a drifted session emits one
     /// control event per new type rather than one per line.
     pub reported: &'a mut BTreeSet<String>,
+    /// The session's two clocks, so backfilled history is stamped as old as it
+    /// is rather than as having just happened.
+    pub age: &'a mut Aging,
 }
 
 impl EmitCtx<'_> {
@@ -1839,14 +2038,19 @@ impl EmitCtx<'_> {
     fn emit(
         &mut self,
         line: &str,
-        source: &TranscriptSource,
+        file: &TranscriptFile,
         offset: u64,
         out: &mut Vec<Event>,
     ) -> usize {
         let before = self.stats.unknown_types_seen.len();
-        let Some((event, _)) = transcript_line_parts(line, source, offset, self.stats) else {
+        let Some((mut event, wall)) = transcript_line_parts(line, &file.source, offset, self.stats)
+        else {
             return 0;
         };
+        attribute_to_file(&mut event, file);
+        // History reads as history: see [`Aging`]. The record's own `timestamp`
+        // is still verbatim inside the payload for anything that wants it.
+        event.meta.observed = self.age.stamp(wall, event.meta.observed);
         if self.stats.unknown_types_seen.len() != before {
             self.report_new_drift(out);
         }
@@ -1895,6 +2099,7 @@ pub struct SessionTailer {
     tails: BTreeMap<(u8, PathBuf), FileTail>,
     stats: ParseStats,
     reported: BTreeSet<String>,
+    age: Aging,
 }
 
 impl SessionTailer {
@@ -1913,6 +2118,7 @@ impl SessionTailer {
             tails: BTreeMap::new(),
             stats: ParseStats::default(),
             reported: BTreeSet::new(),
+            age: Aging::start(),
         };
         for file in session_files(session_dir)? {
             let key = (file.rank(), file.path.clone());
@@ -1993,6 +2199,7 @@ impl SessionTailer {
         let mut ctx = EmitCtx {
             stats: &mut self.stats,
             reported: &mut self.reported,
+            age: &mut self.age,
         };
         for (key, tail) in &mut self.tails {
             match tail.poll(&mut ctx, out) {
@@ -2213,8 +2420,11 @@ fn read_files(files: Vec<TranscriptFile>, mapper: &PathMapper) -> io::Result<Rep
         };
         for (offset, line) in lines_with_offsets(&bytes) {
             let text = String::from_utf8_lossy(line);
-            if let Some(parts) = transcript_line_parts(&text, &file.source, offset, &mut stats) {
-                parsed.push(parts);
+            if let Some((mut event, wall)) =
+                transcript_line_parts(&text, &file.source, offset, &mut stats)
+            {
+                attribute_to_file(&mut event, file);
+                parsed.push((event, wall));
             }
         }
     }
@@ -2281,6 +2491,7 @@ fn monotonise(parsed: Vec<(Event, Option<WallTime>)>) -> Vec<RecordedEvent> {
 enum Followed {
     Session(Box<SessionTailer>),
     Projects(Box<ProjectsTailer>),
+    Live(Box<crate::live::LiveTailer>),
 }
 
 impl Followed {
@@ -2288,12 +2499,17 @@ impl Followed {
         match self {
             Self::Session(t) => t.poll(out),
             Self::Projects(t) => t.poll(out),
+            Self::Live(t) => t.poll(out),
         }
     }
 
     fn rescan(&mut self) {
-        if let Self::Projects(t) = self {
-            let _ = t.rescan();
+        match self {
+            Self::Session(_) => {}
+            Self::Projects(t) => {
+                let _ = t.rescan();
+            }
+            Self::Live(t) => t.rescan(),
         }
     }
 
@@ -2307,6 +2523,18 @@ impl Followed {
                 .parent()
                 .map_or_else(|| t.session_dir().to_path_buf(), Path::to_path_buf),
             Self::Projects(t) => t.projects_dir().to_path_buf(),
+            Self::Live(t) => t.projects_dir().to_path_buf(),
+        }
+    }
+
+    /// The roster, and the reason the channel is degraded, for a live watch.
+    ///
+    /// Published after every rescan so that the window, the status rail and
+    /// `polis doctor` all read one value rather than three approximations of it.
+    fn roster(&self) -> Option<crate::live::Roster> {
+        match self {
+            Self::Live(t) => Some(t.roster()),
+            _ => None,
         }
     }
 }
@@ -2319,6 +2547,10 @@ pub struct TranscriptTailer {
     health: Arc<Mutex<SourceHealth>>,
     handle: Option<JoinHandle<()>>,
     mapper: PathMapper,
+    /// Published by the thread after every rescan when this is a live watch
+    /// ([`TranscriptTailer::start_live`]); `None` for the replay and
+    /// single-session modes, which have no roster to publish.
+    roster: Arc<Mutex<Option<crate::live::Roster>>>,
 }
 
 impl TranscriptTailer {
@@ -2368,6 +2600,47 @@ impl TranscriptTailer {
         ))
     }
 
+    /// Watches one repository's live agents, with zero configuration
+    /// (PRD §15 M3).
+    ///
+    /// The difference from [`TranscriptTailer::start_discovering`] is what it
+    /// refuses to do. That one opens a tail on every session that has ever run
+    /// on the machine and follows each from its end; this one discovers the same
+    /// set but follows only the sessions that are **alive and in `scope`**,
+    /// catches each of them up from a bounded tail so the map is populated the
+    /// instant the window opens, and publishes a [`crate::live::Roster`] saying
+    /// which agents it can see — including the ones in other repositories, which
+    /// are reported and deliberately not drawn.
+    ///
+    /// Infallible: a missing `~/.claude/projects` is a machine on which no agent
+    /// has ever run. The channel reports itself degraded, with the reason, and
+    /// starts watching for the directory to appear (ADR-0011).
+    pub fn start_live(
+        projects_dir: &Path,
+        scope: crate::live::Scope,
+        sink: EventSink,
+        mapper: PathMapper,
+    ) -> Self {
+        let tailer = crate::live::LiveTailer::open(projects_dir, scope);
+        Self::spawn(Followed::Live(Box::new(tailer)), sink, mapper)
+    }
+
+    /// The live roster, when this tailer was started by
+    /// [`TranscriptTailer::start_live`].
+    pub fn roster(&self) -> Option<crate::live::Roster> {
+        match self.roster.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// The slot the roster is published into, for a caller that outlives this
+    /// handle — [`crate::Ingest`] keeps one so the window can read the roster
+    /// without downcasting a `Box<dyn IngestSource>`.
+    pub fn roster_slot(&self) -> Arc<Mutex<Option<crate::live::Roster>>> {
+        Arc::clone(&self.roster)
+    }
+
     /// Replays a transcript offline as fast as it can be parsed (PRD §15 M2).
     ///
     /// The fastest iteration loop the project has: minutes per iteration, real
@@ -2408,14 +2681,18 @@ impl TranscriptTailer {
     fn spawn(mut followed: Followed, sink: EventSink, mapper: PathMapper) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let health = Arc::new(Mutex::new(SourceHealth::Running));
+        let roster: Arc<Mutex<Option<crate::live::Roster>>> =
+            Arc::new(Mutex::new(followed.roster()));
         let thread_stop = Arc::clone(&stop);
         let thread_health = Arc::clone(&health);
+        let thread_roster = Arc::clone(&roster);
         let handle = std::thread::Builder::new()
             .name("polis-transcript".to_owned())
             .spawn(move || {
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
                 let watcher = install_watcher(&followed.watch_root(), wake_tx);
-                if let Err(reason) = &watcher {
+                let watcher_failed = watcher.as_ref().err().map(ToString::to_string);
+                if let Some(reason) = &watcher_failed {
                     set_health(
                         &thread_health,
                         SourceHealth::Degraded {
@@ -2428,6 +2705,24 @@ impl TranscriptTailer {
                 while !thread_stop.load(Ordering::Relaxed) {
                     if ticks.is_multiple_of(RESCAN_EVERY) {
                         followed.rescan();
+                        // A live watch republishes its roster on every rescan
+                        // and reports "the directory an agent writes into is not
+                        // there" as a degraded channel rather than as silence,
+                        // which is the failure this milestone exists to fix.
+                        if let Some(current) = followed.roster() {
+                            let reason = current.error.clone().or_else(|| watcher_failed.clone());
+                            set_health(
+                                &thread_health,
+                                match reason {
+                                    None => SourceHealth::Running,
+                                    Some(reason) => SourceHealth::Degraded { reason },
+                                },
+                            );
+                            match thread_roster.lock() {
+                                Ok(mut slot) => *slot = Some(current),
+                                Err(poisoned) => *poisoned.into_inner() = Some(current),
+                            }
+                        }
                     }
                     ticks = ticks.wrapping_add(1);
                     buf.clear();
@@ -2453,6 +2748,7 @@ impl TranscriptTailer {
             health,
             handle,
             mapper,
+            roster,
         }
     }
 
@@ -3066,6 +3362,80 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_line_carries_the_session_of_the_directory_it_was_read_from() {
+        // A journal record is `{type, key, agentId}` — no `sessionId`, so
+        // `meta_for` leaves the session empty and the world has nothing to
+        // attribute the agent to but the parent `Workflow` call, which live
+        // tailing has usually already skipped past. The path still knows.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let sid = "sess";
+        write(&project.join("sess.jsonl"), "{\"type\":\"mode\"}\n");
+        let line = "{\"type\":\"started\",\"key\":\"v2:aa\",\"agentId\":\"a1234\"}\n";
+        write(
+            &project
+                .join(sid)
+                .join("subagents")
+                .join("workflows")
+                .join("wf_run_2026")
+                .join("journal.jsonl"),
+            line,
+        );
+        let files = session_files(&project.join(sid)).unwrap();
+        let journal = files
+            .iter()
+            .find(|f| matches!(f.source, TranscriptSource::WorkflowJournal { .. }))
+            .expect("the journal");
+
+        let mut stats = ParseStats::default();
+        let (mut event, _) =
+            transcript_line_parts(line.trim_end(), &journal.source, 0, &mut stats).expect("parsed");
+        assert!(
+            event.meta.session.is_none(),
+            "the record itself names no session — that is the whole problem"
+        );
+        attribute_to_file(&mut event, journal);
+        assert_eq!(
+            event.meta.session,
+            Some(SessionId::new(sid)),
+            "so the directory it was read out of says it instead"
+        );
+    }
+
+    #[test]
+    fn a_record_that_names_its_own_session_is_never_overridden_by_the_path() {
+        // The fallback is a fallback. A subagent transcript carries the parent's
+        // `sessionId`, and that is a stronger statement than the directory —
+        // for a worktree or a moved sidecar the two can disagree.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        write(&project.join("outer.jsonl"), "{\"type\":\"mode\"}\n");
+        let line = "{\"type\":\"assistant\",\"sessionId\":\"inner\",\"message\":{\"content\":[]}}";
+        write(
+            &project
+                .join("outer")
+                .join("subagents")
+                .join("agent-a1234.jsonl"),
+            "{\"type\":\"mode\"}\n",
+        );
+        let files = session_files(&project.join("outer")).unwrap();
+        let sub = files
+            .iter()
+            .find(|f| matches!(f.source, TranscriptSource::Subagent { .. }))
+            .expect("the subagent file");
+
+        let mut stats = ParseStats::default();
+        let (mut event, _) =
+            transcript_line_parts(line, &sub.source, 0, &mut stats).expect("parsed");
+        attribute_to_file(&mut event, sub);
+        assert_eq!(
+            event.meta.session,
+            Some(SessionId::new("inner")),
+            "the record's own word wins"
+        );
+    }
+
+    #[test]
     fn transcript_source_never_assumes_a_fixed_depth() {
         let deep = Path::new("/x/sid/subagents/workflows/wf_r/nested/agent-abc.jsonl");
         assert_eq!(
@@ -3246,6 +3616,56 @@ mod tests {
         let mut out = Vec::new();
         let n = tailer.poll(&mut out);
         (n, out)
+    }
+
+    #[test]
+    fn backfilled_history_is_stamped_as_old_as_it_is() {
+        // The bug this exists for: Channel D reads up to `live::BACKFILL_BYTES`
+        // of an already-running session the instant it attaches, and
+        // `EventMeta::now` stamped every one of those records "now". A session
+        // the operator closed twenty minutes ago therefore arrived in
+        // `polis-world` as `working`, holding a rail row on a fresh
+        // `THREAD_RETIRE_AFTER` lease — which is the whole "agents never decay"
+        // report.
+        let mut age = Aging::start();
+        let received = Instant::now();
+        let minute_ago = WallTime::from_unix_millis(WallTime::now().unix_millis() - 60_000);
+
+        let stamped = age.stamp(Some(minute_ago), received);
+        assert!(
+            received.saturating_duration_since(stamped) >= Duration::from_secs(55),
+            "a record written a minute ago must read as a minute old, not as now"
+        );
+    }
+
+    #[test]
+    fn a_backwards_timestamp_step_still_cannot_reorder_the_bus() {
+        // 20% of transcript files step backwards and one observed jump was 60
+        // seconds (ADR-0014). Byte order is the order, so the aged stamp goes
+        // through a running maximum — exactly what `monotonise` does for the
+        // recorded path.
+        let mut age = Aging::start();
+        let received = Instant::now();
+        let now = WallTime::now().unix_millis();
+
+        let first = age.stamp(Some(WallTime::from_unix_millis(now - 60_000)), received);
+        let second = age.stamp(Some(WallTime::from_unix_millis(now - 600_000)), received);
+        assert_eq!(
+            second, first,
+            "a later record never lands before an earlier one"
+        );
+
+        let third = age.stamp(Some(WallTime::from_unix_millis(now)), received);
+        assert_eq!(third, received, "and a record written now is happening now");
+    }
+
+    #[test]
+    fn a_record_with_no_timestamp_keeps_the_receipt_clock() {
+        // Every sidecar record is timestamp-free, and there is nothing better to
+        // date one by than the moment it was read.
+        let mut age = Aging::start();
+        let received = Instant::now();
+        assert_eq!(age.stamp(None, received), received);
     }
 
     #[test]

@@ -1,0 +1,28 @@
+[package]
+name = "polis-sessiond"
+description = "The session daemon: it owns the ptys, so the agents outlive the window."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "polis-sessiond"
+path = "src/main.rs"
+
+[dependencies]
+polis-term = { workspace = true }
+polis-events = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

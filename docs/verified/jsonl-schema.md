@@ -791,6 +791,49 @@ Two files have **zero** roots — every record's parent is present but the file
 begins mid-chain (a resumed session whose head lives in the ancestor file named
 by `session_id`). A parser must not assume a root exists.
 
+### 10.1 One process, several sessions: `bridgeSessionId` and `/clear`
+
+**Measured 2026-09-06 over the 263 transcripts then under `~/.claude/projects`**
+(1 unreadable: its path exceeds `MAX_PATH` through a `glob` that does not use the
+`\\?\` prefix — §1.3).
+
+`/clear` writes **no ending record**. It abandons the transcript where it stands
+and opens a **new file with a new session id**, whose first user record is
+`<command-name>/clear</command-name>`. Nothing in the old file says it is over —
+which is the whole difficulty in §10's neighbourhood, and the reason
+`polis_ingest::live` otherwise has to reason from silence.
+
+The link between the two files is `bridge-session.bridgeSessionId`. It is a
+property of the running `claude` **process**, not of the conversation:
+
+| claim | measurement |
+|---|---|
+| files carrying ≥ 1 `bridge-session` record | 225 / 262 readable |
+| `bridgeSessionId` changes within one file | **0** files |
+| the record is re-emitted as the session runs | 1–16+ per file; 217 files have one past line 5 |
+| byte offset of the **first** one | ≤ 392 in 224 of 225 files; one outlier at 17 458 |
+| distinct bridge ids | 114, of which 48 cover more than one session |
+| sessions that are the **successor** of another under one id | 107 (longest chain: 9) |
+| …of those, beginning with `/clear` | **106 / 107** (the exception opens with `/design`) |
+| …where the predecessor's **last** record post-dates the successor's **first** | **0 / 107** |
+
+So the sessions of one bridge id form a strict, non-overlapping sequence, and a
+second live session under an id means the first is finished. That is the one
+ending this format lets a reader *prove*, and Polis acts on it: ADR-0105,
+`polis_ingest::live::LiveTailer::detect_supersession`.
+
+**Two cautions for anyone implementing it.**
+
+* **Order by the first record, never by mtime.** A finished session's file can
+  still be written to — the final assistant flush, a `cost-state` at exit — and
+  20% of files contain a backwards timestamp step anyway (§10). The first record
+  of each file is the only comparison that survives both.
+* **The bridge id is readable before the first timestamp is.** `bridge-session`
+  is written among the opening sidecars, several records ahead of the first
+  threaded one, so there is a window of a few hundred bytes in which a brand-new
+  session has an id but no time. A reader that treats "no timestamp" as "oldest"
+  will conclude the *new* session was the one that ended.
+
 ---
 
 ## 11. Redacted sample records

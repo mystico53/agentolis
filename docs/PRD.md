@@ -35,6 +35,13 @@ Kill and review are supported but demoted to the drill-down layer.
 - Not a code editor or reviewer. Clicking a building opens the file in the user's editor and stops there.
 - Not multi-repo. One repository, one city. Worktrees of that repo are in scope (§7.6); unrelated repos are not.
 - Not a team/multi-user product. Single operator, local machine, local data. No server, no auth, no telemetry leaving the box.
+  - **"No server" means no cloud, no account, and nothing leaving the box.** It
+    does not mean no local background process. `polis-sessiond` (PRD §15 M7)
+    holds the ptys so that agents outlive the window; it binds `127.0.0.1`
+    only, refuses to bind anything else, requires a token from a file only
+    this user can read, and is never reachable from the network. See
+    ADR-0098, which records why this clause is amended here rather than
+    reinterpreted in a commit message.
 - Not 3D. The camera is top-down orthographic with zoom and pan. No orbit, no perspective, no flying.
 
 ---
@@ -186,6 +193,23 @@ Not all path touches carry equal signal.
 | `Edit` / `Write` | 3.0 | Commitment. |
 | `Read` | 1.0 | Weak — could be orientation. |
 | `Bash` cwd | 0.5 | Noisy. |
+
+  - **The `Bash` cwd row contributes no scope at all in the common case, and
+    that is deliberate.** A shell tool input carries `command` and almost never
+    `path`, so the cwd fallback fires, and a cwd at the checkout root resolves to
+    the repository root — which is the absorbing element of §6.2's lowest common
+    ancestor, so one live root-scoped observation pins `depth(A)` at 0 for as
+    long as it lives. Measured across three recorded sessions, 119, 108 and 6 of
+    128 live evidence entries were the root, and in the two where it dominated
+    the territory never converged and the thread drew nothing. Those
+    observations are therefore counted and dropped:
+    `polis_world::territory::Territory::observe` discards them from the evidence
+    and `polis_world::Health::root_scoped_observations` reports how many —
+    57.3 % of the stream on the corpus it was added against. They are **not**
+    discarded as evidence that the thread is *alive*: they refresh the clock
+    §10.4's dormancy gate reads, they step §12's trail, and they draw their own
+    operation mark. Weight 0.5 still applies to a `Bash` call that does carry a
+    path. See ADR-0100.
 
 **Ubiquity discount (TF-IDF over your own corpus).** Every agent reads the README, `package.json`, and top-level config. Maintain a rolling count over the last N sessions of how many read each path, and scale each observation by `log(N / sessions_that_read_path)`. A path read by 90% of sessions contributes ~nothing; one read by 3% dominates. Persist this table in `$XDG_STATE_HOME/polis/corpus.db` (SQLite). Cold start with no corpus: fall back to a shipped denylist of common orientation files.
 

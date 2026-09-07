@@ -161,6 +161,38 @@ impl LogicalPath {
         self.components().count()
     }
 
+    /// The ancestor `n` components deep, or `None` when this path is shallower
+    /// than that.
+    ///
+    /// `lp("polis-layout/src/roads.rs").ancestor_at(2)` is `polis-layout/src`.
+    /// A path with exactly `n` components is its own ancestor at `n`; one with
+    /// fewer has none, which is what lets a caller reject a top-level file
+    /// rather than silently promoting it to the root.
+    ///
+    /// PRD §6.4's lobes are grouped by this: clustering evidence at a fixed
+    /// depth is what stops one thread working in two crates from collapsing to
+    /// a root-level ancestor and drawing nothing.
+    pub fn ancestor_at(&self, n: usize) -> Option<Self> {
+        if n == 0 {
+            return Some(Self::root());
+        }
+        let mut end = 0usize;
+        let mut seen = 0usize;
+        for c in self.components() {
+            if seen == n {
+                return Some(Self(self.0[..end].into()));
+            }
+            // `components` filters empties, so the separator is exactly one byte
+            // and only after the first component.
+            end += usize::from(seen > 0) + c.len();
+            seen += 1;
+        }
+        // Exactly `n` components: the path is its own ancestor at `n`. Fewer
+        // than `n` and there is no such ancestor — checking the count, not the
+        // byte offset, is what distinguishes those two cases.
+        (seen == n).then(|| self.clone())
+    }
+
     /// The containing directory — the **district** of PRD §3. `None` at the root.
     pub fn parent(&self) -> Option<Self> {
         if self.is_root() {
@@ -783,6 +815,43 @@ mod tests {
         );
         assert_eq!(LogicalPath::root().join("a/b").unwrap().as_str(), "a/b");
         assert_eq!(lp("src").join("../../x"), Err(PathParseError::EscapesRoot));
+    }
+
+    #[test]
+    fn ancestor_at_groups_evidence_into_lobes_prd_6_4() {
+        let p = lp("polis-layout/src/roads.rs");
+        assert_eq!(
+            p.ancestor_at(2).as_ref().map(LogicalPath::as_str),
+            Some("polis-layout/src")
+        );
+        assert_eq!(
+            p.ancestor_at(1).as_ref().map(LogicalPath::as_str),
+            Some("polis-layout")
+        );
+        assert_eq!(
+            p.ancestor_at(3).as_ref().map(LogicalPath::as_str),
+            Some("polis-layout/src/roads.rs")
+        );
+        // Deeper than the path is: no lobe, rather than a silent promotion.
+        assert_eq!(p.ancestor_at(4), None);
+        // A top-level file cannot name a lobe at depth 2 — the case that would
+        // otherwise drag an orchestrator's claim to the root.
+        assert_eq!(lp("README.md").ancestor_at(2), None);
+        assert_eq!(
+            lp("README.md")
+                .ancestor_at(1)
+                .as_ref()
+                .map(LogicalPath::as_str),
+            Some("README.md")
+        );
+        assert_eq!(p.ancestor_at(0), Some(LogicalPath::root()));
+    }
+
+    #[test]
+    fn ancestor_at_agrees_with_common_ancestor_on_a_shared_prefix() {
+        let a = lp("polis-render/src/live.rs");
+        let b = lp("polis-render/src/salience.rs");
+        assert_eq!(a.common_ancestor(&b), a.ancestor_at(2).unwrap());
     }
 
     #[test]

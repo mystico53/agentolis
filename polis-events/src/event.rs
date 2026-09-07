@@ -910,6 +910,23 @@ pub enum ControlEvent {
         /// What was unrecognised.
         detail: String,
     },
+    /// One session replaced another in the same CLI process — `/clear`.
+    ///
+    /// The one thing a transcript can say about an ending, and it is said by the
+    /// *successor*: both files carry the same `bridge-session.bridgeSessionId`,
+    /// which is a property of the running `claude` process rather than of the
+    /// conversation, so a second session appearing under it means the first one
+    /// will never be appended to again (ADR-0105,
+    /// `docs/verified/jsonl-schema.md` §10.1).
+    ///
+    /// Inferred by Polis rather than reported by Claude Code, which is why it is
+    /// here and not on [`super::TranscriptRecordKind`].
+    SessionSuperseded {
+        /// The session that ended.
+        session: SessionId,
+        /// The one that took the process over.
+        by: SessionId,
+    },
     /// Ingest is shutting down; the world thread should flush and stop.
     Shutdown,
 }

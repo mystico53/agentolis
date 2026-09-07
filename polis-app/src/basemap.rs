@@ -51,7 +51,7 @@ use polis_render::plan::{self, View};
 ///
 /// The same 1 600 `polis snapshot` defaults to, so the window and the PNG are
 /// the same picture. It is the ground the vector layers are drawn over rather
-/// than the source of detail — from [`polis_render::camera::ZoomTier::District`]
+/// than the source of detail — from [`polis_render::zoom::ZoomTier::District`]
 /// up, buildings and roads are redrawn as crisp vectors on top, which is what
 /// makes zooming in sharpen the map instead of magnifying its pixels.
 pub const BASE_MAP_PIXELS: usize = 1600;
@@ -113,6 +113,10 @@ pub struct Geometry {
     pub buildings: BTreeMap<LogicalPath, MapShape>,
     /// District boundaries.
     pub districts: BTreeMap<LogicalPath, MapShape>,
+    /// The hue `polis-render` gave each district, so the window's City tier
+    /// fills them with the same colour the raster outlines them in rather than
+    /// inventing a second scheme.
+    pub district_colours: BTreeMap<LogicalPath, polis_render::raster::Rgb>,
     /// Industrial masses (PRD §8) — drawn as one shape, never as buildings.
     pub industrial: Vec<(LogicalPath, MapShape)>,
     /// Road segments, as base-map pixel pairs with their class.
@@ -151,6 +155,8 @@ impl Geometry {
             .iter()
             .map(|(path, d)| (path.clone(), project(&d.boundary)))
             .collect();
+
+        let district_colours = plan::district_colours(city);
 
         let industrial = city
             .industrial
@@ -202,6 +208,7 @@ impl Geometry {
         Self {
             buildings,
             districts,
+            district_colours,
             industrial,
             roads,
             streets,

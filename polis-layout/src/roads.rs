@@ -440,16 +440,23 @@ impl Graph {
         }
         for (ni, list) in adj.iter_mut().enumerate() {
             let here = self.nodes[ni];
-            // Counter-clockwise by outgoing direction. `atan2` produces an
-            // ordering here, never a coordinate, so it cannot reach output
-            // geometry; ties fall back to edge id for a total order.
+            // Counter-clockwise by outgoing direction, through the quantised
+            // angle rather than a raw `atan2`. The earlier version of this
+            // argued that an `atan2` here produces "an ordering, never a
+            // coordinate, so it cannot reach output geometry". That is the
+            // wrong test. This ordering is what the face walk consumes, so it
+            // chooses the face set, therefore the blocks, therefore the lots
+            // and the buildings — one ulp of libm disagreement between two
+            // machines on one near-collinear pair is two different cities.
+            // `det_angle_f64` snaps to `TRIG_QUANTUM`; ties it creates fall
+            // back to edge id, which is a total order everywhere (ADR-0110).
             let mut keyed: Vec<(f64, u32)> = list
                 .iter()
                 .map(|&e| {
                     let o = self.nodes
                         [self.other(e as usize, u32::try_from(ni).expect("fits")) as usize];
                     let d = sub(o, here);
-                    (d[1].atan2(d[0]), e)
+                    (crate::determinism::det_angle_f64(d[1], d[0]), e)
                 })
                 .collect();
             keyed.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.cmp(&y.1)));

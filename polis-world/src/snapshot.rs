@@ -38,7 +38,7 @@ use arc_swap::ArcSwap;
 use polis_events::{LogicalPath, ThreadId};
 use polis_layout::CityLayout;
 
-use crate::{FileState, Health, Thread, ThreadStatus, UnattributedWorker, World};
+use crate::{FileState, Health, Thread, UnattributedWorker, World};
 
 /// The floor between two publishes.
 ///
@@ -60,6 +60,14 @@ pub struct WorldSnapshot {
     pub threads: Vec<Thread>,
     /// Attention marks in PRD §11.1 order.
     pub attention: Vec<crate::attention::Attention>,
+    /// PRD §11.3's early warning: pairs of threads whose clouds overlap, worst
+    /// first.
+    ///
+    /// Kept out of [`WorldSnapshot::attention`] on purpose — a signal that
+    /// fires *before* anything is destroyed must not compete for the eye with
+    /// the one that fires while it is. See
+    /// [`crate::contention::TerritoryOverlap`].
+    pub overlaps: Vec<crate::contention::TerritoryOverlap>,
     /// Channel health, for the status bar.
     pub health: Health,
     /// Per-file live state — the source of PRD §7.3's building height.
@@ -84,6 +92,7 @@ impl WorldSnapshot {
             layout,
             threads: Vec::new(),
             attention: Vec::new(),
+            overlaps: Vec::new(),
             health: Health::default(),
             files: Arc::new(BTreeMap::new()),
             unattributed: Vec::new(),
@@ -112,13 +121,13 @@ impl WorldSnapshot {
     /// > **Primary decision it accelerates:** *unblock* — get to the thread that
     /// > is waiting on a human. (PRD §1)
     pub fn waiting(&self) -> impl Iterator<Item = &Thread> + '_ {
-        self.threads
-            .iter()
-            .filter(|t| t.status == ThreadStatus::Waiting)
+        self.threads.iter().filter(|t| t.status.blocks_operator())
     }
 
     /// Threads with a converged territory, paired with it, ready for
-    /// [`crate::territory::visible_clouds`].
+    /// [`crate::territory::select_clouds`] — which is what both renderers call,
+    /// because the counts it returns for the threads it *withholds* are what
+    /// lets an empty sky say why.
     pub fn territories(&self) -> Vec<(&Thread, &crate::territory::Territory)> {
         self.threads.iter().map(|t| (t, &t.territory)).collect()
     }
@@ -241,6 +250,7 @@ impl SnapshotPublisher {
             layout: Arc::clone(&state.layout),
             threads: world.threads_for_rail().into_iter().cloned().collect(),
             attention: world.attention.clone(),
+            overlaps: world.overlaps.clone(),
             health: world.health.clone(),
             files: Arc::clone(&state.files),
             unattributed: world.unattributed.values().cloned().collect(),

@@ -19,23 +19,90 @@
 //! ```
 //!
 //! There is no `#[tokio::main]` anywhere in Polis.
+//!
+//! # The window, in one page
+//!
+//! * [`camera`] — top-down orthographic, no rotation, no tilt (PRD §12), in
+//!   base-map pixel space so the overlay lines up with the texture exactly.
+//! * [`basemap`] — `polis-render`'s raster, uploaded once and redrawn only on
+//!   layout change (PRD §13), plus every static shape projected the same way and
+//!   the hit-test that answers "which building is under the cursor".
+//! * [`mapview`] — the five layers of PRD §10.3 in order, and the three
+//!   semantic-zoom representations of PRD §12.
+//! * [`clouds`] — PRD §10.4's iso-bands, summed on the CPU into one texture.
+//! * [`labels`] — the collision and decluttering PRD §13 calls "the one
+//!   genuinely hard thing a map engine would have bought you".
+//! * [`treeview`] — the linked filesystem view, co-equal with the map.
+//! * [`drill`] — PRD §12's *exact below*: one computation of who touched a file
+//!   and when, shared by the hover card, the detail panel and the tree, plus the
+//!   ordered attention list the *unblock* decision is made from.
+//! * [`palette`] — every colour, clamped into PRD §10.3's band for its layer.
+//! * [`ui`] — the overlay: status bar, status rail, detail panel, transport.
+//! * [`session`] — the picker, which is `polis replay`'s first-run experience.
+//! * [`repos`] — the repository launcher: which checkouts have agents working in
+//!   them right now. Bare `polis` opens it, and `o` in an open window switches
+//!   the watch to another checkout in place.
+//! * [`explain`] — the four sentences that say what a building is, in one place,
+//!   so the terminal screen and the window cannot drift apart.
+//!
+//! # The front door
+//!
+//! Two modules exist so that none of the above has to be known before the first
+//! useful minute:
+//!
+//! * [`setup`] — what bare `polis` does on a machine that has never run it
+//!   (detect, explain in one screen, open the session picker), plus `polis
+//!   connect` and `polis doctor`.
+//! * [`mod@watch`] — `polis watch`, the headline command: point it at a
+//!   repository and see every agent working in it, with **no** configuration at
+//!   all. This is the front door; the two below add detail on top of it.
+//! * [`status`] — [`status::Connectivity`], the one place that says which
+//!   channels are delivering and which are not, read by the window's status
+//!   area, `polis doctor` and `polis watch` alike.
+//! * [`mod@run`] — `polis run -- claude`, which launches an agent with the telemetry
+//!   environment already set on it, the receiver already listening and the map
+//!   already open.
+//!
+//! # Diagnostic environment variables
+//!
+//! All three are off unless set, print to stderr, and exist because each one
+//! answered a question that cost real time to answer any other way:
+//!
+//! | Variable | Prints |
+//! |---|---|
+//! | `POLIS_DEBUG_LAYOUT` | points per pixel, the viewport, and the rectangle the map was given — the DPI question |
+//! | `POLIS_DEBUG_FRAMES` | every frame's wall time and *why* it was drawn — the idle-budget question |
+//! | `POLIS_DEBUG_PICK` | the pointer, its map coordinate and the building it hit — the hit-test question |
+//!
+//! `POLIS_EDITOR` is not a diagnostic: it is the documented override for what a
+//! click on a building runs. See [`config::default_editor_command`].
 
 pub mod app;
 pub mod basemap;
+pub mod callout;
 pub mod camera;
 pub mod citygen;
 pub mod cli;
 pub mod clouds;
 pub mod commands;
 pub mod config;
+pub mod drill;
+pub mod explain;
 pub mod format;
+pub mod intent;
 pub mod labels;
 pub mod mapview;
 pub mod palette;
+pub mod panes;
+pub mod repos;
+pub mod run;
 pub mod session;
+pub mod setup;
 pub mod snapshot;
+pub mod status;
 pub mod treeview;
 pub mod ui;
+pub mod watch;
 
 #[cfg(test)]
 pub(crate) mod testutil;

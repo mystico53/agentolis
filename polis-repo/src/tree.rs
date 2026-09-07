@@ -945,6 +945,14 @@ const DEFAULT_INDUSTRIAL_DIRS: &[&str] = &[
     ".turbo",
     ".parcel-cache",
     ".angular",
+    // Astro's generated cache. Its absence made `stickingplace/.astro` — seven
+    // files of `content-modules.mjs` and `types.d.ts` that a tool wrote — read
+    // as one of that repository's twelve source districts.
+    ".astro",
+    ".docusaurus",
+    ".vercel",
+    ".netlify",
+    ".wrangler",
     // Rust / Go / JVM / .NET / C++
     "target",
     "obj",
@@ -979,6 +987,12 @@ const DEFAULT_INDUSTRIAL_DIRS: &[&str] = &[
     ".nyc_output",
     ".terraform",
     ".cache",
+    // Artifact dumps written by an agent's own browser tooling: console logs and
+    // page snapshots, timestamped, never edited. Present in three of the
+    // operator's repositories, where 106 of them read as `config`.
+    ".playwright-mcp",
+    "playwright-report",
+    "test-results",
     ".git",
 ];
 
