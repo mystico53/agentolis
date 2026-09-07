@@ -19,14 +19,15 @@
 //! `world → map px → screen px`, and every layer in the window uses it, which is
 //! why the overlay lines up with the texture at every zoom.
 //!
-//! [`polis_render::camera::Camera`] is a different object with a different job:
-//! it produces the orthographic matrix a wgpu pass needs. The two agree about
-//! [`ZoomTier`], which is why that enum is imported from there rather than
-//! redefined here.
+//! This is the only camera in the tree. `polis-render` once declared a second
+//! one — an orthographic projection for the wgpu pass PRD §13 specifies — but
+//! that pass was never implemented and both were removed (ADR-0110). What the
+//! renderer and the window still have to agree about is [`ZoomTier`], which is
+//! why that enum is imported from there rather than redefined here.
 
 use eframe::egui::{self, Pos2, Rect, Vec2};
 
-pub use polis_render::camera::ZoomTier;
+pub use polis_render::zoom::ZoomTier;
 
 /// How far out the camera may zoom, as a multiple of the fit-the-whole-city
 /// scale.

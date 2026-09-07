@@ -333,6 +333,12 @@ notoriously opaque error. Note that `glow 0.17.0` in the tree is **not** eframe'
 glow renderer — it arrives via `wgpu-hal`'s GLES backend — so its presence does
 not mean you are off the wgpu path.
 
+**Superseded in part by ADR-0110.** The paragraph below describes the shape of a
+wgpu pipeline that was declared and never implemented; it was removed, and with
+it `polis-render`'s `eframe` dependency. The rule this ADR is actually about —
+wgpu and winit come through eframe, never directly — stands, and now applies to
+`polis-app` alone.
+
 PRD §14 also lists `polis-render` as if it were independent of the UI shell. It
 cannot be: the offscreen density pass can only be encoded from inside
 `egui_wgpu::CallbackTrait::prepare()` (you cannot nest a render pass inside
@@ -5322,3 +5328,90 @@ every card to its own cloud (ADR-0108). It is an ambient link that is there
 before the operator asks, which is a different mark from the ones this decision
 removed — those appeared *because* they were asked for, and answered with a
 cobweb.
+
+---
+
+## ADR-0110 — Declaring a renderer is not having one: the wgpu tier is removed, and the sort key it justified is quantised
+
+**Context.** A review asked whether this architecture makes sense or whether
+half of it could be a web page. Answering it required counting the code
+honestly, and the count did not survive contact. Of 167 117 lines of Rust,
+13 761 are bake-off prototypes that are not workspace members and have never
+compiled, and roughly 55 000 are tests. Two of the remaining figures were worse
+than inflated, they were wrong:
+
+* **`polis-render` had 1 901 lines of GPU renderer that has never run.**
+  `PolisRenderer`, `PolisCallback`, `BaseMap`, `AgentLayer`, `MarkLayer`,
+  `Camera` and `FollowCamera` were declared exactly as ADR-0012 and PRD §13
+  describe, and every one of their bodies was `todo!()` — 18 of them across five
+  files. `density.rs` was the exception and was worse: 963 lines of a real,
+  finished three-pass wgpu pipeline, constructed by nothing anywhere in the
+  workspace except its own test. `grep -rln DensityField` returned two files,
+  `density.rs` and `tests/density_gpu.rs`.
+
+  What actually draws, and has since M2, is `plan` rasterising the base map into
+  one texture and `live` painting layers 3–5 over it, both onto a
+  `raster::Canvas` of plain sRGB bytes, with `polis-app` compositing that
+  texture under a few hundred `egui::Painter` shapes.
+
+* **`roads.rs` sorted the face-walk adjacency on a raw `f64::atan2`**, defended
+  by a comment reading "`atan2` produces an ordering here, never a coordinate,
+  so it cannot reach output geometry". `determinism::det_angle` sat fifteen
+  lines away in the same crate.
+
+**Decision.** Delete the wgpu tier — `agents.rs`, `city.rs`, `marks.rs`,
+`density.rs`, `tests/density_gpu.rs`, and the `PolisRenderer` / `PolisCallback`
+shell in `lib.rs`. `camera.rs` becomes `zoom.rs` and keeps only `ZoomTier`,
+which is the one thing the renderer and the window genuinely have to agree
+about and the only item in that module anything imported. Add
+`determinism::det_angle_f64` and route the adjacency sort through it. Archive
+the bake-off prototypes at the `archive/design-prototypes` tag with a pointer
+left in `docs/design/README.md`.
+
+**Why the ordering argument was wrong.** The test is not "does this number reach
+output geometry", it is "does this *decide* anything". The counter-clockwise
+order around a node is what the face walk consumes, so it chooses the face set,
+therefore the block set, therefore the lots and therefore the buildings. `atan2`
+is a platform libm call and is not correctly rounded, so two machines whose libm
+disagree by one ulp on a single near-collinear pair produce two different cities
+from the same repository — the exact failure PRD §7.4 and ADR-0029 exist to
+prevent, in the crate whose entire purpose is preventing it. `det_angle_f64`
+snaps to `TRIG_QUANTUM` and the existing edge-id tie-break makes the result a
+total order, so quantisation ties are already handled and cost nothing. It does
+not narrow to `f32`: the value lives only long enough to sort by, and the
+crate's discipline is `f64` inside and `f32` at the boundaries (ADR-0053).
+
+**Consequences.**
+
+* **`polis-render` now declares no GPU dependency at all.** `eframe`, `lyon` and
+  `bytemuck` are gone from its manifest; it keeps `thiserror` and `serde_json`.
+  The GPU stack enters the workspace exactly once, in `polis-app`, which is the
+  crate that opens a window. ADR-0012's rule — wgpu and winit come through
+  eframe, never directly — is unchanged and now has one member to apply to.
+* **ADR-0012's second half is superseded.** Its claim that PRD §14 is wrong to
+  list `polis-render` as independent of the UI shell was true only of the
+  pipeline that was never built. The crate that exists is independent of the UI
+  shell, and that is what makes the notation diffable, testable on pixels and
+  recordable without a window (PRD §15).
+* **ADR-0021 is closed on the one path that exists.** The colour-space question
+  it left open was specifically about reconciling an offscreen `Rgba8UnormSrgb`
+  target against eframe's backend-dependent non-sRGB surface. There is one
+  encoder now and it writes sRGB bytes into the file.
+* **This is not a decision about GPUs.** If the map ever needs one, `plan` and
+  `live` are where the notation is defined and tuned, and a pipeline would be
+  written against them rather than beside them. What is refused is carrying a
+  second, parallel, non-functioning definition of the notation in the meantime.
+* **`polis-app` still holds a real one.** `mapview.rs`, `clouds.rs` and
+  `basemap.rs` contain zero references to `FrameRenderer`, `LiveFrame` or
+  `build_frame`: the window reimplements the notation `polis-render` already
+  computes headlessly, so every notation change lands twice or the window and
+  the shared PNG drift. That is the larger duplication and it is not addressed
+  here.
+
+**Measured.** −15 662 lines: 1 901 of unbuilt renderer, 13 761 of archived
+prototype. +29 in `zoom.rs`, +33 in `determinism.rs`, +26 in `docs/design`.
+Every future line count of this repository stops being wrong by 8 %.
+
+**Expect the golden layout files to move.** The `atan2` change alters a sort key
+that decides the block set, so a golden that shifts is the bug being caught, not
+a regression — ADR-0029 rule 7 is explicit that this is the signal.

@@ -51,7 +51,7 @@ use polis_render::plan::{self, View};
 ///
 /// The same 1 600 `polis snapshot` defaults to, so the window and the PNG are
 /// the same picture. It is the ground the vector layers are drawn over rather
-/// than the source of detail — from [`polis_render::camera::ZoomTier::District`]
+/// than the source of detail — from [`polis_render::zoom::ZoomTier::District`]
 /// up, buildings and roads are redrawn as crisp vectors on top, which is what
 /// makes zooming in sharpen the map instead of magnifying its pixels.
 pub const BASE_MAP_PIXELS: usize = 1600;

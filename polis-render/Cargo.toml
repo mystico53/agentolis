@@ -1,6 +1,6 @@
 [package]
 name = "polis-render"
-description = "Polis renderer: wgpu pipelines, offscreen density field, camera, culling (PRD §10, §13)."
+description = "Polis renderer: CPU rasteriser, the live notation, semantic zoom (PRD §10, §13)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,13 +11,11 @@ repository.workspace = true
 polis-events = { workspace = true }
 polis-layout = { workspace = true }
 polis-world = { workspace = true }
-# NO direct `wgpu` and NO direct `winit`. eframe re-exports both
-# (`eframe::wgpu`, and winit through egui-winit) and pins them: wgpu 30.0.1,
-# winit 0.30.13. A direct dependency resolves to a *different* wgpu the day
-# eframe bumps, and the Device/Queue mismatch that follows is opaque. ADR-0012.
-eframe = { workspace = true }
-lyon = { workspace = true }
-bytemuck = { workspace = true }
+# NO GPU stack here, and that is load-bearing rather than incidental. This
+# crate rasterises on the CPU into plain sRGB bytes; the wgpu tier ADR-0012
+# shaped its public surface around was declared and never implemented, and was
+# removed with it (ADR-0110). eframe, lyon and bytemuck went with it. The GPU
+# enters the workspace exactly once, in `polis-app`, which opens the window.
 thiserror = { workspace = true }
 # `pacing` reads Channel D records to tell a tool call apart from a paragraph of
 # assistant text; the transcript carries them verbatim as `Value` (PRD §4.4).

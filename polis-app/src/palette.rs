@@ -249,7 +249,7 @@ pub fn monument_label() -> Ink {
     Ink::typography([96, 96, 96])
 }
 
-/// A file name at [`polis_render::camera::ZoomTier::Building`].
+/// A file name at [`polis_render::zoom::ZoomTier::Building`].
 pub fn file_label() -> Ink {
     Ink::typography([84, 86, 90])
 }

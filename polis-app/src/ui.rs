@@ -33,7 +33,7 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, RichText};
 use polis_events::{LogicalPath, ThreadId};
 use polis_render::live::CloudCensus;
-use polis_render::camera::ZoomTier;
+use polis_render::zoom::ZoomTier;
 use polis_world::attention::AttentionKind;
 use polis_world::replay::{Interest, ReplayProgress};
 use polis_world::snapshot::WorldSnapshot;

@@ -1784,7 +1784,7 @@ impl PolisApp {
                 frame.tier = scene
                     .camera
                     .as_ref()
-                    .map_or(polis_render::camera::ZoomTier::City, Camera::tier);
+                    .map_or(polis_render::zoom::ZoomTier::City, Camera::tier);
             }
         }
 

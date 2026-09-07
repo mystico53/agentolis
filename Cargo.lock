@@ -2481,9 +2481,6 @@ dependencies = [
 name = "polis-render"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
- "eframe",
- "lyon",
  "polis-events",
  "polis-ingest",
  "polis-layout",
